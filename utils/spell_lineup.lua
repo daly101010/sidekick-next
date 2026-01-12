@@ -1,0 +1,181 @@
+-- F:/lua/sidekick/utils/spell_lineup.lua
+-- Spell Lineup - Gem scanning and spell categorization
+
+local mq = require('mq')
+
+local M = {}
+
+-- Cached spell list
+M.spells = {}
+M.lastScanZone = ''
+
+-- SPA IDs for categorization
+M.SPA = {
+    HP = 0,
+    MOVEMENT_SPEED = 3,
+    ATTACK_SPEED = 11,
+    STUN = 21,
+    CHARM = 22,
+    FEAR = 23,
+    MESMERIZE = 31,
+    RESIST_FIRE = 46,
+    RESIST_COLD = 47,
+    RESIST_POISON = 48,
+    RESIST_DISEASE = 49,
+    RESIST_MAGIC = 50,
+    HP_OVER_TIME = 79,
+    ROOT = 99,
+}
+
+-- Category priority (lower = higher priority)
+M.CATEGORY_PRIORITY = {
+    heal = 1,
+    mez = 2,
+    slow = 3,
+    tash = 4,
+    debuff = 5,
+    nuke = 6,
+    dot = 7,
+    snare = 8,
+    root = 9,
+    charm = 10,
+    fear = 11,
+    stun = 12,
+    buff = 20,
+}
+
+--- Categorize a spell based on its SPA effects
+-- @param spell userdata MQ Spell object
+-- @return string Category name
+function M.categorizeSpell(spell)
+    if not spell or not spell() then return nil end
+
+    local isDetrimental = spell.SpellType() == 'Detrimental'
+
+    -- Check specific CC/debuff effects first (most specific wins)
+    if spell.HasSPA(M.SPA.MESMERIZE)() then return 'mez' end
+    if spell.HasSPA(M.SPA.ATTACK_SPEED)() and isDetrimental then return 'slow' end
+    if spell.HasSPA(M.SPA.ROOT)() then return 'root' end
+    if spell.HasSPA(M.SPA.MOVEMENT_SPEED)() and isDetrimental then return 'snare' end
+    if spell.HasSPA(M.SPA.CHARM)() then return 'charm' end
+    if spell.HasSPA(M.SPA.FEAR)() then return 'fear' end
+    if spell.HasSPA(M.SPA.STUN)() and isDetrimental then return 'stun' end
+    if spell.HasSPA(M.SPA.RESIST_MAGIC)() and isDetrimental then return 'tash' end
+
+    -- Resist debuffs (malo-type)
+    if isDetrimental then
+        for _, spa in ipairs({M.SPA.RESIST_FIRE, M.SPA.RESIST_COLD, M.SPA.RESIST_POISON, M.SPA.RESIST_DISEASE}) do
+            if spell.HasSPA(spa)() then return 'debuff' end
+        end
+    end
+
+    -- HP-based: heal vs nuke/dot
+    local hasHP = spell.HasSPA(M.SPA.HP)()
+    local hasHPot = spell.HasSPA(M.SPA.HP_OVER_TIME)()
+    if hasHP or hasHPot then
+        if isDetrimental then
+            if hasHPot then return 'dot' end
+            return 'nuke'
+        else
+            return 'heal'
+        end
+    end
+
+    -- Fallback
+    if isDetrimental then return 'debuff' end
+    return 'buff'
+end
+
+--- Get resist type for a spell
+-- @param spell userdata MQ Spell object
+-- @return string|nil Resist type or nil
+function M.getResistType(spell)
+    if not spell or not spell() then return nil end
+    local rt = spell.ResistType and spell.ResistType()
+    if rt and rt ~= '' and rt ~= 'Unresistable' then
+        return rt
+    end
+    return nil
+end
+
+--- Get target type for a spell
+-- @param spell userdata MQ Spell object
+-- @return string Target type
+function M.getTargetType(spell)
+    if not spell or not spell() then return 'Unknown' end
+    local tt = spell.TargetType and spell.TargetType()
+    return tt or 'Unknown'
+end
+
+--- Scan memorized spells and build sorted list
+-- @return table Array of spell entries
+function M.scan()
+    local spells = {}
+    local numGems = mq.TLO.Me.NumGems() or 8
+
+    -- Scan gems 1 to (NumGems-1), skip utility gem
+    for gem = 1, numGems - 1 do
+        local spell = mq.TLO.Me.Gem(gem)
+        if spell and spell() and spell.ID() and spell.ID() > 0 then
+            local category = M.categorizeSpell(spell)
+            local entry = {
+                gem = gem,
+                name = spell.Name(),
+                id = spell.ID(),
+                category = category,
+                resistType = nil,
+                targetType = M.getTargetType(spell),
+            }
+
+            -- Store resist type for damage spells
+            if category == 'nuke' or category == 'dot' then
+                entry.resistType = M.getResistType(spell)
+            end
+
+            table.insert(spells, entry)
+        end
+    end
+
+    -- Sort by category priority, then gem order
+    table.sort(spells, function(a, b)
+        local prioA = M.CATEGORY_PRIORITY[a.category] or 99
+        local prioB = M.CATEGORY_PRIORITY[b.category] or 99
+        if prioA ~= prioB then
+            return prioA < prioB
+        end
+        return a.gem < b.gem
+    end)
+
+    M.spells = spells
+    M.lastScanZone = mq.TLO.Zone.ShortName() or ''
+
+    return spells
+end
+
+--- Get cached spells, rescan if needed
+-- @param forceRescan boolean Force a rescan
+-- @return table Array of spell entries
+function M.getSpells(forceRescan)
+    if forceRescan or #M.spells == 0 then
+        return M.scan()
+    end
+    return M.spells
+end
+
+--- Check if zone changed and rescan if needed
+-- @param settings table Settings table
+function M.checkZoneChange(settings)
+    if not settings or settings.SpellRescanOnZone == false then return end
+
+    local currentZone = mq.TLO.Zone.ShortName() or ''
+    if currentZone ~= M.lastScanZone and currentZone ~= '' then
+        M.scan()
+    end
+end
+
+--- Initialize spell lineup
+function M.init()
+    M.scan()
+end
+
+return M

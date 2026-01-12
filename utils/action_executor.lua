@@ -1,0 +1,224 @@
+-- F:/lua/SideKick/utils/action_executor.lua
+-- Action Executor - Channel-based action execution with lockouts
+-- Prevents spam, ensures proper sequencing, enables future spell integration
+
+local mq = require('mq')
+
+local M = {}
+
+-- Channels with independent lockouts
+local CHANNELS = {
+    melee = { lastAction = 0, lockout = 0.1 },    -- 100ms between melee actions
+    aa_disc = { lastAction = 0, lockout = 0.1 },  -- 100ms between AA/disc
+    spell = { lastAction = 0, lockout = 0.5 },    -- 500ms between spell casts (GCD)
+    item = { lastAction = 0, lockout = 0.2 },     -- 200ms between item clicks
+}
+
+-- Global casting lock (can't do most actions while casting)
+local _casting = false
+local _castEndTime = 0
+
+function M.init()
+    for _, ch in pairs(CHANNELS) do
+        ch.lastAction = 0
+    end
+    _casting = false
+    _castEndTime = 0
+end
+
+--- Check if a channel is ready for action
+-- @param channel string Channel name ('melee', 'aa_disc', 'spell', 'item')
+-- @return boolean True if channel can execute
+function M.isChannelReady(channel)
+    local ch = CHANNELS[channel]
+    if not ch then return false end
+
+    local now = os.clock()
+
+    -- Global casting lock (except melee)
+    if channel ~= 'melee' and _casting and now < _castEndTime then
+        return false
+    end
+
+    return (now - ch.lastAction) >= ch.lockout
+end
+
+--- Mark a channel as used (start lockout)
+-- @param channel string Channel name
+function M.markChannelUsed(channel)
+    local ch = CHANNELS[channel]
+    if ch then
+        ch.lastAction = os.clock()
+    end
+end
+
+--- Set casting state (blocks other channels during cast)
+-- @param casting boolean Is currently casting
+-- @param duration number Cast duration in seconds (optional)
+function M.setCasting(casting, duration)
+    _casting = casting
+    if casting and duration then
+        _castEndTime = os.clock() + duration
+    elseif not casting then
+        _castEndTime = 0
+    end
+end
+
+--- Check if currently casting
+function M.isCasting()
+    if _casting and os.clock() >= _castEndTime then
+        _casting = false
+    end
+    return _casting
+end
+
+-- AA/Disc Execution
+
+--- Execute an AA ability
+-- @param altId number Alt ability ID
+-- @return boolean True if executed
+function M.executeAA(altId)
+    if not altId then return false end
+    if not M.isChannelReady('aa_disc') then return false end
+
+    local me = mq.TLO.Me
+    if not me or not me() then return false end
+    if not me.AltAbilityReady(altId)() then return false end
+
+    mq.cmdf('/alt activate %d', altId)
+    M.markChannelUsed('aa_disc')
+    return true
+end
+
+--- Execute a discipline
+-- @param discName string Discipline name
+-- @return boolean True if executed
+function M.executeDisc(discName)
+    if not discName or discName == '' then return false end
+    if not M.isChannelReady('aa_disc') then return false end
+
+    local me = mq.TLO.Me
+    if not me or not me() then return false end
+    if not me.CombatAbilityReady(discName)() then return false end
+
+    mq.cmdf('/disc %s', discName)
+    M.markChannelUsed('aa_disc')
+    return true
+end
+
+--- Execute an ability from definition table
+-- @param def table Ability definition with kind, altID/discName/spellName
+-- @return boolean True if executed
+function M.executeAbility(def)
+    if not def then return false end
+
+    local kind = tostring(def.kind or 'aa')
+
+    if kind == 'aa' then
+        return M.executeAA(tonumber(def.altID))
+    elseif kind == 'disc' then
+        return M.executeDisc(def.discName or def.altName)
+    elseif kind == 'spell' then
+        return M.executeSpell(def.spellName, def.targetId, def)
+    end
+
+    return false
+end
+
+-- Spell Execution
+
+--- Execute a spell through the spell engine
+-- @param spellName string Spell name
+-- @param targetId number|nil Target spawn ID
+-- @param opts table|nil Options (allowMem, preferredGem, maxRetries, spellCategory)
+-- @return boolean True if cast initiated
+function M.executeSpell(spellName, targetId, opts)
+    if not spellName or spellName == '' then return false end
+    if not M.isChannelReady('spell') then return false end
+
+    -- Delegate to spell engine for full state machine handling
+    local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+    if not ok or not SpellEngine then return false end
+
+    -- Check if spell engine is already casting
+    if SpellEngine.isBusy() then return false end
+
+    local success, reason = SpellEngine.cast(spellName, targetId, opts)
+    return success == true
+end
+
+--- Check if spell engine is busy
+-- @return boolean True if currently casting a spell
+function M.isSpellBusy()
+    local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+    if ok and SpellEngine then
+        return SpellEngine.isBusy()
+    end
+    return false
+end
+
+-- Item Execution
+
+--- Execute an item click
+-- @param itemName string Item name
+-- @return boolean True if executed
+function M.executeItem(itemName)
+    if not itemName or itemName == '' then return false end
+    if not M.isChannelReady('item') then return false end
+
+    local item = mq.TLO.FindItem(itemName)
+    if not item or not item() then return false end
+    if item.TimerReady() ~= 0 then return false end  -- 0 means ready
+
+    mq.cmdf('/useitem "%s"', itemName)
+    M.markChannelUsed('item')
+    return true
+end
+
+--- Execute an item click by slot
+-- @param slotName string Slot name (e.g., 'charm', 'pack1')
+-- @return boolean True if executed
+function M.executeItemSlot(slotName)
+    if not slotName or slotName == '' then return false end
+    if not M.isChannelReady('item') then return false end
+
+    local item = mq.TLO.InvSlot(slotName).Item
+    if not item or not item() then return false end
+    if item.TimerReady() ~= 0 then return false end
+
+    mq.cmdf('/itemnotify %s rightmouseup', slotName)
+    M.markChannelUsed('item')
+    return true
+end
+
+-- Melee Ability Execution
+
+--- Execute a melee ability (Taunt, Kick, Bash, etc.)
+-- @param abilityName string Ability name
+-- @return boolean True if executed
+function M.executeMeleeAbility(abilityName)
+    if not abilityName or abilityName == '' then return false end
+    if not M.isChannelReady('melee') then return false end
+
+    local me = mq.TLO.Me
+    if not me or not me() then return false end
+    if not me.AbilityReady(abilityName)() then return false end
+
+    mq.cmdf('/doability %s', abilityName)
+    M.markChannelUsed('melee')
+    return true
+end
+
+--- Execute Taunt specifically (commonly used)
+-- @return boolean True if executed
+function M.executeTaunt()
+    return M.executeMeleeAbility('Taunt')
+end
+
+--- Execute Kick
+-- @return boolean True if executed
+function M.executeKick()
+    return M.executeMeleeAbility('Kick')
+end
+
+return M

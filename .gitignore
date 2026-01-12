@@ -1,0 +1,13 @@
+# Backup files
+*.bak
+*_backup.lua
+
+# Local settings
+.claude/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
