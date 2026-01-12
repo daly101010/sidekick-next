@@ -4,8 +4,11 @@ local Core = require('utils.core')
 
 local M = {}
 
--- Mode constant for condition-based activation
-local MODE_ON_CONDITION = 6
+-- Simplified mode system:
+-- ON_DEMAND (1) = never auto-fire, user must click
+-- AUTO (2) = auto-fire based on category layer + condition gate
+local MODE_ON_DEMAND = 1
+local MODE_AUTO = 2
 
 local LAYER_KEYS = { 'auto', 'emergency', 'aggro', 'defenses', 'burn', 'combat', 'utility' }
 local LAYER_LABELS = {
@@ -372,7 +375,7 @@ function M.drawAbilities(ctx)
                 end
                 imgui.NextColumn()
 
-                local mode = tonumber(settings[def.modeKey]) or 4
+                local mode = tonumber(settings[def.modeKey]) or MODE_ON_DEMAND
                 imgui.SetNextItemWidth(modeW - 6)
                 local newMode = comboMode('##mode_' .. def.settingKey, mode, modeLabels)
                 if newMode ~= mode and ctx.onMode then
@@ -391,8 +394,8 @@ function M.drawAbilities(ctx)
                 imgui.Text(cdText)
                 imgui.NextColumn()
 
-                -- Show condition builder when mode is On Condition
-                if mode == MODE_ON_CONDITION or newMode == MODE_ON_CONDITION then
+                -- Show condition builder when mode is AUTO
+                if mode == MODE_AUTO or newMode == MODE_AUTO then
                     local condKey = def.modeKey:gsub('Mode$', 'Condition')
                     local condData = settings[condKey]
                     if not condData and Core.Ini and Core.Ini['SideKick-Abilities'] then
@@ -640,7 +643,7 @@ function M.drawAbilities(ctx)
                     imgui.NextColumn()
 
                     imgui.SetNextItemWidth(modeW - 6)
-                    local mode = tonumber(settings[def.modeKey]) or 4
+                    local mode = tonumber(settings[def.modeKey]) or MODE_ON_DEMAND
                     local newMode = comboMode('##mode_' .. def.settingKey, mode, modeLabels)
                     if newMode ~= mode and ctx.onMode then ctx.onMode(def.modeKey, newMode) end
                     imgui.NextColumn()
@@ -656,8 +659,8 @@ function M.drawAbilities(ctx)
                     imgui.Text(cdText)
                     imgui.NextColumn()
 
-                    -- Show condition builder when mode is On Condition
-                    if mode == MODE_ON_CONDITION or newMode == MODE_ON_CONDITION then
+                    -- Show condition builder when mode is AUTO
+                    if mode == MODE_AUTO or newMode == MODE_AUTO then
                         local condKey = def.modeKey:gsub('Mode$', 'Condition')
                         local condData = settings[condKey]
                         if not condData and Core.Ini and Core.Ini['SideKick-Abilities'] then

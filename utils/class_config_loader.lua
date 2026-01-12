@@ -19,6 +19,9 @@ M.current = nil
 function M.load(classShort)
     if not classShort or classShort == '' then return nil end
 
+    -- Normalize to uppercase for consistent file naming
+    classShort = classShort:upper()
+
     -- Check cache
     if M.configs[classShort] then
         M.current = M.configs[classShort]

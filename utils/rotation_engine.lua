@@ -308,6 +308,7 @@ function M.evaluateConditionGate(def, settings, ctx, classConfig)
 end
 
 --- Check if an ability passes its mode gate
+-- Simplified: abilities are either ON_DEMAND (never auto) or AUTO (category + conditions)
 -- @param def table Ability definition
 -- @param settings table Settings table
 -- @param state table Current automation state
@@ -321,47 +322,28 @@ function M.checkModeGate(def, settings, state, ctx, classConfig)
     local mode = def.modeKey and tonumber(settings[def.modeKey]) or Abilities.MODE.ON_DEMAND
 
     -- On-demand: never auto-fire (user must click)
-    if mode == Abilities.MODE.ON_DEMAND or mode == Abilities.MODE.MANUAL then
+    if mode == Abilities.MODE.ON_DEMAND then
         return false
     end
 
-    -- On cooldown: always fire (if ready)
-    if mode == Abilities.MODE.ON_CD then
-        return true
-    end
-
-    -- On burn: only during burn
-    if mode == Abilities.MODE.ON_BURN then
-        return state.burnActive == true
-    end
-
-    -- On named: only against named mobs
-    if mode == Abilities.MODE.ON_NAMED then
-        local Cache = getCache()
-        return Cache and Cache.isTargetNamed() or false
-    end
-
-    -- On condition: evaluate condition gate (user override OR class config default)
-    if mode == Abilities.MODE.ON_CONDITION then
-        -- Build context if not provided
-        if not ctx then
-            local ConditionContext = getConditionContext()
-            if ConditionContext then
-                ctx = ConditionContext.build()
-            else
-                ctx = {}
-            end
+    -- AUTO mode: evaluate condition gate (user override OR class config default)
+    -- Note: category/layer context is already checked by shouldLayerRun()
+    -- Build context if not provided
+    if not ctx then
+        local ConditionContext = getConditionContext()
+        if ConditionContext then
+            ctx = ConditionContext.build()
+        else
+            ctx = {}
         end
-
-        -- Load class config if not provided
-        if not classConfig then
-            classConfig = getClassConfig(state.myClass)
-        end
-
-        return M.evaluateConditionGate(def, settings, ctx, classConfig)
     end
 
-    return false
+    -- Load class config if not provided
+    if not classConfig then
+        classConfig = getClassConfig(state.myClass)
+    end
+
+    return M.evaluateConditionGate(def, settings, ctx, classConfig)
 end
 
 --- Try to execute an ability through the action executor

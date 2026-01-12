@@ -80,22 +80,24 @@ local function getOrderPosition(def, orderIndex)
     return orderIndex[def.settingKey] or 9999
 end
 
+-- Simplified mode: abilities either auto-fire (via category + conditions) or are on-demand only
+-- The old ON_CD/ON_BURN/ON_NAMED modes are now handled by:
+--   - Category assignment (burn abilities go in burn layer)
+--   - defaultConditions in class configs (e.g., ctx.target.named for named-only abilities)
 M.MODE = {
-    ON_DEMAND = 1,    -- Never auto-fire, user must click (was MANUAL)
-    ON_CD = 2,        -- Always fire when ready
-    ON_BURN = 3,      -- Fire only during burn phase
-    ON_NAMED = 4,     -- Fire only on named mobs
-    ON_CONDITION = 5, -- Fire when condition gate passes
+    ON_DEMAND = 1,  -- Never auto-fire, user must click
+    AUTO = 2,       -- Auto-fire based on category layer + condition gate
 }
--- Backward compatibility alias
+-- Backward compatibility aliases
 M.MODE.MANUAL = M.MODE.ON_DEMAND
+M.MODE.ON_CD = M.MODE.AUTO        -- Deprecated: use AUTO + no condition
+M.MODE.ON_BURN = M.MODE.AUTO      -- Deprecated: use burn category
+M.MODE.ON_NAMED = M.MODE.AUTO     -- Deprecated: use condition ctx.target.named
+M.MODE.ON_CONDITION = M.MODE.AUTO -- Deprecated: use AUTO (conditions always evaluated)
 
 M.MODE_LABELS = {
     [M.MODE.ON_DEMAND] = 'On Demand',
-    [M.MODE.ON_CD] = 'On Cooldown',
-    [M.MODE.ON_BURN] = 'On Burn',
-    [M.MODE.ON_NAMED] = 'On Named',
-    [M.MODE.ON_CONDITION] = 'On Condition',
+    [M.MODE.AUTO] = 'Auto',
 }
 
 --- Sort abilities by BarOrder position (user drag-drop order from UI)
@@ -258,46 +260,43 @@ function M.activate(def)
     end
 end
 
+--- Try all abilities in sorted priority order
+-- Note: This is a simplified version for backwards compatibility.
+-- The rotation_engine.lua now handles the full category + condition logic.
+-- @param opts table Options: abilities, settings, burn
 function M.tryAllAbilities(opts)
     opts = opts or {}
     local abilities = opts.abilities or {}
     local settings = opts.settings or {}
-    local burn = opts.burn == true
 
     local me = mq.TLO.Me
     if not me or not me() then return end
     if not (me.Combat and me.Combat()) then return end
 
-    local named = isNamedTarget()
     local sorted = M.sortByPriority(abilities)
 
     for _, def in ipairs(sorted) do
         if type(def) ~= 'table' then goto continue end
 
+        -- Check individual enabled toggle
         local enabled = def.settingKey and settings[def.settingKey] == true
         if not enabled then goto continue end
 
+        -- Check mode: ON_DEMAND skips auto-fire, AUTO proceeds
         local mode = def.modeKey and tonumber(settings[def.modeKey]) or M.MODE.ON_DEMAND
-        if mode == M.MODE.MANUAL or mode == M.MODE.ON_DEMAND then goto continue end
-        if mode == M.MODE.ON_BURN and not burn then goto continue end
-        if mode == M.MODE.ON_NAMED and not named then goto continue end
-        if mode == M.MODE.ON_CONDITION then
-            -- Evaluate condition from settings
-            local condKey = def.conditionKey or (def.modeKey and def.modeKey:gsub('Mode$', 'Condition'))
-            local condData = condKey and settings[condKey]
-            local cb = getConditionBuilder()
-            if cb and condData then
-                -- Handle both deserialized table and serialized string
-                local evalData = condData
-                if type(condData) == 'string' and condData ~= '' then
-                    evalData = cb.deserialize and cb.deserialize(condData) or nil
-                end
-                if not evalData or type(evalData) ~= 'table' then
-                    goto continue  -- Invalid condition data
-                end
+        if mode == M.MODE.ON_DEMAND then goto continue end
+
+        -- For AUTO mode, evaluate condition gate if present
+        local condKey = def.conditionKey or (def.modeKey and def.modeKey:gsub('Mode$', 'Condition'))
+        local condData = condKey and settings[condKey]
+        local cb = getConditionBuilder()
+        if cb and condData then
+            local evalData = condData
+            if type(condData) == 'string' and condData ~= '' then
+                evalData = cb.deserialize and cb.deserialize(condData) or nil
+            end
+            if evalData and type(evalData) == 'table' then
                 if not cb.evaluate(evalData) then goto continue end
-            else
-                goto continue  -- No condition set, skip
             end
         end
 

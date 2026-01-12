@@ -84,10 +84,12 @@ local function findGemForAbilitySet(abilitySetName, loadoutName)
     local ConfigLoader = getConfigLoader()
     if not ConfigLoader or not ConfigLoader.current then return nil end
 
-    local loadouts = ConfigLoader.current.SpellLoadouts
-    if not loadouts or not loadouts[loadoutName] then return nil end
+    -- Use getSpellLoadouts to support both old and new format
+    local loadouts = ConfigLoader.getSpellLoadouts()
+    local loadout = loadouts[loadoutName] or loadouts[loadoutName:lower()]
+    if not loadout then return nil end
 
-    local gems = loadouts[loadoutName].gems
+    local gems = loadout.gems
     if not gems then return nil end
 
     for gem, setName in pairs(gems) do
