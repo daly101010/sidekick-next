@@ -55,3 +55,8 @@ mq.bind('/sidekick', function(cmd)
 end)
 
 log('SideKick launcher loaded. Use /sidekick start|stop|restart')
+
+-- Keep script alive so command binding persists
+while mq.TLO.MacroQuest.GameState() == 'INGAME' do
+    mq.delay(1000)
+end
