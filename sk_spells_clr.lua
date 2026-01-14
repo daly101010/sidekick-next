@@ -117,12 +117,100 @@ M.GroupHeals = {
 
 -- HoT (Heal over Time) spell lines
 M.HoT = {
-    -- Celestial line (group HoT)
+    -- Elixir line (group HoT)
+    Elixir = {
+        'Elixir of Absolution',   -- 130
+        'Eminent Elixir',         -- 127
+        'Elixir of Realization',  -- 125
+        'Avowed Elixir',          -- 122
+        'Elixir of Benevolence',  -- 120
+        'Hallowed Elixir',        -- 117
+        'Elixir of Transcendence', -- 115
+        'Elixir of Wulthan',      -- 110
+        'Merciful Elixir',        -- 107
+        'Elixir of the Seas',     -- 105
+        'Ardent Elixir',          -- 102
+        'Elixir of the Acquittal', -- 100
+        'Elixir of the Beneficent', -- 95
+        'Elixir of the Ardent',   -- 90
+        'Elixir of Atonement',    -- 80
+        'Solemn Elixir',          -- 77
+        'Elixir of Redemption',   -- 75
+        'Elixir of Divinity',     -- 70
+        'Pious Elixir',           -- 67
+        'Holy Elixir',            -- 65
+        'Ethereal Elixir',        -- 60
+        'Celestial Elixir',       -- 59
+    },
+
+    -- Celestial line (older HoT)
     Celestial = {
         'Celestial Elixir',       -- 59
         'Celestial Healing',      -- 44
         'Celestial Health',       -- 29
         'Celestial Remedy',       -- 19
+    },
+}
+
+-- Direct single-target heals
+M.DirectHeals = {
+    -- Light line (efficient direct heals)
+    Light = {
+        'Eminent Light',          -- 128
+        'Avowed Light',           -- 123
+        'Fervent Light',          -- 118
+        'Sincere Light',          -- 113
+        'Merciful Light',         -- 108
+        'Ardent Light',           -- 103
+        'Reverent Light',         -- 98
+        'Zealous Light',          -- 93
+        'Earnest Light',          -- 88
+        'Devout Light',           -- 83
+        'Solemn Light',           -- 78
+        'Sacred Light',           -- 73
+        'Ancient Hallowed Light', -- 70
+        'Divine Light',           -- 53
+    },
+
+    -- Splash line (targeted AE heals)
+    Splash = {
+        'Flourishing Splash',     -- 130
+        'Acceptance Splash',      -- 125
+        'Refreshing Splash',      -- 120
+        'Restoring Splash',       -- 115
+        'Mending Splash',         -- 110
+        'Convalescent Splash',    -- 105
+        'Reforming Splash',       -- 100
+        'Rejuvenating Splash',    -- 95
+        'Healing Splash',         -- 90
+    },
+}
+
+-- Reactive/Guardian heals
+M.Reactive = {
+    -- Divine line (reactive heals/wards)
+    Divine = {
+        'Divine Magnitude',       -- 129
+        'Divine Interstition',    -- 127
+        'Divine Rejoinder',       -- 124
+        'Divine Interference',    -- 122
+        'Divine Liturgy',         -- 122
+        'Divine Contingency',     -- 118
+        'Divine Mediation',       -- 117
+        'Divine Bulwark',         -- 117
+        'Divine Consequence',     -- 113
+        'Divine Reaction',        -- 108
+        'Divine Jurisdiction',    -- 107
+        'Divine Response',        -- 102
+        'Divine Indemnification', -- 102
+        'Divine Indemnity',       -- 102
+        'Divine Invocation',      -- 92
+        'Divine Guard',           -- 92
+        'Divine Intercession',    -- 87
+        'Divine Fortitude',       -- 87
+        'Divine Eminence',        -- 82
+        'Divine Destiny',         -- 77
+        'Divine Custody',         -- 72
     },
 }
 
@@ -140,6 +228,45 @@ M.Damage = {
         'Elysian Contravention',  -- 95
         'Celestial Contravention', -- 90
         'Holy Contravention',     -- 85
+    },
+
+    -- Undead damage line
+    Undead = {
+        'Expunge the Undead',     -- 129
+        'Banish the Undead',      -- 121
+        'Extirpate the Undead',   -- 116
+        'Obliterate the Undead',  -- 111
+        'Repudiate the Undead',   -- 106
+        'Eradicate the Undead',   -- 101
+        'Abrogate the Undead',    -- 96
+        'Abolish the Undead',     -- 91
+        'Annihilate the Undead',  -- 86
+        'Desolate Undead',        -- 68
+        'Destroy Undead',         -- 64
+        'Exile Undead',           -- 55
+        'Banish Undead',          -- 43
+        'Expel Undead',           -- 33
+        'Dismiss Undead',         -- 23
+        'Expulse Undead',         -- 13
+        'Ward Undead',            -- 4
+    },
+
+    -- Sermon line (DD + stun hybrid)
+    Sermon = {
+        'Sermon of Eminence',     -- 127
+        'Sermon of the Decree',   -- 121
+        'Sermon of Repentance',   -- 118
+        'Sermon of Injunction',   -- 113
+        'Sermon of Sanction',     -- 108
+        'Sermon of Justice',      -- 103
+        'Sermon of Rebuke',       -- 98
+        'Sermon of Condemnation', -- 93
+        'Sermon of Censure',      -- 88
+        'Sermon of Castigation',  -- 83
+        'Sermon of Admonition',   -- 78
+        'Sermon of Reproach',     -- 67
+        'Sermon of Penitence',    -- 62
+        'Sermon of the Righteous', -- 25
     },
 }
 
@@ -275,6 +402,41 @@ M.Buffs = {
         'Benediction of Reverence', -- 111
         'Benediction of Piety',   -- 101
         'Blessing of Assurance',  -- 91
+    },
+
+    -- Unity (combined group buff)
+    Unity = {
+        'Unity of Sharosh',       -- 126
+        'Unity of Helmsbane',     -- 121
+        'Unity of the Sanguine',  -- 116
+        'Unity of Jorlleag',      -- 111
+        'Unity of Emra',          -- 106
+        'Unity of Nonia',         -- 101
+        'Unity of Gezat',         -- 96
+        'Unity of the Triumvirate', -- 91
+    },
+
+    -- Yaulp (self buff - HP/mana regen, haste)
+    Yaulp = {
+        'Yaulp XIX',              -- 126
+        'Yaulp XVIII',            -- 121
+        'Yaulp XVII',             -- 116
+        'Yaulp XVI',              -- 111
+        'Yaulp XV',               -- 106
+        'Yaulp XIV',              -- 101
+        'Yaulp XIII',             -- 96
+        'Yaulp XII',              -- 91
+        'Yaulp XI',               -- 86
+        'Yaulp X',                -- 81
+        'Yaulp IX',               -- 76
+        'Yaulp VIII',             -- 71
+        'Yaulp VII',              -- 69
+        'Yaulp VI',               -- 65
+        'Yaulp V',                -- 56
+        'Yaulp IV',               -- 53
+        'Yaulp III',              -- 41
+        'Yaulp II',               -- 16
+        'Yaulp',                  -- 1
     },
 }
 
