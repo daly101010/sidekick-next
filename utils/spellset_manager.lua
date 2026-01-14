@@ -1590,4 +1590,188 @@ function M.resolveSpellFromLine(lineName)
     return nil
 end
 
+--------------------------------------------------------------------------------
+-- Spell Set CRUD Operations
+--------------------------------------------------------------------------------
+
+--- Create a new spell set
+-- @param name string The spell set name
+-- @return table|nil The new spell set or nil if invalid
+function M.createSet(name)
+    if not name or name == '' then return nil end
+    if M.spellSets[name] then return M.spellSets[name] end
+
+    local set = {
+        name = name,
+        lines = {},  -- {[lineName] = {enabled, slotType, condition, priority}}
+    }
+
+    M.spellSets[name] = set
+    return set
+end
+
+--- Delete a spell set
+-- @param name string The spell set name
+-- @return boolean True if deleted
+function M.deleteSet(name)
+    if not name or not M.spellSets[name] then return false end
+
+    M.spellSets[name] = nil
+
+    if M.activeSetName == name then
+        M.activeSetName = nil
+    end
+
+    M.saveSpellSets()
+    return true
+end
+
+--- Get a spell set by name
+-- @param name string The spell set name
+-- @return table|nil The spell set or nil
+function M.getSet(name)
+    return M.spellSets[name]
+end
+
+--- Get the active spell set
+-- @return table|nil The active spell set or nil
+function M.getActiveSet()
+    if not M.activeSetName then return nil end
+    return M.spellSets[M.activeSetName]
+end
+
+--- Get list of all spell set names
+-- @return table Array of spell set names
+function M.getSetNames()
+    local names = {}
+    for name, _ in pairs(M.spellSets) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
+--------------------------------------------------------------------------------
+-- Spell Line Enable/Disable Operations
+--------------------------------------------------------------------------------
+
+--- Enable a spell line in a set
+-- @param setName string The spell set name
+-- @param lineName string The spell line name
+-- @param slotType string 'rotation' or 'buff_swap' (optional, defaults to line's defaultSlotType)
+-- @return boolean True if enabled, false if at capacity or invalid
+function M.enableLine(setName, lineName, slotType)
+    local set = M.getSet(setName)
+    if not set then return false end
+
+    slotType = slotType or 'rotation'
+
+    -- Check capacity for rotation lines
+    if slotType == 'rotation' then
+        local count = M.countEnabledRotation(setName)
+        if count >= M.getRotationCapacity() then
+            return false  -- At capacity
+        end
+    end
+
+    -- Get default slot type if not specified
+    if not set.lines[lineName] then
+        local SpellsClr = getSpellsClr()
+        local lineData = SpellsClr and SpellsClr.getLine(lineName)
+        if lineData then
+            slotType = lineData.defaultSlotType or 'rotation'
+        end
+    end
+
+    set.lines[lineName] = set.lines[lineName] or {}
+    set.lines[lineName].enabled = true
+    set.lines[lineName].slotType = slotType
+    set.lines[lineName].priority = set.lines[lineName].priority or 999
+    set.lines[lineName].resolved = M.resolveSpellFromLine(lineName)
+
+    M.saveSpellSets()
+    return true
+end
+
+--- Disable a spell line in a set
+-- @param setName string The spell set name
+-- @param lineName string The spell line name
+function M.disableLine(setName, lineName)
+    local set = M.getSet(setName)
+    if not set or not set.lines[lineName] then return end
+
+    set.lines[lineName].enabled = false
+    M.saveSpellSets()
+end
+
+--- Count enabled rotation lines in a set
+-- @param setName string The spell set name
+-- @return number Count of enabled rotation lines
+function M.countEnabledRotation(setName)
+    local set = M.getSet(setName)
+    if not set then return 0 end
+
+    local count = 0
+    for _, lineData in pairs(set.lines) do
+        if lineData.enabled and lineData.slotType == 'rotation' then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+--- Set the slot type for a line
+-- @param setName string The spell set name
+-- @param lineName string The spell line name
+-- @param slotType string 'rotation' or 'buff_swap'
+-- @return boolean True if successful
+function M.setLineSlotType(setName, lineName, slotType)
+    local set = M.getSet(setName)
+    if not set or not set.lines[lineName] then return false end
+
+    -- If moving to rotation, check capacity
+    if slotType == 'rotation' and set.lines[lineName].slotType ~= 'rotation' then
+        if set.lines[lineName].enabled then
+            local count = M.countEnabledRotation(setName)
+            if count >= M.getRotationCapacity() then
+                return false  -- At capacity
+            end
+        end
+    end
+
+    set.lines[lineName].slotType = slotType
+    M.saveSpellSets()
+    return true
+end
+
+--- Set condition for a line
+-- @param setName string The spell set name
+-- @param lineName string The spell line name
+-- @param conditionData table The condition data (from ConditionBuilder)
+function M.setLineCondition(setName, lineName, conditionData)
+    local set = M.getSet(setName)
+    if not set or not set.lines[lineName] then return end
+
+    set.lines[lineName].condition = conditionData
+    M.saveSpellSets()
+end
+
+--- Set priority for a line
+-- @param setName string The spell set name
+-- @param lineName string The spell line name
+-- @param priority number The priority (lower = higher priority)
+function M.setLinePriority(setName, lineName, priority)
+    local set = M.getSet(setName)
+    if not set or not set.lines[lineName] then return end
+
+    set.lines[lineName].priority = priority
+    M.saveSpellSets()
+end
+
+--- Placeholder for spell set persistence (implemented in Task 5)
+-- @private
+function M.saveSpellSets()
+    -- Will be implemented in Task 5
+end
+
 return M
