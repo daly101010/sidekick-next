@@ -705,4 +705,126 @@ M.Heals.Acquittal = {
     'Cleansing Acquittal',    -- 99
 }
 
+-- Ward line (defensive buff, NOT Vie absorption)
+M.Wards.Ward = {
+    'Ward of Retribution',    -- 127
+    'Ward of Eminence',       -- 126
+    'Ward of Repudiation',    -- 122
+    'Ward of Commitment',     -- 122
+    'Ward of the Avowed',     -- 121
+    'Ward of Persistence',    -- 117
+    'Ward of Prohibition',    -- 117
+    'Ward of the Guileless',  -- 116
+    'Ward of Injunction',     -- 112
+    'Ward of Righteousness',  -- 112
+    'Ward of Sincerity',      -- 111
+    'Ward of Assurance',      -- 107
+    'Ward of Condemnation',   -- 107
+    'Ward of Censure',        -- 102
+    'Ward of Surety',         -- 102
+    'Ward of Indictment',     -- 97
+    'Ward of Certitude',      -- 97
+    'Ward of the Reverent',   -- 96
+    'Ward of Recrimination',  -- 92
+    'Ward of the Zealous',    -- 91
+    'Ward of Retaliation',    -- 87
+    'Ward of the Earnest',    -- 86
+    'Ward of Admonishment',   -- 82
+    'Ward of the Devout',     -- 81
+    'Ward of Requital',       -- 77
+    'Ward of the Resolute',   -- 76
+    'Ward of Reprisal',       -- 72
+    'Ward of the Dauntless',  -- 71
+}
+
+-- Chromatic damage line
+M.Damage.Chromatic = {
+    'Chromaclast',            -- 129
+    'Chromaruption',          -- 124
+    'Chromablast',            -- 119
+    'Chromaflare',            -- 114
+    'Chromaburst',            -- 109
+    'Chromabash',             -- 104
+    'Chromacrush',            -- 99
+    'Chromacleave',           -- 94
+    'Chromarend',             -- 89
+    'Chromassail',            -- 84
+    'Chromassault',           -- 79
+    'Chromastrike',           -- 69
+}
+
+-- Corruption cure line
+M.Cures.Corruption = {
+    'Mastery Purge Corruption', -- 129
+    'Defy Corruption',        -- 128
+    'Purge Corruption',       -- 119
+    'Deny Corruption',        -- 118
+    'Extricate Corruption',   -- 109
+    'Endure Corruption',      -- 108
+    'Nullify Corruption',     -- 104
+    'Abrogate Corruption',    -- 99
+    'Thwart Corruption',      -- 98
+    'Eradicate Corruption',   -- 94
+    'Dissolve Corruption',    -- 89
+    'Reject Corruption',      -- 88
+    'Abolish Corruption',     -- 84
+    'Repel Corruption',       -- 83
+    'Vitiate Corruption',     -- 79
+    'Forbear Corruption',     -- 78
+    'Expunge Corruption',     -- 64
+    'Resist Corruption',      -- 63
+}
+
+-- Unyielding damage line (high damage DD)
+M.Damage.Unyielding = {
+    'Unyielding Denunciation', -- 129
+    'Unyielding Admonition',  -- 124
+    'Unyielding Rebuke',      -- 119
+    'Unyielding Censure',     -- 114
+    'Unyielding Judgment',    -- 109
+}
+
+-- Glorious damage line (triple DD)
+M.Damage.Glorious = {
+    'Glorious Judgment',      -- 104
+    'Glorious Rebuke',        -- 99
+    'Glorious Admonition',    -- 94
+    'Glorious Censure',       -- 89
+    'Glorious Denunciation',  -- 84
+}
+
+-- Unified group buff lines
+M.GroupBuffs = {
+    -- Unified Hand (combined group buff)
+    UnifiedHand = {
+        'Unified Hand of Sharosh', -- 130
+        'Unified Hand of Aegolism XV', -- 130
+        'Unified Hand of Helmsbane', -- 125
+        'Unified Hand of Infallibility', -- 125
+        'Unified Hand of the Diabo', -- 120
+        'Unified Hand of Persistence', -- 120
+        'Unified Hand of Jorlleag', -- 115
+        'Unified Hand of Righteousness', -- 115
+        'Unified Hand of Emra',   -- 110
+        'Unified Hand of Assurance', -- 110
+        'Unified Hand of Surety', -- 105
+        'Unified Hand of Nonia',  -- 105
+        'Unified Hand of Certitude', -- 100
+        'Unified Hand of Gezat',  -- 100
+        'Unified Hand of Credence', -- 95
+        'Unified Hand of the Triumvirate', -- 95
+    },
+
+    -- Unified self buff (combined self buff)
+    Unified = {
+        'Unified Aegolism XV',    -- 127
+        'Unified Commitment',     -- 122
+        'Unified Righteousness',  -- 112
+        'Unified Assurance',      -- 107
+        'Unified Surety',         -- 102
+        'Unified Certitude',      -- 97
+        'Unified Credence',       -- 92
+    },
+}
+
 return M
