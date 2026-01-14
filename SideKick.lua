@@ -31,6 +31,7 @@ local Items = require('utils.items')
 -- New enhancement modules
 local RemoteAbilities = require('ui.remote_abilities')
 local AggroWarning = require('ui.aggro_warning')
+local ActorsDebug = require('ui.actors_debug')
 
 -- Runtime cache, action executor, rotation engine, CC, and spell engine
 local RuntimeCache = require('utils.runtime_cache')
@@ -45,6 +46,20 @@ local ImmuneDB = require('utils.immune_database')
 local SpellLineup = require('utils.spell_lineup')
 local ClassConfigLoader = require('utils.class_config_loader')
 local SpellsetManager = require('utils.spellset_manager')
+local SpellSetEditor = require('ui.spell_set_editor')
+
+-- Throttled logging
+local _ThrottledLog = nil
+local function getThrottledLog()
+    if not _ThrottledLog then
+        local ok, tl = pcall(require, 'utils.throttled_log')
+        if ok then _ThrottledLog = tl end
+    end
+    return _ThrottledLog
+end
+
+-- Debug logging flags for main automation loop
+local debugAutomationLogging = true
 
 -- Lazy-load class settings for loadout application
 local _ClassSettings = nil
@@ -845,10 +860,16 @@ local function tickAutomation()
 
     -- Pause automation while applying a spell loadout (memorizing needs to sit through book)
     local ClassSettings = getClassSettings()
-    local isApplyingLoadout = ClassSettings and ClassSettings.isApplying and ClassSettings.isApplying()
+    local isApplyingLoadout = (ClassSettings and ClassSettings.isApplying and ClassSettings.isApplying())
+        or SpellsetManager.isApplying()
     if isApplyingLoadout then
         allowAbilityAutomation = false
         allowMovementAutomation = false
+    end
+
+    -- Keep runtime settings aligned to active loadout defaults + overrides.
+    if SpellsetManager and SpellsetManager.applyActiveLoadoutSettings then
+        SpellsetManager.applyActiveLoadoutSettings(Core.Settings)
     end
 
     -- Update runtime cache (before other automation)
@@ -869,6 +890,7 @@ local function tickAutomation()
     SpellEngine.tick()
     GemManager.tick()
     SpellsetManager.tick()
+    SpellsetManager.processPending()
 
     -- Process events for cast result detection
     mq.doevents()
@@ -884,18 +906,40 @@ local function tickAutomation()
     end
 
     -- Run layered rotation engine (replaces flat Abilities.tryAllAbilities)
+    local TL = getThrottledLog()
     if allowAbilityAutomation and Core.Settings.AutoAbilitiesEnabled ~= false then
+        if debugAutomationLogging and TL then
+            TL.log('rotation_start', 15, 'RotationEngine.tick: abilities=%d, burnActive=%s, priorityHealing=%s',
+                #(State.abilities or {}), tostring(Burn.active), tostring(priorityHealingActive))
+        end
         RotationEngine.tick({
             abilities = State.abilities,
             settings = Core.Settings,
             burnActive = Burn.active,
             priorityHealingActive = priorityHealingActive,
         })
+
+        -- Process mash queue (ON_COOLDOWN abilities) after rotation
+        -- These are instant/off-GCD abilities that fire whenever ready
+        RotationEngine.processMashQueue({
+            abilities = State.abilities,
+            settings = Core.Settings,
+        })
+    else
+        if debugAutomationLogging and TL then
+            TL.log('rotation_skip', 15, 'RotationEngine SKIP: allowAbilityAutomation=%s, AutoAbilitiesEnabled=%s',
+                tostring(allowAbilityAutomation), tostring(Core.Settings.AutoAbilitiesEnabled))
+        end
     end
 
     -- Buff casting - only when not in priority healing mode and ability automation allowed
     if allowAbilityAutomation and not priorityHealingActive then
         Buff.buffTick()
+    else
+        if debugAutomationLogging and TL then
+            TL.log('buff_tick_skip', 15, 'Buff.buffTick SKIP: allowAbilityAutomation=%s, priorityHealingActive=%s',
+                tostring(allowAbilityAutomation), tostring(priorityHealingActive))
+        end
     end
 
     Burn.tick()
@@ -923,8 +967,8 @@ local function tickAutomation()
 
     -- Meditation (sit/stand) should run last to avoid fighting with casting/movement actions.
     -- Skip meditation while applying a spell loadout (memorizing requires sitting through book)
-    local ClassSettings = getClassSettings()
-    local isApplyingLoadout = ClassSettings and ClassSettings.isApplying and ClassSettings.isApplying()
+    local isApplyingLoadout = (ClassSettings and ClassSettings.isApplying and ClassSettings.isApplying())
+        or SpellsetManager.isApplying()
     if playStyle ~= 'manual' and Meditation and Meditation.tick and not isApplyingLoadout then
         Meditation.tick(Core.Settings)
     end
@@ -1147,6 +1191,7 @@ local function main()
     SpellLineup.init()
     ClassConfigLoader.init()
     SpellsetManager.init()
+    SpellSetEditor.init()
 
     _bindCmd('/SideKick', function(...)
         local args = { ... }
@@ -1234,6 +1279,8 @@ local function main()
             enqueue(function()
                 ActorsCoordinator.broadcastAssistMe()
             end)
+        elseif a1 == 'spellset' or a1 == 'ss' then
+            SpellSetEditor.toggle()
         else
             State.open = not State.open
         end
@@ -1256,6 +1303,9 @@ local function main()
         enqueue(function()
             ActorsCoordinator.broadcastAssistMe()
         end)
+    end)
+    _bindCmd('/skactors', function()
+        ActorsDebug.toggle()
     end)
 
     mq.imgui.init('SideKick', function()
@@ -1303,6 +1353,8 @@ local function main()
         -- Draw new enhancement UIs
         RemoteAbilities.draw()
         AggroWarning.draw()
+        ActorsDebug.render()
+        SpellSetEditor.render()
 
         if State.shouldDraw then
             draw()
