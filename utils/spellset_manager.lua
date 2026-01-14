@@ -1802,7 +1802,7 @@ function M.saveSpellSets()
         local prefix = 'set_' .. setName:gsub('[^%w]', '_') .. '_'
 
         for lineName, lineData in pairs(set.lines) do
-            local linePrefix = prefix .. lineName .. '_'
+            local linePrefix = prefix .. lineName:gsub('[^%w]', '_') .. '_'
             section[linePrefix .. 'enabled'] = lineData.enabled and '1' or '0'
             section[linePrefix .. 'slotType'] = lineData.slotType or 'rotation'
             section[linePrefix .. 'priority'] = tostring(lineData.priority or 999)
