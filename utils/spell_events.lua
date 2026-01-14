@@ -335,10 +335,10 @@ function M.registerEvents()
     end)
 
     -- ============================================
-    -- MEMORIZATION EVENTS (for gem_manager)
+    -- MEMORIZATION EVENTS (callbacks)
     -- ============================================
     mq.event('sk_mem_begin', "Beginning to memorize #1#...", function(_, spell)
-        -- Notify gem manager if callback set
+        -- Notify listener if callback set
         if M.onMemBegin then
             pcall(M.onMemBegin, spell)
         end
@@ -429,7 +429,7 @@ function M.unregisterEvents()
     mq.unevent('sk_mem_abort')
 end
 
--- Memorization callbacks (set by gem_manager)
+-- Memorization callbacks (optional listeners)
 M.onMemBegin = nil
 M.onMemEnd = nil
 M.onMemAbort = nil

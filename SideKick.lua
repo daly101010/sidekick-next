@@ -41,7 +41,6 @@ local CC = require('automation.cc')
 local Buff = require('automation.buff')
 local SpellEngine = require('utils.spell_engine')
 local SpellEvents = require('utils.spell_events')
-local GemManager = require('utils.gem_manager')
 local ImmuneDB = require('utils.immune_database')
 local SpellLineup = require('utils.spell_lineup')
 local ClassConfigLoader = require('utils.class_config_loader')
@@ -61,15 +60,6 @@ end
 -- Debug logging flags for main automation loop
 local debugAutomationLogging = true
 
--- Lazy-load class settings for loadout application
-local _ClassSettings = nil
-local function getClassSettings()
-    if not _ClassSettings then
-        local ok, cs = pcall(require, 'ui.class_settings')
-        if ok then _ClassSettings = cs end
-    end
-    return _ClassSettings
-end
 
 local animSpellIcons = mq.FindTextureAnimation and mq.FindTextureAnimation('A_SpellIcons') or nil
 local animItems = mq.FindTextureAnimation and mq.FindTextureAnimation('A_DragItem') or nil
@@ -858,20 +848,6 @@ local function tickAutomation()
     local allowAbilityAutomation = (playStyle ~= 'manual')
     local allowMovementAutomation = (playStyle == 'auto')
 
-    -- Pause automation while applying a spell loadout (memorizing needs to sit through book)
-    local ClassSettings = getClassSettings()
-    local isApplyingLoadout = (ClassSettings and ClassSettings.isApplying and ClassSettings.isApplying())
-        or SpellsetManager.isApplying()
-    if isApplyingLoadout then
-        allowAbilityAutomation = false
-        allowMovementAutomation = false
-    end
-
-    -- Keep runtime settings aligned to active loadout defaults + overrides.
-    if SpellsetManager and SpellsetManager.applyActiveLoadoutSettings then
-        SpellsetManager.applyActiveLoadoutSettings(Core.Settings)
-    end
-
     -- Update runtime cache (before other automation)
     RuntimeCache.tick()
 
@@ -888,9 +864,7 @@ local function tickAutomation()
 
     -- Update spell engine state machine (non-blocking cast monitoring)
     SpellEngine.tick()
-    GemManager.tick()
     SpellsetManager.tick()
-    SpellsetManager.processPending()
 
     -- Process events for cast result detection
     mq.doevents()
@@ -966,10 +940,7 @@ local function tickAutomation()
     end
 
     -- Meditation (sit/stand) should run last to avoid fighting with casting/movement actions.
-    -- Skip meditation while applying a spell loadout (memorizing requires sitting through book)
-    local isApplyingLoadout = (ClassSettings and ClassSettings.isApplying and ClassSettings.isApplying())
-        or SpellsetManager.isApplying()
-    if playStyle ~= 'manual' and Meditation and Meditation.tick and not isApplyingLoadout then
+    if playStyle ~= 'manual' and Meditation and Meditation.tick then
         Meditation.tick(Core.Settings)
     end
 end
@@ -1186,7 +1157,6 @@ local function main()
     Buff.init()
     Cures.init()
     SpellEngine.init()
-    GemManager.init()
     ImmuneDB.init()
     SpellLineup.init()
     ClassConfigLoader.init()
@@ -1260,8 +1230,6 @@ local function main()
                 print(string.format('[Spell] Casting: %s (ID: %d)', castInfo.spellName, castInfo.spellId))
                 print(string.format('[Spell] Target: %d, Retries left: %d', castInfo.targetId, castInfo.retriesLeft))
             end
-            print(string.format('[Spell] GemManager role: %s', GemManager.getActiveRole()))
-            print(string.format('[Spell] Available roles: %s', table.concat(GemManager.getAvailableRoles(), ', ')))
         elseif a1 == 'testcast' then
             -- Debug command: test cast a spell
             local spellName = args[2]
@@ -1375,12 +1343,6 @@ local function main()
 
         -- Update aggro warning state
         AggroWarning.update()
-
-        -- Process pending spell loadout application
-        local ClassSettings = getClassSettings()
-        if ClassSettings and ClassSettings.processPending then
-            ClassSettings.processPending()
-        end
 
         -- Actors + GT dock/status updates (runs in main loop so yields are allowed elsewhere).
         if Core.Settings.ActorsEnabled ~= false then

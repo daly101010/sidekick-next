@@ -6,16 +6,6 @@ local RemoteAbilities = require('ui.remote_abilities')
 local ConditionBuilder = require('ui.condition_builder')
 local Core = require('utils.core')
 
--- Lazy-load class settings
-local _ClassSettings = nil
-local function getClassSettings()
-    if not _ClassSettings then
-        local ok, cs = pcall(require, 'ui.class_settings')
-        if ok then _ClassSettings = cs end
-    end
-    return _ClassSettings
-end
-
 local M = {}
 
 local function safeTooltip(text)
@@ -1324,23 +1314,6 @@ local function drawItems(settings, onChange)
     end
 end
 
-local function drawClass(settings, onChange)
-    local ClassSettings = getClassSettings()
-    if not ClassSettings then
-        imgui.TextColored(0.6, 0.6, 0.6, 1, "Class settings module not loaded")
-        return
-    end
-
-    -- Render loadout selector first
-    ClassSettings.renderLoadoutSelector(settings, onChange)
-    imgui.Spacing()
-    imgui.Separator()
-    imgui.Spacing()
-
-    -- Render class-specific settings
-    ClassSettings.render(settings, onChange)
-end
-
 local function drawBuffs(settings, onChange)
     local changed
 
@@ -1604,12 +1577,6 @@ function M.draw(ctx)
         if imgui.BeginTabItem('Buffs') then
             withTabScrollChild('##sk_settings_buffs_scroll', function()
                 drawBuffs(settings, onChange)
-            end)
-            imgui.EndTabItem()
-        end
-        if imgui.BeginTabItem('Class') then
-            withTabScrollChild('##sk_settings_class_scroll', function()
-                drawClass(settings, onChange)
             end)
             imgui.EndTabItem()
         end

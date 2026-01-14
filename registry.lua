@@ -187,7 +187,6 @@ M.defaults = {
 
     -- Spell Engine Settings
     SpellRole = { type = 'text', Default = 'default', Category = 'Spells', DisplayName = 'Spell Role' },
-    SpellUseGem = { type = 'number', Default = 13, Category = 'Spells', DisplayName = 'Rotation Gem Slot' },
     SpellAutoMemorize = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Auto-Memorize Spells' },
     SpellMaxRetries = { type = 'number', Default = 3, Category = 'Spells', DisplayName = 'Max Cast Retries' },
     SpellMemTimeout = { type = 'number', Default = 25000, Category = 'Spells', DisplayName = 'Memorize Timeout (ms)' },
@@ -207,10 +206,6 @@ M.defaults = {
 
     -- Gem Lock Settings
     GemLockEnabled = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Enable Gem Locking' },
-
-    -- Spell Loadout Settings
-    SpellLoadout = { type = 'text', Default = '' , Category = 'Spells', DisplayName = 'Spell Loadout' },
-    AutoDetectSpellChanges = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Auto-Detect Spell Changes' },
 
     -- Buff Settings
     BuffingEnabled = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Enable Buffing' },

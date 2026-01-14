@@ -16,15 +16,6 @@ local function getSpellEvents()
     return _SpellEvents
 end
 
-local _GemManager = nil
-local function getGemManager()
-    if not _GemManager then
-        local ok, gm = pcall(require, 'utils.gem_manager')
-        if ok then _GemManager = gm end
-    end
-    return _GemManager
-end
-
 local _Cache = nil
 local function getCache()
     if not _Cache then

@@ -568,10 +568,24 @@ function M.loadBuffDefinitions()
     -- Store full class config for spell line resolution
     _classConfig = classConfig
 
+    -- Get current settings
+    local Core = getCore()
+    local settings = Core and Core.Settings or {}
+
     -- Look for buffLines in the class config (may not exist in all configs)
     if classConfig.buffLines then
         for category, def in pairs(classConfig.buffLines) do
+            -- Check if this buff has a settingKey and if it's disabled
+            local settingKey = def.settingKey
+            if settingKey then
+                local enabled = settings[settingKey]
+                -- Skip if explicitly disabled (false or 0)
+                if enabled == false or enabled == 0 then
+                    goto continue
+                end
+            end
             M.buffDefinitions[category] = def
+            ::continue::
         end
     end
 end

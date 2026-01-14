@@ -991,6 +991,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        settingKey = 'DoACBuff',
     },
     -- Vie Buff (melee damage absorb)
     VieBuff = {
@@ -999,6 +1000,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        settingKey = 'DoVieBuff',
     },
     -- Shining Buff (tank armor)
     ShiningBuff = {
@@ -1006,6 +1008,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        settingKey = 'DoShining',
     },
     -- Divine Buff (death save)
     DivineBuff = {
@@ -1013,6 +1016,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        settingKey = 'DoDivineBuff',
     },
     -- Symbol (HP/mana regen)
     SymbolBuff = {

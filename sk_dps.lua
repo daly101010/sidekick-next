@@ -5,7 +5,7 @@
 local mq = require('mq')
 local lib = require('sidekick.sk_lib')
 local ModuleBase = require('sidekick.sk_module_base')
-local Spells = require('sidekick.sk_spells_clr')
+local Spells = require('sk_spells_clr')
 
 -- Create module instance
 local module = ModuleBase.create('dps', lib.Priority.DPS)

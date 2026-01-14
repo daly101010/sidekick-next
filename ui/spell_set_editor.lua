@@ -30,7 +30,7 @@ end
 local _SpellsClr = nil
 local function getSpellsClr()
     if not _SpellsClr then
-        local ok, s = pcall(require, 'sidekick.sk_spells_clr')
+        local ok, s = pcall(require, 'sk_spells_clr')
         if ok then _SpellsClr = s end
     end
     return _SpellsClr
@@ -56,8 +56,15 @@ function M.open()
 
     -- Select active set if none selected
     local SpellsetManager = getSpellsetManager()
+    if SpellsetManager and not SpellsetManager.initialized and SpellsetManager.init then
+        SpellsetManager.init()
+    end
     if SpellsetManager and not M.selectedSet then
         M.selectedSet = SpellsetManager.activeSetName
+        if not M.selectedSet then
+            local names = SpellsetManager.getSetNames()
+            M.selectedSet = names[1]
+        end
     end
 end
 
@@ -70,7 +77,14 @@ end
 function M.init()
     local SpellsetManager = getSpellsetManager()
     if SpellsetManager then
+        if not SpellsetManager.initialized and SpellsetManager.init then
+            SpellsetManager.init()
+        end
         M.selectedSet = SpellsetManager.activeSetName
+        if not M.selectedSet then
+            local names = SpellsetManager.getSetNames()
+            M.selectedSet = names[1]
+        end
     end
 end
 
@@ -124,8 +138,8 @@ function M.renderHeader(SpellsetManager)
             local result = SpellsetManager.applySet(M.selectedSet)
             if result == 'queued' then
                 mq.cmd('/echo [SpellSet] Memorization queued for out of combat')
-            elseif result == 'applied' then
-                mq.cmd('/echo [SpellSet] Memorization started')
+            else
+                mq.cmd('/echo [SpellSet] Unable to queue memorization')
             end
         end
     end
@@ -410,6 +424,19 @@ function M.render()
     local SpellsetManager = getSpellsetManager()
     local SpellsClr = getSpellsClr()
     if not SpellsetManager or not SpellsClr then return end
+    if not SpellsetManager.initialized and SpellsetManager.init then
+        SpellsetManager.init()
+    end
+    if (not M.selectedSet) or not SpellsetManager.getSet(M.selectedSet) then
+        M.selectedSet = SpellsetManager.activeSetName
+        if not M.selectedSet then
+            local names = SpellsetManager.getSetNames()
+            M.selectedSet = names[1]
+        end
+        if M.selectedSet then
+            SpellsetManager.activateSet(M.selectedSet)
+        end
+    end
 
     imgui.SetNextWindowSize(500, 600, ImGuiCond.FirstUseEver)
 
