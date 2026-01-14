@@ -137,8 +137,150 @@ function M.renderHeader(SpellsetManager)
     end
 end
 
--- Placeholder stubs for functions to be implemented in Tasks 10 and 11
-M.renderSpellLines = function() end
+--- Render the spell lines sections
+function M.renderSpellLines(SpellsetManager, SpellsClr)
+    if not M.selectedSet then
+        imgui.TextDisabled('Select or create a spell set to begin.')
+        return
+    end
+
+    local set = SpellsetManager.getSet(M.selectedSet)
+    if not set then return end
+
+    local allLines = SpellsClr.enumerateLines()
+    local capacity = SpellsetManager.getRotationCapacity()
+    local rotationCount = SpellsetManager.countEnabledRotation(M.selectedSet)
+    local atCapacity = rotationCount >= capacity
+
+    -- Category filter
+    imgui.Text('Filter:')
+    imgui.SameLine()
+    imgui.SetNextItemWidth(150)
+    if imgui.BeginCombo('##CategoryFilter', M.categoryFilter) then
+        if imgui.Selectable('All', M.categoryFilter == 'All') then
+            M.categoryFilter = 'All'
+        end
+
+        local categories = {}
+        for _, line in ipairs(allLines) do
+            if not categories[line.category] then
+                categories[line.category] = true
+                if imgui.Selectable(line.category, M.categoryFilter == line.category) then
+                    M.categoryFilter = line.category
+                end
+            end
+        end
+        imgui.EndCombo()
+    end
+
+    imgui.Separator()
+
+    -- Rotation section
+    if imgui.CollapsingHeader('Rotation Spells (combat)', ImGuiTreeNodeFlags.DefaultOpen) then
+        M.renderLineSection(SpellsetManager, allLines, set, 'rotation', atCapacity)
+    end
+
+    -- Buff swap section
+    if imgui.CollapsingHeader('Buff Swap Spells (OOC only)', ImGuiTreeNodeFlags.DefaultOpen) then
+        M.renderLineSection(SpellsetManager, allLines, set, 'buff_swap', false)
+    end
+end
+
+--- Render a section of spell lines
+function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacity)
+    for _, lineInfo in ipairs(allLines) do
+        -- Apply category filter
+        if M.categoryFilter ~= 'All' and lineInfo.category ~= M.categoryFilter then
+            goto continue
+        end
+
+        local lineName = lineInfo.lineName
+        local lineData = set.lines[lineName] or {}
+        local isEnabled = lineData.enabled == true
+        local currentSlotType = lineData.slotType or lineInfo.defaultSlotType
+
+        -- Only show lines matching this section's slot type
+        if currentSlotType ~= slotType then
+            goto continue
+        end
+
+        imgui.PushID('line_' .. lineName)
+
+        -- Checkbox (disabled if at capacity and not enabled)
+        local canEnable = isEnabled or not atCapacity or slotType ~= 'rotation'
+
+        if not canEnable then
+            imgui.BeginDisabled()
+        end
+
+        local newEnabled
+        newEnabled, _ = imgui.Checkbox('##enabled', isEnabled)
+
+        if not canEnable then
+            imgui.EndDisabled()
+            if imgui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) then
+                imgui.SetTooltip('Disable another rotation line to enable this one')
+            end
+        end
+
+        if newEnabled ~= isEnabled then
+            if newEnabled then
+                SpellsetManager.enableLine(M.selectedSet, lineName, slotType)
+            else
+                SpellsetManager.disableLine(M.selectedSet, lineName)
+            end
+        end
+
+        -- Line name
+        imgui.SameLine()
+        imgui.Text(lineName)
+
+        -- Resolved spell
+        local resolved = lineData.resolved or SpellsetManager.resolveSpellFromLine(lineName)
+        imgui.SameLine()
+        imgui.TextColored(0.6, 0.6, 0.6, 1, '→')
+        imgui.SameLine()
+        if resolved then
+            imgui.TextColored(0.7, 0.9, 0.7, 1, resolved)
+        else
+            imgui.TextColored(0.9, 0.5, 0.5, 1, '(not in book)')
+        end
+
+        -- Condition button
+        imgui.SameLine()
+        local hasCondition = lineData.condition and lineData.condition.conditions and #lineData.condition.conditions > 0
+        if hasCondition then
+            imgui.PushStyleColor(ImGuiCol.Button, 0.2, 0.5, 0.2, 1)
+        end
+        if imgui.SmallButton('Cond##' .. lineName) then
+            M.conditionEditLine = lineName
+            M.showConditionPopup = true
+        end
+        if hasCondition then
+            imgui.PopStyleColor()
+        end
+
+        -- Right-click context menu
+        if imgui.BeginPopupContextItem('ctx_' .. lineName) then
+            local otherSlot = slotType == 'rotation' and 'buff_swap' or 'rotation'
+            local label = slotType == 'rotation' and 'Move to Buff Swap' or 'Move to Rotation'
+
+            if imgui.MenuItem(label) then
+                if otherSlot == 'rotation' and atCapacity then
+                    mq.cmd('/echo [SpellSet] Cannot move to rotation - at capacity')
+                else
+                    SpellsetManager.setLineSlotType(M.selectedSet, lineName, otherSlot)
+                end
+            end
+            imgui.EndPopup()
+        end
+
+        imgui.PopID()
+        ::continue::
+    end
+end
+
+-- Placeholder stubs for functions to be implemented in Task 11
 M.renderNewSetPopup = function() end
 M.renderDeleteConfirmPopup = function() end
 M.renderConditionPopup = function() end
