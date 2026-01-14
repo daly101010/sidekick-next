@@ -77,6 +77,15 @@ M.Heals = {
         'Promised Renewal',       -- 73
     },
 
+    -- Basic Healing line (classic direct heals)
+    Basic = {
+        'Superior Healing',       -- 30
+        'Greater Healing',        -- 20
+        'Healing',                -- 10
+        'Light Healing',          -- 4
+        'Minor Healing',          -- 1
+    },
+
     -- Complete Heal
     CompleteHeal = {
         'Complete Heal',          -- 39
