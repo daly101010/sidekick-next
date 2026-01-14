@@ -14,6 +14,7 @@ M.showNewSetPopup = false
 M.showDeleteConfirm = false
 M.showConditionPopup = false
 M.conditionEditLine = nil
+M.editingCondition = nil
 M.categoryFilter = 'All'
 
 -- Lazy-load dependencies
@@ -280,10 +281,124 @@ function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacit
     end
 end
 
--- Placeholder stubs for functions to be implemented in Task 11
-M.renderNewSetPopup = function() end
-M.renderDeleteConfirmPopup = function() end
-M.renderConditionPopup = function() end
+--- Render the new set popup
+function M.renderNewSetPopup(SpellsetManager)
+    if imgui.BeginPopupModal('New Spell Set##NewSetPopup', nil, ImGuiWindowFlags.AlwaysAutoResize) then
+        imgui.Text('Enter a name for the new spell set:')
+        imgui.SetNextItemWidth(250)
+
+        local changed
+        M.newSetName, changed = imgui.InputText('##NewSetName', M.newSetName, 64)
+
+        imgui.Spacing()
+
+        if imgui.Button('Create', 100, 0) then
+            if M.newSetName ~= '' then
+                SpellsetManager.createSet(M.newSetName)
+                M.selectedSet = M.newSetName
+                SpellsetManager.activateSet(M.newSetName)
+                SpellsetManager.saveSpellSets()
+                imgui.CloseCurrentPopup()
+            end
+        end
+
+        imgui.SameLine()
+        if imgui.Button('Cancel', 100, 0) then
+            imgui.CloseCurrentPopup()
+        end
+
+        imgui.EndPopup()
+    end
+end
+
+--- Render the delete confirmation popup
+function M.renderDeleteConfirmPopup(SpellsetManager)
+    if imgui.BeginPopupModal('Delete Spell Set?##DeleteConfirm', nil, ImGuiWindowFlags.AlwaysAutoResize) then
+        imgui.Text(string.format('Are you sure you want to delete "%s"?', M.selectedSet or ''))
+        imgui.Spacing()
+
+        if imgui.Button('Delete', 100, 0) then
+            SpellsetManager.deleteSet(M.selectedSet)
+            M.selectedSet = nil
+
+            -- Select first available set
+            local names = SpellsetManager.getSetNames()
+            if #names > 0 then
+                M.selectedSet = names[1]
+                SpellsetManager.activateSet(M.selectedSet)
+            end
+
+            imgui.CloseCurrentPopup()
+        end
+
+        imgui.SameLine()
+        if imgui.Button('Cancel', 100, 0) then
+            imgui.CloseCurrentPopup()
+        end
+
+        imgui.EndPopup()
+    end
+end
+
+--- Render the condition editor popup
+function M.renderConditionPopup()
+    if not M.showConditionPopup or not M.conditionEditLine then return end
+
+    local ConditionBuilder = getConditionBuilder()
+    local SpellsetManager = getSpellsetManager()
+    if not ConditionBuilder or not SpellsetManager then return end
+
+    local set = SpellsetManager.getSet(M.selectedSet)
+    if not set then return end
+
+    local lineData = set.lines[M.conditionEditLine] or {}
+    local resolved = lineData.resolved or SpellsetManager.resolveSpellFromLine(M.conditionEditLine)
+
+    imgui.SetNextWindowSize(450, 300, ImGuiCond.FirstUseEver)
+
+    local title = string.format('Condition: %s → %s##CondPopup', M.conditionEditLine, resolved or '?')
+    local open = true
+    open, _ = imgui.Begin(title, open, ImGuiWindowFlags.NoCollapse)
+
+    if open then
+        -- Initialize condition data if needed
+        if not M.editingCondition then
+            M.editingCondition = lineData.condition or { conditions = {} }
+        end
+
+        -- Render condition builder
+        ConditionBuilder.render(M.editingCondition)
+
+        imgui.Spacing()
+        imgui.Separator()
+        imgui.Spacing()
+
+        if imgui.Button('Save', 80, 0) then
+            SpellsetManager.setLineCondition(M.selectedSet, M.conditionEditLine, M.editingCondition)
+            M.showConditionPopup = false
+            M.conditionEditLine = nil
+            M.editingCondition = nil
+        end
+
+        imgui.SameLine()
+        if imgui.Button('Clear', 80, 0) then
+            M.editingCondition = { conditions = {} }
+        end
+
+        imgui.SameLine()
+        if imgui.Button('Cancel', 80, 0) then
+            M.showConditionPopup = false
+            M.conditionEditLine = nil
+            M.editingCondition = nil
+        end
+    else
+        M.showConditionPopup = false
+        M.conditionEditLine = nil
+        M.editingCondition = nil
+    end
+
+    imgui.End()
+end
 
 --- Render the spell set editor window
 function M.render()
