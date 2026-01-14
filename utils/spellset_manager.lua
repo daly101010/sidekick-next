@@ -1865,6 +1865,9 @@ end
 function M.checkPendingApply()
     if not M.pendingApply then return end
 
+    -- Don't interfere with existing loadout apply
+    if M._applyState then return end
+
     local me = mq.TLO.Me
     if not me or not me() then return end
 
