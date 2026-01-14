@@ -1994,4 +1994,98 @@ function M.loadSpellSets()
     end
 end
 
+--------------------------------------------------------------------------------
+-- Module Query Functions
+--------------------------------------------------------------------------------
+
+--- Get enabled lines of a specific slot type, sorted by priority
+-- @param slotType string 'rotation' or 'buff_swap'
+-- @return table Array of {lineName, spellName, condition, priority}
+function M.getEnabledLines(slotType)
+    local set = M.getActiveSet()
+    if not set then return {} end
+
+    local lines = {}
+    for lineName, lineData in pairs(set.lines) do
+        if lineData.enabled and lineData.slotType == slotType and lineData.resolved then
+            table.insert(lines, {
+                lineName = lineName,
+                spellName = lineData.resolved,
+                condition = lineData.condition,
+                priority = lineData.priority or 999,
+            })
+        end
+    end
+
+    table.sort(lines, function(a, b)
+        return a.priority < b.priority
+    end)
+
+    return lines
+end
+
+--- Get enabled rotation lines
+-- @return table Array of rotation line data
+function M.getRotationLines()
+    return M.getEnabledLines('rotation')
+end
+
+--- Get enabled buff swap lines
+-- @return table Array of buff swap line data
+function M.getBuffSwapLines()
+    return M.getEnabledLines('buff_swap')
+end
+
+--- Find the best matching spell for a category with conditions
+-- @param category string The category to match (e.g., 'Heals', 'Damage')
+-- @param ctx table Context for condition evaluation
+-- @return string|nil The best matching spell name or nil
+function M.findBestSpell(category, ctx)
+    local set = M.getActiveSet()
+    if not set then return nil end
+
+    local SpellsClr = getSpellsClr()
+    local ConditionBuilder = getConditionBuilder()
+    if not SpellsClr then return nil end
+
+    -- Build list of matching lines
+    local candidates = {}
+    for lineName, lineData in pairs(set.lines) do
+        if lineData.enabled and lineData.slotType == 'rotation' and lineData.resolved then
+            local lineInfo = SpellsClr.getLine(lineName)
+            if lineInfo and lineInfo.category == category then
+                table.insert(candidates, {
+                    lineName = lineName,
+                    spellName = lineData.resolved,
+                    condition = lineData.condition,
+                    priority = lineData.priority or 999,
+                })
+            end
+        end
+    end
+
+    -- Sort by priority
+    table.sort(candidates, function(a, b)
+        return a.priority < b.priority
+    end)
+
+    -- Return first one where condition passes
+    for _, cand in ipairs(candidates) do
+        local passes = true
+        if cand.condition and ConditionBuilder then
+            passes = ConditionBuilder.evaluateWithContext(cand.condition, ctx)
+        end
+
+        if passes then
+            -- Check if spell is ready
+            local me = mq.TLO.Me
+            if me and me() and me.SpellReady(cand.spellName)() then
+                return cand.spellName
+            end
+        end
+    end
+
+    return nil
+end
+
 return M
