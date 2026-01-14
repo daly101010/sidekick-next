@@ -259,7 +259,7 @@ M.categoryOverrides = {
     ['doSelfRune'] = 'utility',
     ['doPolyRune'] = 'utility',
     ['doGroupRune'] = 'utility',
-    ['doHaste'] = 'utility',
+    ['doHaste'] = 'buff',
     ['doManaRegen'] = 'utility',
     ['doChromaticHaze'] = 'burn',
     ['doIllusionsOfGrandeur'] = 'burn',
@@ -281,9 +281,15 @@ M.AbilitySets = {
 
     -- Fast Mez
     MezSpellFast = {
-        "Deceiving Flash", "Deluding Flash", "Bewildering Flash",
-        "Confounding Flash", "Misleading Flash", "Baffling Flash",
-        "Befuddling Flash", "Mystifying Flash",
+        "Flummoxing Flash", "Addling Flash", "Deceiving Flash", "Deluding Flash",
+        "Bewildering Flash", "Confounding Flash", "Misleading Flash", "Baffling Flash",
+        "Befuddling Flash", "Mystifying Flash", "Perplexing Flash",
+    },
+
+    -- Fast AE Mez (Glance line)
+    MezAESpellFast = {
+        "Vexing Glance", "Confounding Glance", "Neutralizing Glance",
+        "Perplexing Glance", "Slackening Glance",
     },
 
     -- AE Mez
@@ -292,6 +298,7 @@ M.AbilitySets = {
         "Slackening Wave", "Peaceful Wave", "Serene Wave",
         "Ensorcelling Wave", "Quelling Wave", "Wake of Subdual",
         "Wake of Felicity", "Bliss of the Nihil", "Fascination",
+        "Mesmerization", "Bewildering Wave",
     },
 
     -- PBAE Mez
@@ -368,6 +375,7 @@ M.AbilitySets = {
     MagicNuke = {
         "Mindrend", "Mindreap", "Mindrift", "Mindslash", "Mindsunder",
         "Mindcleave", "Mindscythe", "Mindblade", "Spectral Assault",
+        "Polychaotic Assault", "Multichromatic Assault",
     },
 
     -- Chromatic Nuke (Fast)
@@ -450,7 +458,7 @@ M.AbilitySets = {
     SelfStasisAA = { "Self Stasis" },
 }
 
--- SpellLoadouts: Role-based gem assignments
+-- SpellLoadouts: Role-based gem assignments with extended schema
 M.SpellLoadouts = {
     cc = {
         name = "Crowd Control",
@@ -465,6 +473,66 @@ M.SpellLoadouts = {
             [7] = "ManaRegenSpell",
             [8] = "SelfRune1",
             [9] = "GroupRune",
+        },
+        defaults = {
+            -- CC
+            DoMez = true,
+            DoAEMez = true,
+            DoStun = false,
+            -- Debuffs
+            DoSlow = true,
+            DoTash = true,
+            DoCripple = false,
+            -- Combat (minimal for CC role)
+            DoNuke = false,
+            DoDoT = false,
+            DoCharm = false,
+            DoManaTap = true,
+            -- Defense
+            DoSelfRune = true,
+            DoGroupRune = true,
+            UseReactiveRune = true,
+            -- Buffs
+            DoHaste = true,
+            DoManaRegen = true,
+            -- Burn
+            UseChromaticHaze = true,
+            UseIllusionsOfGrandeur = true,
+            UseSpireOfEnchantment = true,
+            UseBeguilersSynergy = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            DoSelfRune = "emergency",
+            UseReactiveRune = "emergency",
+            -- Support (CC primary)
+            DoMez = "support",
+            DoAEMez = "support",
+            DoStun = "support",
+            DoSlow = "support",
+            DoTash = "support",
+            DoCripple = "support",
+            -- Combat
+            DoNuke = "combat",
+            DoDoT = "combat",
+            DoManaTap = "combat",
+            DoCharm = "combat",
+            -- Burn
+            UseChromaticHaze = "burn",
+            UseIllusionsOfGrandeur = "burn",
+            UseSpireOfEnchantment = "burn",
+            UseBeguilersSynergy = "burn",
+            -- Utility
+            DoGroupRune = "buff",
+            DoHaste = "buff",
+            DoManaRegen = "buff",
+        },
+        layerOrder = {
+            emergency = {"DoSelfRune", "UseReactiveRune"},
+            support = {"DoMez", "DoAEMez", "DoStun", "DoSlow", "DoTash", "DoCripple"},
+            combat = {"DoManaTap", "DoNuke", "DoDoT", "DoCharm"},
+            burn = {"UseChromaticHaze", "UseIllusionsOfGrandeur", "UseSpireOfEnchantment", "UseBeguilersSynergy"},
+            buff = {"DoGroupRune", "DoHaste", "DoManaRegen"},
         },
     },
     dps = {
@@ -481,6 +549,66 @@ M.SpellLoadouts = {
             [8] = "SelfRune1",
             [9] = "HasteSpell",
         },
+        defaults = {
+            -- CC (minimal)
+            DoMez = true,
+            DoAEMez = false,
+            DoStun = false,
+            -- Debuffs
+            DoSlow = true,
+            DoTash = true,
+            DoCripple = false,
+            -- Combat (primary)
+            DoNuke = true,
+            DoDoT = true,
+            DoCharm = false,
+            DoManaTap = true,
+            -- Defense
+            DoSelfRune = true,
+            DoGroupRune = false,
+            UseReactiveRune = true,
+            -- Buffs
+            DoHaste = true,
+            DoManaRegen = false,
+            -- Burn
+            UseChromaticHaze = true,
+            UseIllusionsOfGrandeur = true,
+            UseSpireOfEnchantment = true,
+            UseBeguilersSynergy = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            DoSelfRune = "emergency",
+            UseReactiveRune = "emergency",
+            -- Support
+            DoMez = "support",
+            DoAEMez = "support",
+            DoStun = "support",
+            DoSlow = "support",
+            DoTash = "support",
+            DoCripple = "support",
+            -- Combat (primary)
+            DoNuke = "combat",
+            DoDoT = "combat",
+            DoManaTap = "combat",
+            DoCharm = "combat",
+            -- Burn
+            UseChromaticHaze = "burn",
+            UseIllusionsOfGrandeur = "burn",
+            UseSpireOfEnchantment = "burn",
+            UseBeguilersSynergy = "burn",
+            -- Utility
+            DoGroupRune = "buff",
+            DoHaste = "buff",
+            DoManaRegen = "buff",
+        },
+        layerOrder = {
+            emergency = {"DoSelfRune", "UseReactiveRune"},
+            support = {"DoTash", "DoSlow", "DoMez", "DoAEMez", "DoStun", "DoCripple"},
+            combat = {"DoNuke", "DoDoT", "DoManaTap", "DoCharm"},
+            burn = {"UseChromaticHaze", "UseIllusionsOfGrandeur", "UseSpireOfEnchantment", "UseBeguilersSynergy"},
+            buff = {"DoHaste", "DoGroupRune", "DoManaRegen"},
+        },
     },
     buff = {
         name = "Buff/Support",
@@ -494,6 +622,66 @@ M.SpellLoadouts = {
             [6] = "MezSpell",
             [7] = "SlowSpell",
             [8] = "TashSpell",
+        },
+        defaults = {
+            -- CC (backup)
+            DoMez = true,
+            DoAEMez = false,
+            DoStun = false,
+            -- Debuffs
+            DoSlow = true,
+            DoTash = true,
+            DoCripple = false,
+            -- Combat (minimal)
+            DoNuke = false,
+            DoDoT = false,
+            DoCharm = false,
+            DoManaTap = true,
+            -- Defense
+            DoSelfRune = true,
+            DoGroupRune = true,
+            UseReactiveRune = true,
+            -- Buffs (primary)
+            DoHaste = true,
+            DoManaRegen = true,
+            -- Burn
+            UseChromaticHaze = true,
+            UseIllusionsOfGrandeur = true,
+            UseSpireOfEnchantment = true,
+            UseBeguilersSynergy = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            DoSelfRune = "emergency",
+            UseReactiveRune = "emergency",
+            -- Support
+            DoMez = "support",
+            DoAEMez = "support",
+            DoStun = "support",
+            DoSlow = "support",
+            DoTash = "support",
+            DoCripple = "support",
+            -- Combat
+            DoNuke = "combat",
+            DoDoT = "combat",
+            DoManaTap = "combat",
+            DoCharm = "combat",
+            -- Burn
+            UseChromaticHaze = "burn",
+            UseIllusionsOfGrandeur = "burn",
+            UseSpireOfEnchantment = "burn",
+            UseBeguilersSynergy = "burn",
+            -- Utility (primary)
+            DoGroupRune = "buff",
+            DoHaste = "buff",
+            DoManaRegen = "buff",
+        },
+        layerOrder = {
+            emergency = {"DoSelfRune", "UseReactiveRune"},
+            support = {"DoMez", "DoSlow", "DoTash", "DoAEMez", "DoStun", "DoCripple"},
+            combat = {"DoManaTap", "DoNuke", "DoDoT", "DoCharm"},
+            burn = {"UseIllusionsOfGrandeur", "UseChromaticHaze", "UseSpireOfEnchantment", "UseBeguilersSynergy"},
+            buff = {"DoHaste", "DoManaRegen", "DoGroupRune"},
         },
     },
     raid = {
@@ -509,6 +697,66 @@ M.SpellLoadouts = {
             [7] = "SelfRune1",
             [8] = "SelfRune2",
             [9] = "ColorStun",
+        },
+        defaults = {
+            -- CC (essential)
+            DoMez = true,
+            DoAEMez = false,
+            DoStun = true,
+            -- Debuffs
+            DoSlow = false,
+            DoTash = true,
+            DoCripple = false,
+            -- Combat (primary)
+            DoNuke = true,
+            DoDoT = true,
+            DoCharm = false,
+            DoManaTap = true,
+            -- Defense
+            DoSelfRune = true,
+            DoGroupRune = false,
+            UseReactiveRune = true,
+            -- Buffs (minimal)
+            DoHaste = false,
+            DoManaRegen = false,
+            -- Burn (full)
+            UseChromaticHaze = true,
+            UseIllusionsOfGrandeur = true,
+            UseSpireOfEnchantment = true,
+            UseBeguilersSynergy = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            DoSelfRune = "emergency",
+            UseReactiveRune = "emergency",
+            -- Support
+            DoMez = "support",
+            DoAEMez = "support",
+            DoStun = "support",
+            DoSlow = "support",
+            DoTash = "support",
+            DoCripple = "support",
+            -- Combat (primary)
+            DoNuke = "combat",
+            DoDoT = "combat",
+            DoManaTap = "combat",
+            DoCharm = "combat",
+            -- Burn (primary)
+            UseChromaticHaze = "burn",
+            UseIllusionsOfGrandeur = "burn",
+            UseSpireOfEnchantment = "burn",
+            UseBeguilersSynergy = "burn",
+            -- Utility
+            DoGroupRune = "buff",
+            DoHaste = "buff",
+            DoManaRegen = "buff",
+        },
+        layerOrder = {
+            emergency = {"DoSelfRune", "UseReactiveRune"},
+            support = {"DoTash", "DoMez", "DoStun", "DoAEMez", "DoSlow", "DoCripple"},
+            combat = {"DoNuke", "DoDoT", "DoManaTap", "DoCharm"},
+            burn = {"UseChromaticHaze", "UseIllusionsOfGrandeur", "UseSpireOfEnchantment", "UseBeguilersSynergy"},
+            buff = {"DoHaste", "DoManaRegen", "DoGroupRune"},
         },
     },
 }

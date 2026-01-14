@@ -1,14 +1,22 @@
 local imgui = require('ImGui')
 local ConditionBuilder = require('ui.condition_builder')
 local Core = require('utils.core')
+local Ability = require('utils.abilities')
 
 local M = {}
 
--- Simplified mode system:
--- ON_DEMAND (1) = never auto-fire, user must click
--- AUTO (2) = auto-fire based on category layer + condition gate
-local MODE_ON_DEMAND = 1
-local MODE_AUTO = 2
+-- Mode constants (from Ability module)
+local MODE_ON_DEMAND = Ability.MODE.ON_DEMAND
+local MODE_ON_CONDITION = Ability.MODE.ON_CONDITION
+local MODE_ON_COOLDOWN = Ability.MODE.ON_COOLDOWN
+
+-- Context constants for ON_COOLDOWN mode
+local CONTEXT_COMBAT = Ability.CONTEXT.COMBAT
+local CONTEXT_OUT_OF_COMBAT = Ability.CONTEXT.OUT_OF_COMBAT
+local CONTEXT_ANYTIME = Ability.CONTEXT.ANYTIME
+
+local CONTEXT_KEYS = { CONTEXT_COMBAT, CONTEXT_OUT_OF_COMBAT, CONTEXT_ANYTIME }
+local CONTEXT_LABELS = Ability.CONTEXT_LABELS
 
 local LAYER_KEYS = { 'auto', 'emergency', 'aggro', 'defenses', 'burn', 'combat', 'utility' }
 local LAYER_LABELS = {
@@ -286,27 +294,25 @@ function M.drawAbilities(ctx)
     end
 
     local function drawList(list)
-        imgui.Columns(6, '##sk_cols', false)
+        -- New column layout: Enable | Ability | Mode | Context/Layer | CD
+        imgui.Columns(5, '##sk_cols', false)
         local avail = math.max(360, getAvailX())
-        local enW = math.max(60, textWidth('Enable') + 12)
-        local layerW = 95
-        local aggroW = 60
-        local modeW = 110
+        local enW = math.max(50, textWidth('Enable') + 8)
+        local modeW = 105
+        local contextW = 105  -- Context or Layer column
         local cdW = 54
-        local abilityW = math.max(160, avail - (enW + layerW + aggroW + modeW + cdW))
+        local abilityW = math.max(160, avail - (enW + modeW + contextW + cdW))
         if imgui.SetColumnWidth then
             imgui.SetColumnWidth(0, enW)
             imgui.SetColumnWidth(1, abilityW)
-            imgui.SetColumnWidth(2, layerW)
-            imgui.SetColumnWidth(3, aggroW)
-            imgui.SetColumnWidth(4, modeW)
-            imgui.SetColumnWidth(5, cdW)
+            imgui.SetColumnWidth(2, modeW)
+            imgui.SetColumnWidth(3, contextW)
+            imgui.SetColumnWidth(4, cdW)
         end
         imgui.Text('Enable'); imgui.NextColumn()
         imgui.Text('Ability'); imgui.NextColumn()
-        imgui.Text('Layer'); imgui.NextColumn()
-        imgui.Text('Aggro'); imgui.NextColumn()
         imgui.Text('Mode'); imgui.NextColumn()
+        imgui.Text(''); imgui.NextColumn()  -- Context/Layer header (dynamic)
         imgui.Text('CD'); imgui.NextColumn()
         imgui.Separator()
 
@@ -355,34 +361,45 @@ function M.drawAbilities(ctx)
                 end
                 imgui.NextColumn()
 
-                local layerKey = tostring(def.settingKey) .. 'Layer'
-                local curLayer = tostring(settings[layerKey] or 'auto'):lower()
-                if curLayer == '' or curLayer == 'nil' or LAYER_LABELS[curLayer] == nil then
-                    curLayer = 'auto'
-                end
-                imgui.SetNextItemWidth(layerW - 6)
-                local newLayer = comboKeyed('##layer_' .. def.settingKey, curLayer, LAYER_KEYS, LAYER_LABELS)
-                if newLayer ~= curLayer then
-                    setSetting(layerKey, newLayer)
-                end
-                imgui.NextColumn()
-
-                local aggroKey = tostring(def.settingKey) .. 'UseForAggro'
-                local useAggro = settings[aggroKey] == true
-                useAggro, changed = imgui.Checkbox('##aggro', useAggro)
-                if changed then
-                    setSetting(aggroKey, useAggro)
-                end
-                imgui.NextColumn()
-
+                -- Mode dropdown
                 local mode = tonumber(settings[def.modeKey]) or MODE_ON_DEMAND
                 imgui.SetNextItemWidth(modeW - 6)
                 local newMode = comboMode('##mode_' .. def.settingKey, mode, modeLabels)
                 if newMode ~= mode and ctx.onMode then
                     ctx.onMode(def.modeKey, newMode)
+                    mode = newMode  -- Update for conditional rendering below
                 end
                 imgui.NextColumn()
 
+                -- Context/Layer column (depends on mode)
+                if mode == MODE_ON_COOLDOWN then
+                    -- Show Context dropdown for mash abilities
+                    local contextKey = tostring(def.settingKey) .. 'Context'
+                    local curContext = tonumber(settings[contextKey]) or CONTEXT_COMBAT
+                    imgui.SetNextItemWidth(contextW - 6)
+                    local newContext = comboMode('##ctx_' .. def.settingKey, curContext, CONTEXT_LABELS)
+                    if newContext ~= curContext then
+                        setSetting(contextKey, newContext)
+                    end
+                elseif mode == MODE_ON_CONDITION then
+                    -- Show Layer dropdown for conditional abilities
+                    local layerKey = tostring(def.settingKey) .. 'Layer'
+                    local curLayer = tostring(settings[layerKey] or 'auto'):lower()
+                    if curLayer == '' or curLayer == 'nil' or LAYER_LABELS[curLayer] == nil then
+                        curLayer = 'auto'
+                    end
+                    imgui.SetNextItemWidth(contextW - 6)
+                    local newLayer = comboKeyed('##layer_' .. def.settingKey, curLayer, LAYER_KEYS, LAYER_LABELS)
+                    if newLayer ~= curLayer then
+                        setSetting(layerKey, newLayer)
+                    end
+                else
+                    -- On Demand: no additional controls
+                    imgui.Text('')
+                end
+                imgui.NextColumn()
+
+                -- CD column
                 local cdText = ''
                 if ctx.cooldownProbe then
                     local nm = def.altName or def.discName
@@ -394,8 +411,8 @@ function M.drawAbilities(ctx)
                 imgui.Text(cdText)
                 imgui.NextColumn()
 
-                -- Show condition builder when mode is AUTO
-                if mode == MODE_AUTO or newMode == MODE_AUTO then
+                -- Show condition builder when mode is ON_CONDITION
+                if mode == MODE_ON_CONDITION then
                     local condKey = def.modeKey:gsub('Mode$', 'Condition')
                     local condData = settings[condKey]
                     if not condData and Core.Ini and Core.Ini['SideKick-Abilities'] then
@@ -418,14 +435,13 @@ function M.drawAbilities(ctx)
                     end)
                     imgui.Unindent(20)
                     -- Restore columns
-                    imgui.Columns(6, '##sk_cols', false)
+                    imgui.Columns(5, '##sk_cols', false)
                     if imgui.SetColumnWidth then
                         imgui.SetColumnWidth(0, enW)
                         imgui.SetColumnWidth(1, abilityW)
-                        imgui.SetColumnWidth(2, layerW)
-                        imgui.SetColumnWidth(3, aggroW)
-                        imgui.SetColumnWidth(4, modeW)
-                        imgui.SetColumnWidth(5, cdW)
+                        imgui.SetColumnWidth(2, modeW)
+                        imgui.SetColumnWidth(3, contextW)
+                        imgui.SetColumnWidth(4, cdW)
                     end
                 end
 
@@ -491,30 +507,28 @@ function M.drawAbilities(ctx)
             end
         end
 
-        imgui.Columns(7, '##sk_disc_groups', false)
+        -- New column layout: Enable | Timer | Discipline | Mode | Context/Layer | CD
+        imgui.Columns(6, '##sk_disc_groups', false)
         local avail = math.max(420, getAvailX())
-        local enW = math.max(60, textWidth('Enable') + 12)
-        local tW = math.max(52, textWidth('Timer') + 12)
-        local layerW = 95
-        local aggroW = 60
-        local modeW = 110
+        local enW = math.max(50, textWidth('Enable') + 8)
+        local tW = math.max(48, textWidth('Timer') + 8)
+        local modeW = 105
+        local contextW = 105  -- Context or Layer column
         local cdW = 54
-        local discW = math.max(160, avail - (enW + tW + layerW + aggroW + modeW + cdW))
+        local discW = math.max(160, avail - (enW + tW + modeW + contextW + cdW))
         if imgui.SetColumnWidth then
             imgui.SetColumnWidth(0, enW)
             imgui.SetColumnWidth(1, tW)
             imgui.SetColumnWidth(2, discW)
-            imgui.SetColumnWidth(3, layerW)
-            imgui.SetColumnWidth(4, aggroW)
-            imgui.SetColumnWidth(5, modeW)
-            imgui.SetColumnWidth(6, cdW)
+            imgui.SetColumnWidth(3, modeW)
+            imgui.SetColumnWidth(4, contextW)
+            imgui.SetColumnWidth(5, cdW)
         end
         imgui.Text('Enable'); imgui.NextColumn()
         imgui.Text('Timer'); imgui.NextColumn()
         imgui.Text('Discipline'); imgui.NextColumn()
-        imgui.Text('Layer'); imgui.NextColumn()
-        imgui.Text('Aggro'); imgui.NextColumn()
         imgui.Text('Mode'); imgui.NextColumn()
+        imgui.Text(''); imgui.NextColumn()  -- Context/Layer header (dynamic)
         imgui.Text('CD'); imgui.NextColumn()
         imgui.Separator()
 
@@ -588,9 +602,8 @@ function M.drawAbilities(ctx)
             end
             imgui.NextColumn()
 
-            imgui.Text(''); imgui.NextColumn() -- Layer (group header)
-            imgui.Text(''); imgui.NextColumn() -- Aggro (group header)
             imgui.Text(''); imgui.NextColumn() -- Mode (group header)
+            imgui.Text(''); imgui.NextColumn() -- Context/Layer (group header)
             imgui.Text(''); imgui.NextColumn() -- CD (group header)
 
             if open then
@@ -622,32 +635,45 @@ function M.drawAbilities(ctx)
                     end
                     imgui.NextColumn()
 
-                    local layerKey = tostring(def.settingKey) .. 'Layer'
-                    local curLayer = tostring(settings[layerKey] or 'auto'):lower()
-                    if curLayer == '' or curLayer == 'nil' or LAYER_LABELS[curLayer] == nil then
-                        curLayer = 'auto'
-                    end
-                    imgui.SetNextItemWidth(layerW - 6)
-                    local newLayer = comboKeyed('##layer_' .. def.settingKey, curLayer, LAYER_KEYS, LAYER_LABELS)
-                    if newLayer ~= curLayer then
-                        setSetting(layerKey, newLayer)
-                    end
-                    imgui.NextColumn()
-
-                    local aggroKey = tostring(def.settingKey) .. 'UseForAggro'
-                    local useAggro = settings[aggroKey] == true
-                    useAggro, changed2 = imgui.Checkbox('##aggro', useAggro)
-                    if changed2 then
-                        setSetting(aggroKey, useAggro)
-                    end
-                    imgui.NextColumn()
-
-                    imgui.SetNextItemWidth(modeW - 6)
+                    -- Mode dropdown
                     local mode = tonumber(settings[def.modeKey]) or MODE_ON_DEMAND
+                    imgui.SetNextItemWidth(modeW - 6)
                     local newMode = comboMode('##mode_' .. def.settingKey, mode, modeLabels)
-                    if newMode ~= mode and ctx.onMode then ctx.onMode(def.modeKey, newMode) end
+                    if newMode ~= mode and ctx.onMode then
+                        ctx.onMode(def.modeKey, newMode)
+                        mode = newMode  -- Update for conditional rendering below
+                    end
                     imgui.NextColumn()
 
+                    -- Context/Layer column (depends on mode)
+                    if mode == MODE_ON_COOLDOWN then
+                        -- Show Context dropdown for mash abilities
+                        local contextKey = tostring(def.settingKey) .. 'Context'
+                        local curContext = tonumber(settings[contextKey]) or CONTEXT_COMBAT
+                        imgui.SetNextItemWidth(contextW - 6)
+                        local newContext = comboMode('##ctx_' .. def.settingKey, curContext, CONTEXT_LABELS)
+                        if newContext ~= curContext then
+                            setSetting(contextKey, newContext)
+                        end
+                    elseif mode == MODE_ON_CONDITION then
+                        -- Show Layer dropdown for conditional abilities
+                        local layerKey = tostring(def.settingKey) .. 'Layer'
+                        local curLayer = tostring(settings[layerKey] or 'auto'):lower()
+                        if curLayer == '' or curLayer == 'nil' or LAYER_LABELS[curLayer] == nil then
+                            curLayer = 'auto'
+                        end
+                        imgui.SetNextItemWidth(contextW - 6)
+                        local newLayer = comboKeyed('##layer_' .. def.settingKey, curLayer, LAYER_KEYS, LAYER_LABELS)
+                        if newLayer ~= curLayer then
+                            setSetting(layerKey, newLayer)
+                        end
+                    else
+                        -- On Demand: no additional controls
+                        imgui.Text('')
+                    end
+                    imgui.NextColumn()
+
+                    -- CD column
                     local cdText = ''
                     if ctx.cooldownProbe then
                         local keyName = def.discName or def.altName
@@ -659,8 +685,8 @@ function M.drawAbilities(ctx)
                     imgui.Text(cdText)
                     imgui.NextColumn()
 
-                    -- Show condition builder when mode is AUTO
-                    if mode == MODE_AUTO or newMode == MODE_AUTO then
+                    -- Show condition builder when mode is ON_CONDITION
+                    if mode == MODE_ON_CONDITION then
                         local condKey = def.modeKey:gsub('Mode$', 'Condition')
                         local condData = settings[condKey]
                         if not condData and Core.Ini and Core.Ini['SideKick-Abilities'] then
@@ -683,15 +709,14 @@ function M.drawAbilities(ctx)
                         end)
                         imgui.Unindent(20)
                         -- Restore columns
-                        imgui.Columns(7, '##sk_disc_groups', false)
+                        imgui.Columns(6, '##sk_disc_groups', false)
                         if imgui.SetColumnWidth then
                             imgui.SetColumnWidth(0, enW)
                             imgui.SetColumnWidth(1, tW)
                             imgui.SetColumnWidth(2, discW)
-                            imgui.SetColumnWidth(3, layerW)
-                            imgui.SetColumnWidth(4, aggroW)
-                            imgui.SetColumnWidth(5, modeW)
-                            imgui.SetColumnWidth(6, cdW)
+                            imgui.SetColumnWidth(3, modeW)
+                            imgui.SetColumnWidth(4, contextW)
+                            imgui.SetColumnWidth(5, cdW)
                         end
                     end
 

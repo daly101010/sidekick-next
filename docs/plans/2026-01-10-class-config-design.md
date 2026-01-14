@@ -2,29 +2,25 @@
 
 ## Overview
 
-Unified class configuration system that provides prebuilt spell lineups, rotation conditions, and settings UI based on RGMercs patterns. Consolidates spellsets, class_configs, and UI settings into one per-class file.
+Unified class configuration system that provides prebuilt spell lineups, rotation conditions, and settings UI based on RGMercs patterns. All spell lines, ability sets, rotations, and UI settings are consolidated into one per-class file.
 
 ---
 
 ## Part 1: File Structure
 
-### Current Structure
-```
-data/
-  spellsets/ENC.lua     -- Spell lines and role loadouts
-  class_configs/WAR.lua -- Ability sets and conditions
-  classes/ENC.lua       -- AA ability definitions
-```
-
-### New Structure
+### Structure (Migration Complete)
 ```
 data/
   class_configs/
-    ENC.lua   -- Unified: spellsets + ability sets + rotations + settings
+    ENC.lua   -- Unified: spell lines + ability sets + rotations + settings
     SHM.lua   -- Same pattern
-    WAR.lua   -- Already exists, extend with rotations
-    ...
+    CLR.lua   -- Same pattern
+    WAR.lua   -- Same pattern (non-casters have simpler spell lines)
+    ...       -- All 16 classes
 ```
+
+Note: The old `data/spellsets/` folder has been removed. All spell line definitions
+are now in `M.spellLines` within each class config file.
 
 ---
 

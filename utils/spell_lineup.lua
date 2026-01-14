@@ -8,6 +8,57 @@ local M = {}
 -- Cached spell list
 M.spells = {}
 M.lastScanZone = ''
+M.lastLoadout = ''
+
+-- Lazy-load class config loader (to map gem slots -> settingKey)
+local _ConfigLoader = nil
+local function getConfigLoader()
+    if not _ConfigLoader then
+        local ok, cl = pcall(require, 'utils.class_config_loader')
+        if ok then _ConfigLoader = cl end
+    end
+    return _ConfigLoader
+end
+
+local function buildGemToSettingKey(settings)
+    local gemToKey = {}
+    settings = settings or {}
+
+    local loadoutName = tostring(settings.SpellLoadout or '')
+    if loadoutName == '' then return gemToKey end
+
+    local ConfigLoader = getConfigLoader()
+    if not ConfigLoader then return gemToKey end
+    if not ConfigLoader.current and ConfigLoader.init then
+        ConfigLoader.init()
+    end
+    if not ConfigLoader.current then return gemToKey end
+
+    local loadouts = ConfigLoader.getSpellLoadouts and ConfigLoader.getSpellLoadouts(ConfigLoader.current) or {}
+    local loadout = loadouts[loadoutName] or loadouts[loadoutName:lower()]
+    if not loadout or not loadout.gems then return gemToKey end
+
+    -- Build AbilitySet -> settingKey map from DefaultConfig metadata
+    local defaultConfig = ConfigLoader.getDefaultConfig and ConfigLoader.getDefaultConfig() or {}
+    local setToKey = {}
+    for settingKey, meta in pairs(defaultConfig) do
+        local setName = meta and meta.AbilitySet
+        if setName and setName ~= '' and not setToKey[setName] then
+            setToKey[setName] = settingKey
+        end
+    end
+
+    for gem, setName in pairs(loadout.gems) do
+        local gemNum = tonumber(gem)
+        if gemNum and setName then
+            -- Prefer an explicit Settings key that references this AbilitySet,
+            -- but fall back to using the AbilitySet name itself as the settingKey.
+            gemToKey[gemNum] = setToKey[setName] or setName
+        end
+    end
+
+    return gemToKey
+end
 
 -- SPA IDs for categorization
 M.SPA = {
@@ -108,10 +159,14 @@ function M.getTargetType(spell)
 end
 
 --- Scan memorized spells and build sorted list
+-- @param settings table|nil Settings table (used to map gems to settingKey via active loadout)
 -- @return table Array of spell entries
-function M.scan()
+function M.scan(settings)
     local spells = {}
     local numGems = mq.TLO.Me.NumGems() or 8
+
+    local gemToSettingKey = buildGemToSettingKey(settings)
+    M.lastLoadout = tostring((settings or {}).SpellLoadout or '')
 
     -- Scan gems 1 to (NumGems-1), skip utility gem
     for gem = 1, numGems - 1 do
@@ -125,6 +180,7 @@ function M.scan()
                 category = category,
                 resistType = nil,
                 targetType = M.getTargetType(spell),
+                settingKey = gemToSettingKey[gem],
             }
 
             -- Store resist type for damage spells
@@ -154,10 +210,15 @@ end
 
 --- Get cached spells, rescan if needed
 -- @param forceRescan boolean Force a rescan
+-- @param settings table|nil Settings table (used to map gems to settingKey via active loadout)
 -- @return table Array of spell entries
-function M.getSpells(forceRescan)
+function M.getSpells(forceRescan, settings)
+    local loadoutName = tostring((settings or {}).SpellLoadout or '')
+    if loadoutName ~= M.lastLoadout then
+        forceRescan = true
+    end
     if forceRescan or #M.spells == 0 then
-        return M.scan()
+        return M.scan(settings)
     end
     return M.spells
 end
@@ -169,7 +230,7 @@ function M.checkZoneChange(settings)
 
     local currentZone = mq.TLO.Zone.ShortName() or ''
     if currentZone ~= M.lastScanZone and currentZone ~= '' then
-        M.scan()
+        M.scan(settings)
     end
 end
 

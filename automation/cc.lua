@@ -619,17 +619,17 @@ local function spellMemorized(spellName)
     return false
 end
 
--- Helper: load spellset for class
-local function loadSpellset(classShort)
-    local ok, set = pcall(require, string.format('data.spellsets.%s', classShort))
-    if ok then return set end
+-- Helper: load class config for class
+local function loadClassConfig(classShort)
+    local ok, config = pcall(require, string.format('data.class_configs.%s', classShort))
+    if ok then return config end
     return nil
 end
 
 -- Helper: resolve best memorized spell from a line
-local function resolveSpellLine(spellset, lineName)
-    if not spellset or not spellset.spellLines or not lineName then return nil end
-    local line = spellset.spellLines[lineName]
+local function resolveSpellLine(classConfig, lineName)
+    if not classConfig or not classConfig.spellLines or not lineName then return nil end
+    local line = classConfig.spellLines[lineName]
     if type(line) ~= 'table' then return nil end
     for _, name in ipairs(line) do
         if spellMemorized(name) then
@@ -640,9 +640,9 @@ local function resolveSpellLine(spellset, lineName)
 end
 
 -- Helper: choose spell from profile
-local function chooseSpellForLines(spellset, lines)
+local function chooseSpellForLines(classConfig, lines)
     for _, lineName in ipairs(lines or {}) do
-        local spellName = resolveSpellLine(spellset, lineName)
+        local spellName = resolveSpellLine(classConfig, lineName)
         if spellName and spellName ~= '' then
             return spellName
         end
@@ -873,14 +873,14 @@ function M.mezTick(settings)
     end
     _mezCastState.lastMezDecisionAt = now
 
-    -- Get class profile and spellset
+    -- Get class profile and class config
     local profile = _mezProfiles[cls]
     if not profile then
         return false
     end
 
-    local spellset = loadSpellset(cls)
-    if not spellset then
+    local classConfig = loadClassConfig(cls)
+    if not classConfig then
         return false
     end
 
@@ -895,9 +895,9 @@ function M.mezTick(settings)
         for mobId, data in pairs(M.localMezzes) do
             if M.needsRemez(mobId, refreshWindow) then
                 -- Remez this target
-                local spellName = chooseSpellForLines(spellset, settings.UseFastMez and profile.fast or profile.main)
+                local spellName = chooseSpellForLines(classConfig, settings.UseFastMez and profile.fast or profile.main)
                 if not spellName then
-                    spellName = chooseSpellForLines(spellset, profile.main)
+                    spellName = chooseSpellForLines(classConfig, profile.main)
                 end
                 if spellName and isValidMezTarget(mobId, settings) then
                     return M.castMez(mobId, data.name, spellName)
@@ -927,9 +927,9 @@ function M.mezTick(settings)
         local aeCount = getAETargetCount(targetId)
         if aeCount >= aeMinTargets then
             -- Use AE mez
-            spellName = chooseSpellForLines(spellset, profile.aeFast or profile.ae)
+            spellName = chooseSpellForLines(classConfig, profile.aeFast or profile.ae)
             if not spellName then
-                spellName = chooseSpellForLines(spellset, profile.ae)
+                spellName = chooseSpellForLines(classConfig, profile.ae)
             end
         end
     end
@@ -937,10 +937,10 @@ function M.mezTick(settings)
     -- Fall back to single target mez
     if not spellName then
         if settings.UseFastMez and profile.fast then
-            spellName = chooseSpellForLines(spellset, profile.fast)
+            spellName = chooseSpellForLines(classConfig, profile.fast)
         end
         if not spellName then
-            spellName = chooseSpellForLines(spellset, profile.main)
+            spellName = chooseSpellForLines(classConfig, profile.main)
         end
     end
 

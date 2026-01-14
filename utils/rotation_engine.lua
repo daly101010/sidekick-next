@@ -6,6 +6,19 @@ local mq = require('mq')
 
 local M = {}
 
+-- Lazy-load throttled logging
+local _ThrottledLog = nil
+local function getThrottledLog()
+    if not _ThrottledLog then
+        local ok, tl = pcall(require, 'utils.throttled_log')
+        if ok then _ThrottledLog = tl end
+    end
+    return _ThrottledLog
+end
+
+-- Enable/disable debug logging for rotation engine
+M.debugLogging = true  -- Set to true to enable layer/ability logging
+
 -- Lazy-load dependencies to avoid circular requires
 local _Cache = nil
 local function getCache()
@@ -80,12 +93,14 @@ end
 -- Each layer processes before the next
 M.LAYERS = {
     { name = 'emergency',  priority = 1, stepsPerTick = 2 },  -- Panic buttons (HP critical)
-    { name = 'aggro',      priority = 2, stepsPerTick = 1 },  -- Hate generation (tank only)
-    { name = 'defenses',   priority = 3, stepsPerTick = 1 },  -- Defensive cooldowns
-    { name = 'support',    priority = 4, stepsPerTick = 2 },  -- Support: self-heal > CC > debuffs (SHM/ENC/DRU/BRD/NEC)
-    { name = 'burn',       priority = 5, stepsPerTick = 2 },  -- Burn abilities (when burning)
-    { name = 'combat',     priority = 6, stepsPerTick = 1 },  -- Normal combat rotation
-    { name = 'utility',    priority = 7, stepsPerTick = 1 },  -- Utility (misc)
+    { name = 'heal',       priority = 2, stepsPerTick = 2 },  -- Heals (anytime - not combat gated)
+    { name = 'aggro',      priority = 3, stepsPerTick = 1 },  -- Hate generation (tank only)
+    { name = 'defenses',   priority = 4, stepsPerTick = 1 },  -- Defensive cooldowns
+    { name = 'support',    priority = 5, stepsPerTick = 2 },  -- Support: CC > debuffs (SHM/ENC/DRU/BRD/NEC)
+    { name = 'burn',       priority = 6, stepsPerTick = 2 },  -- Burn abilities (when burning)
+    { name = 'combat',     priority = 7, stepsPerTick = 1 },  -- Normal combat rotation
+    { name = 'utility',    priority = 8, stepsPerTick = 1 },  -- Utility (misc)
+    { name = 'buff',       priority = 9, stepsPerTick = 1 },  -- Buffs (out of combat only)
 }
 
 -- Layer name -> definition lookup
@@ -96,16 +111,22 @@ end
 
 -- Category -> Layer mapping
 -- Abilities are assigned to layers based on their category tag
+-- NOTE: Categories from class_config Settings.Category are case-insensitive (lowercased)
 local CATEGORY_TO_LAYER = {
+    -- Emergency layer
     emergency = 'emergency',
     defensive = 'defenses',
     defense = 'defenses',
+    -- Aggro layer
     aggro = 'aggro',
     hate = 'aggro',
     taunt = 'aggro',
-    -- Support layer: self-heals, CC, debuffs (for support classes)
-    selfheal = 'support',
-    groupheal = 'support',
+    -- Heal layer: heals anytime (not combat gated)
+    heal = 'heal',
+    selfheal = 'heal',
+    groupheal = 'heal',
+    cure = 'heal',  -- Cures run like heals (anytime)
+    -- Support layer: CC, debuffs (for support classes, in combat)
     cc = 'support',
     mez = 'support',
     debuff = 'support',
@@ -121,8 +142,15 @@ local CATEGORY_TO_LAYER = {
     dps = 'combat',
     nuke = 'combat',
     dot = 'combat',
-    -- Utility layer (misc)
+    -- Utility layer (misc, in combat)
     utility = 'utility',
+    rez = 'utility',  -- Rez is utility (in combat battle rez)
+    mana = 'buff',    -- Mana regen runs out of combat with buffs
+    -- Buff layer (out of combat)
+    buff = 'buff',
+    selfbuff = 'buff',
+    groupbuff = 'buff',
+    aura = 'buff',
 }
 
 -- Support classes that use the support layer (casters/priests only)
@@ -142,8 +170,9 @@ local SUPPORT_CLASSES = {
 --- Determine which layer an ability belongs to
 -- @param def table Ability definition
 -- @param settings table Settings table
+-- @param classConfig table Optional class config with Settings metadata
 -- @return string Layer name
-function M.getAbilityLayer(def, settings)
+function M.getAbilityLayer(def, settings, classConfig)
     if not def then return 'combat' end
 
     -- Check for explicit layer assignment in settings
@@ -155,10 +184,19 @@ function M.getAbilityLayer(def, settings)
         end
     end
 
-    -- Check category tag on ability definition
+    -- Check category tag on ability definition itself
     if def.category then
         local mapped = CATEGORY_TO_LAYER[def.category:lower()]
         if mapped then return mapped end
+    end
+
+    -- Check Category from class config Settings metadata (e.g., Settings.DoHaste.Category = "Buff")
+    if classConfig and classConfig.Settings and def.settingKey then
+        local settingMeta = classConfig.Settings[def.settingKey]
+        if settingMeta and settingMeta.Category then
+            local mapped = CATEGORY_TO_LAYER[settingMeta.Category:lower()]
+            if mapped then return mapped end
+        end
     end
 
     -- Check if marked for aggro use (tank abilities)
@@ -177,11 +215,15 @@ end
 -- @return boolean True if layer should run
 function M.shouldLayerRun(layer, state)
     local Cache = getCache()
+    local TL = getThrottledLog()
     local name = layer.name
 
     -- If we're in "priority healing" state, skip damage-focused layers.
     if state and state.priorityHealingActive == true then
         if name == 'combat' or name == 'burn' then
+            if M.debugLogging and TL then
+                TL.log('layer_skip_' .. name, 10, 'Layer %s SKIP: priority healing active', name)
+            end
             return false
         end
     end
@@ -190,20 +232,41 @@ function M.shouldLayerRun(layer, state)
     if name == 'emergency' then
         local hp = Cache and Cache.me.hp or 100
         local threshold = state.emergencyHpThreshold or 35
-        return hp <= threshold
+        local shouldRun = hp <= threshold
+        if M.debugLogging and TL and shouldRun then
+            TL.log('layer_emergency', 5, 'Layer EMERGENCY: HP=%d <= threshold=%d', hp, threshold)
+        end
+        return shouldRun
+    end
+
+    -- Heal: always runs (not combat gated) - heals should work anytime
+    if name == 'heal' then
+        if M.debugLogging and TL then
+            TL.log('layer_heal', 10, 'Layer HEAL: always runs (not combat gated)')
+        end
+        return true
     end
 
     -- Aggro: only when tanking and in combat
     if name == 'aggro' then
         local isTanking = state.combatMode == 'tank'
         local inCombat = Cache and Cache.inCombat() or false
-        return isTanking and inCombat
+        local shouldRun = isTanking and inCombat
+        if M.debugLogging and TL then
+            TL.log('layer_aggro', 10, 'Layer AGGRO: tanking=%s, inCombat=%s -> %s', tostring(isTanking), tostring(inCombat), tostring(shouldRun))
+        end
+        return shouldRun
     end
 
     -- Defenses: in combat, optionally gated by HP or named
     if name == 'defenses' then
         local inCombat = Cache and Cache.inCombat() or false
-        if not inCombat then return false end
+        if not inCombat then
+            if M.debugLogging and TL then
+                TL.log('layer_defenses_ooc', 10, 'Layer DEFENSES: SKIP (not in combat)')
+            end
+            return false
+        end
 
         -- Run defenses if HP below threshold or fighting named
         -- Tanks use lower threshold (40%), non-tanks use higher (70%)
@@ -211,37 +274,80 @@ function M.shouldLayerRun(layer, state)
         local isTanking = state.combatMode == 'tank'
         local defenseHpThreshold = isTanking and (state.tankDefenseHpThreshold or 40) or (state.defenseHpThreshold or 70)
         local isNamed = Cache and Cache.isTargetNamed() or false
-        return hp <= defenseHpThreshold or isNamed
+        local shouldRun = hp <= defenseHpThreshold or isNamed
+        if M.debugLogging and TL then
+            TL.log('layer_defenses', 10, 'Layer DEFENSES: hp=%d, threshold=%d, named=%s -> %s', hp, defenseHpThreshold, tostring(isNamed), tostring(shouldRun))
+        end
+        return shouldRun
     end
 
     -- Support: for support classes (SHM/ENC/DRU/BRD/NEC/CLR) when in combat
     -- Handles: self-heals (if low), CC/mez, debuffs
     if name == 'support' then
         local inCombat = Cache and Cache.inCombat() or false
-        if not inCombat then return false end
+        if not inCombat then
+            if M.debugLogging and TL then
+                TL.log('layer_support_ooc', 10, 'Layer SUPPORT: SKIP (not in combat)')
+            end
+            return false
+        end
 
         -- Only run for support classes
         local myClass = state.myClass or ''
-        if not SUPPORT_CLASSES[myClass] then return false end
+        if not SUPPORT_CLASSES[myClass] then
+            if M.debugLogging and TL then
+                TL.log('layer_support_class', 10, 'Layer SUPPORT: SKIP (class %s not a support class)', myClass)
+            end
+            return false
+        end
 
+        if M.debugLogging and TL then
+            TL.log('layer_support', 10, 'Layer SUPPORT: class=%s, running', myClass)
+        end
         return true
     end
 
     -- Burn: only when burn is active
     if name == 'burn' then
-        return state.burnActive == true
+        local shouldRun = state.burnActive == true
+        if M.debugLogging and TL then
+            TL.log('layer_burn', 10, 'Layer BURN: active=%s', tostring(state.burnActive))
+        end
+        return shouldRun
     end
 
     -- Combat: always runs in combat
     if name == 'combat' then
         local inCombat = Cache and Cache.inCombat() or false
+        if M.debugLogging and TL then
+            TL.log('layer_combat', 10, 'Layer COMBAT: inCombat=%s', tostring(inCombat))
+        end
         return inCombat
     end
 
     -- Utility: in combat
     if name == 'utility' then
         local inCombat = Cache and Cache.inCombat() or false
+        if M.debugLogging and TL then
+            TL.log('layer_utility', 10, 'Layer UTILITY: inCombat=%s', tostring(inCombat))
+        end
         return inCombat
+    end
+
+    -- Buff: out of combat only (for rebuffing self/group)
+    if name == 'buff' then
+        local inCombat = Cache and Cache.inCombat() or false
+        -- Only buff when not in combat
+        if inCombat then
+            if M.debugLogging and TL then
+                TL.log('layer_buff_ic', 10, 'Layer BUFF: SKIP (in combat)')
+            end
+            return false
+        end
+        if M.debugLogging and TL then
+            TL.log('layer_buff', 10, 'Layer BUFF: out of combat, running')
+        end
+        return true
     end
 
     return true
@@ -308,7 +414,10 @@ function M.evaluateConditionGate(def, settings, ctx, classConfig)
 end
 
 --- Check if an ability passes its mode gate
--- Simplified: abilities are either ON_DEMAND (never auto) or AUTO (category + conditions)
+-- Mode types:
+--   ON_DEMAND = never auto-fire (user must click)
+--   ON_CONDITION = auto-fire based on layer + condition gate
+--   ON_COOLDOWN = handled separately by mash queue (not in normal rotation)
 -- @param def table Ability definition
 -- @param settings table Settings table
 -- @param state table Current automation state
@@ -326,7 +435,12 @@ function M.checkModeGate(def, settings, state, ctx, classConfig)
         return false
     end
 
-    -- AUTO mode: evaluate condition gate (user override OR class config default)
+    -- On-cooldown: handled by separate mash queue, not in normal rotation
+    if mode == Abilities.MODE.ON_COOLDOWN then
+        return false
+    end
+
+    -- ON_CONDITION mode: evaluate condition gate (user override OR class config default)
     -- Note: category/layer context is already checked by shouldLayerRun()
     -- Build context if not provided
     if not ctx then
@@ -359,8 +473,9 @@ end
 --- Categorize abilities into layers
 -- @param abilities table Array of ability definitions
 -- @param settings table Settings table
+-- @param classConfig table Optional class config with Settings metadata
 -- @return table Map of layer name -> array of abilities
-function M.categorizeByLayer(abilities, settings)
+function M.categorizeByLayer(abilities, settings, classConfig)
     local byLayer = {}
     for _, layer in ipairs(M.LAYERS) do
         byLayer[layer.name] = {}
@@ -368,7 +483,7 @@ function M.categorizeByLayer(abilities, settings)
 
     for _, def in ipairs(abilities) do
         if type(def) == 'table' then
-            local layer = M.getAbilityLayer(def, settings)
+            local layer = M.getAbilityLayer(def, settings, classConfig)
             table.insert(byLayer[layer], def)
         end
     end
@@ -386,10 +501,16 @@ end
 -- @return number Number of abilities executed
 function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
     local Abilities = getAbilities()
+    local TL = getThrottledLog()
     if not Abilities then return 0 end
 
     local executed = 0
     local maxSteps = layer.stepsPerTick or 1
+
+    -- Log layer execution start
+    if M.debugLogging and TL then
+        TL.log('runLayer_' .. layer.name, 10, 'Running layer %s with %d abilities (max %d steps)', layer.name, #abilities, maxSteps)
+    end
 
     -- Sort by user priority
     local sorted = Abilities.sortByPriority(abilities)
@@ -397,19 +518,47 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
     for _, def in ipairs(sorted) do
         if executed >= maxSteps then break end
 
+        local abilityName = def.settingKey or def.name or 'unknown'
+
         -- 1. Check master toggle by ability type (UseSpells, UseAAs, UseDiscs)
-        if not M.checkMasterToggle(def, settings) then goto continue end
+        if not M.checkMasterToggle(def, settings) then
+            if M.debugLogging and TL then
+                TL.log('ability_master_' .. abilityName, 15, '  %s: SKIP (master toggle disabled for %s)', abilityName, def.kind or 'unknown')
+            end
+            goto continue
+        end
 
         -- 2. Check individual enabled toggle
         local enabled = def.settingKey and settings[def.settingKey] == true
-        if not enabled then goto continue end
+        if not enabled then
+            if M.debugLogging and TL then
+                TL.log('ability_disabled_' .. abilityName, 15, '  %s: SKIP (setting disabled, key=%s, value=%s)', abilityName, tostring(def.settingKey), tostring(settings[def.settingKey]))
+            end
+            goto continue
+        end
 
         -- 3. Check mode gate (includes condition evaluation for ON_CONDITION mode)
-        if not M.checkModeGate(def, settings, state, ctx, classConfig) then goto continue end
+        if not M.checkModeGate(def, settings, state, ctx, classConfig) then
+            if M.debugLogging and TL then
+                local modeVal = def.modeKey and settings[def.modeKey] or 'nil'
+                TL.log('ability_mode_' .. abilityName, 15, '  %s: SKIP (mode gate failed, modeKey=%s, mode=%s)', abilityName, tostring(def.modeKey), tostring(modeVal))
+            end
+            goto continue
+        end
 
         -- 4. Try to execute
+        if M.debugLogging and TL then
+            TL.log('ability_exec_' .. abilityName, 5, '  %s: EXECUTING (all gates passed)', abilityName)
+        end
         if M.tryExecute(def) then
             executed = executed + 1
+            if M.debugLogging and TL then
+                TL.log('ability_success_' .. abilityName, 5, '  %s: SUCCESS', abilityName)
+            end
+        else
+            if M.debugLogging and TL then
+                TL.log('ability_fail_' .. abilityName, 5, '  %s: FAILED (executor returned false)', abilityName)
+            end
         end
 
         ::continue::
@@ -421,12 +570,17 @@ end
 --- Run full rotation through all layers
 -- @param opts table Options: abilities, settings, burnActive, combatMode
 function M.tick(opts)
+    local TL = getThrottledLog()
     opts = opts or {}
     local abilities = opts.abilities or {}
     local settings = opts.settings or {}
 
     -- Early exit if all ability types are disabled
     if settings.UseSpells == false and settings.UseAAs == false and settings.UseDiscs == false then
+        if M.debugLogging and TL then
+            TL.log('tick_disabled', 30, 'Rotation SKIP: all ability types disabled (UseSpells=%s, UseAAs=%s, UseDiscs=%s)',
+                tostring(settings.UseSpells), tostring(settings.UseAAs), tostring(settings.UseDiscs))
+        end
         return
     end
 
@@ -448,6 +602,19 @@ function M.tick(opts)
         priorityHealingActive = opts.priorityHealingActive == true,
     }
 
+    -- Log tick start
+    if M.debugLogging and TL then
+        local inCombat = Cache and Cache.inCombat() or false
+        TL.log('tick_start', 10, 'Rotation tick: class=%s, combatMode=%s, inCombat=%s, abilities=%d',
+            myClass, state.combatMode, tostring(inCombat), #abilities)
+    end
+
+    -- Load class config once (shared across all layers) - MUST be before categorizeByLayer
+    local classConfig = getClassConfig(myClass)
+
+    -- Categorize abilities by layer (needs classConfig for Settings.Category lookup)
+    local byLayer = M.categorizeByLayer(abilities, settings, classConfig)
+
     -- Build condition context once (shared across all layers)
     local ctx = nil
     local ConditionContext = getConditionContext()
@@ -455,11 +622,19 @@ function M.tick(opts)
         ctx = ConditionContext.build()
     end
 
-    -- Load class config once (shared across all layers)
-    local classConfig = getClassConfig(myClass)
-
-    -- Categorize abilities by layer
-    local byLayer = M.categorizeByLayer(abilities, settings)
+    -- Log layer categorization
+    if M.debugLogging and TL then
+        local layerCounts = {}
+        for _, layer in ipairs(M.LAYERS) do
+            local count = byLayer[layer.name] and #byLayer[layer.name] or 0
+            if count > 0 then
+                table.insert(layerCounts, layer.name .. '=' .. count)
+            end
+        end
+        if #layerCounts > 0 then
+            TL.log('tick_layers', 15, 'Ability layer counts: %s', table.concat(layerCounts, ', '))
+        end
+    end
 
     -- Process each layer in priority order
     for _, layer in ipairs(M.LAYERS) do
@@ -488,13 +663,112 @@ end
 function M.getLayerInfo()
     return {
         { name = 'emergency', priority = 1, description = 'Panic buttons when HP critical' },
-        { name = 'aggro',     priority = 2, description = 'Hate generation (tank mode)' },
-        { name = 'defenses',  priority = 3, description = 'Defensive cooldowns' },
-        { name = 'support',   priority = 4, description = 'Support: self-heal > CC > debuffs (SHM/ENC/DRU/BRD/NEC/CLR)' },
-        { name = 'burn',      priority = 5, description = 'Burn abilities (when burning)' },
-        { name = 'combat',    priority = 6, description = 'Normal combat rotation' },
-        { name = 'utility',   priority = 7, description = 'Utility abilities' },
+        { name = 'heal',      priority = 2, description = 'Heals (anytime - not combat gated)' },
+        { name = 'aggro',     priority = 3, description = 'Hate generation (tank mode)' },
+        { name = 'defenses',  priority = 4, description = 'Defensive cooldowns' },
+        { name = 'support',   priority = 5, description = 'Support: CC > debuffs (SHM/ENC/DRU/BRD/NEC/CLR)' },
+        { name = 'burn',      priority = 6, description = 'Burn abilities (when burning)' },
+        { name = 'combat',    priority = 7, description = 'Normal combat rotation' },
+        { name = 'utility',   priority = 8, description = 'Utility abilities' },
+        { name = 'buff',      priority = 9, description = 'Buffs (out of combat only)' },
     }
+end
+
+--- Get currently active layers based on current state
+-- @param settings table Optional settings table for combat mode etc
+-- @return table { active = { layerName = true }, inCombat = bool, hp = number }
+function M.getActiveLayerState(settings)
+    settings = settings or {}
+    local Cache = getCache()
+
+    local myClass = ''
+    if Cache and Cache.me and Cache.me.class then
+        myClass = Cache.me.class
+    elseif mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName then
+        myClass = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
+    end
+
+    local state = {
+        burnActive = settings.BurnActive or false,
+        combatMode = settings.CombatMode or 'off',
+        myClass = myClass,
+        emergencyHpThreshold = settings.EmergencyHpThreshold or 35,
+        defenseHpThreshold = settings.DefenseHpThreshold or 70,
+        tankDefenseHpThreshold = settings.TankDefenseHpThreshold or 40,
+    }
+
+    local inCombat = Cache and Cache.inCombat() or false
+    local hp = Cache and Cache.me.hp or 100
+    local isNamed = Cache and Cache.isTargetNamed() or false
+
+    local activeLayers = {}
+    for _, layer in ipairs(M.LAYERS) do
+        if M.shouldLayerRun(layer, state) then
+            activeLayers[layer.name] = true
+        end
+    end
+
+    return {
+        active = activeLayers,
+        inCombat = inCombat,
+        hp = hp,
+        isNamed = isNamed,
+        myClass = myClass,
+    }
+end
+
+--- Process mash queue (ON_COOLDOWN abilities)
+-- These are instant abilities that fire whenever ready, checked after normal rotation.
+-- Multiple can fire per tick since they're off-GCD.
+-- @param opts table Options: abilities, settings
+-- @return number Number of abilities executed
+function M.processMashQueue(opts)
+    opts = opts or {}
+    local abilities = opts.abilities or {}
+    local settings = opts.settings or {}
+
+    local Abilities = getAbilities()
+    if not Abilities then return 0 end
+
+    local Cache = getCache()
+    local inCombat = Cache and Cache.inCombat() or false
+
+    local executed = 0
+
+    for _, def in ipairs(abilities) do
+        if type(def) ~= 'table' then goto continue end
+
+        -- Only process ON_COOLDOWN mode abilities
+        local mode = def.modeKey and tonumber(settings[def.modeKey]) or Abilities.MODE.ON_DEMAND
+        if mode ~= Abilities.MODE.ON_COOLDOWN then goto continue end
+
+        -- Check master toggle by ability type
+        if not M.checkMasterToggle(def, settings) then goto continue end
+
+        -- Check individual enabled toggle
+        local enabled = def.settingKey and settings[def.settingKey] == true
+        if not enabled then goto continue end
+
+        -- Check context (Combat/Out of Combat/Anytime)
+        local contextKey = def.settingKey and (def.settingKey .. 'Context')
+        local context = contextKey and tonumber(settings[contextKey]) or Abilities.CONTEXT.COMBAT
+
+        if context == Abilities.CONTEXT.COMBAT and not inCombat then
+            goto continue
+        elseif context == Abilities.CONTEXT.OUT_OF_COMBAT and inCombat then
+            goto continue
+        end
+        -- ANYTIME passes regardless of combat state
+
+        -- Try to execute (instant abilities, no GCD contention)
+        if M.tryExecute(def) then
+            executed = executed + 1
+        end
+
+        ::continue::
+    end
+
+    return executed
 end
 
 return M

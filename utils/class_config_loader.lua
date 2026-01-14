@@ -73,8 +73,10 @@ function M.getAbilitySets(config)
     return sets
 end
 
---- Resolve an AbilitySet to the best available ability
--- @param setName string AbilitySet name
+--- Resolve an AbilitySet (spellLine/aaLine/discLine) to the best available ability
+-- Checks spellbook for spells, AltAbility for AAs, CombatAbility for discs
+-- Uses proper resolution order: iterate through the line (best to worst) and return first found
+-- @param setName string AbilitySet/spellLine name
 -- @param config table Optional specific config (uses current if nil)
 -- @return string|nil Best available ability name
 function M.resolveAbilitySet(setName, config)
@@ -83,25 +85,27 @@ function M.resolveAbilitySet(setName, config)
 
     local sets = M.getAbilitySets(config)
     local set = sets[setName]
-    if not set then return nil end
+    if not set or type(set) ~= 'table' then return nil end
 
     local me = mq.TLO.Me
     if not me or not me() then return nil end
 
+    -- Iterate through the ability line (ordered best to worst)
+    -- Return the first one found in spellbook/AA/disc list
     for _, name in ipairs(set) do
-        -- Check spellbook
+        -- Check spellbook first (most common case for spell lines)
         local spell = me.Book(name)
         if spell and spell() then
             return name
         end
 
-        -- Check AAs
+        -- Check AAs (for AA lines)
         local aa = me.AltAbility(name)
         if aa and aa() then
             return name
         end
 
-        -- Check combat abilities (discs)
+        -- Check combat abilities/discs (for disc lines)
         local disc = me.CombatAbility(name)
         if disc and disc() then
             return name

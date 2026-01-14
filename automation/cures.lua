@@ -124,12 +124,12 @@ function M.init()
 end
 
 --------------------------------------------------------------------------------
--- Spellset Integration
+-- Class Config Integration
 --------------------------------------------------------------------------------
 
-local function loadSpellset(classShort)
-    local ok, set = pcall(require, string.format('data.spellsets.%s', classShort))
-    if ok then return set end
+local function loadClassConfig(classShort)
+    local ok, config = pcall(require, string.format('data.class_configs.%s', classShort))
+    if ok then return config end
     return nil
 end
 
@@ -147,9 +147,9 @@ local function spellMemorized(spellName)
     return false
 end
 
-local function resolveSpellLine(spellset, lineName)
-    if not spellset or not spellset.spellLines or not lineName then return nil end
-    local line = spellset.spellLines[lineName]
+local function resolveSpellLine(classConfig, lineName)
+    if not classConfig or not classConfig.spellLines or not lineName then return nil end
+    local line = classConfig.spellLines[lineName]
     if type(line) ~= 'table' then return nil end
     for _, name in ipairs(line) do
         if spellMemorized(name) then
@@ -160,8 +160,8 @@ local function resolveSpellLine(spellset, lineName)
 end
 
 local function getBestCureSpell(debuffType, forGroup)
-    local spellset = loadSpellset(_state.classShort)
-    if not spellset then return nil end
+    local classConfig = loadClassConfig(_state.classShort)
+    if not classConfig then return nil end
 
     local lineNames = M.CURE_LINE_MAP[debuffType]
     if not lineNames then return nil end
@@ -170,7 +170,7 @@ local function getBestCureSpell(debuffType, forGroup)
     if forGroup then
         for _, lineName in ipairs(lineNames) do
             if lineName:find('Group') or lineName == 'CureAll' then
-                local spell = resolveSpellLine(spellset, lineName)
+                local spell = resolveSpellLine(classConfig, lineName)
                 if spell then return spell end
             end
         end
@@ -178,7 +178,7 @@ local function getBestCureSpell(debuffType, forGroup)
 
     -- Fallback to single-target cures
     for _, lineName in ipairs(lineNames) do
-        local spell = resolveSpellLine(spellset, lineName)
+        local spell = resolveSpellLine(classConfig, lineName)
         if spell then return spell end
     end
 

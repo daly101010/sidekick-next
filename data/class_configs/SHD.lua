@@ -188,10 +188,266 @@ M.categoryOverrides = {
     ['doPoisonDoT'] = 'combat',
     ['doDiseaseDoT'] = 'combat',
     ['doCorruptionDoT'] = 'combat',
-    ['doHateBuff'] = 'utility',
-    ['doLifetapProc'] = 'utility',
-    ['doHPBuff'] = 'utility',
+    ['doHateBuff'] = 'buff',
+    ['doLifetapProc'] = 'buff',
+    ['doHPBuff'] = 'buff',
     ['doSpireOfShadowKnight'] = 'burn',
+}
+
+-- AbilitySets: Spell/AA progressions (highest to lowest rank)
+M.AbilitySets = {
+    -- Spear Nuke
+    SpearNuke = {
+        "Spear of Grelleth", "Spear of Vizat", "Spear of Tylix",
+        "Spear of Bloodwretch", "Spear of Lazam", "Spear of Muram",
+    },
+    -- Life Tap
+    LifeTap = {
+        "Dire Confession", "Dire Covenant", "Dire Testimony",
+        "Dire Declaration", "Dire Indictment", "Dire Accusation",
+    },
+    -- Terror (hate)
+    Terror = {
+        "Terror of Tarantella", "Terror of Teratoma", "Terror of Desolor",
+        "Terror of Thule", "Terror of Discord", "Terror of Darkness",
+    },
+    -- Torrent (AE hate)
+    Torrent = {
+        "Torrent of Pain", "Torrent of Agony", "Torrent of Suffering",
+        "Torrent of Misery", "Torrent of Hate", "Torrent of Anguish",
+    },
+    -- Poison DoT
+    PoisonDoT = {
+        "Dire Stenosis", "Dire Stricture", "Dire Convulsion",
+        "Dire Seizure", "Dire Implication", "Dire Constriction",
+    },
+    -- Disease DoT
+    DiseaseDoT = {
+        "Blood of Laarthik", "Blood of Korihor", "Blood of Ikatiar",
+        "Blood of Tearc", "Blood of Shoru", "Blood of Thule",
+    },
+    -- Corruption DoT
+    CorruptionDoT = {
+        "Bond of Vulak", "Bond of Bynn", "Bond of Inruku",
+        "Bond of Tatalros", "Bond of Mortality", "Bond of Death",
+    },
+    -- Hate Buff
+    HateBuff = {
+        "Voice of Thule", "Voice of the Grave", "Voice of Death",
+        "Shroud of Undeath", "Shroud of Discord",
+    },
+    -- Lifetap Proc
+    LifetapProc = {
+        "Lich Sting", "Mental Anguish", "Seething Hatred",
+        "Touch of T`Vem", "Touch of Volatis", "Touch of the Warlord",
+    },
+    -- HP Buff
+    HPBuff = {
+        "Dire Shield", "Dark Shield", "Shadow Shield",
+        "Unholy Guard", "Shroud of Pain",
+    },
+    -- Pet
+    Pet = {
+        "Servant of Darkness", "Minion of Darkness", "Child of Darkness",
+        "Spawn of Darkness", "Specter of Darkness",
+    },
+    -- AA: Explosion of Hatred
+    ExplosionOfHatredAA = { "Explosion of Hatred" },
+    -- AA: Explosion of Spite
+    ExplosionOfSpiteAA = { "Explosion of Spite" },
+    -- AA: Leech Touch
+    LeechAA = { "Leech Touch" },
+    -- AA: Harm Touch
+    HarmTouchAA = { "Harm Touch" },
+    -- AA: Thought Leech
+    ThoughtLeechAA = { "Thought Leech" },
+    -- AA: Visage of Death
+    VisageOfDeathAA = { "Visage of Death" },
+    -- AA: Spire of the Reavers
+    SpireOfShadowKnightAA = { "Spire of the Reavers" },
+}
+
+-- SpellLoadouts: Role-based gem assignments with extended schema
+M.SpellLoadouts = {
+    tank = {
+        name = "Tank Focused",
+        description = "Focus on aggro and tanking",
+        gems = {
+            [1] = "SpearNuke",
+            [2] = "Terror",
+            [3] = "Torrent",
+            [4] = "LifeTap",
+            [5] = "HateBuff",
+            [6] = "LifetapProc",
+            [7] = "HPBuff",
+            [8] = "PoisonDoT",
+        },
+        defaults = {
+            -- Tank
+            DoTerror = true,
+            DoTorrent = true,
+            -- Combat
+            DoLifeTaps = true,
+            DoDoTs = false,
+            DoSpearNuke = true,
+            -- Buffs
+            DoHateBuff = true,
+            DoLifetapProc = true,
+            DoHPBuff = true,
+            -- Emergency
+            UseLeech = true,
+            UseVisageOfDeath = true,
+            UseLeechcurse = true,
+            UseDefenseDiscs = true,
+            -- Burns
+            UseHarmTouch = true,
+            UseSpireOfShadowKnight = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            UseLeech = "emergency",
+            UseVisageOfDeath = "emergency",
+            UseLeechcurse = "emergency",
+            -- Defenses
+            UseDefenseDiscs = "defenses",
+            -- Combat (aggro)
+            DoTerror = "combat",
+            DoTorrent = "combat",
+            DoLifeTaps = "combat",
+            DoDoTs = "combat",
+            DoSpearNuke = "combat",
+            -- Burn
+            UseHarmTouch = "burn",
+            UseSpireOfShadowKnight = "burn",
+            -- Buff
+            DoHateBuff = "buff",
+            DoLifetapProc = "buff",
+            DoHPBuff = "buff",
+        },
+        layerOrder = {
+            emergency = {"UseLeech", "UseVisageOfDeath", "UseLeechcurse"},
+            defenses = {"UseDefenseDiscs"},
+            combat = {"DoTerror", "DoTorrent", "DoLifeTaps", "DoSpearNuke", "DoDoTs"},
+            burn = {"UseHarmTouch", "UseSpireOfShadowKnight"},
+            buff = {"DoHateBuff", "DoLifetapProc", "DoHPBuff"},
+        },
+    },
+    dps = {
+        name = "DPS Focused",
+        description = "Maximize damage with DoTs and nukes",
+        gems = {
+            [1] = "SpearNuke",
+            [2] = "LifeTap",
+            [3] = "PoisonDoT",
+            [4] = "DiseaseDoT",
+            [5] = "CorruptionDoT",
+            [6] = "Terror",
+            [7] = "LifetapProc",
+            [8] = "HPBuff",
+        },
+        defaults = {
+            -- Tank (minimal)
+            DoTerror = true,
+            DoTorrent = false,
+            -- Combat (primary)
+            DoLifeTaps = true,
+            DoDoTs = true,
+            DoSpearNuke = true,
+            -- Buffs
+            DoHateBuff = false,
+            DoLifetapProc = true,
+            DoHPBuff = true,
+            -- Emergency
+            UseLeech = true,
+            UseVisageOfDeath = true,
+            UseLeechcurse = true,
+            UseDefenseDiscs = false,
+            -- Burns
+            UseHarmTouch = true,
+            UseSpireOfShadowKnight = true,
+        },
+        layerAssignments = {
+            UseLeech = "emergency",
+            UseVisageOfDeath = "emergency",
+            UseLeechcurse = "emergency",
+            UseDefenseDiscs = "defenses",
+            DoTerror = "combat",
+            DoTorrent = "combat",
+            DoLifeTaps = "combat",
+            DoDoTs = "combat",
+            DoSpearNuke = "combat",
+            UseHarmTouch = "burn",
+            UseSpireOfShadowKnight = "burn",
+            DoHateBuff = "utility",
+            DoLifetapProc = "utility",
+            DoHPBuff = "utility",
+        },
+        layerOrder = {
+            emergency = {"UseLeech", "UseVisageOfDeath", "UseLeechcurse"},
+            defenses = {"UseDefenseDiscs"},
+            combat = {"DoDoTs", "DoSpearNuke", "DoLifeTaps", "DoTerror", "DoTorrent"},
+            burn = {"UseHarmTouch", "UseSpireOfShadowKnight"},
+            buff = {"DoLifetapProc", "DoHPBuff", "DoHateBuff"},
+        },
+    },
+    dot = {
+        name = "DOT Heavy",
+        description = "Focus on damage over time abilities",
+        gems = {
+            [1] = "PoisonDoT",
+            [2] = "DiseaseDoT",
+            [3] = "CorruptionDoT",
+            [4] = "LifeTap",
+            [5] = "SpearNuke",
+            [6] = "Terror",
+            [7] = "LifetapProc",
+            [8] = "HPBuff",
+        },
+        defaults = {
+            -- Tank (minimal)
+            DoTerror = true,
+            DoTorrent = false,
+            -- Combat (primary)
+            DoLifeTaps = true,
+            DoDoTs = true,
+            DoSpearNuke = true,
+            -- Buffs
+            DoHateBuff = false,
+            DoLifetapProc = true,
+            DoHPBuff = true,
+            -- Emergency
+            UseLeech = true,
+            UseVisageOfDeath = true,
+            UseLeechcurse = true,
+            UseDefenseDiscs = false,
+            -- Burns
+            UseHarmTouch = true,
+            UseSpireOfShadowKnight = true,
+        },
+        layerAssignments = {
+            UseLeech = "emergency",
+            UseVisageOfDeath = "emergency",
+            UseLeechcurse = "emergency",
+            UseDefenseDiscs = "defenses",
+            DoTerror = "combat",
+            DoTorrent = "combat",
+            DoLifeTaps = "combat",
+            DoDoTs = "combat",
+            DoSpearNuke = "combat",
+            UseHarmTouch = "burn",
+            UseSpireOfShadowKnight = "burn",
+            DoHateBuff = "utility",
+            DoLifetapProc = "utility",
+            DoHPBuff = "utility",
+        },
+        layerOrder = {
+            emergency = {"UseLeech", "UseVisageOfDeath", "UseLeechcurse"},
+            defenses = {"UseDefenseDiscs"},
+            combat = {"DoDoTs", "DoLifeTaps", "DoSpearNuke", "DoTerror", "DoTorrent"},
+            burn = {"UseHarmTouch", "UseSpireOfShadowKnight"},
+            buff = {"DoLifetapProc", "DoHPBuff", "DoHateBuff"},
+        },
+    },
 }
 
 M.Settings = {
@@ -205,15 +461,65 @@ M.Settings = {
         Category = "Combat",
         DisplayName = "Use DoTs",
     },
+    DoSpearNuke = {
+        Default = true,
+        Category = "Combat",
+        DisplayName = "Spear Nuke",
+    },
     DoTerror = {
         Default = true,
         Category = "Aggro",
         DisplayName = "Use Terror",
     },
+    DoTorrent = {
+        Default = true,
+        Category = "Aggro",
+        DisplayName = "AE Torrent",
+    },
+    DoHateBuff = {
+        Default = true,
+        Category = "Buff",
+        DisplayName = "Hate Buff",
+    },
+    DoLifetapProc = {
+        Default = true,
+        Category = "Buff",
+        DisplayName = "Lifetap Proc",
+    },
+    DoHPBuff = {
+        Default = true,
+        Category = "Buff",
+        DisplayName = "HP Buff",
+    },
+    UseLeech = {
+        Default = true,
+        Category = "Emergency",
+        DisplayName = "Leech Touch",
+    },
+    UseVisageOfDeath = {
+        Default = true,
+        Category = "Emergency",
+        DisplayName = "Visage of Death",
+    },
+    UseLeechcurse = {
+        Default = true,
+        Category = "Emergency",
+        DisplayName = "Leechcurse",
+    },
     UseDefenseDiscs = {
         Default = true,
         Category = "Defense",
         DisplayName = "Defense Discs",
+    },
+    UseHarmTouch = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Harm Touch",
+    },
+    UseSpireOfShadowKnight = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Spire of SK",
     },
 }
 

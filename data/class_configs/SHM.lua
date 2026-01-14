@@ -242,45 +242,316 @@ M.categoryOverrides = {
     ['doPoisonDoT'] = 'combat',
     ['doDiseaseDoT'] = 'combat',
     ['doPoisonNuke'] = 'combat',
-    ['doCannibalize'] = 'utility',
-    ['doHaste'] = 'utility',
-    ['doHPBuff'] = 'utility',
-    ['doRegenBuff'] = 'utility',
+    ['doCannibalize'] = 'buff',
+    ['doHaste'] = 'buff',
+    ['doHPBuff'] = 'buff',
+    ['doRegenBuff'] = 'buff',
     ['doSpireOfAncestors'] = 'burn',
     ['doRabidBear'] = 'burn',
 }
 
--- Gem loadouts
-M.gemLoadouts = {
-    ['Heal'] = {
-        [1] = 'RecklessHeal1',
-        [2] = 'RecklessHeal2',
-        [3] = 'InterventionHeal',
-        [4] = 'AESpiritualHeal',
-        [5] = 'GroupRenewalHoT',
-        [6] = 'Slow',
-        [7] = 'Malo',
-        [8] = 'Cannibalize',
+-- AbilitySets: Spell/AA progressions (highest to lowest rank)
+M.AbilitySets = {
+    -- Heals (Reckless line)
+    RecklessHeal1 = {
+        "Reckless Reinvigoration", "Reckless Resurgence", "Reckless Renewal",
+        "Reckless Regeneration", "Reckless Rejuvenation", "Reckless Restoration",
+        "Reckless Mending", "Reckless Remedy", "Reckless Healing",
     },
-    ['Debuff'] = {
-        [1] = 'Slow',
-        [2] = 'Malo',
-        [3] = 'Cripple',
-        [4] = 'RecklessHeal1',
-        [5] = 'AESpiritualHeal',
-        [6] = 'PoisonDoT',
-        [7] = 'DiseaseDoT',
-        [8] = 'Cannibalize',
+    RecklessHeal2 = {
+        "Reckless Reinvigoration", "Reckless Resurgence", "Reckless Renewal",
+        "Reckless Regeneration", "Reckless Rejuvenation", "Reckless Restoration",
     },
-    ['DPS'] = {
-        [1] = 'PoisonNuke',
-        [2] = 'PoisonDoT',
-        [3] = 'DiseaseDoT',
-        [4] = 'Slow',
-        [5] = 'Malo',
-        [6] = 'RecklessHeal1',
-        [7] = 'AESpiritualHeal',
-        [8] = 'Cannibalize',
+    -- Recourse Heal
+    RecourseHeal = {
+        "Grayleaf's Recourse", "Krasir's Recourse", "Blezon's Recourse",
+        "Qirik's Recourse", "Gotikan's Recourse", "Eyrzekla's Recourse",
+        "Zrelik's Recourse", "Rowain's Recourse", "Dannal's Recourse",
+    },
+    -- Intervention Heal
+    InterventionHeal = {
+        "Immortal Intervention", "Antediluvian Intervention", "Primordial Intervention",
+        "Prehistoric Intervention", "Ancestral Intervention", "Preternatural Intervention",
+    },
+    -- AE Spiritual Heal
+    AESpiritualHeal = {
+        "Spiritual Shower", "Spiritual Swell", "Spiritual Surge",
+        "Spiritual Squall", "Spiritual Serenity", "Spiritual Salve",
+    },
+    -- Group Renewal HoT
+    GroupRenewalHoT = {
+        "Reverie of Renewal", "Spirit of Renewal", "Specter of Renewal",
+        "Shadow of Renewal", "Phantom of Renewal", "Penumbra of Renewal",
+    },
+    -- Slow
+    SlowSpell = {
+        "Turgur's Swarm", "Turgur's Virulent Swarm", "Turgur's Insects",
+        "Balance of Discord", "Balance of the Nihil", "Drowsy", "Walking Sleep",
+    },
+    -- Malo
+    MaloSpell = {
+        "Wind of Malosinera", "Wind of Malaise", "Malosinara",
+        "Malosinete", "Malosinia", "Malosini", "Malo",
+    },
+    -- Cripple
+    CrippleSpell = {
+        "Crippling Spasm", "Crippling Parasite", "Listless Power",
+        "Incapacity", "Cripple",
+    },
+    -- Poison DoT
+    PoisonDoT = {
+        "Nectar of Agony", "Nectar of Suffering", "Nectar of Pain",
+        "Nectar of Torment", "Nectar of Affliction", "Nectar of Misery",
+    },
+    -- Disease DoT
+    DiseaseDoT = {
+        "Malady of Mori", "Malady of the Priest", "Scourge of Fates",
+        "Scourge of Destiny", "Breath of Ultor", "Plague",
+    },
+    -- Poison Nuke
+    PoisonNuke = {
+        "Oka's Venom", "Bledrek's Venom", "Yoppa's Venom",
+        "Nexona's Venom", "Serpent's Venom", "Venomous Blast",
+    },
+    -- Cannibalize
+    Cannibalize = {
+        "Cannibalize VIII", "Cannibalize VII", "Cannibalize VI",
+        "Cannibalize V", "Cannibalize IV", "Cannibalize III",
+        "Cannibalize II", "Cannibalize",
+    },
+    -- Pet
+    Pet = {
+        "Spirit of Zehkes", "Spirit of Oroshar", "Spirit of Averc",
+        "Spirit of Rashara", "Spirit of Kolos", "Spirit of Lachemit",
+    },
+    -- Haste
+    Haste = {
+        "Talisman of the Faithful", "Talisman of the Devoted",
+        "Talisman of Celerity", "Talisman of Alacrity",
+    },
+    -- HP Buff
+    HPBuff = {
+        "Talisman of the Resolute", "Talisman of the Steadfast",
+        "Talisman of the Enduring", "Focus of Soul",
+    },
+    -- Regen Buff
+    RegenBuff = {
+        "Talisman of the Tenacious", "Talisman of the Unwavering",
+        "Talisman of the Unflinching", "Talisman of the Stoic",
+    },
+    -- Cure All
+    CureAllSpell = {
+        "Blood of Rivans", "Blood of Sanera", "Blood of Corbeth", "Blood of Klar",
+    },
+    -- AA: Ancestral Guard
+    AncestralGuardAA = { "Ancestral Guard" },
+    -- AA: Union of Spirits
+    UnionOfSpiritsAA = { "Union of Spirits" },
+    -- AA: Spirit Guardian
+    SpiritGuardianAA = { "Spirit Guardian" },
+    -- AA: Call of the Ancients
+    CallOfTheAncientsAA = { "Call of the Ancients" },
+    -- AA: Rabid Bear
+    RabidBearAA = { "Rabid Bear" },
+    -- AA: Spire of the Ancestors
+    SpireOfAncestorsAA = { "Spire of the Ancestors" },
+}
+
+-- SpellLoadouts: Role-based gem assignments with extended schema
+M.SpellLoadouts = {
+    heal = {
+        name = "Healing Focused",
+        description = "Focus on healing and HoTs",
+        gems = {
+            [1] = "RecklessHeal1",
+            [2] = "RecklessHeal2",
+            [3] = "InterventionHeal",
+            [4] = "AESpiritualHeal",
+            [5] = "GroupRenewalHoT",
+            [6] = "SlowSpell",
+            [7] = "MaloSpell",
+            [8] = "Cannibalize",
+        },
+        defaults = {
+            -- Healing
+            DoHealing = true,
+            DoGroupHeals = true,
+            DoHoTs = true,
+            -- Debuffs
+            DoSlow = true,
+            DoMalo = true,
+            DoCripple = false,
+            -- DPS (minimal)
+            DoDoTs = false,
+            DoNukes = false,
+            -- Utility
+            DoCannibalize = true,
+            DoHaste = true,
+            DoHPBuff = true,
+            DoRegenBuff = true,
+            -- Emergency
+            UseAncestralGuard = true,
+            UseUnionOfSpirits = true,
+            -- Burns
+            UseSpireOfAncestors = true,
+            UseRabidBear = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            UseAncestralGuard = "emergency",
+            UseUnionOfSpirits = "emergency",
+            -- Support (healing primary)
+            DoHealing = "support",
+            DoGroupHeals = "support",
+            DoHoTs = "support",
+            DoSlow = "support",
+            DoMalo = "support",
+            DoCripple = "support",
+            -- Combat
+            DoDoTs = "combat",
+            DoNukes = "combat",
+            -- Burn
+            UseSpireOfAncestors = "burn",
+            UseRabidBear = "burn",
+            -- Buff
+            DoCannibalize = "buff",
+            DoHaste = "buff",
+            DoHPBuff = "buff",
+            DoRegenBuff = "buff",
+        },
+        layerOrder = {
+            emergency = {"UseAncestralGuard", "UseUnionOfSpirits"},
+            support = {"DoHealing", "DoGroupHeals", "DoHoTs", "DoSlow", "DoMalo", "DoCripple"},
+            combat = {"DoDoTs", "DoNukes"},
+            burn = {"UseSpireOfAncestors", "UseRabidBear"},
+            buff = {"DoCannibalize", "DoHaste", "DoHPBuff", "DoRegenBuff"},
+        },
+    },
+    debuff = {
+        name = "Debuff Focused",
+        description = "Focus on slowing and debuffing",
+        gems = {
+            [1] = "SlowSpell",
+            [2] = "MaloSpell",
+            [3] = "CrippleSpell",
+            [4] = "RecklessHeal1",
+            [5] = "AESpiritualHeal",
+            [6] = "PoisonDoT",
+            [7] = "DiseaseDoT",
+            [8] = "Cannibalize",
+        },
+        defaults = {
+            -- Healing (essential)
+            DoHealing = true,
+            DoGroupHeals = true,
+            DoHoTs = false,
+            -- Debuffs (primary)
+            DoSlow = true,
+            DoMalo = true,
+            DoCripple = true,
+            -- DPS
+            DoDoTs = true,
+            DoNukes = false,
+            -- Utility
+            DoCannibalize = true,
+            DoHaste = true,
+            DoHPBuff = true,
+            DoRegenBuff = false,
+            -- Emergency
+            UseAncestralGuard = true,
+            UseUnionOfSpirits = true,
+            -- Burns
+            UseSpireOfAncestors = true,
+            UseRabidBear = true,
+        },
+        layerAssignments = {
+            UseAncestralGuard = "emergency",
+            UseUnionOfSpirits = "emergency",
+            DoHealing = "support",
+            DoGroupHeals = "support",
+            DoHoTs = "support",
+            DoSlow = "support",
+            DoMalo = "support",
+            DoCripple = "support",
+            DoDoTs = "combat",
+            DoNukes = "combat",
+            UseSpireOfAncestors = "burn",
+            UseRabidBear = "burn",
+            DoCannibalize = "utility",
+            DoHaste = "utility",
+            DoHPBuff = "utility",
+            DoRegenBuff = "utility",
+        },
+        layerOrder = {
+            emergency = {"UseAncestralGuard", "UseUnionOfSpirits"},
+            support = {"DoSlow", "DoMalo", "DoCripple", "DoHealing", "DoGroupHeals", "DoHoTs"},
+            combat = {"DoDoTs", "DoNukes"},
+            burn = {"UseSpireOfAncestors", "UseRabidBear"},
+            buff = {"DoCannibalize", "DoHaste", "DoHPBuff", "DoRegenBuff"},
+        },
+    },
+    dps = {
+        name = "DPS Focused",
+        description = "Maximize damage with DoTs and nukes",
+        gems = {
+            [1] = "PoisonNuke",
+            [2] = "PoisonDoT",
+            [3] = "DiseaseDoT",
+            [4] = "SlowSpell",
+            [5] = "MaloSpell",
+            [6] = "RecklessHeal1",
+            [7] = "AESpiritualHeal",
+            [8] = "Cannibalize",
+        },
+        defaults = {
+            -- Healing (essential)
+            DoHealing = true,
+            DoGroupHeals = true,
+            DoHoTs = false,
+            -- Debuffs
+            DoSlow = true,
+            DoMalo = true,
+            DoCripple = false,
+            -- DPS (primary)
+            DoDoTs = true,
+            DoNukes = true,
+            -- Utility
+            DoCannibalize = true,
+            DoHaste = false,
+            DoHPBuff = false,
+            DoRegenBuff = false,
+            -- Emergency
+            UseAncestralGuard = true,
+            UseUnionOfSpirits = true,
+            -- Burns
+            UseSpireOfAncestors = true,
+            UseRabidBear = true,
+        },
+        layerAssignments = {
+            UseAncestralGuard = "emergency",
+            UseUnionOfSpirits = "emergency",
+            DoHealing = "support",
+            DoGroupHeals = "support",
+            DoHoTs = "support",
+            DoSlow = "support",
+            DoMalo = "support",
+            DoCripple = "support",
+            DoDoTs = "combat",
+            DoNukes = "combat",
+            UseSpireOfAncestors = "burn",
+            UseRabidBear = "burn",
+            DoCannibalize = "utility",
+            DoHaste = "utility",
+            DoHPBuff = "utility",
+            DoRegenBuff = "utility",
+        },
+        layerOrder = {
+            emergency = {"UseAncestralGuard", "UseUnionOfSpirits"},
+            support = {"DoSlow", "DoMalo", "DoHealing", "DoGroupHeals", "DoCripple", "DoHoTs"},
+            combat = {"DoDoTs", "DoNukes"},
+            burn = {"UseRabidBear", "UseSpireOfAncestors"},
+            buff = {"DoCannibalize", "DoHaste", "DoHPBuff", "DoRegenBuff"},
+        },
     },
 }
 
@@ -291,42 +562,84 @@ M.Settings = {
         Category = "Heal",
         DisplayName = "Enable Healing",
         Tooltip = "Enable automatic healing",
+        AbilitySet = "RecklessHeal1",
+    },
+    DoGroupHeals = {
+        Default = true,
+        Category = "Heal",
+        DisplayName = "Use Group Heals",
+        Tooltip = "Use group heal spells",
+        AbilitySet = "AESpiritualHeal",
+    },
+    DoHoTs = {
+        Default = true,
+        Category = "Heal",
+        DisplayName = "Use HoTs",
+        Tooltip = "Use heal-over-time spells",
+        AbilitySet = "GroupRenewalHoT",
+    },
+    DoIntervention = {
+        Default = true,
+        Category = "Heal",
+        DisplayName = "Use Intervention",
+        Tooltip = "Use intervention heal line",
+        AbilitySet = "InterventionHeal",
     },
     DoSlow = {
         Default = true,
         Category = "Debuff",
         DisplayName = "Auto-Slow",
         Tooltip = "Automatically slow targets",
+        AbilitySet = "SlowSpell",
     },
     DoMalo = {
         Default = true,
         Category = "Debuff",
         DisplayName = "Auto-Malo",
         Tooltip = "Automatically malo targets",
+        AbilitySet = "MaloSpell",
     },
     DoCripple = {
         Default = false,
         Category = "Debuff",
         DisplayName = "Auto-Cripple",
         Tooltip = "Automatically cripple named targets",
+        AbilitySet = "CrippleSpell",
     },
     DoDoTs = {
         Default = true,
         Category = "DPS",
         DisplayName = "Use DoTs",
         Tooltip = "Use damage-over-time spells",
+        AbilitySet = "PoisonDoT",
     },
     DoNukes = {
         Default = true,
         Category = "DPS",
         DisplayName = "Use Nukes",
         Tooltip = "Use direct damage spells",
+        AbilitySet = "PoisonNuke",
+    },
+    DoCures = {
+        Default = true,
+        Category = "Cure",
+        DisplayName = "Enable Cures",
+        Tooltip = "Automatically cure detrimental effects",
+        AbilitySet = "CureAllSpell",
     },
     DoCannibalize = {
         Default = true,
         Category = "Self",
         DisplayName = "Cannibalize",
         Tooltip = "Convert HP to mana when low",
+        AbilitySet = "Cannibalize",
+    },
+    DoPet = {
+        Default = true,
+        Category = "Pet",
+        DisplayName = "Use Pet",
+        Tooltip = "Summon and control pet",
+        AbilitySet = "Pet",
     },
 }
 

@@ -7,6 +7,18 @@ local ActorsCoordinator = require('utils.actors_coordinator')
 
 local M = {}
 
+-- Logging
+local _ThrottledLog = nil
+local function getThrottledLog()
+    if not _ThrottledLog then
+        local ok, tl = pcall(require, 'utils.throttled_log')
+        if ok then _ThrottledLog = tl end
+    end
+    return _ThrottledLog
+end
+
+M.debugHealLineMapping = true
+
 local _state = {
     priorityActive = false,
     lastDecisionAt = 0,
@@ -58,9 +70,9 @@ local function spell_memorized(spellName)
     return false
 end
 
-local function resolve_spell_line(spellset, lineName)
-    if not spellset or not spellset.spellLines or not lineName then return nil end
-    local line = spellset.spellLines[lineName]
+local function resolve_spell_line(classConfig, lineName)
+    if not classConfig or not classConfig.spellLines or not lineName then return nil end
+    local line = classConfig.spellLines[lineName]
     if type(line) ~= 'table' then return nil end
     local me = mq.TLO.Me
     if not (me and me()) then return nil end
@@ -72,24 +84,25 @@ local function resolve_spell_line(spellset, lineName)
     return nil
 end
 
-local function load_spellset(classShort)
-    local ok, set = pcall(require, string.format('data.spellsets.%s', classShort))
-    if ok then return set end
+local function load_class_config(classShort)
+    local ok, config = pcall(require, string.format('data.class_configs.%s', classShort))
+    if ok then return config end
     return nil
 end
 
-local function get_profile(classShort, spellset)
+local function get_profile(classShort, classConfig)
     -- Exclude PAL explicitly.
     if classShort == 'PAL' then return nil end
 
     -- Profiles are line-name lists; resolve_spell_line chooses the best memorized spell.
     if classShort == 'CLR' then
         return {
-            main = { 'Remedy', 'Intervention', 'Contravention' },
-            big = { 'Renewal', 'Intervention', 'Remedy' },
+            -- These must match the keys in data/class_configs/CLR.lua spellLines.
+            main = { 'RemedyHeal', 'HealNuke', 'NukeHeal', 'HealingLight' },
+            big = { 'Renewal', 'HealNuke', 'RemedyHeal', 'HealingLight' },
             group = { 'GroupFastHeal', 'GroupHealCure' },
-            hotSingle = { 'SingleHoT', 'PromisedHeal' },
-            hotGroup = { 'GroupHoT' },
+            hotSingle = { 'SingleElixir' },
+            hotGroup = { 'GroupElixir', 'GroupAcquittal' },
         }
     end
     if classShort == 'SHM' then
@@ -204,12 +217,35 @@ local function broadcast_hot(targetId, spellName, exp)
     })
 end
 
-local function choose_spell_for_lines(spellset, lines)
+local function is_line_enabled(settings, lineName)
+    local key = 'HealLine_' .. tostring(lineName or '')
+    if key == 'HealLine_' then return true end
+    -- Default enabled unless explicitly disabled.
+    return settings[key] ~= false
+end
+
+local function choose_spell_for_lines(classConfig, lines, settings)
+    settings = settings or Core.Settings or {}
+    local TL = getThrottledLog()
+
     for _, lineName in ipairs(lines or {}) do
-        local spellName = resolve_spell_line(spellset, lineName)
+        if not is_line_enabled(settings, lineName) then
+            if M.debugHealLineMapping and TL then
+                TL.log('heal_line_disabled_' .. tostring(lineName), 10, 'Healing: line disabled by setting HealLine_%s', tostring(lineName))
+            end
+            goto continue
+        end
+        local spellName = resolve_spell_line(classConfig, lineName)
         if spellName and spellName ~= '' then
+            if M.debugHealLineMapping and TL then
+                TL.log('heal_line_resolved_' .. tostring(lineName), 5, 'Healing: %s -> %s (memorized)', tostring(lineName), tostring(spellName))
+            end
             return spellName
         end
+        if M.debugHealLineMapping and TL then
+            TL.log('heal_line_missing_' .. tostring(lineName), 10, 'Healing: no memorized spell found for line %s (check gems/loadout)', tostring(lineName))
+        end
+        ::continue::
     end
     return nil
 end
@@ -267,8 +303,8 @@ function M.tick(settings)
     end
     _state.lastDecisionAt = now
 
-    local spellset = load_spellset(classShort)
-    local profile = get_profile(classShort, spellset)
+    local classConfig = load_class_config(classShort)
+    local profile = get_profile(classShort, classConfig)
     if not profile then
         _state.priorityActive = false
         return false
@@ -343,39 +379,39 @@ function M.tick(settings)
     local spellName = nil
     local hotChosen = false
 
-    if useHots and tier == 'main' then
-        local rem = get_hot_remaining(targetId, now)
-        if rem <= hotWindow then
-            local hotSpell = choose_spell_for_lines(spellset, profile.hotSingle)
+        if useHots and tier == 'main' then
+            local rem = get_hot_remaining(targetId, now)
+            if rem <= hotWindow then
+            local hotSpell = choose_spell_for_lines(classConfig, profile.hotSingle, settings)
             if hotSpell and is_hot_spell(hotSpell) then
                 spellName = hotSpell
                 hotChosen = true
             end
+            end
         end
-    end
 
-    if useHots and tier == 'group' then
-        local rem = get_hot_remaining(targetId, now)
-        if rem <= hotWindow then
-            local hotSpell = choose_spell_for_lines(spellset, profile.hotGroup)
+        if useHots and tier == 'group' then
+            local rem = get_hot_remaining(targetId, now)
+            if rem <= hotWindow then
+            local hotSpell = choose_spell_for_lines(classConfig, profile.hotGroup, settings)
             if hotSpell and is_hot_spell(hotSpell) then
                 spellName = hotSpell
                 hotChosen = true
             end
+            end
         end
-    end
 
-    if not spellName then
-        if tier == 'pet' then
-            spellName = choose_spell_for_lines(spellset, profile.pet) or choose_spell_for_lines(spellset, profile.main)
-        elseif tier == 'big' then
-            spellName = choose_spell_for_lines(spellset, profile.big) or choose_spell_for_lines(spellset, profile.main)
-        elseif tier == 'group' then
-            spellName = choose_spell_for_lines(spellset, profile.group)
-        else
-            spellName = choose_spell_for_lines(spellset, profile.main)
+        if not spellName then
+            if tier == 'pet' then
+            spellName = choose_spell_for_lines(classConfig, profile.pet, settings) or choose_spell_for_lines(classConfig, profile.main, settings)
+            elseif tier == 'big' then
+            spellName = choose_spell_for_lines(classConfig, profile.big, settings) or choose_spell_for_lines(classConfig, profile.main, settings)
+            elseif tier == 'group' then
+            spellName = choose_spell_for_lines(classConfig, profile.group, settings)
+            else
+            spellName = choose_spell_for_lines(classConfig, profile.main, settings)
+            end
         end
-    end
 
     if not spellName then
         return _state.priorityActive
@@ -410,4 +446,3 @@ function M.tick(settings)
 end
 
 return M
-

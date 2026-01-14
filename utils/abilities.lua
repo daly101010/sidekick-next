@@ -85,19 +85,34 @@ end
 --   - Category assignment (burn abilities go in burn layer)
 --   - defaultConditions in class configs (e.g., ctx.target.named for named-only abilities)
 M.MODE = {
-    ON_DEMAND = 1,  -- Never auto-fire, user must click
-    AUTO = 2,       -- Auto-fire based on category layer + condition gate
+    ON_DEMAND = 1,     -- Never auto-fire, user must click
+    ON_CONDITION = 2,  -- Auto-fire based on layer + condition gate
+    ON_COOLDOWN = 3,   -- Mash ability: fire whenever ready (checked after rotation)
 }
 -- Backward compatibility aliases
 M.MODE.MANUAL = M.MODE.ON_DEMAND
-M.MODE.ON_CD = M.MODE.AUTO        -- Deprecated: use AUTO + no condition
-M.MODE.ON_BURN = M.MODE.AUTO      -- Deprecated: use burn category
-M.MODE.ON_NAMED = M.MODE.AUTO     -- Deprecated: use condition ctx.target.named
-M.MODE.ON_CONDITION = M.MODE.AUTO -- Deprecated: use AUTO (conditions always evaluated)
+M.MODE.AUTO = M.MODE.ON_CONDITION  -- Legacy alias
+M.MODE.ON_CD = M.MODE.ON_COOLDOWN  -- Legacy alias
+M.MODE.ON_BURN = M.MODE.ON_CONDITION
+M.MODE.ON_NAMED = M.MODE.ON_CONDITION
 
 M.MODE_LABELS = {
     [M.MODE.ON_DEMAND] = 'On Demand',
-    [M.MODE.AUTO] = 'Auto',
+    [M.MODE.ON_CONDITION] = 'On Condition',
+    [M.MODE.ON_COOLDOWN] = 'On Cooldown',
+}
+
+-- Context for ON_COOLDOWN mode (when to spam the ability)
+M.CONTEXT = {
+    COMBAT = 1,        -- Only during combat (has XTarget haters)
+    OUT_OF_COMBAT = 2, -- Only when not in combat
+    ANYTIME = 3,       -- Always check/fire when ready
+}
+
+M.CONTEXT_LABELS = {
+    [M.CONTEXT.COMBAT] = 'Combat',
+    [M.CONTEXT.OUT_OF_COMBAT] = 'Out of Combat',
+    [M.CONTEXT.ANYTIME] = 'Anytime',
 }
 
 --- Sort abilities by BarOrder position (user drag-drop order from UI)
@@ -282,11 +297,15 @@ function M.tryAllAbilities(opts)
         local enabled = def.settingKey and settings[def.settingKey] == true
         if not enabled then goto continue end
 
-        -- Check mode: ON_DEMAND skips auto-fire, AUTO proceeds
+        -- Check mode:
+        --   ON_DEMAND = skip auto-fire (user must click)
+        --   ON_CONDITION = evaluate condition gate then fire
+        --   ON_COOLDOWN = handled by mash queue, skip here
         local mode = def.modeKey and tonumber(settings[def.modeKey]) or M.MODE.ON_DEMAND
         if mode == M.MODE.ON_DEMAND then goto continue end
+        if mode == M.MODE.ON_COOLDOWN then goto continue end  -- Handled by mash queue
 
-        -- For AUTO mode, evaluate condition gate if present
+        -- For ON_CONDITION mode, evaluate condition gate if present
         local condKey = def.conditionKey or (def.modeKey and def.modeKey:gsub('Mode$', 'Condition'))
         local condData = condKey and settings[condKey]
         local cb = getConditionBuilder()

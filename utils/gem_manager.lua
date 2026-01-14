@@ -30,7 +30,7 @@ local GemState = {
     assignments = {},      -- [gemNum] = { spellName, priority, locked, spellId }
     spellToGem = {},       -- [spellName] = gemNum
     activeRole = 'default',
-    useGem = 13,           -- Rotation gem (for dynamic memorization)
+    useGem = 13,           -- Use gem (for dynamic memorization); clamped to rotation gems (NumGems-1)
     numGems = 13,          -- mq.TLO.Me.NumGems()
     memorizing = false,
     memorizingGem = 0,
@@ -39,8 +39,50 @@ local GemState = {
     initialized = false,
 }
 
--- Loaded spellsets cache
-local _spellsets = {}
+local function clamp(n, min, max)
+    if n == nil then return min end
+    if n < min then return min end
+    if n > max then return max end
+    return n
+end
+
+local function getLiveNumGems()
+    local me = mq.TLO.Me
+    if not (me and me()) then return nil end
+    local n = tonumber(me.NumGems()) or 0
+    if n <= 0 then return nil end
+    return n
+end
+
+local function getRotationGemCount(numGems)
+    numGems = tonumber(numGems) or 0
+    if numGems <= 1 then return 0 end
+    return numGems - 1
+end
+
+local function computeUseGem(numGems, getSettingFn)
+    local rotation = getRotationGemCount(numGems)
+    if rotation <= 0 then return 1 end
+    local desired = tonumber(getSettingFn('SpellUseGem', rotation)) or rotation
+    return clamp(desired, 1, rotation)
+end
+
+local function resizeAssignments(numGems)
+    numGems = tonumber(numGems) or 0
+    if numGems <= 0 then return end
+
+    for i = 1, numGems do
+        if not GemState.assignments[i] then
+            GemState.assignments[i] = { spellName = '', priority = 0, locked = false, spellId = 0 }
+        end
+    end
+    for i = numGems + 1, #GemState.assignments do
+        GemState.assignments[i] = nil
+    end
+end
+
+-- Loaded class configs cache
+local _classConfigs = {}
 
 -- Get class short name
 local function getClassShort()
@@ -51,29 +93,29 @@ local function getClassShort()
     return class.ShortName()
 end
 
--- Load spellset for class
-local function loadSpellset(classShort)
-    if _spellsets[classShort] then
-        return _spellsets[classShort]
+-- Load class config for class
+local function loadClassConfig(classShort)
+    if _classConfigs[classShort] then
+        return _classConfigs[classShort]
     end
 
-    local path = string.format('data.spellsets.%s', classShort)
-    local ok, spellset = pcall(require, path)
-    if ok and spellset then
-        _spellsets[classShort] = spellset
-        return spellset
+    local path = string.format('data.class_configs.%s', classShort)
+    local ok, classConfig = pcall(require, path)
+    if ok and classConfig then
+        _classConfigs[classShort] = classConfig
+        return classConfig
     end
 
     return nil
 end
 
 -- Resolve spell line to best available spell
-local function resolveSpellLine(spellLine, spellset)
+local function resolveSpellLine(spellLine, classConfig)
     local me = mq.TLO.Me
     if not me or not me() then return nil end
 
-    -- Check spellset for spell line definition
-    local lineSpells = spellset and spellset.spellLines and spellset.spellLines[spellLine]
+    -- Check class config for spell line definition
+    local lineSpells = classConfig and classConfig.spellLines and classConfig.spellLines[spellLine]
     if lineSpells then
         -- Try each spell in order (newest first)
         for _, spellName in ipairs(lineSpells) do
@@ -102,21 +144,32 @@ local function getSetting(key, default)
     return default
 end
 
+--- Refresh gem count and derived settings from TLO
+-- @return boolean True if character loaded and gem info available
+function M.refresh()
+    local numGems = getLiveNumGems()
+    if not numGems then return false end
+
+    if GemState.numGems ~= numGems then
+        GemState.numGems = numGems
+        resizeAssignments(numGems)
+    end
+
+    GemState.useGem = computeUseGem(GemState.numGems, getSetting)
+    return true
+end
+
 --- Initialize gem manager
 function M.init()
     local me = mq.TLO.Me
     if not me or not me() then return end
 
-    -- Get number of gem slots
-    GemState.numGems = tonumber(me.NumGems()) or 13
-    GemState.useGem = getSetting('SpellUseGem', GemState.numGems)
+    -- Get number of gem slots and clamp use gem away from reserved buff gem.
+    if not M.refresh() then return end
 
-    -- Initialize assignments
-    GemState.assignments = {}
+    -- Initialize assignments (preserve locks if already present)
     GemState.spellToGem = {}
-    for i = 1, GemState.numGems do
-        GemState.assignments[i] = { spellName = '', priority = 0, locked = false, spellId = 0 }
-    end
+    resizeAssignments(GemState.numGems)
 
     -- Load current gem bar state
     M.syncFromGameState()
@@ -148,6 +201,7 @@ function M.syncFromGameState()
     local me = mq.TLO.Me
     if not me or not me() then return end
 
+    M.refresh()
     GemState.spellToGem = {}
 
     for i = 1, GemState.numGems do
@@ -176,22 +230,23 @@ function M.loadRole(roleName)
     local classShort = getClassShort()
     if not classShort then return end
 
-    local spellset = loadSpellset(classShort)
-    if not spellset or not spellset.roles or not spellset.roles[roleName] then
+    local classConfig = loadClassConfig(classShort)
+    if not classConfig or not classConfig.SpellLoadouts or not classConfig.SpellLoadouts[roleName] then
         return
     end
 
-    local role = spellset.roles[roleName]
+    local loadout = classConfig.SpellLoadouts[roleName]
     GemState.activeRole = roleName
 
-    -- Apply role gems (skip locked gems)
-    for gemNum, gemDef in pairs(role.gems or {}) do
+    -- Apply loadout gems (skip locked gems)
+    -- SpellLoadouts use gem number as key, spell line name as value
+    for gemNum, spellLine in pairs(loadout.gems or {}) do
         local current = GemState.assignments[gemNum]
         if current and not current.locked then
-            local spellName = resolveSpellLine(gemDef.spellLine, spellset)
+            local spellName = resolveSpellLine(spellLine, classConfig)
             if spellName then
                 current.spellName = spellName
-                current.priority = gemDef.priority or 1
+                current.priority = 1
                 current.locked = false
 
                 -- Get spell ID
@@ -353,7 +408,33 @@ end
 --- Get available gem for dynamic memorization
 -- @return number Gem slot number
 function M.getAvailableGem()
-    return GemState.useGem or GemState.numGems
+    M.refresh()
+    local rotation = getRotationGemCount(GemState.numGems)
+    if rotation > 0 then
+        return clamp(GemState.useGem or rotation, 1, rotation)
+    end
+    return 1
+end
+
+--- Get the reserved buff rotation gem (last gem)
+-- @return number
+function M.getReservedBuffGem()
+    M.refresh()
+    return GemState.numGems
+end
+
+--- Get number of gems available for rotation spells (NumGems - 1)
+-- @return number
+function M.getRotationGems()
+    M.refresh()
+    return getRotationGemCount(GemState.numGems)
+end
+
+--- Get total number of gems (NumGems)
+-- @return number
+function M.getNumGems()
+    M.refresh()
+    return GemState.numGems
 end
 
 --- Memorize spell to gem (non-blocking start)
@@ -408,11 +489,11 @@ function M.getAvailableRoles()
     local classShort = getClassShort()
     if not classShort then return {} end
 
-    local spellset = loadSpellset(classShort)
-    if not spellset or not spellset.roles then return {} end
+    local classConfig = loadClassConfig(classShort)
+    if not classConfig or not classConfig.SpellLoadouts then return {} end
 
     local roles = {}
-    for roleName, _ in pairs(spellset.roles) do
+    for roleName, _ in pairs(classConfig.SpellLoadouts) do
         table.insert(roles, roleName)
     end
     table.sort(roles)
@@ -421,6 +502,14 @@ end
 
 --- Tick function for ongoing operations
 function M.tick()
+    -- Auto-init once the character is loaded (init() can be called before Me() is ready).
+    if not GemState.initialized then
+        M.init()
+        return
+    end
+
+    M.refresh()
+
     -- Check memorization timeout
     if GemState.memorizing then
         local timeout = getSetting('SpellMemTimeout', 25000) / 1000

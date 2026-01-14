@@ -309,7 +309,7 @@ function M.tick(opts)
     local spells = {}
     if SpellLineup then
         SpellLineup.checkZoneChange(settings)
-        spells = SpellLineup.getSpells()
+        spells = SpellLineup.getSpells(false, settings)
     end
 
     -- Check if spell rotation is enabled

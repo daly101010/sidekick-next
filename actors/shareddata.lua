@@ -18,6 +18,84 @@ local function safeBool(fn, fallback)
     return (s == '1' or s == 'true' or s == 'yes' or s == 'on')
 end
 
+-- Build buff status: what buffs this character currently HAS
+-- This allows other characters to know who needs buffs
+local function buildSelfBuffStatus()
+    local me = mq.TLO.Me
+    if not me or not me() then return {} end
+
+    local out = {}
+
+    -- Check common buff categories by looking for spells in buff window
+    -- These are the buff lines that are commonly coordinated between characters
+    local buffCategories = {
+        { name = 'haste', patterns = {'Haste', 'Speed', 'Celerity', 'Alacrity'} },
+        { name = 'hp', patterns = {'Aegolism', 'Unity', 'Symbol', 'Blessing'} },
+        { name = 'regen', patterns = {'Regen', 'Chloro', 'Pack Regen', 'Group Regen'} },
+        { name = 'sta', patterns = {'Stamina', 'Fortitude', 'Endurance'} },
+        { name = 'str', patterns = {'Strength', 'Furious Might', 'Ferocity'} },
+        { name = 'agi', patterns = {'Agility', 'Deftness', 'Spirit of'} },
+        { name = 'focus', patterns = {'Focus', 'Clarity', 'Koadic', 'Flowing', 'Mana'} },
+        { name = 'ac', patterns = {'Skin', 'Guard', 'Ward', 'Armor'} },
+        { name = 'ds', patterns = {'Damage Shield', 'Retribution', 'Thorns'} },
+        { name = 'shielding', patterns = {'Shielding', 'Enchant', 'Rune'} },
+        { name = 'aura', patterns = {'Aura'} },
+    }
+
+    -- Check buff and song windows for each category
+    for _, cat in ipairs(buffCategories) do
+        local hasBuff = false
+        local remaining = 0
+
+        -- Check buff slots (1-42 is typical max)
+        for i = 1, 42 do
+            local buff = me.Buff(i)
+            if buff and buff() then
+                local buffName = buff.Name and buff.Name() or ''
+                if buffName ~= '' then
+                    for _, pattern in ipairs(cat.patterns) do
+                        if buffName:find(pattern) then
+                            hasBuff = true
+                            local duration = buff.Duration and tonumber(buff.Duration()) or 0
+                            remaining = math.max(remaining, duration / 1000)  -- Duration is in ms
+                            break
+                        end
+                    end
+                end
+            end
+            if hasBuff then break end
+        end
+
+        -- Check song slots too
+        if not hasBuff then
+            for i = 1, 30 do
+                local song = me.Song(i)
+                if song and song() then
+                    local songName = song.Name and song.Name() or ''
+                    if songName ~= '' then
+                        for _, pattern in ipairs(cat.patterns) do
+                            if songName:find(pattern) then
+                                hasBuff = true
+                                local duration = song.Duration and tonumber(song.Duration()) or 0
+                                remaining = math.max(remaining, duration / 1000)
+                                break
+                            end
+                        end
+                    end
+                end
+                if hasBuff then break end
+            end
+        end
+
+        out[cat.name] = {
+            present = hasBuff,
+            remaining = remaining,
+        }
+    end
+
+    return out
+end
+
 local function buildAbilityStatus(abilities, cooldownProbe)
     local out = {}
     local me = mq.TLO.Me
@@ -109,6 +187,7 @@ function M.buildStatusPayload(opts)
         follow = following,
         chase = opts.chase == true,
         abilities = buildAbilityStatus(opts.abilities, opts.cooldownProbe),
+        buffs = buildSelfBuffStatus(),  -- What buffs this character currently has
         script = 'sidekick',
     }
 end

@@ -172,7 +172,7 @@ M.defaultConditions = {
 M.categoryOverrides = {
     ['doDeathBloom'] = 'emergency',
     ['doFeignDeath'] = 'emergency',
-    ['doThoughtLeech'] = 'utility',
+    ['doThoughtLeech'] = 'buff',
     ['doPetHeal'] = 'support',
     ['doSwiftDoT'] = 'combat',
     ['doPoisonDoT'] = 'combat',
@@ -182,8 +182,8 @@ M.categoryOverrides = {
     ['doMagicDoT'] = 'combat',
     ['doLifeTap'] = 'combat',
     ['doMez'] = 'support',
-    ['doShield'] = 'utility',
-    ['doLich'] = 'utility',
+    ['doShield'] = 'buff',
+    ['doLich'] = 'buff',
     ['doLifeBurn'] = 'burn',
     ['doSpireOfNecro'] = 'burn',
     ['doFuryOfDeath'] = 'burn',
@@ -191,6 +191,223 @@ M.categoryOverrides = {
     ['doSwarmPet'] = 'burn',
     ['doHandOfDeath'] = 'burn',
     ['doImprovedTwincast'] = 'burn',
+}
+
+-- AbilitySets: Spell/AA progressions (highest to lowest rank)
+M.AbilitySets = {
+    -- Swift DoT
+    SwiftDoT = {
+        "Swift Deconstruction", "Swift Decomposition", "Swift Decay",
+        "Swift Deterioration", "Swift Degeneracy", "Swift Dissolution",
+    },
+    -- Poison DoT
+    PoisonDoT = {
+        "Pyre of Jorobb", "Pyre of Klraggek", "Pyre of Mori",
+        "Pyre of Ferora", "Pyre of Hazarak", "Pyre of Nos",
+    },
+    -- Disease DoT
+    DiseaseDoT = {
+        "Scourge of Fates", "Scourge of Destiny", "Scourge of Helix",
+        "Scourge of Luna", "Scourge of the Moors", "Scourge of Death",
+    },
+    -- Fire DoT
+    FireDoT = {
+        "Pyre of the Forgotten", "Pyre of the Wretched", "Pyre of the Lost Hasty",
+        "Pyre of the Lost", "Pyre of the Fereth", "Pyre of Marnek",
+    },
+    -- Corruption DoT
+    CorruptionDoT = {
+        "Absolute Corruption", "Ignominious Corruption", "Remorseless Corruption",
+        "Merciless Corruption", "Relentless Corruption", "Pitiless Corruption",
+    },
+    -- Magic DoT
+    MagicDoT = {
+        "Grip of Jarati", "Grip of Kraz", "Grip of Mori",
+        "Grip of Zorglim", "Grip of Zargo", "Grip of Morstin",
+    },
+    -- Life Tap
+    LifeTap = {
+        "Vampiric Draw", "Siphon Life", "Drain Soul",
+        "Touch of Night", "Lifetap", "Siphon",
+    },
+    -- Pet
+    Pet = {
+        "Rekki`s Shades", "Bashi`s Shades", "Tylix`s Shades",
+        "Gryme`s Shades", "Azeron`s Shades", "Cadcane`s Shades",
+    },
+    -- Pet Heal
+    PetHeal = {
+        "Mend Companion", "Convoke Shadow", "Renewal of Bones",
+    },
+    -- Mez
+    Mez = {
+        "Enslave Death", "Command Undead", "Control Undead",
+        "Dominate Undead", "Subjugate Undead",
+    },
+    -- FD
+    FeignDeath = {
+        "Death Peace", "Feign Death",
+    },
+    -- Shield
+    Shield = {
+        "Bulwark of Shadows", "Shield of Darkness", "Dark Shield",
+    },
+    -- Lich
+    Lich = {
+        "Lich Unity", "Deathly Resolve", "Lich", "Call of Bones",
+    },
+    -- AA: Death Bloom
+    DeathBloomAA = { "Death Bloom" },
+    -- AA: Feign Death
+    FeignDeathAA = { "Death Peace", "Feign Death" },
+    -- AA: Life Burn
+    LifeBurnAA = { "Life Burn" },
+    -- AA: Spire of Necromancy
+    SpireOfNecroAA = { "Spire of Necromancy" },
+    -- AA: Fury of the Gods
+    FuryOfDeathAA = { "Fury of the Gods" },
+    -- AA: Wake the Dead
+    WakeTheDeadAA = { "Wake the Dead" },
+    -- AA: Rise of Bones
+    SwarmPetAA = { "Rise of Bones" },
+    -- AA: Thought Leech
+    ThoughtLeechAA = { "Thought Leech" },
+    -- AA: Hand of Death
+    HandOfDeathAA = { "Hand of Death" },
+    -- AA: Improved Twincast
+    ImprovedTwincastAA = { "Improved Twincast" },
+}
+
+-- SpellLoadouts: Role-based gem assignments with extended schema
+M.SpellLoadouts = {
+    dot = {
+        name = "DoT Focused",
+        description = "Focus on damage over time",
+        gems = {
+            [1] = "SwiftDoT",
+            [2] = "PoisonDoT",
+            [3] = "DiseaseDoT",
+            [4] = "FireDoT",
+            [5] = "CorruptionDoT",
+            [6] = "MagicDoT",
+            [7] = "LifeTap",
+            [8] = "Lich",
+        },
+        defaults = {
+            -- DPS
+            DoDoTs = true,
+            DoSwiftDoT = true,
+            DoLifeTaps = true,
+            -- Support
+            DoPetHeals = true,
+            DoMez = true,
+            -- Utility
+            DoShield = true,
+            DoLich = true,
+            -- Emergency
+            UseFeignDeath = true,
+            UseDeathBloom = true,
+            UseThoughtLeech = true,
+            -- Burns
+            UseLifeBurn = true,
+            UseSpireOfNecro = true,
+            UseFuryOfDeath = true,
+            UseWakeTheDead = true,
+            UseSwarmPet = true,
+            UseHandOfDeath = true,
+            UseImprovedTwincast = true,
+        },
+        layerAssignments = {
+            -- Emergency
+            UseFeignDeath = "emergency",
+            UseDeathBloom = "emergency",
+            -- Support
+            DoPetHeals = "support",
+            DoMez = "support",
+            -- Combat
+            DoDoTs = "combat",
+            DoSwiftDoT = "combat",
+            DoLifeTaps = "combat",
+            -- Burn
+            UseLifeBurn = "burn",
+            UseSpireOfNecro = "burn",
+            UseFuryOfDeath = "burn",
+            UseWakeTheDead = "burn",
+            UseSwarmPet = "burn",
+            UseHandOfDeath = "burn",
+            UseImprovedTwincast = "burn",
+            -- Buff
+            DoShield = "buff",
+            DoLich = "buff",
+            UseThoughtLeech = "buff",
+        },
+        layerOrder = {
+            emergency = {"UseFeignDeath", "UseDeathBloom"},
+            support = {"DoPetHeals", "DoMez"},
+            combat = {"DoSwiftDoT", "DoDoTs", "DoLifeTaps"},
+            burn = {"UseImprovedTwincast", "UseLifeBurn", "UseSpireOfNecro", "UseFuryOfDeath", "UseWakeTheDead", "UseSwarmPet", "UseHandOfDeath"},
+            buff = {"DoLich", "DoShield", "UseThoughtLeech"},
+        },
+    },
+    hybrid = {
+        name = "Hybrid",
+        description = "Balance DoTs and life taps",
+        gems = {
+            [1] = "SwiftDoT",
+            [2] = "PoisonDoT",
+            [3] = "DiseaseDoT",
+            [4] = "LifeTap",
+            [5] = "PetHeal",
+            [6] = "Shield",
+            [7] = "Lich",
+            [8] = "Mez",
+        },
+        defaults = {
+            DoDoTs = true,
+            DoSwiftDoT = true,
+            DoLifeTaps = true,
+            DoPetHeals = true,
+            DoMez = true,
+            DoShield = true,
+            DoLich = true,
+            UseFeignDeath = true,
+            UseDeathBloom = true,
+            UseThoughtLeech = true,
+            UseLifeBurn = true,
+            UseSpireOfNecro = true,
+            UseFuryOfDeath = true,
+            UseWakeTheDead = true,
+            UseSwarmPet = true,
+            UseHandOfDeath = true,
+            UseImprovedTwincast = true,
+        },
+        layerAssignments = {
+            UseFeignDeath = "emergency",
+            UseDeathBloom = "emergency",
+            DoPetHeals = "support",
+            DoMez = "support",
+            DoDoTs = "combat",
+            DoSwiftDoT = "combat",
+            DoLifeTaps = "combat",
+            UseLifeBurn = "burn",
+            UseSpireOfNecro = "burn",
+            UseFuryOfDeath = "burn",
+            UseWakeTheDead = "burn",
+            UseSwarmPet = "burn",
+            UseHandOfDeath = "burn",
+            UseImprovedTwincast = "burn",
+            DoShield = "utility",
+            DoLich = "utility",
+            UseThoughtLeech = "utility",
+        },
+        layerOrder = {
+            emergency = {"UseFeignDeath", "UseDeathBloom"},
+            support = {"DoPetHeals", "DoMez"},
+            combat = {"DoSwiftDoT", "DoDoTs", "DoLifeTaps"},
+            burn = {"UseImprovedTwincast", "UseSpireOfNecro", "UseFuryOfDeath", "UseLifeBurn", "UseWakeTheDead", "UseSwarmPet", "UseHandOfDeath"},
+            buff = {"DoLich", "DoShield", "UseThoughtLeech"},
+        },
+    },
 }
 
 M.Settings = {
@@ -218,6 +435,66 @@ M.Settings = {
         Default = true,
         Category = "CC",
         DisplayName = "Mez Undead",
+    },
+    DoShield = {
+        Default = true,
+        Category = "Utility",
+        DisplayName = "Self Shield",
+    },
+    DoLich = {
+        Default = true,
+        Category = "Utility",
+        DisplayName = "Lich",
+    },
+    UseFeignDeath = {
+        Default = true,
+        Category = "Emergency",
+        DisplayName = "Feign Death",
+    },
+    UseDeathBloom = {
+        Default = true,
+        Category = "Emergency",
+        DisplayName = "Death Bloom",
+    },
+    UseThoughtLeech = {
+        Default = true,
+        Category = "Utility",
+        DisplayName = "Thought Leech",
+    },
+    UseLifeBurn = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Life Burn",
+    },
+    UseSpireOfNecro = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Spire of Necro",
+    },
+    UseFuryOfDeath = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Fury of Death",
+    },
+    UseWakeTheDead = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Wake the Dead",
+    },
+    UseSwarmPet = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Swarm Pet",
+    },
+    UseHandOfDeath = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Hand of Death",
+    },
+    UseImprovedTwincast = {
+        Default = true,
+        Category = "Burn",
+        DisplayName = "Improved Twincast",
     },
 }
 

@@ -124,6 +124,7 @@ function M.init(opts)
                 zone = tostring(content.zone or ''),
                 class = content.class or '',
                 abilities = content.abilities or {},
+                buffs = content.buffs or {},  -- What buffs this character currently has
                 chase = content.chase,
                 hp = content.hp,
                 mana = content.mana,
@@ -456,8 +457,8 @@ function M.tick(opts)
         end
     end
 
-    -- Status broadcast (hp/mana/end + selected ability readiness) ~1 Hz
-    if opts.status and (now - _lastStatusSendAt) >= 1.0 then
+    -- Status broadcast (hp/mana/end + selected ability readiness) ~5 Hz
+    if opts.status and (now - _lastStatusSendAt) >= 0.2 then
         _lastStatusSendAt = now
         _lastStatusPayload = opts.status
         sendToGroupTarget(opts.status)
@@ -673,6 +674,34 @@ end
 --- Update zone on tick (call periodically to track zone changes)
 function M.updateZone()
     _selfZone = safeZone()
+end
+
+--- Get the last outgoing status payload (what we're broadcasting)
+-- @return table|nil The status payload or nil if not yet set
+function M.getOutgoingStatus()
+    return _lastStatusPayload
+end
+
+--- Get self info for debug display
+-- @return table { name, server, zone }
+function M.getSelfInfo()
+    return {
+        name = _selfName,
+        server = _selfServer,
+        zone = _selfZone,
+    }
+end
+
+--- Get heal claims for debug display
+-- @return table Heal claims table
+function M.getHealClaimsRaw()
+    return _healClaims
+end
+
+--- Get HoT states for debug display
+-- @return table HoT states table
+function M.getHoTStatesRaw()
+    return _hotStates
 end
 
 return M
