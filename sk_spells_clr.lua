@@ -827,4 +827,93 @@ M.GroupBuffs = {
     },
 }
 
+-- Category to default slot type mapping
+M.DEFAULT_SLOT_TYPES = {
+    -- Combat essential (rotation)
+    Heals = 'rotation',
+    GroupHeals = 'rotation',
+    HoT = 'rotation',
+    DirectHeals = 'rotation',
+    Reactive = 'rotation',
+    Damage = 'rotation',
+    Stuns = 'rotation',
+    Debuffs = 'rotation',
+    Cures = 'rotation',
+    AEDamage = 'rotation',
+
+    -- OOC acceptable (buff_swap)
+    Buffs = 'buff_swap',
+    Auras = 'buff_swap',
+    SelfBuffs = 'buff_swap',
+    Wards = 'buff_swap',
+    GroupBuffs = 'buff_swap',
+    Procs = 'buff_swap',
+    Persistent = 'buff_swap',
+    Resurrection = 'buff_swap',
+}
+
+--- Enumerate all spell lines with their category
+-- @return table Array of {category, lineName, spells, defaultSlotType}
+function M.enumerateLines()
+    local lines = {}
+
+    -- Helper to process a category table
+    local function processCategory(categoryName, categoryTable)
+        if type(categoryTable) ~= 'table' then return end
+
+        for lineName, spells in pairs(categoryTable) do
+            if type(spells) == 'table' and #spells > 0 then
+                table.insert(lines, {
+                    category = categoryName,
+                    lineName = lineName,
+                    spells = spells,
+                    defaultSlotType = M.DEFAULT_SLOT_TYPES[categoryName] or 'rotation',
+                })
+            end
+        end
+    end
+
+    -- Process all categories
+    processCategory('Heals', M.Heals)
+    processCategory('GroupHeals', M.GroupHeals)
+    processCategory('HoT', M.HoT)
+    processCategory('DirectHeals', M.DirectHeals)
+    processCategory('Reactive', M.Reactive)
+    processCategory('Damage', M.Damage)
+    processCategory('Stuns', M.Stuns)
+    processCategory('Debuffs', M.Debuffs)
+    processCategory('Cures', M.Cures)
+    processCategory('AEDamage', M.AEDamage)
+    processCategory('Buffs', M.Buffs)
+    processCategory('Auras', M.Auras)
+    processCategory('SelfBuffs', M.SelfBuffs)
+    processCategory('Wards', M.Wards)
+    processCategory('GroupBuffs', M.GroupBuffs)
+    processCategory('Procs', M.Procs)
+    processCategory('Persistent', M.Persistent)
+    processCategory('Resurrection', M.Resurrection)
+
+    -- Sort by category then line name
+    table.sort(lines, function(a, b)
+        if a.category ~= b.category then
+            return a.category < b.category
+        end
+        return a.lineName < b.lineName
+    end)
+
+    return lines
+end
+
+--- Get a specific spell line by name
+-- @param lineName string The line name (e.g., "Remedy")
+-- @return table|nil The spell list or nil if not found
+function M.getLine(lineName)
+    for _, lineData in ipairs(M.enumerateLines()) do
+        if lineData.lineName == lineName then
+            return lineData
+        end
+    end
+    return nil
+end
+
 return M
