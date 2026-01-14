@@ -7,6 +7,28 @@ local lib = require('sidekick.sk_lib')
 local ModuleBase = require('sidekick.sk_module_base')
 local Spells = require('sidekick.sk_spells_clr')
 
+-------------------------------------------------------------------------------
+-- Lazy-load Dependencies
+-------------------------------------------------------------------------------
+
+local _SpellsetManager = nil
+local function getSpellsetManager()
+    if not _SpellsetManager then
+        local ok, sm = pcall(require, 'utils.spellset_manager')
+        if ok then _SpellsetManager = sm end
+    end
+    return _SpellsetManager
+end
+
+local _ConditionBuilder = nil
+local function getConditionBuilder()
+    if not _ConditionBuilder then
+        local ok, cb = pcall(require, 'ui.condition_builder')
+        if ok then _ConditionBuilder = cb end
+    end
+    return _ConditionBuilder
+end
+
 -- Create module instance
 local module = ModuleBase.create('healing', lib.Priority.HEALING)
 
@@ -34,6 +56,25 @@ local Config = {
 -- Spell Resolution
 -------------------------------------------------------------------------------
 
+--- Build context for condition evaluation
+-- @param targetId number The heal target ID (optional)
+-- @return table Context data for condition evaluation
+local function buildHealContext(targetId)
+    local target = targetId and mq.TLO.Spawn(targetId)
+    local me = mq.TLO.Me
+
+    return {
+        targetId = targetId or 0,
+        targetHp = target and target() and lib.safeNum(function() return target.PctHPs() end, 100) or 100,
+        targetClass = target and target() and lib.safeTLO(function() return target.Class.ShortName() end, '') or '',
+        targetType = target and target() and lib.safeTLO(function() return target.Type() end, '') or '',
+        myHp = me and me() and lib.safeNum(function() return me.PctHPs() end, 100) or 100,
+        myMana = me and me() and lib.safeNum(function() return me.PctMana() end, 100) or 100,
+        inCombat = me and me() and lib.safeTLO(function() return me.Combat() end, false) or false,
+        groupCount = lib.safeNum(function() return mq.TLO.Group.Members() end, 0),
+    }
+end
+
 local function isSpellMemorized(spellName)
     if not spellName or spellName == '' then return false end
     local me = mq.TLO.Me
@@ -48,7 +89,41 @@ local function isSpellMemorized(spellName)
     return false
 end
 
-local function resolveSpell(lineKey)
+--- Map lineKey to spell set category for findBestSpell queries
+local lineKeyToCategory = {
+    main = 'Heals',
+    big = 'Heals',
+    intervention = 'Heals',
+    group = 'GroupHeals',
+}
+
+--- Resolve the best spell for a heal line
+-- First tries active spell set, then falls back to hardcoded config
+-- @param lineKey string The config line key (main, big, group, etc.)
+-- @param targetId number|nil Optional target ID for context building
+-- @return string|nil The resolved spell name or nil
+local function resolveSpell(lineKey, targetId)
+    local SpellsetManager = getSpellsetManager()
+
+    -- Try spell set first
+    if SpellsetManager then
+        local set = SpellsetManager.getActiveSet()
+        if set then
+            -- Build context for condition evaluation
+            local ctx = buildHealContext(targetId)
+
+            -- Map lineKey to category
+            local category = lineKeyToCategory[lineKey]
+            if category then
+                local spellName = SpellsetManager.findBestSpell(category, ctx)
+                if spellName and isSpellMemorized(spellName) then
+                    return spellName
+                end
+            end
+        end
+    end
+
+    -- Fall back to hardcoded config
     local line = Config.spellLines[lineKey]
     if not line then return nil end
     for _, name in ipairs(line) do
@@ -168,16 +243,16 @@ module.getAction = function(self)
     local tier = 'main'
 
     if needGroup then
-        spellName = resolveSpell('group')
         targetId = lib.safeNum(function() return mq.TLO.Me.ID() end, 0)
+        spellName = resolveSpell('group', targetId)
         tier = 'group'
     elseif target then
         targetId = target.id
         if target.hp < Config.bigHealPct then
-            spellName = resolveSpell('big') or resolveSpell('main')
+            spellName = resolveSpell('big', targetId) or resolveSpell('main', targetId)
             tier = 'big'
         else
-            spellName = resolveSpell('main')
+            spellName = resolveSpell('main', targetId)
             tier = 'main'
         end
     end
