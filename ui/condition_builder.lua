@@ -81,6 +81,8 @@ M.properties = {
     { key = "PctHPs",   label = "HP",       type = "numeric", isPercent = true, min = 0, max = 100 },
     { key = "Level",    label = "Level",    type = "numeric", min = 1, max = 125 },
     { key = "Distance", label = "Distance", type = "numeric", min = 0, max = 500 },
+    { key = "Class",    label = "Class",    type = "match" },
+    { key = "Type",     label = "Type",     type = "match" },
     { key = "Named",    label = "Is a Named",    type = "affirmed" },
     { key = "Slowed",   label = "is not Slowed",   type = "negated" },
     { key = "Rooted",   label = "is not Rooted",   type = "negated" },
@@ -235,6 +237,12 @@ local function buildSingleConditionString(cond)
     return "When " .. subjectLabel .. " " .. propLabel
   end
 
+  -- Handle match type (e.g., "When My Target Class is WAR|PAL")
+  if propType == "match" then
+    local value = cond.value or ""
+    return "When " .. subjectLabel .. " " .. propLabel .. " is " .. value
+  end
+
   -- Handle group type (e.g., "When My Group's members w/ HP below 50% >= 3")
   if propType == "group" then
     local threshold = cond.threshold or 50
@@ -340,6 +348,9 @@ local function drawConditionRowEdit(condition, index, uniqueId)
       condition.operator = ">="
       condition.value = 3  -- Default to 3 members
       condition.threshold = 50  -- Default to 50%
+    elseif propDef and propDef.type == "match" then
+      condition.operator = "=="
+      condition.value = ""  -- Default to empty string for text input
     else
       condition.operator = "<"
     end
@@ -385,6 +396,9 @@ local function drawConditionRowEdit(condition, index, uniqueId)
         condition.operator = ">="
         condition.value = 3  -- Default to 3 members
         condition.threshold = 50  -- Default to 50%
+      elseif propDef and propDef.type == "match" then
+        condition.operator = "=="
+        condition.value = ""  -- Default to empty string for text input
       else
         condition.operator = "<"
       end
@@ -412,6 +426,35 @@ local function drawConditionRowEdit(condition, index, uniqueId)
 
   -- Handle "affirmed" type (e.g., "Is a Named") - no operator combo needed
   if propType == "affirmed" then
+    imgui.SameLine()
+    imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.2, 0.2, 1.0)
+    imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 1.0)
+    if imgui.SmallButton("X##delete") then
+      deleted = true
+    end
+    imgui.PopStyleColor(2)
+    imgui.PopID()
+    return changed, deleted
+  end
+
+  -- Handle "match" type (Class, Type) - text input with multi-value support
+  if propType == "match" then
+    imgui.SameLine()
+    imgui.TextColored(0.7, 0.7, 0.7, 1.0, "is")
+    imgui.SameLine()
+    imgui.PushItemWidth(80)
+    local value = condition.value or ""
+    local newValue = imgui.InputText("##matchvalue", value)
+    if newValue ~= value then
+      condition.value = newValue
+      changed = true
+    end
+    imgui.PopItemWidth()
+    if imgui.IsItemHovered() then
+      imgui.SetTooltip("Use | for multiple values: WAR|PAL|SHD")
+    end
+
+    -- Delete button
     imgui.SameLine()
     imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.2, 0.2, 1.0)
     imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 1.0)
@@ -1062,6 +1105,16 @@ function M.evaluateWithContext(conditionData, ctx)
           local raw = mq.TLO.Target.Snared()
           actual = raw ~= nil and raw ~= '' and raw ~= false
         end
+      elseif cond.property == "Class" then
+        actual = ctx.targetClass
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.Class.ShortName()
+        end
+      elseif cond.property == "Type" then
+        actual = ctx.targetType
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.Type()
+        end
       end
 
     elseif cond.type == "spawn" then
@@ -1087,6 +1140,20 @@ function M.evaluateWithContext(conditionData, ctx)
     -- Handle affirmed type (Is a Named) - check for true
     if propType == "affirmed" then
       return actual == true
+    end
+
+    -- Handle match type (Class, Type) - string matching with | separator for multi-value
+    if propType == "match" then
+      if actual == nil or actual == '' then return false end
+      local condValue = cond.value or ''
+      if condValue == '' then return false end
+      -- Support multi-value matching: "WAR|PAL|SHD"
+      for matchValue in string.gmatch(condValue, "[^|]+") do
+        if actual:upper() == matchValue:upper() then
+          return true
+        end
+      end
+      return false
     end
 
     -- Evaluate based on property type and operator
