@@ -513,10 +513,187 @@ M.Cures = {
         'Pure Blood',             -- 51
     },
 
+    -- Blood cure line (poison/disease removal)
+    Blood = {
+        'Mastery Sanctified Blood', -- 129
+        'Sanctified Blood',       -- 119
+        'Expurgated Blood',       -- 109
+        'Unblemished Blood',      -- 104
+        'Cleansed Blood',         -- 99
+        'Blood of the Adherent',  -- 95
+        'Perfected Blood',        -- 94
+        'Blood of the Devout',    -- 90
+        'Purged Blood',           -- 89
+        'Pristine Blood',         -- 87
+        'Blood of the Unsullied', -- 85
+        'Purified Blood',         -- 84
+        'Blood of the Devoted',   -- 80
+        'Blood of the Martyr',    -- 75
+    },
+
     -- Basic cures
     Disease = { 'Cure Disease' }, -- 4
     Poison = { 'Cure Poison' },   -- 1
     Blindness = { 'Cure Blindness' }, -- 3
+}
+
+-- Self buff spell lines
+M.SelfBuffs = {
+    -- Armor line (HP/AC self buff)
+    Armor = {
+        'Armor of the Eminent',   -- 130
+        'Armor of the Avowed',    -- 125
+        'Armor of Penance',       -- 120
+        'Armor of Sincerity',     -- 115
+        'Armor of the Merciful',  -- 110
+        'Armor of the Ardent',    -- 105
+        'Armor of the Reverent',  -- 100
+        'Armor of the Zealous',   -- 95
+        'Armor of the Earnest',   -- 90
+        'Armor of the Devout',    -- 85
+        'Armor of the Solemn',    -- 80
+        'Armor of the Sacred',    -- 75
+        'Armor of the Pious',     -- 70
+        'Armor of the Zealot',    -- 65
+        'Blessed Armor of the Risen', -- 58
+        'Armor of the Faithful',  -- 49
+        'Armor of Protection',    -- 34
+    },
+
+    -- Glow line (reaction radius self buff)
+    Glow = {
+        'Tranquil Glow',          -- 126
+        'Congenial Glow',         -- 121
+        'Contenting Glow',        -- 116
+        'Placating Glow',         -- 111
+        'Mollifying Glow',        -- 106
+        'Pacifying Glow',         -- 101
+        'Soothing Glow',          -- 96
+    },
+
+    -- Vow line (self buff)
+    Vow = {
+        'Vow of Vitriol XI',      -- 128
+        'Vow of Valor XI',        -- 126
+        'Vow of Retribution',     -- 123
+        'Vow of Virtuosity',      -- 121
+        'Vow of Perniciousness',  -- 118
+        'Vow of Tenacity',        -- 116
+        'Vow of Vituperation',    -- 113
+        'Vow of Veracity',        -- 111
+        'Vow of Vengeance',       -- 108
+        'Vow of Vigilance',       -- 106
+        'Vow of Virulence',       -- 103
+        'Vow of Vigor',           -- 101
+        'Vow of Vehemence',       -- 98
+        'Vow of Vitality',        -- 96
+        'Vow of Veneration',      -- 91
+        'Vow of Vanquishing',     -- 86
+        'Vow of Valiance',        -- 81
+        'Vow of Victory',         -- 76
+        'Vow of Valor',           -- 71
+    },
+
+    -- Aegolism line (HP buff)
+    Aegolism = {
+        'Aegolism XV',            -- 127
+        'Ancient Gift of Aegolism', -- 60
+        'Blessing of Aegolism',   -- 60
+        'Aegolism',               -- 60
+    },
+}
+
+-- Proc buff spell lines
+M.Procs = {
+    -- Retort line (heal proc on target)
+    Retort = {
+        'Hazuri\'s Retort',       -- 125
+        'Axoeviq\'s Retort',      -- 120
+        'Jorlleag\'s Retort',     -- 115
+        'Curate\'s Retort',       -- 110
+        'Vicarum\'s Retort',      -- 105
+        'Olsif\'s Retort',        -- 100
+        'Galvos\' Retort',        -- 95
+        'Fintar\'s Retort',       -- 90
+    },
+}
+
+-- Persistent/Ground heal spell lines
+M.Persistent = {
+    -- Ground line (persistent AE heal)
+    Ground = {
+        'Resplendent Ground',     -- 125
+        'Venerated Ground',       -- 118
+        'Purified Ground',        -- 113
+        'Blessed Ground',         -- 108
+        'Glorified Ground',       -- 98
+        'Anointed Ground',        -- 93
+        'Sanctified Ground',      -- 88
+        'Holy Ground',            -- 83
+        'Hallowed Ground',        -- 78
+        'Consecrate Ground',      -- 73
+    },
+
+    -- Issuance line (healing pet)
+    Issuance = {
+        'Issuance of Eminence',   -- 130
+        'Issuance of Heroism',    -- 123
+        'Issuance of Conviction', -- 118
+        'Issuance of Sincerity',  -- 113
+        'Issuance of Mercy',      -- 108
+        'Issuance of Spirit',     -- 103
+        'Issuance of Grace',      -- 98
+        'Issuance of Faith',      -- 93
+    },
+}
+
+-- Additional damage spell lines
+M.AEDamage = {
+    -- Tectonic line (PB AE damage)
+    Tectonic = {
+        'Tectonic Quake XVI',     -- 130
+        'Tectonic Bedlam',        -- 125
+        'Tectonic Shadowvent',    -- 119
+        'Tectonic Frostheave',    -- 114
+        'Tectonic Eruption',      -- 109
+        'Tectonic Destruction',   -- 104
+        'Tectonic Temblor',       -- 99
+        'Tectonic Tremor',        -- 94
+        'Tectonic Shock',         -- 89
+        'Tectonic Tumult',        -- 84
+        'Tectonic Upheaval',      -- 79
+        'Tectonic Quake',         -- 74
+    },
+
+    -- Hammer line (DD)
+    Hammer = {
+        'Hammer of Eminence',     -- 127
+        'Hammer of the Remembered', -- 122
+        'Hammer of Penance',      -- 117
+        'Hammer of Obliteration', -- 112
+        'Hammer of Repudiation',  -- 107
+        'Ardent Hammer of Zeal',  -- 104
+        'Hammer of Reverence',    -- 97
+        'Hammer of Reproach',     -- 68
+        'Hammer of Damnation',    -- 63
+        'Hammer of Souls',        -- 60
+        'Hammer of Divinity',     -- 58
+        'Hammer of Judgment',     -- 56
+        'Hammer of Requital',     -- 40
+        'Hammer of Striking',     -- 20
+        'Hammer of Wrath',        -- 7
+    },
+}
+
+-- Acquittal heal line
+M.Heals.Acquittal = {
+    'Eminent Acquittal',      -- 129
+    'Avowed Acquittal',       -- 124
+    'Devout Acquittal',       -- 119
+    'Sincere Acquittal',      -- 114
+    'Merciful Acquittal',     -- 109
+    'Ardent Acquittal',       -- 104
+    'Cleansing Acquittal',    -- 99
 }
 
 return M
