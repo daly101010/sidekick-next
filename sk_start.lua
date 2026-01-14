@@ -8,10 +8,10 @@ local function log(msg)
 end
 
 local modules = {
-    'sk_coordinator',
-    'sk_emergency',
-    'sk_healing',
-    'sk_dps',
+    'sidekick/sk_coordinator',
+    'sidekick/sk_emergency',
+    'sidekick/sk_healing',
+    'sidekick/sk_dps',
 }
 
 local function startAll()

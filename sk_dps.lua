@@ -3,8 +3,8 @@
 -- Priority 4: Nukes, stuns, meditation when idle
 
 local mq = require('mq')
-local lib = require('sk_lib')
-local ModuleBase = require('sk_module_base')
+local lib = require('sidekick.sk_lib')
+local ModuleBase = require('sidekick.sk_module_base')
 
 -- Create module instance
 local module = ModuleBase.create('dps', lib.Priority.DPS)

@@ -4,7 +4,7 @@
 
 local mq = require('mq')
 local actors = require('actors')
-local lib = require('sk_lib')
+local lib = require('sidekick.sk_lib')
 
 local M = {}
 
