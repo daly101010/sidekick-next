@@ -5,6 +5,7 @@
 local mq = require('mq')
 local lib = require('sidekick.sk_lib')
 local ModuleBase = require('sidekick.sk_module_base')
+local Spells = require('sidekick.sk_spells_clr')
 
 -- Create module instance
 local module = ModuleBase.create('dps', lib.Priority.DPS)
@@ -20,10 +21,11 @@ local Config = {
     -- Target HP threshold (don't nuke nearly dead targets)
     minTargetHpPct = 20,
 
-    -- Spell preferences
+    -- Spell lines (from sk_spells_clr.lua)
     spellLines = {
-        nuke = { 'Divine Contravention', 'Sincere Contravention', 'Merciful Contravention' },
-        stun = { 'Sound of Divinity', 'Sound of Zeal', 'Sound of Resonance' },
+        nuke = Spells.Damage.Contravention,
+        stun = Spells.Stuns.Sound,
+        stunSingle = Spells.Stuns.Silent,
     },
 }
 

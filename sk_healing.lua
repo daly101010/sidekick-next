@@ -5,6 +5,7 @@
 local mq = require('mq')
 local lib = require('sidekick.sk_lib')
 local ModuleBase = require('sidekick.sk_module_base')
+local Spells = require('sidekick.sk_spells_clr')
 
 -- Create module instance
 local module = ModuleBase.create('healing', lib.Priority.HEALING)
@@ -20,11 +21,12 @@ local Config = {
     groupHealPct = 75,
     groupInjuredCount = 2,
 
-    -- Spell preferences (resolve from memorized)
+    -- Spell lines (from sk_spells_clr.lua)
     spellLines = {
-        main = { 'Guileless Remedy', 'Sincere Remedy', 'Merciful Remedy', 'Spiritual Remedy' },
-        big = { 'Determined Renewal', 'Dire Renewal', 'Furial Renewal' },
-        group = { 'Word of Greater Vivification', 'Word of Greater Rejuvenation' },
+        main = Spells.Heals.Remedy,
+        big = Spells.Heals.Renewal,
+        intervention = Spells.Heals.Intervention,
+        group = Spells.GroupHeals.Word,
     },
 }
 
