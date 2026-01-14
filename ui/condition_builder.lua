@@ -1149,7 +1149,7 @@ function M.evaluateWithContext(conditionData, ctx)
       if condValue == '' then return false end
       -- Support multi-value matching: "WAR|PAL|SHD"
       for matchValue in string.gmatch(condValue, "[^|]+") do
-        if actual:upper() == matchValue:upper() then
+        if tostring(actual):upper() == matchValue:upper() then
           return true
         end
       end
