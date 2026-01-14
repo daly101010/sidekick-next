@@ -56,6 +56,28 @@ local function getSpellEngine()
     return _SpellEngine
 end
 
+local _SpellsetManager = nil
+local function getSpellsetManager()
+    if not _SpellsetManager then
+        local ok, sm = pcall(require, 'utils.spellset_manager')
+        if ok then
+            if not sm.initialized and sm.init then
+                sm.init()
+            end
+            _SpellsetManager = sm
+        end
+    end
+    return _SpellsetManager
+end
+
+local function isSpellsetLineEnabled(lineName)
+    local sm = getSpellsetManager()
+    if not sm or not sm.isLineEnabled then
+        return true
+    end
+    return sm.isLineEnabled(lineName)
+end
+
 -- Local buff tracking (buffs we've applied)
 M.localBuffs = {}  -- { [targetId] = { [buffCategory] = { expiresAt, spellId, spellName } } }
 
@@ -107,6 +129,9 @@ local _activeBuff = {
     startedAt = 0,         -- When we started this attempt
     timeout = 15.0,        -- Max seconds to wait for spell to be ready and cast
 }
+
+-- Forward declaration for helper used in buff state refresh
+local getSpellId
 
 local function getNumGems()
     local me = mq.TLO.Me
@@ -340,7 +365,7 @@ local function updateBuffState(targetId, buffCategory, spellId, allowTargetChang
     return result
 end
 
-local function refreshBuffStateForCategory(buffCategory, spellId, maxAge)
+local function refreshBuffStateForCategory(buffCategory, spellId, maxAge, skipSelf)
     local Cache = getCache()
     if not Cache or not Cache.isBuffStateStale then return end
     if not spellId then return end
@@ -348,9 +373,11 @@ local function refreshBuffStateForCategory(buffCategory, spellId, maxAge)
     maxAge = maxAge or BUFF_CHECK_INTERVAL
 
     -- Self
-    local myId = Cache.me and Cache.me.id or 0
-    if myId > 0 and Cache.isBuffStateStale(myId, buffCategory, maxAge) then
-        updateBuffState(myId, buffCategory, spellId, false)
+    if not skipSelf then
+        local myId = Cache.me and Cache.me.id or 0
+        if myId > 0 and Cache.isBuffStateStale(myId, buffCategory, maxAge) then
+            updateBuffState(myId, buffCategory, spellId, false)
+        end
     end
 
     -- Group members
@@ -362,6 +389,70 @@ local function refreshBuffStateForCategory(buffCategory, spellId, maxAge)
             end
         end
     end
+end
+
+local function buildBuffCheckSpellIds(buffDef)
+    if not buffDef then return {} end
+    local ids = {}
+    local seen = {}
+
+    local function addLine(lineName)
+        if not lineName then return end
+        local spellName = resolveBestBookSpellFromLine(lineName)
+        if not spellName then return end
+        local spellId = getSpellId(spellName)
+        if not spellId or spellId == 0 then return end
+        if not seen[spellId] then
+            seen[spellId] = true
+            table.insert(ids, spellId)
+        end
+    end
+
+    addLine(buffDef.spellLine)
+    addLine(buffDef.groupSpellLine)
+    return ids
+end
+
+local function refreshSelfBuffStateForCategory(buffCategory, spellIds, maxAge)
+    local Cache = getCache()
+    if not Cache or not Cache.isBuffStateStale then return end
+    if not spellIds or #spellIds == 0 then return end
+
+    maxAge = maxAge or BUFF_CHECK_INTERVAL
+
+    local myId = Cache.me and Cache.me.id or 0
+    if myId <= 0 or not Cache.isBuffStateStale(myId, buffCategory, maxAge) then return end
+
+    local best = nil
+    local bestSpellId = nil
+    local fallback = nil
+    local fallbackSpellId = nil
+
+    for _, spellId in ipairs(spellIds) do
+        local res = rgmercsLocalBuffCheck(spellId)
+        if not fallback then
+            fallback = res
+            fallbackSpellId = spellId
+        end
+        if res and res.shouldCast == false then
+            if (not best) or (tonumber(res.remaining) or 0) > (tonumber(best.remaining) or 0) then
+                best = res
+                bestSpellId = spellId
+            end
+        end
+    end
+
+    local result = best or fallback
+    local resultSpellId = bestSpellId or fallbackSpellId
+    if not result then return end
+
+    Cache.buffState[myId] = Cache.buffState[myId] or {}
+    Cache.buffState[myId][buffCategory] = {
+        present = not result.shouldCast,
+        remaining = result.remaining or 0,
+        spellId = resultSpellId,
+        checkedAt = os.clock(),
+    }
 end
 
 local function refreshBuffStateForPets(buffCategory, spellId, maxAge)
@@ -1135,7 +1226,7 @@ end
 --- Get spell ID from spell name
 -- @param spellName string Spell name
 -- @return number|nil Spell ID
-local function getSpellId(spellName)
+getSpellId = function(spellName)
     if not spellName then return nil end
     local spell = mq.TLO.Spell(spellName)
     if spell and spell() and spell.ID then
@@ -1296,6 +1387,11 @@ function M.buffTick()
         local category = entryDef.category
         local buffDef = entryDef.def
 
+        -- Check spell set gating (if configured)
+        if buffDef.spellSetLine and not isSpellsetLineEnabled(buffDef.spellSetLine) then
+            goto continue_buff
+        end
+
         -- Check combat state for this buff
         if not M.shouldBuffNow(buffDef) then
             goto continue_buff
@@ -1306,9 +1402,13 @@ function M.buffTick()
         local checkSpellName = checkLine and resolveBestBookSpellFromLine(checkLine) or nil
         local checkSpellId = checkSpellName and getSpellId(checkSpellName) or nil
 
-        -- Initial buff-state refresh (rgmercs-style) using Target/FindBuff
+        -- Refresh self buff-state using both single + group lines to avoid false negatives
+        local selfCheckIds = buildBuffCheckSpellIds(buffDef)
+        refreshSelfBuffStateForCategory(category, selfCheckIds, BUFF_CHECK_INTERVAL)
+
+        -- Refresh group members using the selected line (retargeting is expensive)
         if checkSpellId then
-            refreshBuffStateForCategory(category, checkSpellId, BUFF_CHECK_INTERVAL)
+            refreshBuffStateForCategory(category, checkSpellId, BUFF_CHECK_INTERVAL, true)
         end
 
         -- Get rebuff window from definition or use default
@@ -1329,6 +1429,20 @@ function M.buffTick()
                     local spellName = resolveBestBookSpellFromLine(buffDef.spellLine)
                     if not spellName then
                         goto continue_buff
+                    end
+
+                    -- Fresh check: verify buff is actually needed before memorizing
+                    local spellId = getSpellId(spellName)
+                    if spellId then
+                        local freshCheck = rgmercsLocalBuffCheck(spellId)
+                        if freshCheck and freshCheck.shouldCast == false then
+                            if M.debugBuffTick and TL then
+                                TL.log('buff_skip_self_nocast_' .. category, 10,
+                                    'Self buff %s skipped (fresh check: %s, remaining=%.0f)',
+                                    spellName, freshCheck.reason or 'unknown', freshCheck.remaining or 0)
+                            end
+                            goto continue_buff
+                        end
                     end
 
                     -- Check not claimed by someone else
@@ -1386,20 +1500,19 @@ function M.buffTick()
                 goto continue_buff
             end
 
-            -- Group buff: sanity check first target using rgmercs-style buff check
-            if isGroup then
-                local firstTarget = validTargets[1]
-                if firstTarget and firstTarget.member and firstTarget.member.id then
-                    local groupSpellId = getSpellId(spellName)
-                    if groupSpellId then
-                        local check = updateBuffState(firstTarget.member.id, category, groupSpellId, true)
-                        if check and check.shouldCast == false then
-                            if M.debugBuffTick and TL then
-                                TL.log('buff_skip_group_nostack_' .. category, 10,
-                                    'Group buff %s skipped (rgmercs check says no cast on %s)', spellName, firstTarget.member.name or 'target')
-                            end
-                            goto continue_buff
+            -- Fresh check: verify buff is actually needed before memorizing
+            local firstTarget = validTargets[1]
+            if firstTarget and firstTarget.member and firstTarget.member.id then
+                local checkSpellId = getSpellId(spellName)
+                if checkSpellId then
+                    local check = updateBuffState(firstTarget.member.id, category, checkSpellId, true)
+                    if check and check.shouldCast == false then
+                        if M.debugBuffTick and TL then
+                            TL.log('buff_skip_nocast_' .. category, 10,
+                                'Buff %s skipped (fresh check: %s on %s, remaining=%.0f)',
+                                spellName, check.reason or 'unknown', firstTarget.member.name or 'target', check.remaining or 0)
                         end
+                        goto continue_buff
                     end
                 end
             end
