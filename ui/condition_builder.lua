@@ -941,6 +941,211 @@ function M.evaluate(conditionData)
   return result
 end
 
+--- Evaluate a condition with explicit context (pure function, no global state)
+-- @param conditionData table The condition data structure
+-- @param ctx table Context with targetId, targetHp, targetClass, myHp, myMana, etc.
+-- @return boolean True if condition passes
+function M.evaluateWithContext(conditionData, ctx)
+  if not conditionData or not conditionData.conditions or #conditionData.conditions == 0 then
+    return true  -- No conditions = always pass
+  end
+
+  ctx = ctx or {}
+
+  local function evaluateSingle(cond)
+    local combined = getCombinedSubject(cond.type, cond.subject)
+    local props = getPropsForCombined(combined)
+    local propDef = findProp(props, cond.property)
+    local propType = propDef and propDef.type or "numeric"
+
+    local actual = nil
+
+    -- Resolve actual value based on type + subject + property
+    if cond.type == "beneficial" then
+      if cond.subject == "Me" then
+        if cond.property == "PctHPs" then
+          actual = ctx.myHp
+          if actual == nil then actual = mq.TLO.Me.PctHPs() or 100 end
+        elseif cond.property == "PctMana" then
+          actual = ctx.myMana
+          if actual == nil then actual = mq.TLO.Me.PctMana() or 100 end
+        elseif cond.property == "PctEndurance" then
+          actual = ctx.myEndurance
+          if actual == nil then actual = mq.TLO.Me.PctEndurance() or 100 end
+        elseif cond.property == "Combat" then
+          actual = ctx.inCombat
+          if actual == nil then actual = mq.TLO.Me.Combat() or false end
+        elseif cond.property == "Invis" then
+          actual = ctx.isInvis
+          if actual == nil then actual = mq.TLO.Me.Invis() or false end
+        elseif cond.property == "PctAggro" then
+          actual = ctx.pctAggro
+          if actual == nil then actual = mq.TLO.Me.PctAggro() or 0 end
+        elseif cond.property == "SecondaryPctAggro" then
+          actual = ctx.secondaryPctAggro
+          if actual == nil then actual = mq.TLO.Me.SecondaryPctAggro() or 0 end
+        elseif cond.property == "XTargetHaterCount" then
+          actual = ctx.xtargetHaterCount
+          if actual == nil then
+            local count = 0
+            for i = 1, 13 do
+              local xtSpawn = mq.TLO.Me.XTarget(i)
+              if xtSpawn() and xtSpawn.TargetType() == "Auto Hater" then
+                count = count + 1
+              end
+            end
+            actual = count
+          end
+        elseif cond.property == "XTargetHasMezzed" then
+          actual = ctx.xtargetHasMezzed
+          if actual == nil then actual = false end  -- Requires CC module, default to false
+        end
+      elseif cond.subject == "Group" then
+        if cond.property == "Injured" then
+          actual = ctx.groupInjuredCount
+          if actual == nil then
+            local threshold = cond.threshold or 50
+            actual = mq.TLO.Group.Injured(threshold)() or 0
+          end
+        elseif cond.property == "LowMana" then
+          actual = ctx.groupLowManaCount
+          if actual == nil then
+            local threshold = cond.threshold or 50
+            actual = mq.TLO.Group.LowMana(threshold)() or 0
+          end
+        end
+      end
+
+    elseif cond.type == "detrimental" then
+      -- Target-based conditions
+      if cond.property == "PctHPs" then
+        actual = ctx.targetHp
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.PctHPs()
+        end
+      elseif cond.property == "Level" then
+        actual = ctx.targetLevel
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.Level()
+        end
+      elseif cond.property == "Distance" then
+        actual = ctx.targetDistance
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.Distance()
+        end
+      elseif cond.property == "Named" then
+        actual = ctx.targetNamed
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.Named() == true
+        end
+      elseif cond.property == "Slowed" then
+        actual = ctx.targetSlowed
+        if actual == nil and mq.TLO.Target() then
+          local raw = mq.TLO.Target.Slowed()
+          actual = raw ~= nil and raw ~= '' and raw ~= false
+        end
+      elseif cond.property == "Rooted" then
+        actual = ctx.targetRooted
+        if actual == nil and mq.TLO.Target() then
+          local raw = mq.TLO.Target.Rooted()
+          actual = raw ~= nil and raw ~= '' and raw ~= false
+        end
+      elseif cond.property == "Mezzed" then
+        actual = ctx.targetMezzed
+        if actual == nil and mq.TLO.Target() then
+          local raw = mq.TLO.Target.Mezzed()
+          actual = raw ~= nil and raw ~= '' and raw ~= false
+        end
+      elseif cond.property == "Snared" then
+        actual = ctx.targetSnared
+        if actual == nil and mq.TLO.Target() then
+          local raw = mq.TLO.Target.Snared()
+          actual = raw ~= nil and raw ~= '' and raw ~= false
+        end
+      end
+
+    elseif cond.type == "spawn" then
+      if cond.property == "SpawnCount" then
+        actual = ctx.spawnCount
+        if actual == nil then
+          local radius = cond.threshold or 50
+          actual = mq.TLO.SpawnCount('npc radius ' .. radius .. ' targetable')() or 0
+        end
+        local requiredCount = tonumber(cond.value) or 1
+        return actual >= requiredCount
+      end
+    end
+
+    -- Handle nil actual value
+    if actual == nil then return false end
+
+    -- Handle negated type (is not Rooted, etc.) - check for nil/empty/false
+    if propType == "negated" then
+      return actual == nil or actual == '' or actual == false
+    end
+
+    -- Handle affirmed type (Is a Named) - check for true
+    if propType == "affirmed" then
+      return actual == true
+    end
+
+    -- Evaluate based on property type and operator
+    if propType == "boolean" then
+      if cond.operator == "true" then
+        return actual == true
+      else
+        return actual == false
+      end
+    elseif propType == "group" then
+      -- Group type uses numeric comparison on count
+      local numValue = tonumber(actual) or 0
+      local compareValue = tonumber(cond.value) or 0
+      if cond.operator == ">" then return numValue > compareValue
+      elseif cond.operator == "<" then return numValue < compareValue
+      elseif cond.operator == ">=" then return numValue >= compareValue
+      elseif cond.operator == "<=" then return numValue <= compareValue
+      elseif cond.operator == "==" then return numValue == compareValue
+      elseif cond.operator == "><" then
+        local compareValue2 = tonumber(cond.value2) or 100
+        return numValue >= compareValue and numValue <= compareValue2
+      end
+    else
+      -- Numeric comparison
+      local numValue = tonumber(actual) or 0
+      local compareValue = tonumber(cond.value) or 0
+
+      if cond.operator == ">" then return numValue > compareValue
+      elseif cond.operator == "<" then return numValue < compareValue
+      elseif cond.operator == ">=" then return numValue >= compareValue
+      elseif cond.operator == "<=" then return numValue <= compareValue
+      elseif cond.operator == "==" then return numValue == compareValue
+      elseif cond.operator == "><" then
+        local compareValue2 = tonumber(cond.value2) or 100
+        return numValue >= compareValue and numValue <= compareValue2
+      end
+    end
+
+    return true  -- Unknown operator = pass
+  end
+
+  -- Evaluate first condition
+  local result = evaluateSingle(conditionData.conditions[1])
+
+  -- Apply connectors for subsequent conditions
+  for i = 2, #conditionData.conditions do
+    local logic = conditionData.logic[i - 1] or "AND"
+    local condResult = evaluateSingle(conditionData.conditions[i])
+
+    if logic == "AND" then
+      result = result and condResult
+    elseif logic == "OR" then
+      result = result or condResult
+    end
+  end
+
+  return result
+end
+
 -- =========================================================================
 -- Serialization (for INI storage)
 -- =========================================================================
