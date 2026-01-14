@@ -367,7 +367,10 @@ function M.renderConditionPopup()
         end
 
         -- Render condition builder
-        ConditionBuilder.render(M.editingCondition)
+        local uniqueId = 'spellset_' .. (M.conditionEditLine or 'unknown')
+        M.editingCondition = ConditionBuilder.drawInline(uniqueId, M.editingCondition, function(newData)
+            M.editingCondition = newData
+        end)
 
         imgui.Spacing()
         imgui.Separator()
