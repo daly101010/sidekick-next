@@ -1607,6 +1607,7 @@ function M.createSet(name)
     }
 
     M.spellSets[name] = set
+    M.saveSpellSets()
     return set
 end
 
@@ -1664,22 +1665,18 @@ function M.enableLine(setName, lineName, slotType)
     local set = M.getSet(setName)
     if not set then return false end
 
-    slotType = slotType or 'rotation'
+    -- Get default slot type only if not specified
+    if not slotType then
+        local SpellsClr = getSpellsClr()
+        local lineData = SpellsClr and SpellsClr.getLine(lineName)
+        slotType = (lineData and lineData.defaultSlotType) or 'rotation'
+    end
 
-    -- Check capacity for rotation lines
+    -- Check capacity for rotation lines (now using the final slotType)
     if slotType == 'rotation' then
         local count = M.countEnabledRotation(setName)
         if count >= M.getRotationCapacity() then
             return false  -- At capacity
-        end
-    end
-
-    -- Get default slot type if not specified
-    if not set.lines[lineName] then
-        local SpellsClr = getSpellsClr()
-        local lineData = SpellsClr and SpellsClr.getLine(lineName)
-        if lineData then
-            slotType = lineData.defaultSlotType or 'rotation'
         end
     end
 
