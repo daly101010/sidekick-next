@@ -66,7 +66,7 @@ end
 local _SpellsClr = nil
 local function getSpellsClr()
     if not _SpellsClr then
-        local ok, s = pcall(require, 'sk_spells_clr')
+        local ok, s = pcall(require, 'sidekick.sk_spells_clr')
         if ok then _SpellsClr = s end
     end
     return _SpellsClr
