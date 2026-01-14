@@ -588,6 +588,10 @@ end
 --- Tick function - call from main loop to detect manual spell changes
 function M.tick()
     if not M.initialized then return end
+
+    -- Check for pending spell set apply
+    M.checkPendingApply()
+
     if not M.detectionEnabled then return end
 
     -- Throttle checks
@@ -1770,6 +1774,106 @@ function M.setLinePriority(setName, lineName, priority)
 
     set.lines[lineName].priority = priority
     M.saveSpellSets()
+end
+
+--------------------------------------------------------------------------------
+-- Spell Set Activation and Memorization
+--------------------------------------------------------------------------------
+
+--- Activate a spell set (does not memorize yet)
+-- @param setName string The spell set name
+-- @return boolean True if activated
+function M.activateSet(setName)
+    if not M.spellSets[setName] then return false end
+
+    M.activeSetName = setName
+    M.saveSpellSets()
+    return true
+end
+
+--- Queue spell set application (memorization)
+-- If in combat, queues for OOC. Otherwise applies immediately.
+-- @param setName string|nil The spell set name (nil = active set)
+-- @return string 'applied', 'queued', or 'error'
+function M.applySet(setName)
+    setName = setName or M.activeSetName
+    if not setName or not M.spellSets[setName] then
+        return 'error'
+    end
+
+    -- Check if in combat
+    local me = mq.TLO.Me
+    local inCombat = me and me() and me.Combat()
+
+    if inCombat then
+        M.pendingApply = setName
+        return 'queued'
+    end
+
+    M.doApplySet(setName)
+    return 'applied'
+end
+
+--- Actually apply a spell set (memorize spells)
+-- Only call when OOC and castBusy == false
+-- @param setName string The spell set name
+function M.doApplySet(setName)
+    local set = M.spellSets[setName]
+    if not set then return end
+
+    local me = mq.TLO.Me
+    if not me or not me() then return end
+
+    -- Build list of rotation spells in priority order
+    local rotationSpells = {}
+    for lineName, lineData in pairs(set.lines) do
+        if lineData.enabled and lineData.slotType == 'rotation' and lineData.resolved then
+            table.insert(rotationSpells, {
+                lineName = lineName,
+                spellName = lineData.resolved,
+                priority = lineData.priority or 999,
+            })
+        end
+    end
+
+    -- Sort by priority
+    table.sort(rotationSpells, function(a, b)
+        return a.priority < b.priority
+    end)
+
+    -- Memorize into gems 1..N
+    local numGems = M.getRotationCapacity()
+    for i, spell in ipairs(rotationSpells) do
+        if i > numGems then break end
+
+        local currentGem = me.Gem(i)
+        local currentName = currentGem and currentGem() and currentGem.Name() or ''
+
+        if currentName ~= spell.spellName then
+            mq.cmdf('/memspell %d "%s"', i, spell.spellName)
+            mq.delay(100)  -- Brief delay between mems
+        end
+    end
+
+    M.activeSetName = setName
+    M.pendingApply = nil
+    M.saveSpellSets()
+end
+
+--- Check for pending apply and execute when safe
+-- Call from main loop tick
+function M.checkPendingApply()
+    if not M.pendingApply then return end
+
+    local me = mq.TLO.Me
+    if not me or not me() then return end
+
+    local inCombat = me.Combat()
+    local casting = me.Casting and me.Casting()
+
+    if not inCombat and not casting then
+        M.doApplySet(M.pendingApply)
+    end
 end
 
 --------------------------------------------------------------------------------
