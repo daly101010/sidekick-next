@@ -85,6 +85,9 @@ end
 -- INI section for custom loadouts
 local LOADOUT_SECTION = 'SideKick-SpellLoadouts'
 
+-- INI section for spell sets (new Spell Set Editor)
+local SPELLSET_SECTION = 'SideKick-SpellSets'
+
 --- Get class short name
 local function getClassShort()
     local me = mq.TLO.Me
@@ -574,6 +577,10 @@ function M.init()
 
     -- Capture initial gem state
     M.captureCurrentGems()
+
+    -- Load spell sets
+    M.loadSpellSets()
+    M.updateCapacity()
 
     M.initialized = true
 end
@@ -1765,10 +1772,119 @@ function M.setLinePriority(setName, lineName, priority)
     M.saveSpellSets()
 end
 
---- Placeholder for spell set persistence (implemented in Task 5)
--- @private
+--------------------------------------------------------------------------------
+-- Spell Set INI Persistence
+--------------------------------------------------------------------------------
+
+--- Save all spell sets to INI
 function M.saveSpellSets()
-    -- Will be implemented in Task 5
+    local Core = getCore()
+    if not Core or not Core.Ini then return end
+
+    local ConditionBuilder = getConditionBuilder()
+
+    -- Save set list
+    Core.Ini[SPELLSET_SECTION] = Core.Ini[SPELLSET_SECTION] or {}
+    local section = Core.Ini[SPELLSET_SECTION]
+
+    -- Clear old entries
+    for key in pairs(section) do
+        section[key] = nil
+    end
+
+    -- Save set names
+    local setNames = M.getSetNames()
+    section['_sets'] = table.concat(setNames, ',')
+    section['_active'] = M.activeSetName or ''
+
+    -- Save each set
+    for setName, set in pairs(M.spellSets) do
+        local prefix = 'set_' .. setName:gsub('[^%w]', '_') .. '_'
+
+        for lineName, lineData in pairs(set.lines) do
+            local linePrefix = prefix .. lineName .. '_'
+            section[linePrefix .. 'enabled'] = lineData.enabled and '1' or '0'
+            section[linePrefix .. 'slotType'] = lineData.slotType or 'rotation'
+            section[linePrefix .. 'priority'] = tostring(lineData.priority or 999)
+
+            if lineData.condition and ConditionBuilder then
+                section[linePrefix .. 'condition'] = ConditionBuilder.serialize(lineData.condition)
+            else
+                section[linePrefix .. 'condition'] = ''
+            end
+        end
+    end
+
+    if Core.save then Core.save() end
+end
+
+--- Load spell sets from INI
+function M.loadSpellSets()
+    local Core = getCore()
+    if not Core or not Core.Ini then return end
+
+    local ConditionBuilder = getConditionBuilder()
+    local section = Core.Ini[SPELLSET_SECTION]
+    if not section then return end
+
+    M.spellSets = {}
+
+    -- Load set names
+    local setNamesStr = section['_sets'] or ''
+    M.activeSetName = section['_active']
+    if M.activeSetName == '' then M.activeSetName = nil end
+
+    -- Parse set names
+    local setNames = {}
+    for name in setNamesStr:gmatch('[^,]+') do
+        name = name:match('^%s*(.-)%s*$')  -- Trim
+        if name ~= '' then
+            table.insert(setNames, name)
+            M.spellSets[name] = { name = name, lines = {} }
+        end
+    end
+
+    -- Load line data for each set
+    for key, value in pairs(section) do
+        local setKey, lineName, prop = key:match('^set_([^_]+)_([^_]+)_(.+)$')
+        if setKey and lineName and prop then
+            -- Find the actual set name (convert back from safe key)
+            local setName = nil
+            for name, _ in pairs(M.spellSets) do
+                if name:gsub('[^%w]', '_') == setKey then
+                    setName = name
+                    break
+                end
+            end
+
+            if setName and M.spellSets[setName] then
+                local set = M.spellSets[setName]
+                set.lines[lineName] = set.lines[lineName] or {}
+                local lineData = set.lines[lineName]
+
+                if prop == 'enabled' then
+                    lineData.enabled = (value == '1')
+                elseif prop == 'slotType' then
+                    lineData.slotType = value
+                elseif prop == 'priority' then
+                    lineData.priority = tonumber(value) or 999
+                elseif prop == 'condition' then
+                    if value ~= '' and ConditionBuilder then
+                        lineData.condition = ConditionBuilder.deserialize(value)
+                    end
+                end
+            end
+        end
+    end
+
+    -- Resolve spells for all enabled lines
+    for _, set in pairs(M.spellSets) do
+        for lineName, lineData in pairs(set.lines) do
+            if lineData.enabled then
+                lineData.resolved = M.resolveSpellFromLine(lineName)
+            end
+        end
+    end
 end
 
 return M
