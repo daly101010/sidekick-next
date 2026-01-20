@@ -303,4 +303,45 @@ function M.validateDps(targetId, hpDeltaDps)
     }
 end
 
+-- Get damage attribution summary for a target
+function M.getTargetDamageInfo(targetId)
+    calculateTargetDps(targetId)
+    calculateAeStatus()
+
+    local data = _targetDamage[targetId]
+    if not data then
+        return {
+            totalDps = 0,
+            sourceCount = 0,
+            isMultiSource = false,
+            primarySourceDps = 0,
+            primarySourceName = nil,
+            isInAE = false,
+            aeTargetCount = 0,
+        }
+    end
+
+    local isInAE, aeMobId, aeTargetCount = M.isTargetInAE(targetId)
+    local primaryName = nil
+    if data.primarySourceId and data.sources[data.primarySourceId] then
+        primaryName = data.sources[data.primarySourceId].mobName
+    end
+
+    return {
+        totalDps = data.totalDps,
+        sourceCount = data.sourceCount,
+        isMultiSource = data.isMultiSource,
+        primarySourceDps = data.primarySourceDps,
+        primarySourceName = primaryName,
+        isInAE = isInAE,
+        aeTargetCount = aeTargetCount,
+    }
+end
+
+-- Tick function - call each frame
+function M.tick()
+    checkCombatTimeout()
+    refreshMobCache()
+end
+
 return M
