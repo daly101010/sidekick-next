@@ -127,6 +127,47 @@ end
 
 **Limitation:** Same-named mobs (e.g., "a goblin" x3) cannot be distinguished. Cache maps to whichever one XTarget saw last. Acceptable for per-fight healing prioritization.
 
+## Self Damage Handling ("You" vs "YOU")
+
+EQ logs use different patterns for self:
+- **Outgoing (ignore):** `You crush a mob for X points of damage.` - attacker is "You"
+- **Incoming to self:** `A mob hits YOU for X points of damage.` - target is "YOU"
+- **Group member:** `A mob hits Playername for X points of damage.` - target is name
+
+The `#1# hits #2#` pattern matches all variants. Handle in `recordDamage`:
+
+```lua
+function M.recordDamage(targetName, amount, attackerName, dmgType)
+    if amount <= 0 then return end
+
+    _lastDamageEvent = mq.gettime()  -- Reset combat timeout
+
+    -- Ignore outgoing damage (we're the attacker)
+    if attackerName == 'You' or attackerName == 'you' then
+        return
+    end
+
+    -- Handle "YOU" as self
+    local resolvedTarget = targetName
+    if targetName == 'YOU' or targetName == 'you' then
+        resolvedTarget = mq.TLO.Me.CleanName()
+    end
+
+    local targetId = M.findTargetIdByName(resolvedTarget)
+    if not targetId then return end  -- Not a group member we care about
+
+    local mobId = resolveMobId(attackerName)
+    local now = mq.gettime()
+
+    -- ... rest of attribution logic
+end
+```
+
+**Key points:**
+- Filter out outgoing damage early (attacker == "You")
+- Map "YOU" → self character name before ID lookup
+- Case-insensitive check handles both "You" and "YOU"
+
 ## DPS Calculation
 
 3-second rolling window for responsive DPS tracking:
