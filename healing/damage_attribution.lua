@@ -104,4 +104,16 @@ local function findTargetIdByName(name)
     return nil
 end
 
+-- Check if combat has timed out (no damage for N seconds)
+local function checkCombatTimeout()
+    local now = mq.gettime()
+    if _lastDamageEvent > 0 and (now - _lastDamageEvent) > COMBAT_TIMEOUT then
+        -- Clear all attribution data
+        _targetDamage = {}
+        _aeDamage = {}
+        _mobNameCache = {}
+        _lastDamageEvent = 0
+    end
+end
+
 return M
