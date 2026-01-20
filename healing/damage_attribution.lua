@@ -344,4 +344,68 @@ function M.tick()
     refreshMobCache()
 end
 
+local _eventsRegistered = false
+
+function M.registerEvents()
+    if _eventsRegistered then return end
+    _eventsRegistered = true
+
+    -- === HIGH FREQUENCY MELEE VERBS ===
+
+    -- punches (46,846)
+    mq.event('DmgAttrPunch', '#1# punches #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'punch')
+    end)
+
+    -- hits (42,663)
+    mq.event('DmgAttrHit', '#1# hits #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'hit')
+    end)
+
+    -- slashes (36,683)
+    mq.event('DmgAttrSlash', '#1# slashes #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'slash')
+    end)
+
+    -- bites (13,985)
+    mq.event('DmgAttrBite', '#1# bites #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'bite')
+    end)
+
+    -- pierces (9,973)
+    mq.event('DmgAttrPierce', '#1# pierces #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'pierce')
+    end)
+
+    -- kicks (9,887)
+    mq.event('DmgAttrKick', '#1# kicks #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'kick')
+    end)
+
+    -- strikes (7,632)
+    mq.event('DmgAttrStrike', '#1# strikes #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'strike')
+    end)
+
+    -- bashes (7,201)
+    mq.event('DmgAttrBash', '#1# bashes #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'bash')
+    end)
+
+    -- frenzies on (4,748)
+    mq.event('DmgAttrFrenzy', '#1# frenzies on #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'frenzy')
+    end)
+
+    -- claws (4,076)
+    mq.event('DmgAttrClaw', '#1# claws #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'claw')
+    end)
+
+    -- shoots (3,464)
+    mq.event('DmgAttrShoot', '#1# shoots #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'shoot')
+    end)
+end
+
 return M
