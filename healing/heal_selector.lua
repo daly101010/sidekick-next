@@ -1129,6 +1129,21 @@ function M.ShouldUseGroupHeal(targets)
         return false, nil
     end
 
+    -- Check for AE damage pattern
+    local aeDetected = false
+    for _, t in ipairs(hurtTargets) do
+        if t.isInAE then
+            aeDetected = true
+            break
+        end
+    end
+
+    -- Lower threshold if AE detected (damage pattern will continue)
+    local minCount = config.groupHealMinCount or 3
+    if aeDetected then
+        minCount = math.max(2, minCount - 1)
+    end
+
     local best = nil
     local bestScore = -math.huge
     local allScores = {}
@@ -1149,7 +1164,7 @@ function M.ShouldUseGroupHeal(targets)
                     end
                 end
 
-                if eligibleCount >= (config.groupHealMinCount or 3) then
+                if eligibleCount >= minCount then
                     local totalHealing = expected * eligibleCount
                     local thresholdDeficit = predictedTotal > 0 and predictedTotal or totalHealing
                     if totalHealing >= thresholdDeficit * 0.7 then
