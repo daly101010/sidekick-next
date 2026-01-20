@@ -5,6 +5,16 @@ local M = {}
 
 local Config = nil
 
+-- Lazy-load Logger
+local Logger = nil
+local function getLogger()
+    if Logger == nil then
+        local ok, l = pcall(require, 'healing.logger')
+        Logger = ok and l or false
+    end
+    return Logger or nil
+end
+
 -- Combat timeout tracking
 local _lastDamageEvent = 0
 local COMBAT_TIMEOUT = 5  -- seconds
@@ -135,6 +145,13 @@ function M.recordDamage(targetName, amount, attackerName, dmgType)
     -- Resolve mob
     local mobId = resolveMobId(attackerName)
     local sourceKey = mobId or ('unknown_' .. (attackerName or '?'))
+
+    -- Log damage event
+    local log = getLogger()
+    if log and log.debug then
+        log.debug('attribution', 'DAMAGE: %s hit %s(id=%s) for %d (%s) mobId=%s',
+            tostring(attackerName), tostring(targetName), tostring(targetId), amount, tostring(dmgType), tostring(mobId))
+    end
 
     -- Initialize target tracking
     if not _targetDamage[targetId] then
@@ -295,12 +312,21 @@ function M.validateDps(targetId, hpDeltaDps)
     local variance = math.abs(logDps - hpDeltaDps) / maxDps * 100
     local threshold = Config and Config.dpsVarianceThreshold or 25
 
-    return {
+    local result = {
         logDps = logDps,
         hpDeltaDps = hpDeltaDps,
         variance = variance,
         isReliable = variance <= threshold,
     }
+
+    -- Log validation result
+    local log = getLogger()
+    if log and log.debug then
+        log.debug('attribution', 'VALIDATE_DPS: target=%s logDps=%.1f hpDeltaDps=%.1f variance=%.1f%% reliable=%s',
+            tostring(targetId), logDps, hpDeltaDps, variance, tostring(result.isReliable))
+    end
+
+    return result
 end
 
 -- Get damage attribution summary for a target
