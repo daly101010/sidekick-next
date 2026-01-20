@@ -183,4 +183,53 @@ function M.recordDamage(targetName, amount, attackerName, dmgType)
     end
 end
 
+-- Calculate DPS for a specific target
+local function calculateTargetDps(targetId)
+    local targetData = _targetDamage[targetId]
+    if not targetData then return end
+
+    local now = mq.gettime()
+    local cutoff = now - WINDOW_DURATION
+
+    local activeSourceCount = 0
+    local totalDps = 0
+    local primaryId = nil
+    local primaryDps = 0
+
+    for sourceKey, sourceData in pairs(targetData.sources) do
+        -- Prune old entries, sum recent damage
+        local recentDamage = 0
+        local recentEntries = {}
+
+        for _, entry in ipairs(sourceData.entries) do
+            if entry.time >= cutoff then
+                table.insert(recentEntries, entry)
+                recentDamage = recentDamage + entry.amount
+            end
+        end
+        sourceData.entries = recentEntries
+
+        -- Calculate this source's DPS
+        local sourceDps = recentDamage / WINDOW_DURATION
+        sourceData.dps = sourceDps
+
+        if #recentEntries > 0 then
+            activeSourceCount = activeSourceCount + 1
+            totalDps = totalDps + sourceDps
+
+            if sourceDps > primaryDps then
+                primaryDps = sourceDps
+                primaryId = sourceKey
+            end
+        end
+    end
+
+    -- Update aggregate fields
+    targetData.sourceCount = activeSourceCount
+    targetData.totalDps = totalDps
+    targetData.primarySourceId = primaryId
+    targetData.primarySourceDps = primaryDps
+    targetData.isMultiSource = activeSourceCount >= 2
+end
+
 return M
