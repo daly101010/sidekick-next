@@ -450,6 +450,29 @@ function M.registerEvents()
     mq.event('DmgAttrMaul', '#1# mauls #2# for #3# points of damage.', function(_, attacker, target, amount)
         M.recordDamage(target, tonumber(amount) or 0, attacker, 'maul')
     end)
+
+    -- === SPELL/DOT DAMAGE ===
+
+    -- Spell damage
+    mq.event('DmgAttrSpell', '#1# hit #2# for #3# points of #4# damage by #5#.', function(_, caster, target, amount, dmgType, spell)
+        M.recordDamage(target, tonumber(amount) or 0, caster, 'spell')
+    end)
+
+    -- DoT damage
+    mq.event('DmgAttrDot', '#1# has taken #2# damage from #3# by #4#.', function(_, target, amount, spell, caster)
+        M.recordDamage(target, tonumber(amount) or 0, caster, 'dot')
+    end)
+
+    -- Non-melee to self (no attacker specified)
+    mq.event('DmgAttrNonMeleeSelf', 'You were hit by non-melee for #1# damage.', function(_, amount)
+        local myName = mq.TLO.Me.CleanName()
+        M.recordDamage(myName, tonumber(amount) or 0, 'unknown', 'nonmelee')
+    end)
+
+    -- Non-melee to others
+    mq.event('DmgAttrNonMeleeOther', '#1# was hit by non-melee for #2# points of damage.', function(_, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, 'unknown', 'nonmelee')
+    end)
 end
 
 return M
