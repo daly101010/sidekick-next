@@ -64,4 +64,44 @@ local function resolveMobId(attackerName)
     return nil
 end
 
+-- Find target ID by name (group members only)
+local function findTargetIdByName(name)
+    if not name or name == '' then return nil end
+
+    -- Handle "YOU" as self
+    if name == 'YOU' or name == 'you' then
+        local me = mq.TLO.Me
+        if me and me() and me.ID() then
+            return me.ID()
+        end
+        return nil
+    end
+
+    -- Check self
+    local me = mq.TLO.Me
+    if me and me() then
+        local myName = me.CleanName()
+        if myName and myName == name then
+            return me.ID()
+        end
+    end
+
+    -- Check group members
+    local groupCount = tonumber(mq.TLO.Group.Members()) or 0
+    for i = 1, groupCount do
+        local member = mq.TLO.Group.Member(i)
+        if member and member() then
+            local memberName = member.CleanName() or member.Name()
+            if memberName and memberName == name then
+                local spawn = member.Spawn and member.Spawn() or member
+                if spawn and spawn() and spawn.ID then
+                    return spawn.ID()
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
 return M
