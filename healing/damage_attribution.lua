@@ -232,4 +232,55 @@ local function calculateTargetDps(targetId)
     targetData.isMultiSource = activeSourceCount >= 2
 end
 
+-- Calculate AE status for all tracked mobs
+local function calculateAeStatus()
+    local now = mq.gettime()
+    local cutoff = now - WINDOW_DURATION
+
+    for mobId, aeData in pairs(_aeDamage) do
+        -- Count targets hit recently
+        local activeTargets = {}
+        for targetId, lastHit in pairs(aeData.targets) do
+            if lastHit >= cutoff then
+                table.insert(activeTargets, targetId)
+            else
+                aeData.targets[targetId] = nil  -- Prune stale
+            end
+        end
+
+        aeData.activeTargetCount = #activeTargets
+        aeData.isAE = #activeTargets >= 2
+
+        -- Sum DPS this mob is doing across all targets
+        local totalMobDps = 0
+        for _, targetId in ipairs(activeTargets) do
+            local targetData = _targetDamage[targetId]
+            if targetData and targetData.sources[mobId] then
+                totalMobDps = totalMobDps + (targetData.sources[mobId].dps or 0)
+            end
+        end
+        aeData.totalDps = totalMobDps
+    end
+end
+
+-- Query: Is this target taking AE damage?
+function M.isTargetInAE(targetId)
+    for mobId, aeData in pairs(_aeDamage) do
+        if aeData.isAE and aeData.targets[targetId] then
+            return true, mobId, aeData.activeTargetCount
+        end
+    end
+    return false, nil, 0
+end
+
+-- Query: Is there any active AE damage?
+function M.hasActiveAE()
+    for mobId, aeData in pairs(_aeDamage) do
+        if aeData.isAE and aeData.totalDps > 0 then
+            return true
+        end
+    end
+    return false
+end
+
 return M
