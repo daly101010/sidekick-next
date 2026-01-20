@@ -283,4 +283,24 @@ function M.hasActiveAE()
     return false
 end
 
+-- Validate log-based DPS against HP delta DPS
+function M.validateDps(targetId, hpDeltaDps)
+    calculateTargetDps(targetId)
+    local targetData = _targetDamage[targetId]
+
+    local logDps = targetData and targetData.totalDps or 0
+    hpDeltaDps = hpDeltaDps or 0
+
+    local maxDps = math.max(logDps, hpDeltaDps, 1)
+    local variance = math.abs(logDps - hpDeltaDps) / maxDps * 100
+    local threshold = Config and Config.dpsVarianceThreshold or 25
+
+    return {
+        logDps = logDps,
+        hpDeltaDps = hpDeltaDps,
+        variance = variance,
+        isReliable = variance <= threshold,
+    }
+end
+
 return M
