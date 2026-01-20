@@ -116,4 +116,71 @@ local function checkCombatTimeout()
     end
 end
 
+-- Record a damage event
+function M.recordDamage(targetName, amount, attackerName, dmgType)
+    if not amount or amount <= 0 then return end
+
+    local now = mq.gettime()
+    _lastDamageEvent = now
+
+    -- Ignore outgoing damage (we're the attacker)
+    if attackerName == 'You' or attackerName == 'you' then
+        return
+    end
+
+    -- Resolve target
+    local targetId = findTargetIdByName(targetName)
+    if not targetId then return end  -- Not a group member we track
+
+    -- Resolve mob
+    local mobId = resolveMobId(attackerName)
+    local sourceKey = mobId or ('unknown_' .. (attackerName or '?'))
+
+    -- Initialize target tracking
+    if not _targetDamage[targetId] then
+        _targetDamage[targetId] = {
+            sources = {},
+            sourceCount = 0,
+            totalDps = 0,
+            primarySourceId = nil,
+            primarySourceDps = 0,
+            isMultiSource = false,
+        }
+    end
+
+    local targetData = _targetDamage[targetId]
+
+    -- Initialize source tracking
+    if not targetData.sources[sourceKey] then
+        targetData.sources[sourceKey] = {
+            mobId = mobId,
+            mobName = attackerName,
+            lastHit = now,
+            dps = 0,
+            entries = {},
+        }
+    end
+
+    local sourceData = targetData.sources[sourceKey]
+    sourceData.lastHit = now
+    table.insert(sourceData.entries, {
+        time = now,
+        amount = amount,
+        dmgType = dmgType,
+    })
+
+    -- Track for AE detection (only if we have a mobId)
+    if mobId then
+        if not _aeDamage[mobId] then
+            _aeDamage[mobId] = {
+                targets = {},
+                activeTargetCount = 0,
+                isAE = false,
+                totalDps = 0,
+            }
+        end
+        _aeDamage[mobId].targets[targetId] = now
+    end
+end
+
 return M
