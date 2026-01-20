@@ -1,424 +1,670 @@
 -- healing/config.lua
--- Configuration module for Healing Intelligence subsystem
--- Provides defaults, load/save functionality for healing settings
-
 local mq = require('mq')
 
-local M = {}
+-- Lazy-load Logger to avoid circular requires
+local Logger = nil
+local function getLogger()
+    if Logger == nil then
+        local ok, l = pcall(require, 'healing.logger')
+        Logger = ok and l or false
+    end
+    return Logger or nil
+end
 
--------------------------------------------------------------------------------
--- Default Configuration
--------------------------------------------------------------------------------
+local M = {
+    _version = "1.0",
 
-M.defaults = {
-    -- Master enable toggle
+    -- Master enable toggle (single source of truth)
     enabled = true,
 
-    ---------------------------------------------------------------------------
-    -- Core Thresholds
-    ---------------------------------------------------------------------------
-    -- Emergency HP threshold - below this we use fastest available heal regardless of efficiency
+    -- Thresholds
     emergencyPct = 25,
-    -- Minimum heal percentage - don't heal if deficit is less than this % of max HP
     minHealPct = 10,
-    -- Group heal minimum count - number of injured members needed to consider group heal
     groupHealMinCount = 3,
-    -- Near-dead mob percentage - if mob HP below this, skip non-emergency heals (dying soon anyway)
-    nearDeadMobPct = 10,
+    nearDeadMobPct = 10,  -- Mobs below this HP% are excluded from fight phase avg
+    -- Character-specific minimum heal threshold:
+    -- Compares deficit% vs (minHeal% of maxHP) * threshold
+    -- E.g., if smallest heal is 10% of target's maxHP, need at least 7% deficit (at 70% threshold)
+    -- This prevents overhealing when all available heals are too big for small deficits
+    minHealThresholdPct = 70,
 
-    ---------------------------------------------------------------------------
-    -- Squishy Class Handling
-    ---------------------------------------------------------------------------
-    -- Classes considered "squishy" (lower HP pool, need faster response)
-    squishyClasses = { 'WIZ', 'ENC', 'NEC', 'MAG' },
-    -- Squishy coverage percentage - heal squishies when deficit exceeds this % of heal amount
+    -- Squishy handling
+    squishyClasses = { WIZ = true, ENC = true, NEC = true, MAG = true },
     squishyCoveragePct = 70,
+    nonSquishyMinHealPct = 15,
+    nonSquishyHotMinDeficitPct = 20,  -- Non-squishy HoT threshold matches base (20% deficit = 80% HP)
+    lowPressureMinDeficitPct = 20,    -- During low pressure, wait for 20% deficit before direct heals
+    lowPressureHotMinDeficitPct = 25, -- During low pressure, wait for 25% deficit before HoTs (more conservative)
+    lowPressureMobCount = 1,
 
-    ---------------------------------------------------------------------------
-    -- Scoring Presets
-    -- Weights for scoring formula: score = w_deficit * deficit_coverage + w_efficiency * mana_efficiency + w_time * time_factor
-    ---------------------------------------------------------------------------
+    -- Scoring weights
+    -- Overheal penalty increased to properly penalize heals that are too big for the deficit
+    -- ManaEff reduced in normal mode - right-sizing heals matters more than raw efficiency
     scoringPresets = {
-        -- Emergency: prioritize speed, ignore efficiency
-        emergency = {
-            deficitWeight = 1.0,
-            efficiencyWeight = 0.0,
-            timeWeight = 0.8,
-            overhealPenalty = 0.0,
-        },
-        -- Normal: balanced approach
-        normal = {
-            deficitWeight = 0.6,
-            efficiencyWeight = 0.3,
-            timeWeight = 0.4,
-            overhealPenalty = 0.3,
-        },
-        -- Low pressure: maximize efficiency when not urgent
-        lowPressure = {
-            deficitWeight = 0.3,
-            efficiencyWeight = 0.6,
-            timeWeight = 0.2,
-            overhealPenalty = 0.5,
-        },
+        emergency = { coverage = 4.0, manaEff = 0.1, overheal = -0.5 },  -- Save the target, efficiency doesn't matter
+        normal = { coverage = 2.0, manaEff = 0.5, overheal = -3.0 },     -- Balance coverage with minimal waste
+        lowPressure = { coverage = 1.0, manaEff = 1.5, overheal = -4.0 }, -- Maximize efficiency, heavily penalize overheal
     },
-    -- Active scoring preset (key into scoringPresets)
-    activeScoringPreset = 'normal',
+    maxOverhealRatio = 2.0,
+    overhealTolerancePct = 20,
+    preferUnderheal = true,
+    underhealMinCoveragePct = 80,
+    critOverhealThreshold = 0.15,
+    critOverhealPenalty = -2.0,
+    smallHealPenalty = -1.0,
 
-    ---------------------------------------------------------------------------
-    -- Spell Ducking (Cancel cast if target healed by someone else)
-    ---------------------------------------------------------------------------
-    -- Enable spell ducking
+    -- Ducking
     duckEnabled = true,
-    -- HP threshold above which we duck (target no longer needs heal)
     duckHpThreshold = 85,
-    -- Emergency threshold - never duck if target still below this HP
     duckEmergencyThreshold = 70,
-    -- Minimum cast time remaining (ms) to consider ducking
-    duckMinCastTimeRemaining = 500,
-    -- Duck window - only duck in first N% of cast time (avoid late ducks)
-    duckWindowPct = 60,
+    duckHotThreshold = 92,
+    duckBufferPct = 0.5,
+    considerIncomingHot = true,
+    hotIncomingCoveragePct = 100,
 
-    ---------------------------------------------------------------------------
-    -- HoT (Heal over Time) Behavior
-    ---------------------------------------------------------------------------
-    -- Enable HoT usage
+    -- HoT behavior
+    -- HoTs start around 80% HP when sustained damage is detected
     hotEnabled = true,
-    -- Minimum coverage ratio for HoTs - only use if HoT will cover at least this % of deficit
+    hotMinDps = 200,             -- Minimum DPS to target for HoT to be considered
+    hotSupplementMinDps = 200,   -- Minimum DPS for HoT supplementation
+    hotMinDeficitPct = 20,       -- Minimum deficit% for HoT (20% = 80% HP) - first response to sustained damage
+    hotMaxDeficitPct = 35,       -- Max deficit% for HoT eligibility (direct heals take over below 65% HP)
+    hotPreferUnderDps = 3000,
+    hotMinDpsForNonTank = 500,
+    hotOverrideDpsPct = 5,
+    hotTypicalDuration = 36,
+    hotLearnForce = false,
+    hotLearnMaxDeficitPct = 10,
+    hotLearnIntervalSec = 30,
+    quickHealMaxPct = 15,
+    quickHealsEmergencyOnly = true,
     hotMinCoverageRatio = 0.3,
-    -- Only apply HoTs to tanks
+    hotUselessRatio = 0.1,
+    hotRefreshWindowPct = 0,
     hotTankOnly = true,
-    -- HoT refresh window (seconds) - refresh HoT when this many seconds remain
-    hotRefreshWindow = 6,
-    -- Stack HoTs - allow multiple HoTs on same target
-    hotAllowStacking = false,
+    hotCoverageMultiplier = 1.2,  -- HoT HPS must exceed DPS * this multiplier to be sufficient
+    hotSafetyBufferSec = 8,       -- Seconds of buffer before danger threshold to allow HoT to work
+    hotSupplementMinGapPct = 5,   -- Minimum gap % of maxHP before supplementing a HoT
+    bigHotMinMobDps = 3000,
+    bigHotMinXTargetCount = 4,
+    bigHotXTargetRange = 100,
+    bigHotWithPromisedMinDps = 6000,
 
-    ---------------------------------------------------------------------------
-    -- Combat Assessment / DPS Tracking
-    ---------------------------------------------------------------------------
-    -- Time window for damage rate calculation (seconds)
-    damageWindowSec = 6,
-    -- Weight for HP-based DPS estimate (direct HP changes)
-    hpDpsWeight = 0.4,
-    -- Weight for combat log based DPS estimate
-    logDpsWeight = 0.6,
-    -- Burst detection - multiplier of stddev above mean to flag as burst damage
-    burstStddevMultiplier = 1.5,
-    -- Minimum samples needed for DPS calculation
-    dpsMinSamples = 3,
-    -- Decay factor for older samples (0-1, lower = faster decay)
-    dpsDecayFactor = 0.85,
+    -- Promised heal behavior
+    promisedEnabled = true,
+    promisedMinDps = 500,
+    promisedMinActiveMobs = 1,
+    promisedDelaySeconds = 18,
+    promisedSafetyFloorPct = 35,
+    promisedSurvivalSafetyFloorPct = 55,
+    promisedRolling = true,
+    promisedDurationBuffer = 5,
 
-    ---------------------------------------------------------------------------
-    -- Pet Healing
-    ---------------------------------------------------------------------------
-    -- Enable pet healing
-    healPetsEnabled = false,
-    -- Minimum HP % before healing pets
-    petHealMinPct = 40,
-    -- Pet priority relative to players (0.0 = never, 1.0 = equal priority)
-    petPriorityMultiplier = 0.5,
-    -- Only heal group member pets (not random pets)
-    petGroupOnly = true,
+    -- Combat assessment
+    survivalModeDpsPct = 5,
+    survivalModeTankFullPct = 90,
+    fightPhaseStartingPct = 70,
+    fightPhaseEndingPct = 25,
+    fightPhaseEndingTTK = 20,
+    hotMinFightDurationPct = 50,
+    survivalModeMaxHotDuration = 12,
+    -- High pressure detection
+    highPressureMinMobs = 3,         -- Min active mobs for high pressure
+    highPressureMinDps = 3000,       -- OR min total DPS for high pressure
+    -- TTK tracking
+    ttkWindowSec = 5,                -- Window for tracking mob HP decline
 
-    ---------------------------------------------------------------------------
-    -- Learning System
-    ---------------------------------------------------------------------------
-    -- Enable learning (track actual heal amounts)
-    learningEnabled = true,
-    -- Minimum casts before trusting learned values
-    learningMinCasts = 5,
-    -- Decay factor for older observations (exponential moving average)
-    learningDecayFactor = 0.1,
-    -- Maximum age (seconds) before discarding learned data on load
-    learningMaxAge = 604800, -- 7 days
+    -- DPS tracking (dual-source: HP delta + log parsing)
+    damageWindowSec = 6,         -- Window for averaging damage (matches design)
+    hpDpsWeight = 0.4,           -- Weight for HP delta DPS
+    logDpsWeight = 0.6,          -- Weight for log-parsed DPS
+    burstStddevMultiplier = 1.5, -- Burst = mean + (stddev * this) (matches design)
+    burstDpsScale = 1.5,
+    useLogDps = true,
+    dpsValidationLogMs = 5000,
 
-    ---------------------------------------------------------------------------
-    -- Multi-Healer Coordination
-    ---------------------------------------------------------------------------
-    -- Enable coordination via Actors
-    coordinationEnabled = true,
-    -- Claim timeout (seconds) - how long a heal claim is valid
-    claimTimeoutSec = 5.0,
-    -- Overlap window (seconds) - allow overlapping claims if cast times differ by more than this
-    claimOverlapWindow = 1.0,
-    -- Trust remote claims (defer to other healers' claims)
-    trustRemoteClaims = true,
-    -- Announce own casts for coordination
-    announceOwnCasts = true,
+    -- Damage Attribution settings
+    combatTimeoutSec = 5,        -- Clear attribution cache after N seconds of no damage
+    dpsWindowSec = 3,            -- Rolling window for DPS calculation
+    dpsVarianceThreshold = 25,   -- Max variance% between log DPS and HP delta DPS to be "reliable"
 
-    ---------------------------------------------------------------------------
-    -- Logging
-    ---------------------------------------------------------------------------
-    -- Enable file logging for healing decisions
-    fileLogging = true,
-    -- Log file path (relative to mq.configDir)
-    logFilePath = 'SideKick_Healing.log',
-    -- Log categories - enable/disable specific log types
-    logCategories = {
-        targetSelection = true,   -- Log target selection decisions
-        spellSelection = true,    -- Log spell selection decisions
-        ducking = true,           -- Log spell ducking events
-        coordination = true,      -- Log multi-healer coordination
-        learning = true,          -- Log learning updates
-        dps = false,              -- Log DPS calculations (verbose)
-        scoring = false,          -- Log scoring details (verbose)
-        hotTracking = true,       -- Log HoT application/tracking
-        emergency = true,         -- Log emergency heal decisions
+    -- Pet healing
+    healPetsEnabled = false,     -- Whether to include pets in healing targets
+    petHealMinPct = 40,          -- Minimum HP% to heal pets
+
+    -- Learning
+    learningWeight = 0.1,
+    minSamplesForReliable = 10,
+
+    -- Coordination
+    incomingHealTimeoutSec = 3,  -- Reduced from 10 - heals should land within cast time
+    broadcastEnabled = true,
+
+    -- Logging (file logging enabled by default for troubleshooting)
+    debugLogging = false,      -- Console debug output
+    fileLogging = true,        -- Write detailed logs to file for review
+    fileLogLevel = 'info',     -- 'debug', 'info', 'warn', 'error'
+    logCategories = {          -- Granular control over what gets logged
+        targetSelection = true,   -- Who needs healing and why
+        spellSelection = true,    -- What spell was chosen and scoring details
+        spellScoring = true,      -- Individual spell scores for comparison
+        ducking = true,           -- Spell ducking decisions
+        incomingHeals = true,     -- Incoming heal coordination
+        combatState = true,       -- Fight phase, survival mode, DPS tracking
+        hotDecisions = true,      -- Proactive HoT logic
+        supplement = true,        -- HoT supplement decisions (HoT vs DPS comparison)
+        events = true,            -- Heal events (landed, HoT ticks, learning data)
+        analytics = true,         -- Session statistics
+        attribution = false,      -- Damage attribution (verbose, disabled by default)
     },
-    -- Console log level (0=off, 1=errors, 2=warnings, 3=info, 4=debug)
-    consoleLogLevel = 2,
 
-    ---------------------------------------------------------------------------
-    -- Spell Assignments
-    -- Maps spell categories to spell names/lines
-    -- These are populated by class-specific configuration
-    ---------------------------------------------------------------------------
+    -- Spells (user assigns)
     spells = {
-        -- Fast heals (low cast time, moderate heal)
         fast = {},
-        -- Small heals (efficient, low mana cost)
         small = {},
-        -- Medium heals (balanced)
         medium = {},
-        -- Large heals (big heal, longer cast)
         large = {},
-        -- Group heals (AE heal)
         group = {},
-        -- Single target HoT
         hot = {},
-        -- Light HoT (shorter duration, faster cast)
         hotLight = {},
-        -- Group HoT
         groupHot = {},
+        promised = {},
     },
 }
 
--------------------------------------------------------------------------------
--- Runtime Configuration State
--------------------------------------------------------------------------------
-
--- Active configuration (merged defaults + saved settings)
-M.config = {}
-
--- Deep copy helper
-local function deepCopy(orig)
-    local copy
-    if type(orig) == 'table' then
-        copy = {}
-        for k, v in pairs(orig) do
-            copy[k] = deepCopy(v)
-        end
-    else
-        copy = orig
+-- Spell validation helpers
+local function getSpell(spellName)
+    local spell = mq.TLO.Spell(spellName)
+    if spell and spell() then
+        return spell
     end
-    return copy
+    return nil
 end
 
--- Merge tables (source overwrites dest)
-local function mergeTables(dest, source)
-    for k, v in pairs(source) do
-        if type(v) == 'table' and type(dest[k]) == 'table' then
-            mergeTables(dest[k], v)
-        else
-            dest[k] = deepCopy(v)
-        end
+local function normalizeText(value)
+    if not value then
+        return ''
     end
+    if type(value) ~= 'string' then
+        value = tostring(value)
+    end
+    return value:lower():gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
 end
 
--------------------------------------------------------------------------------
--- File Path Helpers
--------------------------------------------------------------------------------
-
-local function getConfigPath()
-    local server = 'Server'
-    local charName = 'Character'
-
-    if mq.TLO.EverQuest and mq.TLO.EverQuest.Server then
-        server = mq.TLO.EverQuest.Server() or 'Server'
-    end
-    if mq.TLO.Me and mq.TLO.Me.CleanName then
-        charName = mq.TLO.Me.CleanName() or 'Character'
-    end
-
-    return string.format('%s\\SideKick_Healing_%s_%s.lua', mq.configDir, server, charName)
+local function isSingleTarget(targetType)
+    local t = normalizeText(targetType)
+    return t == 'single' or t:match('^single') ~= nil
 end
 
--------------------------------------------------------------------------------
--- Serialization Helpers
--------------------------------------------------------------------------------
-
-local function serializeValue(value, indent)
-    indent = indent or ''
-    local t = type(value)
-
-    if t == 'nil' then
-        return 'nil'
-    elseif t == 'boolean' then
-        return value and 'true' or 'false'
-    elseif t == 'number' then
-        return tostring(value)
-    elseif t == 'string' then
-        return string.format('%q', value)
-    elseif t == 'table' then
-        local lines = {}
-        table.insert(lines, '{')
-        local nextIndent = indent .. '    '
-
-        -- Check if array-like
-        local isArray = true
-        local maxIndex = 0
-        for k, _ in pairs(value) do
-            if type(k) ~= 'number' or k < 1 or math.floor(k) ~= k then
-                isArray = false
-                break
-            end
-            if k > maxIndex then maxIndex = k end
-        end
-        if isArray and maxIndex > 0 then
-            for i = 1, maxIndex do
-                local v = value[i]
-                local comma = i < maxIndex and ',' or ''
-                table.insert(lines, nextIndent .. serializeValue(v, nextIndent) .. comma)
-            end
-        else
-            local keys = {}
-            for k in pairs(value) do
-                table.insert(keys, k)
-            end
-            table.sort(keys, function(a, b)
-                if type(a) == type(b) then
-                    return tostring(a) < tostring(b)
-                end
-                return type(a) < type(b)
-            end)
-            for i, k in ipairs(keys) do
-                local v = value[k]
-                local keyStr
-                if type(k) == 'string' and k:match('^[%a_][%w_]*$') then
-                    keyStr = k
-                else
-                    keyStr = '[' .. serializeValue(k, nextIndent) .. ']'
-                end
-                local comma = i < #keys and ',' or ''
-                table.insert(lines, nextIndent .. keyStr .. ' = ' .. serializeValue(v, nextIndent) .. comma)
-            end
-        end
-        table.insert(lines, indent .. '}')
-        return table.concat(lines, '\n')
-    else
-        return 'nil -- unsupported type: ' .. t
-    end
+local function isGroupV1(targetType)
+    local t = normalizeText(targetType)
+    return t:match('^group v1') ~= nil
 end
 
--------------------------------------------------------------------------------
--- Public API
--------------------------------------------------------------------------------
-
---- Load configuration from file, merging with defaults
--- @return table The loaded configuration
-function M.load()
-    -- Start with defaults
-    M.config = deepCopy(M.defaults)
-
-    local path = getConfigPath()
-    local file = io.open(path, 'r')
-    if file then
-        local content = file:read('*all')
-        file:close()
-
-        if content and content ~= '' then
-            local fn, err = load('return ' .. content, 'config', 't', {})
-            if fn then
-                local ok, saved = pcall(fn)
-                if ok and type(saved) == 'table' then
-                    mergeTables(M.config, saved)
-                    print(string.format('[Healing] Config loaded from %s', path))
-                else
-                    print(string.format('[Healing] Config parse error: %s', tostring(saved)))
-                end
-            else
-                print(string.format('[Healing] Config load error: %s', tostring(err)))
-            end
+local function getCastTimeMs(spell)
+    ---@diagnostic disable-next-line: undefined-field
+    local mySpell = mq.TLO.Me.Spell(spell.Name())
+    if mySpell and mySpell() then
+        local myCastTime = tonumber(mySpell.MyCastTime())
+        if myCastTime then
+            return myCastTime
         end
-    else
-        print(string.format('[Healing] No config found, using defaults'))
     end
-
-    return M.config
+    local castTime = tonumber(spell.CastTime())
+    if castTime then
+        return castTime
+    end
+    return nil
 end
 
---- Save current configuration to file
--- @return boolean True if save succeeded
-function M.save()
-    local path = getConfigPath()
-    local content = serializeValue(M.config)
-
-    local file, err = io.open(path, 'w')
-    if not file then
-        print(string.format('[Healing] Config save error: %s', tostring(err)))
+function M.IsValidSpellForCategory(category, spellName)
+    local spell = getSpell(spellName)
+    if not spell then
         return false
     end
 
-    file:write(content)
-    file:close()
-    print(string.format('[Healing] Config saved to %s', path))
+    local subcategory = normalizeText(spell.Subcategory())
+    local targetType = normalizeText(spell.TargetType())
+
+    if category == 'hot' or category == 'hotLight' then
+        return subcategory == 'duration heals' and isSingleTarget(targetType)
+    elseif category == 'groupHot' then
+        return subcategory == 'duration heals' and isGroupV1(targetType)
+    elseif category == 'group' then
+        return subcategory == 'heals' and isGroupV1(targetType)
+    elseif category == 'promised' then
+        return subcategory == 'delayed' and isSingleTarget(targetType)
+    elseif category == 'fast' or category == 'small' or category == 'medium' or category == 'large' then
+        if category == 'fast' then
+            return subcategory == 'quick heal' and isSingleTarget(targetType)
+        end
+        if not isSingleTarget(targetType) then
+            return false
+        end
+        if category == 'small' or category == 'medium' then
+            return subcategory == 'heals' or subcategory == 'quick heal'
+        end
+        if subcategory ~= 'heals' then
+            return false
+        end
+        local castTimeMs = getCastTimeMs(spell)
+        if not castTimeMs then
+            return false
+        end
+        return castTimeMs > 2000
+    end
+
     return true
 end
 
---- Get a configuration value
--- @param key string The configuration key (supports dot notation for nested keys)
--- @return any The configuration value
-function M.get(key)
-    if not key then return nil end
-
-    local value = M.config
-    for part in key:gmatch('[^.]+') do
-        if type(value) ~= 'table' then return nil end
-        value = value[part]
+function M.FilterSpells()
+    if not M.spells then
+        return
     end
-    return value
-end
-
---- Set a configuration value
--- @param key string The configuration key (supports dot notation for nested keys)
--- @param value any The value to set
-function M.set(key, value)
-    if not key then return end
-
-    local parts = {}
-    for part in key:gmatch('[^.]+') do
-        table.insert(parts, part)
-    end
-
-    local target = M.config
-    for i = 1, #parts - 1 do
-        local part = parts[i]
-        if type(target[part]) ~= 'table' then
-            target[part] = {}
+    for category, spells in pairs(M.spells) do
+        for i = #spells, 1, -1 do
+            if not M.IsValidSpellForCategory(category, spells[i]) then
+                table.remove(spells, i)
+            end
         end
-        target = target[part]
     end
-
-    target[parts[#parts]] = value
 end
 
---- Reset configuration to defaults
-function M.reset()
-    M.config = deepCopy(M.defaults)
+function M.IsConfiguredSpell(spellName)
+    if not M.spells or not spellName then
+        return false
+    end
+    for _, spells in pairs(M.spells) do
+        for _, name in ipairs(spells) do
+            if name == spellName then
+                return true
+            end
+        end
+    end
+    return false
 end
 
---- Get scoring weights for current combat pressure
--- @param isEmergency boolean True if in emergency healing mode
--- @param pressure number Combat pressure level (0.0 to 1.0)
--- @return table Scoring weights
-function M.getScoringWeights(isEmergency, pressure)
-    if isEmergency then
-        return deepCopy(M.config.scoringPresets.emergency)
-    elseif pressure and pressure < 0.3 then
-        return deepCopy(M.config.scoringPresets.lowPressure)
-    else
-        return deepCopy(M.config.scoringPresets.normal)
+-- Auto-assignment tracking
+M.lastSpellBarScan = 0
+M.spellBarScanInterval = 2.0  -- Rescan every 2 seconds
+
+-- Get spell level for sorting
+local function getSpellLevel(spell)
+    if not spell then return 0 end
+    local level = spell.Level and spell.Level()
+    return tonumber(level) or 0
+end
+
+-- Categorize a healing spell (returns category or nil, plus level for sorting)
+local function categorizeHealSpell(spellName)
+    local spell = getSpell(spellName)
+    if not spell then return nil end
+
+    local subcategory = normalizeText(spell.Subcategory())
+    local targetType = normalizeText(spell.TargetType())
+
+    -- Check if it's a heal-related spell
+    local isHealSpell = subcategory == 'heals' or subcategory == 'quick heal' or
+                        subcategory == 'duration heals' or subcategory == 'delayed'
+    if not isHealSpell then return nil end
+
+    local singleTarget = isSingleTarget(targetType)
+    local groupTarget = isGroupV1(targetType)
+
+    -- Promised (delayed heals)
+    if subcategory == 'delayed' and singleTarget then
+        return 'promised'
     end
+
+    -- Group HoT
+    if subcategory == 'duration heals' and groupTarget then
+        return 'groupHot'
+    end
+
+    -- Single target HoT - return marker for dynamic assignment
+    if subcategory == 'duration heals' and singleTarget then
+        -- Return marker with mana cost for sorting
+        local manaCost = tonumber(spell.Mana()) or 0
+        return 'hot_single', manaCost
+    end
+
+    -- Group direct heal
+    if subcategory == 'heals' and groupTarget then
+        return 'group'
+    end
+
+    -- Quick heal (fast/emergency)
+    if subcategory == 'quick heal' and singleTarget then
+        return 'fast'
+    end
+
+    -- Single target direct heals - return special marker for dynamic sizing by level
+    if subcategory == 'heals' and singleTarget then
+        return 'direct_single', getSpellLevel(spell)
+    end
+
+    return nil
+end
+
+-- Scan spell bar and auto-assign healing spells to categories
+function M.autoAssignFromSpellBar()
+    local now = os.clock()
+    if (now - M.lastSpellBarScan) < M.spellBarScanInterval then
+        return false  -- Not time to scan yet
+    end
+    M.lastSpellBarScan = now
+
+    local me = mq.TLO.Me
+    if not me or not me() then return false end
+
+    -- Clear existing assignments
+    M.spells = {
+        fast = {},
+        small = {},
+        medium = {},
+        large = {},
+        group = {},
+        hot = {},
+        hotLight = {},
+        groupHot = {},
+        promised = {},
+    }
+
+    -- Track which spells we've assigned to avoid duplicates
+    local assigned = {}
+
+    -- Collect direct single-target heals for dynamic sizing by level
+    local directHeals = {}  -- { spellName, level }
+    -- Collect single-target HoTs for dynamic assignment by mana cost
+    local hotHeals = {}  -- { spellName, manaCost }
+
+    -- Scan all gem slots
+    local numGems = tonumber(me.NumGems()) or 13
+    local scanLog = getLogger()
+    if scanLog then scanLog.debug('autoAssign', 'Scanning %d gem slots...', numGems) end
+
+    for gem = 1, numGems do
+        local gemSpell = me.Gem(gem)
+        if gemSpell and gemSpell() then
+            local spellName = gemSpell.Name()
+            if spellName and spellName ~= '' and not assigned[spellName] then
+                local category, value = categorizeHealSpell(spellName)
+                if scanLog then
+                    scanLog.debug('autoAssign', 'Gem %d: %s -> category=%s value=%s',
+                        gem, spellName, tostring(category), tostring(value))
+                end
+                if category == 'direct_single' then
+                    -- Collect for dynamic sizing
+                    table.insert(directHeals, { name = spellName, level = value or 0 })
+                    assigned[spellName] = true  -- Mark as processed
+                elseif category == 'hot_single' then
+                    -- Collect HoTs for dynamic assignment
+                    table.insert(hotHeals, { name = spellName, manaCost = value or 0 })
+                    assigned[spellName] = true  -- Mark as processed
+                elseif category and M.spells[category] then
+                    table.insert(M.spells[category], spellName)
+                    assigned[spellName] = category
+                end
+            end
+        end
+    end
+
+    -- Dynamic sizing for direct single-target heals
+    local log = getLogger()
+    if log then
+        log.debug('autoAssign', 'Direct Heal AutoAssign: Found %d direct heals', #directHeals)
+        for i, h in ipairs(directHeals) do
+            log.debug('autoAssign', 'Direct Heal AutoAssign:   %d. %s (level: %d)', i, h.name, h.level)
+        end
+    end
+
+    if #directHeals > 0 then
+        -- Sort by spell level (ascending: lowest level = smallest heal)
+        table.sort(directHeals, function(a, b) return a.level < b.level end)
+
+        if log then
+            log.debug('autoAssign', 'Direct Heal AutoAssign: After sort:')
+            for i, h in ipairs(directHeals) do
+                log.debug('autoAssign', 'Direct Heal AutoAssign:   %d. %s (level: %d)', i, h.name, h.level)
+            end
+        end
+
+        if #directHeals == 1 then
+            -- One heal: assign to medium (versatile workhorse)
+            table.insert(M.spells.medium, directHeals[1].name)
+            if log then log.debug('autoAssign', 'Direct Heal AutoAssign: Single heal -> medium: %s', directHeals[1].name) end
+        elseif #directHeals == 2 then
+            -- Two heals: smallest → small, largest → large
+            table.insert(M.spells.small, directHeals[1].name)
+            table.insert(M.spells.large, directHeals[2].name)
+            if log then
+                log.debug('autoAssign', 'Direct Heal AutoAssign: Smallest -> small: %s', directHeals[1].name)
+                log.debug('autoAssign', 'Direct Heal AutoAssign: Largest -> large: %s', directHeals[2].name)
+            end
+        else
+            -- Three+ heals: smallest → small, largest → large, middle → medium
+            table.insert(M.spells.small, directHeals[1].name)
+            table.insert(M.spells.large, directHeals[#directHeals].name)
+            if log then
+                log.debug('autoAssign', 'Direct Heal AutoAssign: Smallest -> small: %s', directHeals[1].name)
+                log.debug('autoAssign', 'Direct Heal AutoAssign: Largest -> large: %s', directHeals[#directHeals].name)
+            end
+            -- All middle heals go to medium
+            for i = 2, #directHeals - 1 do
+                table.insert(M.spells.medium, directHeals[i].name)
+                if log then log.debug('autoAssign', 'Direct Heal AutoAssign: Middle -> medium: %s', directHeals[i].name) end
+            end
+        end
+    end
+
+    -- Dynamic assignment for single-target HoTs
+    -- Lower mana cost = hotLight (efficient, for low DPS)
+    -- Higher mana cost = hot (stronger, for high DPS)
+    if #hotHeals > 0 then
+        -- Debug: Show detected HoTs before sorting
+        local log = getLogger()
+        if log then
+            for i, h in ipairs(hotHeals) do
+                log.debug('autoAssign', 'HoT AutoAssign: Detected: %s (mana: %d)', h.name, h.manaCost)
+            end
+        end
+
+        -- Sort by mana cost (ascending: lowest mana = light HoT)
+        table.sort(hotHeals, function(a, b) return a.manaCost < b.manaCost end)
+
+        -- Debug: Show after sorting
+        if log then
+            log.debug('autoAssign', 'HoT AutoAssign: After sort: %d HoTs found', #hotHeals)
+            for i, h in ipairs(hotHeals) do
+                log.debug('autoAssign', 'HoT AutoAssign:   %d. %s (mana: %d)', i, h.name, h.manaCost)
+            end
+        end
+
+        if #hotHeals == 1 then
+            -- Only one HoT: put in hot category (can be used for both situations)
+            table.insert(M.spells.hot, hotHeals[1].name)
+            if log then
+                log.debug('autoAssign', 'HoT AutoAssign: Single HoT -> hot: %s', hotHeals[1].name)
+            end
+        else
+            -- Multiple HoTs: cheapest -> hotLight, most expensive -> hot
+            table.insert(M.spells.hotLight, hotHeals[1].name)
+            table.insert(M.spells.hot, hotHeals[#hotHeals].name)
+            if log then
+                log.debug('autoAssign', 'HoT AutoAssign: Cheapest -> hotLight: %s', hotHeals[1].name)
+                log.debug('autoAssign', 'HoT AutoAssign: Most expensive -> hot: %s', hotHeals[#hotHeals].name)
+            end
+            -- Any middle HoTs also go to hot (higher tier)
+            for i = 2, #hotHeals - 1 do
+                table.insert(M.spells.hot, hotHeals[i].name)
+                if log then
+                    log.debug('autoAssign', 'HoT AutoAssign: Middle -> hot: %s', hotHeals[i].name)
+                end
+            end
+        end
+    end
+
+    return true  -- Scan completed
+end
+
+-- Get a summary of auto-assigned spells (for UI display)
+function M.getAssignmentSummary()
+    local summary = {}
+    local categoryLabels = {
+        fast = 'Quick (Emergency)',
+        small = 'Small',
+        medium = 'Medium',
+        large = 'Big',
+        group = 'Group Heal',
+        hot = 'HoT (High DPS)',
+        hotLight = 'HoT (Low DPS)',
+        groupHot = 'Group HoT',
+        promised = 'Promised',
+    }
+    local categoryOrder = { 'fast', 'small', 'medium', 'large', 'group', 'hot', 'hotLight', 'groupHot', 'promised' }
+
+    for _, category in ipairs(categoryOrder) do
+        local spells = M.spells[category]
+        if spells and #spells > 0 then
+            table.insert(summary, {
+                category = category,
+                label = categoryLabels[category] or category,
+                spells = spells,
+            })
+        end
+    end
+
+    return summary
+end
+
+local _charName = nil
+local _serverName = nil
+
+local function getCharInfo()
+    if not _charName then
+        _charName = mq.TLO.Me.CleanName() or 'Unknown'
+    end
+    if not _serverName then
+        local server = mq.TLO.EverQuest.Server() or 'Unknown'
+        _serverName = server:gsub(" ", "_")
+    end
+    return _charName, _serverName
+end
+
+local function getConfigPath()
+    local char, server = getCharInfo()
+    return string.format('%s/SideKick_Healing_%s_%s.lua', mq.configDir, server, char)
+end
+
+local function serializeValue(v, indent)
+    indent = indent or ''
+    local t = type(v)
+    if t == 'string' then
+        return string.format('%q', v)
+    elseif t == 'number' or t == 'boolean' then
+        return tostring(v)
+    elseif t == 'table' then
+        local parts = {}
+        for k, val in pairs(v) do
+            local key
+            if type(k) == 'string' then
+                if k:match('^[%a_][%w_]*$') then
+                    key = k
+                else
+                    key = string.format('[%q]', k)
+                end
+            else
+                key = string.format('[%s]', tostring(k))
+            end
+            table.insert(parts, string.format('%s    %s = %s,', indent, key, serializeValue(val, indent .. '    ')))
+        end
+        if #parts == 0 then
+            return '{}'
+        end
+        return '{\n' .. table.concat(parts, '\n') .. '\n' .. indent .. '}'
+    end
+    return 'nil'
+end
+
+function M.save()
+    local log = getLogger()
+    local path = getConfigPath()
+    local file = io.open(path, 'w')
+    if not file then
+        if log then log.error('config', 'Failed to open config file for writing: %s', path) end
+        return false
+    end
+    local snapshot = {}
+    for k, v in pairs(M) do
+        if type(v) ~= 'function' then
+            snapshot[k] = v
+        end
+    end
+    file:write('return ')
+    file:write(serializeValue(snapshot))
+    file:write('\n')
+    file:close()
+    if log then log.info('config', 'Config saved to %s', path) end
+    return true
+end
+
+function M.load()
+    local log = getLogger()
+    local path = getConfigPath()
+    local file = io.open(path, 'r')
+    if not file then
+        if log then log.info('config', 'No config file found, using defaults') end
+        return
+    end
+    local content = file:read('*a')
+    file:close()
+    local fn, err = load(content, path, 't', {})
+    if not fn then
+        if log then log.error('config', 'Config load error: %s', err) end
+        return
+    end
+    local ok, data = pcall(fn)
+    if not ok or type(data) ~= 'table' then
+        if log then log.error('config', 'Config parse error') end
+        return
+    end
+    -- Merge loaded data into M (preserving structure)
+    for k, v in pairs(data) do
+        if k ~= '_version' and M[k] ~= nil then
+            M[k] = v
+        end
+    end
+
+    -- Migration: Force new scoring weights if using old defaults
+    -- Old defaults had manaEff=1.0, overheal=-1.5 which favored overhealing
+    local needsMigration = false
+    if M.scoringPresets and M.scoringPresets.normal then
+        local normal = M.scoringPresets.normal
+        -- Detect old weights: manaEff >= 1.0 and overheal > -2.0
+        if (normal.manaEff or 0) >= 1.0 and (normal.overheal or 0) > -2.0 then
+            needsMigration = true
+        end
+    end
+
+    if needsMigration then
+        if log then log.warn('config', 'Migrating scoring weights to prefer underhealing over overhealing') end
+        M.scoringPresets = {
+            emergency = { coverage = 4.0, manaEff = 0.1, overheal = -0.5 },
+            normal = { coverage = 2.0, manaEff = 0.5, overheal = -3.0 },
+            lowPressure = { coverage = 1.0, manaEff = 1.5, overheal = -4.0 },
+        }
+        -- Also update HoT thresholds if they're old values
+        if M.hotMinDeficitPct and M.hotMinDeficitPct < 15 then
+            M.hotMinDeficitPct = 20
+        end
+        if M.hotMaxDeficitPct and M.hotMaxDeficitPct < 30 then
+            M.hotMaxDeficitPct = 35
+        end
+        -- Save migrated config
+        M.save()
+    end
+
+    if log then log.info('config', 'Config loaded from %s', path) end
 end
 
 return M
