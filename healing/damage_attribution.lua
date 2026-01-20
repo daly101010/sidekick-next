@@ -406,6 +406,50 @@ function M.registerEvents()
     mq.event('DmgAttrShoot', '#1# shoots #2# for #3# points of damage.', function(_, attacker, target, amount)
         M.recordDamage(target, tonumber(amount) or 0, attacker, 'shoot')
     end)
+
+    -- === MEDIUM FREQUENCY MELEE VERBS ===
+
+    -- backstabs (2,685)
+    mq.event('DmgAttrBackstab', '#1# backstabs #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'backstab')
+    end)
+
+    -- crushes (2,556)
+    mq.event('DmgAttrCrush', '#1# crushes #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'crush')
+    end)
+
+    -- smashes (828)
+    mq.event('DmgAttrSmash', '#1# smashes #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'smash')
+    end)
+
+    -- === LOW FREQUENCY MELEE VERBS ===
+
+    -- stings (377)
+    mq.event('DmgAttrSting', '#1# stings #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'sting')
+    end)
+
+    -- slices (146)
+    mq.event('DmgAttrSlice', '#1# slices #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'slice')
+    end)
+
+    -- gores (78)
+    mq.event('DmgAttrGore', '#1# gores #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'gore')
+    end)
+
+    -- rends (21)
+    mq.event('DmgAttrRend', '#1# rends #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'rend')
+    end)
+
+    -- mauls (1)
+    mq.event('DmgAttrMaul', '#1# mauls #2# for #3# points of damage.', function(_, attacker, target, amount)
+        M.recordDamage(target, tonumber(amount) or 0, attacker, 'maul')
+    end)
 end
 
 return M
