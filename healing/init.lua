@@ -40,6 +40,16 @@ local function getProactive()
     return Proactive or nil
 end
 
+-- Lazy-load HotAnalyzer (HoT trust calculations)
+local HotAnalyzer = nil
+local function getHotAnalyzer()
+    if HotAnalyzer == nil then
+        local ok, ha = pcall(require, 'healing.hot_analyzer')
+        HotAnalyzer = ok and ha or false
+    end
+    return HotAnalyzer or nil
+end
+
 local M = {}
 
 local _initialized = false
@@ -176,7 +186,7 @@ local function executeHeal(spellName, targetId, tier, isHoT)
         isHoT = isHoT,
         manaCost = manaCost,
         startTime = startTime,  -- Use mq.gettime() for wall-clock accuracy
-        expectedEnd = startTime + (castTimeMs / 1000) + 1.0,
+        expectedEnd = startTime + castTimeMs + 1000,
     })
 
     -- Use SpellEngine if available
@@ -212,7 +222,7 @@ local function executeHeal(spellName, targetId, tier, isHoT)
         end
 
         IncomingHeals.registerMyCast(targetId, spellName, expected, castSec, isHoT, hotTickAmount, hotDuration)
-        M.broadcastIncoming(targetId, spellName, expected, mq.gettime() + castSec, isHoT)
+        M.broadcastIncoming(targetId, spellName, expected, mq.gettime() + castTimeMs, isHoT)
 
         -- Track HoT presence for proactive logic + peers
         if isHoT then
@@ -224,7 +234,7 @@ local function executeHeal(spellName, targetId, tier, isHoT)
                 SpellEvents.registerHotCast(targetName, spellName, hotTickAmount, hotDuration, mq.gettime())
             end
             if ActorsCoordinator and ActorsCoordinator.broadcast and Config and Config.broadcastEnabled then
-                local exp = mq.gettime() + castSec + (hotDuration or 18)
+                local exp = mq.gettime() + castTimeMs + ((hotDuration or 18) * 1000)
                 ActorsCoordinator.broadcast('heal:hots', {
                     targetId = targetId,
                     spellName = spellName,
@@ -332,6 +342,12 @@ function M.init()
         local proactive = getProactive()
         if proactive and proactive.init then
             proactive.init(Config, HealTracker, TargetMonitor, CombatAssessor)
+        end
+
+        -- Initialize HotAnalyzer
+        local ha = getHotAnalyzer()
+        if ha and ha.init then
+            ha.init(Config, HealTracker, CombatAssessor, proactive)
         end
 
         -- Initialize DamageParser early (registers damage events)
