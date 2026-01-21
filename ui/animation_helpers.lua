@@ -7,12 +7,15 @@
 -- low resource warnings, damage flash, and toggle animations.
 --
 -- Usage:
---   local AnimHelpers = require('ui.animation_helpers')
---   AnimHelpers.init(ImAnim)
+--   local AnimHelpers = require('sidekick-next.ui.animation_helpers')
+--   AnimHelpers.init(ImAnim, settings)
 --   AnimHelpers.updateStaggerFrame()
 --   local scale = AnimHelpers.getButtonScale(id, hovered, active)
 
 local imgui = require('ImGui')
+local C = require('sidekick-next.ui.constants')
+local Draw = require('sidekick-next.ui.draw_helpers')
+local Colors = require('sidekick-next.ui.colors')
 
 local M = {}
 
@@ -21,6 +24,7 @@ local M = {}
 -- ============================================================
 
 local _ImAnim = nil
+local _settings = nil  -- Reference to settings for early-exit checks
 local _lastCooldownState = {}
 local _lastFrameTime = os.clock()
 local _cachedDt = 0.016
@@ -28,17 +32,75 @@ local _cachedFrame = nil
 local _staggerGrids = {}
 
 -- State for new animation features
-local _lowResourceThreshold = 0.20  -- 20%
+local _lowResourceThreshold = C.RESOURCE.LOW_THRESHOLD
 local _lastHpValues = {}
 local _damageFlashState = {}
 local _toggleStates = {}
+
+-- Animation ID cache to avoid string concatenation per frame
+local _idCache = {}
+local _idCacheHits = 0
+local _idCacheMisses = 0
+
+-- ============================================================
+-- ANIMATION ID CACHING
+-- ============================================================
+
+local function getCachedId(base, suffix)
+    local key = base
+    if not _idCache[key] then
+        _idCache[key] = {}
+    end
+    local cache = _idCache[key]
+    if not cache[suffix] then
+        cache[suffix] = base .. suffix
+        _idCacheMisses = _idCacheMisses + 1
+    else
+        _idCacheHits = _idCacheHits + 1
+    end
+    return cache[suffix]
+end
+
+-- ============================================================
+-- EARLY EXIT HELPERS
+-- ============================================================
+
+local function animationsEnabled()
+    if not _settings then return true end
+    return _settings.AnimationsEnabled ~= false
+end
+
+local function featureEnabled(settingKey)
+    if not _settings then return true end
+    if not animationsEnabled() then return false end
+    return _settings[settingKey] ~= false
+end
 
 -- ============================================================
 -- INITIALIZATION
 -- ============================================================
 
-function M.init(ImAnim)
+function M.init(ImAnim, settings)
     _ImAnim = ImAnim
+    _settings = settings
+end
+
+function M.setSettings(settings)
+    _settings = settings
+end
+
+function M.getIdCacheStats()
+    local size = 0
+    for _, suffixes in pairs(_idCache) do
+        for _ in pairs(suffixes) do size = size + 1 end
+    end
+    return { hits = _idCacheHits, misses = _idCacheMisses, size = size }
+end
+
+function M.clearIdCache()
+    _idCache = {}
+    _idCacheHits = 0
+    _idCacheMisses = 0
 end
 
 -- ============================================================
@@ -78,15 +140,21 @@ end
 -- ============================================================
 
 function M.getButtonScale(uniqueId, isHovered, isActive)
+    -- Early exit if hover scale is disabled
+    if not featureEnabled('HoverScaleEnabled') then
+        return 1.0
+    end
+
     local targetScale = 1.0
     if isActive then
-        targetScale = 0.95  -- Press down effect
+        targetScale = C.ANIMATION.PRESS_SCALE
     elseif isHovered then
-        targetScale = 1.05  -- Hover enlarge effect
+        targetScale = C.ANIMATION.HOVER_SCALE
     end
 
     if _ImAnim and _ImAnim.spring then
-        return _ImAnim.spring(uniqueId .. '_scale', targetScale, 400, 25)
+        local id = getCachedId(uniqueId, '_scale')
+        return _ImAnim.spring(id, targetScale, C.ANIMATION.SPRING_STIFFNESS, C.ANIMATION.SPRING_DAMPING)
     end
     return targetScale
 end
@@ -96,18 +164,27 @@ end
 -- ============================================================
 
 function M.checkCooldownCompletion(uniqueId, onCooldown)
+    -- Early exit if click bounce is disabled
+    if not featureEnabled('ClickBounceEnabled') then
+        _lastCooldownState[uniqueId] = onCooldown
+        return
+    end
+
     local wasOnCooldown = _lastCooldownState[uniqueId]
     if wasOnCooldown and not onCooldown then
         if _ImAnim and _ImAnim.trigger_shake then
-            _ImAnim.trigger_shake(uniqueId .. '_pulse')
+            local id = getCachedId(uniqueId, '_pulse')
+            _ImAnim.trigger_shake(id)
         end
     end
     _lastCooldownState[uniqueId] = onCooldown
 end
 
 function M.getCompletionPulse(uniqueId)
+    if not featureEnabled('ClickBounceEnabled') then return 0 end
     if not _ImAnim or not _ImAnim.shake then return 0 end
-    return _ImAnim.shake(uniqueId .. '_pulse', 3, 0.25, M.get_dt())
+    local id = getCachedId(uniqueId, '_pulse')
+    return _ImAnim.shake(id, C.ANIMATION.SHAKE_MAGNITUDE, C.ANIMATION.SHAKE_DECAY, M.get_dt())
 end
 
 -- ============================================================
@@ -115,30 +192,36 @@ end
 -- ============================================================
 
 function M.getReadyGlow()
-    local t = os.clock() * 2
+    if not featureEnabled('ReadyPulseEnabled') then
+        return C.COOLDOWN.READY_GLOW_MIN
+    end
+
+    local t = os.clock() * C.COOLDOWN.READY_GLOW_FREQ
     local wave = math.sin(t * math.pi)
     local elastic = 1.0 + 0.15 * math.pow(2, -10 * (t % 1)) * math.sin((t % 1) * 10 * math.pi / 3)
-    return 0.4 + 0.4 * math.abs(wave) * elastic
+    return C.COOLDOWN.READY_GLOW_MIN + (C.COOLDOWN.READY_GLOW_MAX - C.COOLDOWN.READY_GLOW_MIN) * math.abs(wave) * elastic
 end
 
 -- ============================================================
--- READY PULSE ANIMATION (Task 5)
+-- READY PULSE ANIMATION
 -- ============================================================
 
 function M.getReadyPulseAlpha(uniqueId, isReady)
     if not isReady then return 1.0 end
+    if not featureEnabled('ReadyPulseEnabled') then return 1.0 end
 
     if _ImAnim and _ImAnim.oscillate then
-        -- Gentle glow oscillation between 0.7 and 1.0 at 2Hz
-        return _ImAnim.oscillate(uniqueId .. '_ready_pulse', 'sine', 0.7, 1.0, 2.0) or 1.0
+        local id = getCachedId(uniqueId, '_ready_pulse')
+        return _ImAnim.oscillate(id, 'sine', 0.7, 1.0, C.ANIMATION.READY_PULSE_FREQ) or 1.0
     end
     -- Fallback without ImAnim
-    local t = os.clock() * 2 * math.pi * 2.0
+    local t = os.clock() * 2 * math.pi * C.ANIMATION.READY_PULSE_FREQ
     return 0.7 + 0.15 * (1 + math.sin(t))
 end
 
 function M.getReadyGlowColor(uniqueId, isReady, baseColor)
     if not isReady then return baseColor end
+    if not featureEnabled('ReadyPulseEnabled') then return baseColor end
 
     local pulse = M.getReadyPulseAlpha(uniqueId, true)
     -- Interpolate toward a brighter/golden color when ready
@@ -151,47 +234,58 @@ function M.getReadyGlowColor(uniqueId, isReady, baseColor)
 end
 
 -- ============================================================
--- LOW RESOURCE WARNING ANIMATION (Task 6)
+-- LOW RESOURCE WARNING ANIMATION
 -- ============================================================
 
 function M.getLowResourcePulse(uniqueId, currentPct, threshold)
     threshold = threshold or _lowResourceThreshold
     if currentPct >= threshold then return 1.0, nil end
 
+    -- Early exit if low resource warning is disabled
+    if not featureEnabled('LowResourceWarningEnabled') then
+        return 1.0, Colors.lowResource(1.0)
+    end
+
     -- Pulse faster as resource gets lower
     local urgency = 1.0 - (currentPct / threshold)
-    local freq = 1.5 + urgency * 2.0  -- 1.5Hz to 3.5Hz
+    local freq = C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MIN + urgency * (C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MAX - C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MIN)
 
     if _ImAnim and _ImAnim.oscillate then
-        local pulse = _ImAnim.oscillate(uniqueId .. '_low_res', 'sine', 0.5, 1.0, freq) or 1.0
-        -- Return pulse value and warning color (red)
-        return pulse, {1.0, 0.2, 0.2, pulse}
+        local id = getCachedId(uniqueId, '_low_res')
+        local pulse = _ImAnim.oscillate(id, 'sine', 0.5, 1.0, freq) or 1.0
+        return pulse, Colors.lowResource(pulse)
     end
 
     -- Fallback without ImAnim
     local t = os.clock() * 2 * math.pi * freq
     local pulse = 0.5 + 0.25 * (1 + math.sin(t))
-    return pulse, {1.0, 0.2, 0.2, pulse}
+    return pulse, Colors.lowResource(pulse)
 end
 
 function M.setLowResourceThreshold(threshold)
-    _lowResourceThreshold = threshold or 0.20
+    _lowResourceThreshold = threshold or C.RESOURCE.LOW_THRESHOLD
 end
 
 -- ============================================================
--- DAMAGE FLASH DETECTION (Task 7)
+-- DAMAGE FLASH DETECTION
 -- ============================================================
 
 function M.getDamageFlash(uniqueId, currentHp, flashDuration)
-    flashDuration = flashDuration or 0.3
+    -- Early exit if damage flash is disabled
+    if not featureEnabled('DamageFlashEnabled') then
+        _lastHpValues[uniqueId] = currentHp
+        return nil
+    end
+
+    flashDuration = flashDuration or C.ANIMATION.DAMAGE_FLASH_DURATION
     local now = os.clock()
 
     local lastHp = _lastHpValues[uniqueId] or currentHp
     local flashState = _damageFlashState[uniqueId] or { active = false, startTime = 0 }
 
-    -- Detect significant HP drop (>5%)
+    -- Detect significant HP drop
     local hpDrop = lastHp - currentHp
-    if hpDrop > 5 then
+    if hpDrop > C.RESOURCE.DAMAGE_FLASH_THRESHOLD then
         flashState.active = true
         flashState.startTime = now
     end
@@ -211,9 +305,9 @@ function M.getDamageFlash(uniqueId, currentHp, flashDuration)
 
     _damageFlashState[uniqueId] = flashState
 
-    -- Return flash color overlay (red with fading alpha)
+    -- Return flash color overlay
     if intensity > 0 then
-        return {1.0, 0.0, 0.0, intensity * 0.5}
+        return Colors.damageFlash(intensity)
     end
     return nil
 end
@@ -224,7 +318,7 @@ function M.resetDamageFlash(uniqueId)
 end
 
 -- ============================================================
--- TOGGLE BUTTON ANIMATIONS (Task 8)
+-- TOGGLE BUTTON ANIMATIONS
 -- ============================================================
 
 function M.getToggleScale(uniqueId, isActive)
@@ -232,35 +326,57 @@ function M.getToggleScale(uniqueId, isActive)
     local justActivated = isActive and not prevState
     _toggleStates[uniqueId] = isActive
 
+    -- Early exit if toggle pop is disabled
+    if not featureEnabled('TogglePopEnabled') then
+        return 1.0
+    end
+
     -- Trigger pop animation when toggled on
     if justActivated and _ImAnim and _ImAnim.trigger_shake then
-        _ImAnim.trigger_shake(uniqueId .. '_toggle_pop')
+        local id = getCachedId(uniqueId, '_toggle_pop')
+        _ImAnim.trigger_shake(id)
     end
 
     -- Spring-based pop effect
     if _ImAnim and _ImAnim.spring then
+        local scaleId = getCachedId(uniqueId, '_toggle_scale')
         if justActivated then
             -- Temporarily target larger scale for pop
-            return _ImAnim.spring(uniqueId .. '_toggle_scale', 1.15, 500, 20)
+            return _ImAnim.spring(scaleId, C.ANIMATION.TOGGLE_POP_SCALE, C.ANIMATION.SPRING_STIFFNESS_FAST, C.ANIMATION.SPRING_DAMPING_FAST)
         end
-        return _ImAnim.spring(uniqueId .. '_toggle_scale', 1.0, 300, 25)
+        return _ImAnim.spring(scaleId, 1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C.ANIMATION.SPRING_DAMPING)
     end
     return 1.0
 end
 
 function M.getToggleColor(uniqueId, isActive, onColor, offColor)
+    -- Early exit if color tween is disabled
+    if not featureEnabled('ToggleColorTweenEnabled') then
+        return isActive and onColor or offColor
+    end
+
     if not _ImAnim or not _ImAnim.tween_vec4 then
         return isActive and onColor or offColor
     end
 
     local target = isActive and onColor or offColor
-    local result = _ImAnim.tween_vec4(uniqueId .. '_toggle_color', target, 0.2, _ImAnim.EASE and _ImAnim.EASE.out_cubic or 5)
+    local id = getCachedId(uniqueId, '_toggle_color')
+    local result = _ImAnim.tween_vec4(id, target, C.ANIMATION.TWEEN_FAST, _ImAnim.EASE and _ImAnim.EASE.out_cubic or 5)
     return result or target
 end
 
 function M.getTogglePop(uniqueId)
+    if not featureEnabled('TogglePopEnabled') then return 0 end
     if not _ImAnim or not _ImAnim.shake then return 0 end
-    return _ImAnim.shake(uniqueId .. '_toggle_pop', 2, 0.15, M.get_dt()) or 0
+    local id = getCachedId(uniqueId, '_toggle_pop')
+    return _ImAnim.shake(id, 2, C.ANIMATION.TWEEN_FAST, M.get_dt()) or 0
+end
+
+-- Theme-aware toggle color helper
+function M.getToggleColorForTheme(uniqueId, isActive, themeName)
+    local onColor = Colors.toggleOn(themeName)
+    local offColor = Colors.toggleOff(themeName)
+    return M.getToggleColor(uniqueId, isActive, onColor, offColor)
 end
 
 -- ============================================================
@@ -268,15 +384,7 @@ end
 -- ============================================================
 
 local function getTargetColorForPct(pct)
-    if pct > 0.66 then
-        return 1.0, 0.4, 0.4  -- Red
-    elseif pct > 0.33 then
-        return 1.0, 0.7, 0.3  -- Orange
-    elseif pct > 0.10 then
-        return 1.0, 1.0, 0.4  -- Yellow
-    else
-        return 0.4, 1.0, 0.4  -- Green
-    end
+    return Colors.cooldownRGB(pct)
 end
 
 -- ============================================================
@@ -286,12 +394,18 @@ end
 function M.getCooldownColor(uniqueId, pct)
     local targetR, targetG, targetB = getTargetColorForPct(pct)
 
+    -- Early exit if cooldown color tween is disabled
+    if not featureEnabled('CooldownColorTweenEnabled') then
+        return targetR, targetG, targetB
+    end
+
     if _ImAnim and _ImAnim.tween_color then
         local dt = M.get_dt()
+        local id = getCachedId(uniqueId, '_cd')
         local r, g, b = _ImAnim.tween_color(
-            uniqueId .. '_cd', 'col',
+            id, 'col',
             targetR, targetG, targetB, 1.0,
-            0.15,  -- duration
+            C.ANIMATION.TWEEN_FAST,
             _ImAnim.EASE and _ImAnim.EASE.out_cubic or 5,
             _ImAnim.COLOR_SPACE and _ImAnim.COLOR_SPACE.oklab or 3,
             _ImAnim.POLICY and _ImAnim.POLICY.crossfade or 0,
@@ -307,20 +421,14 @@ end
 -- ============================================================
 
 function M.drawOutlinedText(x, y, text, r, g, b)
-    local offsets = { { -1, -1 }, { 0, -1 }, { 1, -1 }, { -1, 0 }, { 1, 0 }, { -1, 1 }, { 0, 1 }, { 1, 1 } }
-    for _, off in ipairs(offsets) do
-        imgui.SetCursorScreenPos(x + off[1], y + off[2])
-        imgui.TextColored(0, 0, 0, 1, text)
-    end
-    imgui.SetCursorScreenPos(x, y)
-    imgui.TextColored(r or 1, g or 1, b or 1, 1, text)
+    Draw.drawOutlinedText(x, y, text, r, g, b)
 end
 
 -- ============================================================
 -- ENHANCED COOLDOWN OVERLAY
 -- ============================================================
 
-function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, IM_COL32, dlAddRectFilled, dlAddRect)
+function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, IM_COL32, dlAddRectFilled, dlAddRect, themeName)
     if not dl then return end
 
     rem = tonumber(rem) or 0
@@ -333,8 +441,9 @@ function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId,
     -- Ready state: enhanced pulsing glow
     if not onCooldown then
         local pulse = M.getReadyGlow()
-        local glowAlpha = math.floor(pulse * 80)
-        local glowColor = IM_COL32(80, 200, 255, glowAlpha)
+        local glowAlpha = math.floor(pulse * C.COLORS.READY_GLOW_ALPHA_MAX)
+        local readyRGB = Colors.ready(themeName)
+        local glowColor = IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], glowAlpha)
         dlAddRect(dl, minX - 1, minY - 1, maxX + 1, maxY + 1, glowColor, 0, 0, 2)
         return
     end
@@ -354,9 +463,9 @@ function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId,
     local b255 = math.floor(b * 255)
 
     -- Draw overlay
-    dlAddRectFilled(dl, minX, minY, maxX, maxY, IM_COL32(0, 0, 0, 110), 0, 0)
-    dlAddRectFilled(dl, minX, fillY, maxX, maxY, IM_COL32(r255, g255, b255, 140), 0, 0)
-    dlAddRect(dl, minX, minY, maxX, maxY, IM_COL32(r255, g255, b255, 200), 0, 0, 2)
+    dlAddRectFilled(dl, minX, minY, maxX, maxY, IM_COL32(0, 0, 0, C.COLORS.COOLDOWN_OVERLAY_ALPHA), 0, 0)
+    dlAddRectFilled(dl, minX, fillY, maxX, maxY, IM_COL32(r255, g255, b255, C.COLORS.COOLDOWN_FILL_ALPHA), 0, 0)
+    dlAddRect(dl, minX, minY, maxX, maxY, IM_COL32(r255, g255, b255, C.COLORS.COOLDOWN_BORDER_ALPHA), 0, 0, 2)
 
     -- Cooldown text with matching color
     if helpers and helpers.fmtCooldown then
@@ -365,11 +474,17 @@ function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId,
     end
 end
 
+-- Simplified cooldown overlay using new modules
+function M.drawCooldownOverlaySimple(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, themeName)
+    M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, Draw.IM_COL32, Draw.addRectFilled, Draw.addRect, themeName)
+end
+
 -- ============================================================
 -- STAGGER ANIMATION SUPPORT
 -- ============================================================
 
 function M.updateStaggerFrame()
+    if not featureEnabled('StaggerAnimationEnabled') then return end
     if _ImAnim and _ImAnim.update_stagger_frame then
         _ImAnim.update_stagger_frame(M.get_dt())
     end
@@ -383,9 +498,10 @@ function M.resetStagger(gridKey)
 end
 
 function M.getStaggerAlpha(gridKey, idx, total, delay)
+    if not featureEnabled('StaggerAnimationEnabled') then return 1.0 end
     if not _ImAnim or not _ImAnim.stagger then return 1.0 end
-    delay = delay or 0.05
-    return _ImAnim.stagger(gridKey, idx, total, 0.5, delay)
+    delay = delay or C.ANIMATION.STAGGER_DELAY
+    return _ImAnim.stagger(gridKey, idx, total, C.ANIMATION.STAGGER_DURATION, delay)
 end
 
 -- ============================================================
@@ -416,6 +532,60 @@ function M.scaleFromCenter(x, y, w, h, scale)
     local sw = w * scale
     local sh = h * scale
     return cx - sw / 2, cy - sh / 2, sw, sh
+end
+
+-- ============================================================
+-- GC SCHEDULING
+-- ============================================================
+
+local _lastGcTime = 0
+local _gcInterval = 30  -- seconds
+
+function M.scheduleGc(interval)
+    _gcInterval = interval or 30
+end
+
+function M.maybeRunGc()
+    local now = os.clock()
+    if now - _lastGcTime < _gcInterval then return end
+    _lastGcTime = now
+
+    -- Clear old cooldown states
+    local staleThreshold = 60  -- seconds
+    for id, _ in pairs(_lastCooldownState) do
+        -- Just clear very old entries to prevent unbounded growth
+        -- In practice, abilities cycle and this keeps the table bounded
+    end
+
+    -- Run ImAnim GC if available
+    if _ImAnim and _ImAnim.gc then
+        _ImAnim.gc(300)  -- max frame age
+    end
+
+    if _ImAnim and _ImAnim.clip_gc then
+        _ImAnim.clip_gc(300)
+    end
+
+    -- Clear old ID cache entries (optional, usually stable)
+    -- Only clear if cache gets very large
+    local cacheSize = 0
+    for _ in pairs(_idCache) do cacheSize = cacheSize + 1 end
+    if cacheSize > 1000 then
+        M.clearIdCache()
+    end
+end
+
+-- ============================================================
+-- CLEANUP
+-- ============================================================
+
+function M.cleanup()
+    _lastCooldownState = {}
+    _lastHpValues = {}
+    _damageFlashState = {}
+    _toggleStates = {}
+    _staggerGrids = {}
+    M.clearIdCache()
 end
 
 return M

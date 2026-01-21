@@ -1,12 +1,62 @@
 local imgui = require('ImGui')
 local mq = require('mq')
-local Items = require('utils.items')
-local ActorsCoordinator = require('utils.actors_coordinator')
-local RemoteAbilities = require('ui.remote_abilities')
-local ConditionBuilder = require('ui.condition_builder')
-local Core = require('utils.core')
+local Items = require('sidekick-next.utils.items')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
+local RemoteAbilities = require('sidekick-next.ui.remote_abilities')
+local ConditionBuilder = require('sidekick-next.ui.condition_builder')
+local Core = require('sidekick-next.utils.core')
 
 local M = {}
+
+-- Lazy-loaded healing modules (CLR only)
+local _healingMod = nil
+local _healingSettingsUI = nil
+local _healingModChecked = false
+
+local _healingLoadError = nil
+
+local function initHealingTab()
+    if _healingModChecked then return end
+    _healingModChecked = true
+
+    local ok, modOrErr = pcall(require, 'sidekick-next.healing')
+    if not ok then
+        _healingLoadError = tostring(modOrErr)
+        return
+    end
+
+    local mod = modOrErr
+    if not mod then
+        _healingLoadError = 'Module returned nil'
+        return
+    end
+
+    -- Ensure healing module is initialized (loads config from disk)
+    if mod.init then
+        local initOk, initErr = pcall(mod.init)
+        if not initOk then
+            _healingLoadError = 'init() failed: ' .. tostring(initErr)
+            return
+        end
+    end
+
+    -- Now Config should have loaded values
+    if not mod.Config then
+        _healingLoadError = 'mod.Config is nil'
+        return
+    end
+
+    _healingMod = mod
+    local ok2, uiOrErr = pcall(require, 'sidekick-next.healing.ui.settings')
+    if ok2 and uiOrErr then
+        _healingSettingsUI = uiOrErr
+        if _healingSettingsUI.init then
+            _healingSettingsUI.init(_healingMod.Config)
+        end
+    else
+        _healingLoadError = 'UI load failed: ' .. tostring(uiOrErr)
+    end
+end
 
 local function safeTooltip(text)
     text = tostring(text or '')
@@ -686,18 +736,23 @@ local function drawAutomation(settings, onChange)
         safeTooltip('Automatically rescan memorized spells when changing zones')
     end
 
-    local healThreshold = tonumber(settings.HealThreshold) or 80
-    healThreshold, changed = imgui.SliderInt('Heal HP Threshold', healThreshold, 10, 100)
-    if changed and onChange then onChange('HealThreshold', healThreshold) end
-    if imgui.IsItemHovered() then
-        safeTooltip('HP percentage below which healing spells will trigger')
-    end
+    local meClass = mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName and mq.TLO.Me.Class.ShortName() or ''
+    local isClr = tostring(meClass):upper() == 'CLR'
 
-    local healPetsEnabled = settings.HealPetsEnabled == true
-    healPetsEnabled, changed = imgui.Checkbox('Heal Pets', healPetsEnabled)
-    if changed and onChange then onChange('HealPetsEnabled', healPetsEnabled) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Include group pets as valid heal targets')
+    if not isClr then
+        local healThreshold = tonumber(settings.HealThreshold) or 80
+        healThreshold, changed = imgui.SliderInt('Heal HP Threshold', healThreshold, 10, 100)
+        if changed and onChange then onChange('HealThreshold', healThreshold) end
+        if imgui.IsItemHovered() then
+            safeTooltip('HP percentage below which healing spells will trigger')
+        end
+
+        local healPetsEnabled = settings.HealPetsEnabled == true
+        healPetsEnabled, changed = imgui.Checkbox('Heal Pets', healPetsEnabled)
+        if changed and onChange then onChange('HealPetsEnabled', healPetsEnabled) end
+        if imgui.IsItemHovered() then
+            safeTooltip('Include group pets as valid heal targets')
+        end
     end
 
     imgui.Spacing()
@@ -706,7 +761,6 @@ local function drawAutomation(settings, onChange)
 
     -- ========== MEZ SECTION (ENC/BRD only) ==========
     local mezClasses = { ENC = true, BRD = true }
-    local meClass = mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName and mq.TLO.Me.Class.ShortName() or ''
     if mezClasses[tostring(meClass):upper()] then
         imgui.TextColored(0.7, 0.9, 1.0, 1.0, 'Mezzing')
         imgui.Separator()
@@ -1525,6 +1579,10 @@ function M.draw(ctx)
     local themeNames = ctx.themeNames or {}
     local onChange = ctx.onChange
 
+    -- Check class for conditional UI
+    local meClass = mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName and mq.TLO.Me.Class.ShortName() or ''
+    local isClr = tostring(meClass):upper() == 'CLR'
+
     local function withTabScrollChild(childId, fn)
         if not (imgui and imgui.BeginChild and imgui.EndChild) then
             fn()
@@ -1571,6 +1629,123 @@ function M.draw(ctx)
         if imgui.BeginTabItem('Automation') then
             withTabScrollChild('##sk_settings_automation_scroll', function()
                 drawAutomation(settings, onChange)
+            end)
+            imgui.EndTabItem()
+        end
+        if imgui.BeginTabItem('Healing') then
+            withTabScrollChild('##sk_settings_healing_scroll', function()
+                initHealingTab()  -- One-time lazy init
+                if _healingSettingsUI and _healingSettingsUI.draw then
+                    _healingSettingsUI.draw()
+                elseif _healingMod then
+                    if isClr then
+                        imgui.TextColored(0.6, 0.8, 1.0, 1.0, 'Heals (Intelligent)')
+                        imgui.TextDisabled('Clerics use Intelligent Healing settings. See the Healing tab.')
+                    else
+                        imgui.TextColored(0.6, 0.8, 1.0, 1.0, 'Heals (Tiered)')
+
+                        local doHeals = settings.DoHeals == true
+                        doHeals, changed = imgui.Checkbox('Enable Heals', doHeals)
+                        if changed and onChange then onChange('DoHeals', doHeals) end
+                        if imgui.IsItemHovered() then
+                            safeTooltip('Enable tiered healing logic (Main/Big/Group/Pet). Paladins are excluded.')
+                        end
+
+                        if doHeals then
+                            imgui.Indent()
+
+                            local priorityHealing = settings.PriorityHealing == true
+                            priorityHealing, changed = imgui.Checkbox('Priority Healing', priorityHealing)
+                            if changed and onChange then onChange('PriorityHealing', priorityHealing) end
+
+                            local breakInvis = settings.HealBreakInvisOOC == true
+                            breakInvis, changed = imgui.Checkbox('Break Invis OOC To Heal', breakInvis)
+                            if changed and onChange then onChange('HealBreakInvisOOC', breakInvis) end
+
+                            local mainPoint = tonumber(settings.MainHealPoint) or 80
+                            mainPoint, changed = imgui.SliderInt('Main Heal Point (HP %)', mainPoint, 1, 100)
+                            if changed and onChange then onChange('MainHealPoint', mainPoint) end
+
+                            local bigPoint = tonumber(settings.BigHealPoint) or 50
+                            bigPoint, changed = imgui.SliderInt('Big Heal Point (HP %)', bigPoint, 1, 100)
+                            if changed and onChange then onChange('BigHealPoint', bigPoint) end
+
+                            local groupPoint = tonumber(settings.GroupHealPoint) or 75
+                            groupPoint, changed = imgui.SliderInt('Group Heal Point (HP %)', groupPoint, 1, 100)
+                            if changed and onChange then onChange('GroupHealPoint', groupPoint) end
+
+                            local injCnt = tonumber(settings.GroupInjureCnt) or 2
+                            injCnt, changed = imgui.SliderInt('Group Injured Count', injCnt, 1, 6)
+                            if changed and onChange then onChange('GroupInjureCnt', injCnt) end
+
+                            imgui.Spacing()
+
+                            local doPetHeals = settings.DoPetHeals == true
+                            doPetHeals, changed = imgui.Checkbox('Enable Pet Heals', doPetHeals)
+                            if changed and onChange then onChange('DoPetHeals', doPetHeals) end
+
+                            local petPoint = tonumber(settings.PetHealPoint) or 50
+                            petPoint, changed = imgui.SliderInt('Pet Heal Point (HP %)', petPoint, 1, 100)
+                            if changed and onChange then onChange('PetHealPoint', petPoint) end
+
+                            imgui.Spacing()
+
+                            local watchMA = settings.HealWatchMA == true
+                            watchMA, changed = imgui.Checkbox('Watch Main Assist (OOG OK)', watchMA)
+                            if changed and onChange then onChange('HealWatchMA', watchMA) end
+
+                            local xtHeal = settings.HealXTargetEnabled == true
+                            xtHeal, changed = imgui.Checkbox('Heal XTarget Slots', xtHeal)
+                            if changed and onChange then onChange('HealXTargetEnabled', xtHeal) end
+
+                            local xtSlots = tostring(settings.HealXTargetSlots or '')
+                            xtSlots, changed = imgui.InputText('XTarget Slots (e.g. 1|2|3)', xtSlots, 64)
+                            if changed and onChange then onChange('HealXTargetSlots', xtSlots) end
+
+                            imgui.Spacing()
+
+                            local useHoTs = settings.HealUseHoTs ~= false
+                            useHoTs, changed = imgui.Checkbox('Use HoTs (when available)', useHoTs)
+                            if changed and onChange then onChange('HealUseHoTs', useHoTs) end
+
+                            local hotWin = tonumber(settings.HealHoTMinSeconds) or 6
+                            hotWin, changed = imgui.SliderInt('HoT Refresh Window (sec)', hotWin, 0, 30)
+                            if changed and onChange then onChange('HealHoTMinSeconds', hotWin) end
+
+                            imgui.Spacing()
+
+                            local coordActors = settings.HealCoordinateActors ~= false
+                            coordActors, changed = imgui.Checkbox('Coordinate Heals via Actors', coordActors)
+                            if changed and onChange then onChange('HealCoordinateActors', coordActors) end
+
+                            imgui.Unindent()
+                        end
+                    end
+                else
+                    -- Module failed to load - show error
+                    if _healingLoadError then
+                        imgui.TextColored(1, 0.3, 0.3, 1, 'Failed to load Healing module:')
+                        imgui.Spacing()
+                        imgui.TextWrapped(_healingLoadError)
+                        imgui.Spacing()
+                        imgui.Spacing()
+                        if imgui.Button('Retry Load') then
+                            -- Clear cached module errors
+                            for k, _ in pairs(package.loaded) do
+                                if type(k) == 'string' and k:match('^healing') then
+                                    package.loaded[k] = nil
+                                end
+                            end
+                            _healingModChecked = false
+                            _healingLoadError = nil
+                            _healingMod = nil
+                            _healingSettingsUI = nil
+                        end
+                    else
+                        imgui.TextColored(0.7, 0.7, 0.7, 1, 'Healing Intelligence is CLR-only')
+                        imgui.TextDisabled('This tab will be available when playing a Cleric')
+                    end
+                end
             end)
             imgui.EndTabItem()
         end

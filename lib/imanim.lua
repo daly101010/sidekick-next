@@ -12,7 +12,7 @@
 --   - Stagger: cascading element animations
 --
 -- Usage:
---   local ImAnim = require('lib.imanim')
+--   local ImAnim = require('sidekick-next.lib.imanim')
 --   
 --   -- Tween
 --   local scale = ImAnim.tween_float('btn', 'scale', 1.1, 0.2, ImAnim.EASE.out_cubic)

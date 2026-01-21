@@ -1,69 +1,18 @@
 local imgui = require('ImGui')
-local ImAnim = require('lib.imanim')
-local AnimHelpers = require('ui.animation_helpers')
-local Themes = require('themes')
-local Anchor = require('ui.anchor')
+local ImAnim = require('sidekick-next.lib.imanim')
+local AnimHelpers = require('sidekick-next.ui.animation_helpers')
+local Themes = require('sidekick-next.themes')
+local Anchor = require('sidekick-next.ui.anchor')
+local Draw = require('sidekick-next.ui.draw_helpers')
 
-local Special = require('utils.special_abilities')
+local Special = require('sidekick-next.utils.special_abilities')
 
 local M = {}
 
-local function IM_COL32(r, g, b, a)
-    local shift = bit32 and bit32.lshift
-    r = math.max(0, math.min(255, math.floor(tonumber(r) or 0)))
-    g = math.max(0, math.min(255, math.floor(tonumber(g) or 0)))
-    b = math.max(0, math.min(255, math.floor(tonumber(b) or 0)))
-    a = math.max(0, math.min(255, math.floor(tonumber(a) or 255)))
-    if shift then
-        return shift(a, 24) + shift(b, 16) + shift(g, 8) + r
-    end
-    return (((a * 256) + b) * 256 + g) * 256 + r
-end
-
-local function dlAddRectFilled(dl, x1, y1, x2, y2, col, rounding, flags)
-    if not dl then return false end
-    rounding = tonumber(rounding) or 0
-    flags = tonumber(flags) or 0
-    local ImVec2 = _G.ImVec2 or imgui.ImVec2
-    local tries = {
-        function() dl:AddRectFilled(x1, y1, x2, y2, col, rounding, flags) end,
-        function() dl:AddRectFilled(x1, y1, x2, y2, col, rounding) end,
-        function() dl:AddRectFilled(x1, y1, x2, y2, col) end,
-    }
-    if ImVec2 then
-        table.insert(tries, function() dl:AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), col, rounding, flags) end)
-        table.insert(tries, function() dl:AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), col, rounding) end)
-        table.insert(tries, function() dl:AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2), col) end)
-    end
-    for _, fn in ipairs(tries) do
-        if pcall(fn) then return true end
-    end
-    return false
-end
-
-local function dlAddRect(dl, x1, y1, x2, y2, col, rounding, flags, thickness)
-    if not dl then return false end
-    rounding = tonumber(rounding) or 0
-    flags = tonumber(flags) or 0
-    thickness = tonumber(thickness) or 1
-    local ImVec2 = _G.ImVec2 or imgui.ImVec2
-    local tries = {
-        function() dl:AddRect(x1, y1, x2, y2, col, rounding, flags, thickness) end,
-        function() dl:AddRect(x1, y1, x2, y2, col, rounding, flags) end,
-        function() dl:AddRect(x1, y1, x2, y2, col, rounding) end,
-        function() dl:AddRect(x1, y1, x2, y2, col) end,
-    }
-    if ImVec2 then
-        table.insert(tries, function() dl:AddRect(ImVec2(x1, y1), ImVec2(x2, y2), col, rounding, flags, thickness) end)
-        table.insert(tries, function() dl:AddRect(ImVec2(x1, y1), ImVec2(x2, y2), col, rounding, flags) end)
-        table.insert(tries, function() dl:AddRect(ImVec2(x1, y1), ImVec2(x2, y2), col, rounding) end)
-        table.insert(tries, function() dl:AddRect(ImVec2(x1, y1), ImVec2(x2, y2), col) end)
-    end
-    for _, fn in ipairs(tries) do
-        if pcall(fn) then return true end
-    end
-    return false
-end
+-- Use centralized draw helpers
+local IM_COL32 = Draw.IM_COL32
+local dlAddRectFilled = Draw.addRectFilled
+local dlAddRect = Draw.addRect
 
 local function getGroupTargetBounds()
     if Anchor and Anchor.getTargetBounds then

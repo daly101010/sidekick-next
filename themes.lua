@@ -16,16 +16,6 @@ local function normalizeThemeKey(name)
     return name
 end
 
--- Helper for colors
-local function IM_COL32(r, g, b, a)
-    local shift = bit32.lshift
-    r = math.max(0, math.min(255, math.floor(tonumber(r) or 0)))
-    g = math.max(0, math.min(255, math.floor(tonumber(g) or 0)))
-    b = math.max(0, math.min(255, math.floor(tonumber(b) or 0)))
-    a = math.max(0, math.min(255, math.floor(tonumber(a) or 255)))
-    return shift(a, 24) + shift(b, 16) + shift(g, 8) + r
-end
-
 -- Theme presets (matching GroupTarget themes for visual consistency)
 M.presets = {
     Default = {

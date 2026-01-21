@@ -1,7 +1,7 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local ImAnim = require('lib.imanim')
-local Core = require('utils.core')
+local ImAnim = require('sidekick-next.lib.imanim')
+local Core = require('sidekick-next.utils.core')
 
 local M = {}
 
@@ -80,21 +80,14 @@ local function shouldShowWarning()
 
     if aggroHolderId and aggroHolderId == myId then return true end
 
-    -- Also check XTarget
-    if me.XTarget then
-        for i = 1, 13 do
-            local xt = me.XTarget(i)
-            if xt and xt.TargetType then
-                local targetType = xt.TargetType()
-                if targetType == 'Auto Hater' then
-                    local xtId = xt.ID and xt.ID() or 0
-                    local targetId = target.ID and target.ID() or -1
-                    if xtId == targetId then
-                        return true
-                    end
-                end
-            end
-        end
+    -- Also check PctAggro - only warn if we have high aggro (>= 90%)
+    -- This avoids false positives from Auto Hater which just means we're on the hate list
+    local pctAggro = 0
+    if me.PctAggro then
+        pctAggro = me.PctAggro() or 0
+    end
+    if (tonumber(pctAggro) or 0) >= 90 then
+        return true
     end
 
     return false

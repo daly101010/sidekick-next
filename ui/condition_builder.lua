@@ -55,6 +55,7 @@ end
 M.subjectOptions = {
   { value = "beneficial:Me",     label = "My" },
   { value = "beneficial:Group",  label = "My Group's" },
+  { value = "beneficial:BuffTarget", label = "Buff Target" },
   { value = "detrimental:Target", label = "My Target" },
   { value = "spawn:Spawn",       label = "There are" },
 }
@@ -76,6 +77,17 @@ M.properties = {
   ["beneficial:Group"] = {
     { key = "Injured", label = "members w/ HP below", type = "group", thresholdLabel = "%", min = 0, max = 6, thresholdMin = 1, thresholdMax = 99 },
     { key = "LowMana", label = "members w/ Mana below", type = "group", thresholdLabel = "%", min = 0, max = 6, thresholdMin = 1, thresholdMax = 99 },
+  },
+  ["beneficial:BuffTarget"] = {
+    { key = "Class",      label = "Class",      type = "match" },
+    { key = "Role",       label = "Role",       type = "match" },
+    { key = "PctHPs",     label = "HP",         type = "numeric", isPercent = true, min = 0, max = 100 },
+    { key = "PctMana",    label = "Mana",       type = "numeric", isPercent = true, min = 0, max = 100 },
+    { key = "IsMe",       label = "is Me",      type = "boolean" },
+    { key = "IsTank",     label = "is Tank",    type = "boolean" },
+    { key = "IsHealer",   label = "is Healer",  type = "boolean" },
+    { key = "IsMelee",    label = "is Melee",   type = "boolean" },
+    { key = "IsCaster",   label = "is Caster",  type = "boolean" },
   },
   ["detrimental:Target"] = {
     { key = "PctHPs",   label = "HP",       type = "numeric", isPercent = true, min = 0, max = 100 },
@@ -802,18 +814,33 @@ function M.drawInline(uniqueId, conditionData, onChange)
       anyChanged = true
     end
   else
-    -- View mode: show read-only labels
+    -- View mode: show read-only labels with wrapping
     imgui.SameLine()
+    local availWidth = imgui.GetContentRegionAvail()
+    local cursorStartX = imgui.GetCursorPosX()
+    local wrapThreshold = 100  -- Minimum space before wrapping
+
     for i, cond in ipairs(conditionData.conditions) do
       if i > 1 then
+        -- Check if we need to wrap to next line
+        local cursorX = imgui.GetCursorPosX()
+        local remaining = availWidth - (cursorX - cursorStartX)
+        if remaining < wrapThreshold then
+          -- Wrap to new line with indent
+          imgui.NewLine()
+          imgui.Indent(20)
+          imgui.Unindent(20)
+        else
+          imgui.SameLine()
+        end
+
         -- Show logic connector as text
         local logic = conditionData.logic[i - 1] or "AND"
-        imgui.SameLine()
         imgui.TextColored(0.6, 0.6, 0.6, 1.0, logic)
         imgui.SameLine()
       end
       drawConditionRowView(cond, i, uniqueId)
-      -- Keep conditions on same line if possible
+      -- Keep conditions on same line if possible (width check happens at loop start)
       if i < #conditionData.conditions then
         imgui.SameLine()
       end
@@ -1057,6 +1084,58 @@ function M.evaluateWithContext(conditionData, ctx)
             actual = mq.TLO.Group.LowMana(threshold)() or 0
           end
         end
+      elseif cond.subject == "BuffTarget" then
+        -- BuffTarget conditions - evaluated against a specific spawn passed in ctx.buffTarget
+        local spawn = ctx.buffTarget
+        if cond.property == "Class" then
+          actual = ctx.buffTargetClass
+          if actual == nil and spawn and spawn() then
+            local cls = spawn.Class
+            actual = cls and cls.ShortName and cls.ShortName() or ''
+          end
+        elseif cond.property == "Role" then
+          actual = ctx.buffTargetRole
+          -- Role is passed in context (MainTank, MainAssist, Puller, etc.)
+        elseif cond.property == "PctHPs" then
+          actual = ctx.buffTargetHp
+          if actual == nil and spawn and spawn() then
+            actual = spawn.PctHPs() or 100
+          end
+        elseif cond.property == "PctMana" then
+          actual = ctx.buffTargetMana
+          if actual == nil and spawn and spawn() then
+            actual = spawn.PctMana() or 100
+          end
+        elseif cond.property == "IsMe" then
+          actual = ctx.buffTargetIsMe
+          if actual == nil and spawn and spawn() then
+            actual = spawn.ID() == mq.TLO.Me.ID()
+          end
+        elseif cond.property == "IsTank" then
+          actual = ctx.buffTargetIsTank
+          if actual == nil and spawn and spawn() then
+            local cls = spawn.Class and spawn.Class.ShortName and spawn.Class.ShortName() or ''
+            actual = cls == 'WAR' or cls == 'PAL' or cls == 'SHD'
+          end
+        elseif cond.property == "IsHealer" then
+          actual = ctx.buffTargetIsHealer
+          if actual == nil and spawn and spawn() then
+            local cls = spawn.Class and spawn.Class.ShortName and spawn.Class.ShortName() or ''
+            actual = cls == 'CLR' or cls == 'DRU' or cls == 'SHM'
+          end
+        elseif cond.property == "IsMelee" then
+          actual = ctx.buffTargetIsMelee
+          if actual == nil and spawn and spawn() then
+            local cls = spawn.Class and spawn.Class.ShortName and spawn.Class.ShortName() or ''
+            actual = cls == 'WAR' or cls == 'PAL' or cls == 'SHD' or cls == 'MNK' or cls == 'ROG' or cls == 'BER' or cls == 'RNG' or cls == 'BST'
+          end
+        elseif cond.property == "IsCaster" then
+          actual = ctx.buffTargetIsCaster
+          if actual == nil and spawn and spawn() then
+            local cls = spawn.Class and spawn.Class.ShortName and spawn.Class.ShortName() or ''
+            actual = cls == 'WIZ' or cls == 'MAG' or cls == 'ENC' or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM'
+          end
+        end
       end
 
     elseif cond.type == "detrimental" then
@@ -1238,6 +1317,49 @@ function M.deserialize(str)
     end
   end
   return nil
+end
+
+--- Generate a human-readable summary of conditions
+function M.getSummary(conditionData)
+  if not conditionData or not conditionData.conditions then return "" end
+  local conditions = conditionData.conditions
+  if #conditions == 0 then return "" end
+
+  local parts = {}
+  for _, cond in ipairs(conditions) do
+    local subjectLabel = "?"
+    for _, opt in ipairs(M.subjectOptions) do
+      if opt.value == cond.subject then
+        subjectLabel = opt.label
+        break
+      end
+    end
+
+    local propLabel = cond.property or "?"
+    local props = M.properties[cond.subject]
+    if props then
+      for _, p in ipairs(props) do
+        if p.key == cond.property then
+          propLabel = p.label
+          break
+        end
+      end
+    end
+
+    local op = cond.op or "="
+    local value = cond.value or "?"
+
+    -- Build short summary like "HP < 50%" or "In Combat"
+    if cond.property == "Combat" or cond.property == "Invis" then
+      table.insert(parts, propLabel)
+    else
+      table.insert(parts, string.format("%s %s %s", propLabel, op, tostring(value)))
+    end
+  end
+
+  local logic = conditionData.logic or "AND"
+  local sep = logic == "OR" and " or " or ", "
+  return table.concat(parts, sep)
 end
 
 return M

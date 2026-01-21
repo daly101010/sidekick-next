@@ -1,10 +1,17 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local ImAnim = require('lib.imanim')
-local AnimHelpers = require('ui.animation_helpers')
-local Core = require('utils.core')
-local ActorsCoordinator = require('utils.actors_coordinator')
-local Themes = require('themes')
+local ImAnim = require('sidekick-next.lib.imanim')
+local AnimHelpers = require('sidekick-next.ui.animation_helpers')
+local Core = require('sidekick-next.utils.core')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
+local Themes = require('sidekick-next.themes')
+local Draw = require('sidekick-next.ui.draw_helpers')
+
+-- Use centralized draw helpers for cross-build compatibility
+local IM_COL32 = Draw.IM_COL32
+local dlAddRectFilled = Draw.addRectFilled
+local dlAddRect = Draw.addRect
+local dlAddText = Draw.addText
 
 local M = {}
 
@@ -124,13 +131,14 @@ local function fmtCooldown(rem)
 end
 
 -- Draw outlined text (for button labels)
+-- Uses Draw.addText wrapper for proper API detection across MQ builds
 local function drawOutlinedText(drawList, x, y, text, col)
     local black = IM_COL32(0, 0, 0, 255)
     local offsets = { {-1,-1}, {0,-1}, {1,-1}, {-1,0}, {1,0}, {-1,1}, {0,1}, {1,1} }
     for _, off in ipairs(offsets) do
-        drawList:AddText(ImVec2(x + off[1], y + off[2]), black, text)
+        Draw.addText(drawList, x + off[1], y + off[2], black, text)
     end
-    drawList:AddText(ImVec2(x, y), col, text)
+    Draw.addText(drawList, x, y, col, text)
 end
 
 -- Render a single ability button with icon, cooldown overlay, and timer
@@ -142,6 +150,9 @@ local function renderAbilityButton(charName, abilityName, ability, size, idx, or
 
     local cursorScreenPos = imgui.GetCursorScreenPosVec()
     local drawList = imgui.GetWindowDrawList()
+
+    -- Extract coordinates for safe DrawList wrapper usage
+    local cx, cy = Draw.vec2xy(cursorScreenPos)
 
     -- Get cooldown info
     local cooldown = tonumber(ability.cooldown) or 0
@@ -155,16 +166,17 @@ local function renderAbilityButton(charName, abilityName, ability, size, idx, or
     -- Draw icon background
     if animSpellIcons and iconId > 0 then
         animSpellIcons:SetTextureCell(iconId)
-        drawList:AddTextureAnimation(animSpellIcons, cursorScreenPos, ImVec2(size, size))
+        -- AddTextureAnimation requires ImVec2, use pcall for safety
+        pcall(function() drawList:AddTextureAnimation(animSpellIcons, cursorScreenPos, ImVec2(size, size)) end)
     else
         -- Fallback: draw colored rectangle
         local bgCol = ready and IM_COL32(60, 120, 60, 200) or IM_COL32(80, 80, 80, 200)
-        drawList:AddRectFilled(cursorScreenPos, ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), bgCol)
+        dlAddRectFilled(drawList, cx, cy, cx + size, cy + size, bgCol)
     end
 
     -- Dim if being dragged
     if _dragKey == myDragKey then
-        drawList:AddRectFilled(cursorScreenPos, ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), IM_COL32(0, 0, 0, 120))
+        dlAddRectFilled(drawList, cx, cy, cx + size, cy + size, IM_COL32(0, 0, 0, 120))
     end
 
     -- Invisible button for interaction
@@ -246,7 +258,7 @@ local function renderAbilityButton(charName, abilityName, ability, size, idx, or
 
     -- Hover highlight (when not dragging)
     if isHovered and not _dragKey then
-        drawList:AddRectFilled(cursorScreenPos, ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), IM_COL32(255, 255, 255, 50))
+        dlAddRectFilled(drawList, cx, cy, cx + size, cy + size, IM_COL32(255, 255, 255, 50))
     end
 
     -- Cooldown overlay (red -> orange -> yellow gradient based on time remaining)
@@ -267,28 +279,28 @@ local function renderAbilityButton(charName, abilityName, ability, size, idx, or
         local overlayCol = IM_COL32(r, g, b, 140)
 
         -- Dark overlay first for better visibility
-        drawList:AddRectFilled(cursorScreenPos, ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), IM_COL32(0, 0, 0, 120))
+        dlAddRectFilled(drawList, cx, cy, cx + size, cy + size, IM_COL32(0, 0, 0, 120))
 
         -- Fill from bottom based on remaining cooldown
         local fillH = math.floor(size * pct)
-        local fillY = cursorScreenPos.y + size - fillH
-        drawList:AddRectFilled(ImVec2(cursorScreenPos.x, fillY), ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), overlayCol)
+        local fillY = cy + size - fillH
+        dlAddRectFilled(drawList, cx, fillY, cx + size, cy + size, overlayCol)
 
         -- Colored border matching the overlay
-        drawList:AddRect(cursorScreenPos, ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), IM_COL32(r, g, b, 200), 0, 0, 2)
+        dlAddRect(drawList, cx, cy, cx + size, cy + size, IM_COL32(r, g, b, 200), 0, 0, 2)
 
         -- Draw cooldown timer text centered on button
         local timerText = fmtCooldown(cooldown)
         local textW, textH = imgui.CalcTextSize(timerText)
-        local tx = cursorScreenPos.x + (size - textW) / 2
-        local ty = cursorScreenPos.y + (size - textH) / 2
+        local tx = cx + (size - textW) / 2
+        local ty = cy + (size - textH) / 2
         -- Outline for readability
         drawOutlinedText(drawList, tx, ty, timerText, IM_COL32(255, 255, 255, 255))
     elseif ready then
         -- Ready glow effect
         local pulse = AnimHelpers.getReadyGlow and AnimHelpers.getReadyGlow() or 0.5
         local glowAlpha = math.floor(pulse * 80)
-        drawList:AddRect(cursorScreenPos, ImVec2(cursorScreenPos.x + size, cursorScreenPos.y + size), IM_COL32(80, 200, 255, glowAlpha), 0, 0, 2)
+        dlAddRect(drawList, cx, cy, cx + size, cy + size, IM_COL32(80, 200, 255, glowAlpha), 0, 0, 2)
     end
 
     -- Draw short name label at top with word wrapping

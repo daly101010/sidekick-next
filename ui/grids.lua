@@ -1,7 +1,7 @@
 local imgui = require('ImGui')
-local ConditionBuilder = require('ui.condition_builder')
-local Core = require('utils.core')
-local Ability = require('utils.abilities')
+local ConditionBuilder = require('sidekick-next.ui.condition_builder')
+local Core = require('sidekick-next.utils.core')
+local Ability = require('sidekick-next.utils.abilities')
 
 local M = {}
 

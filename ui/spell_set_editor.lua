@@ -12,9 +12,8 @@ M.selectedSet = nil
 M.newSetName = ''
 M.showNewSetPopup = false
 M.showDeleteConfirm = false
-M.showConditionPopup = false
-M.conditionEditLine = nil
-M.editingCondition = nil
+M.conditionEditLine = nil   -- Line being edited (inline condition builder)
+M.editingCondition = nil    -- Current condition being edited
 M.categoryFilter = 'All'
 
 -- Lazy-load dependencies
@@ -203,6 +202,8 @@ end
 
 --- Render a section of spell lines
 function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacity)
+    local ConditionBuilder = getConditionBuilder()
+
     for _, lineInfo in ipairs(allLines) do
         -- Apply category filter
         if M.categoryFilter ~= 'All' and lineInfo.category ~= M.categoryFilter then
@@ -219,6 +220,12 @@ function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacit
             goto continue
         end
 
+        -- Resolve spell - skip if not in spellbook
+        local resolved = lineData.resolved or SpellsetManager.resolveSpellFromLine(lineName)
+        if not resolved then
+            goto continue
+        end
+
         imgui.PushID('line_' .. lineName)
 
         -- Checkbox (disabled if at capacity and not enabled)
@@ -228,8 +235,8 @@ function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacit
             imgui.BeginDisabled()
         end
 
-        local newEnabled
-        newEnabled, _ = imgui.Checkbox('##enabled', isEnabled)
+        local newEnabled, changed
+        newEnabled, changed = imgui.Checkbox('##enabled', isEnabled)
 
         if not canEnable then
             imgui.EndDisabled()
@@ -238,7 +245,7 @@ function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacit
             end
         end
 
-        if newEnabled ~= isEnabled then
+        if changed and newEnabled ~= isEnabled then
             if newEnabled then
                 SpellsetManager.enableLine(M.selectedSet, lineName, slotType)
             else
@@ -246,33 +253,41 @@ function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacit
             end
         end
 
-        -- Line name
+        -- Spell name only
         imgui.SameLine()
-        imgui.Text(lineName)
+        imgui.Text(resolved)
 
-        -- Resolved spell
-        local resolved = lineData.resolved or SpellsetManager.resolveSpellFromLine(lineName)
-        imgui.SameLine()
-        imgui.TextColored(0.6, 0.6, 0.6, 1, '→')
-        imgui.SameLine()
-        if resolved then
-            imgui.TextColored(0.7, 0.9, 0.7, 1, resolved)
-        else
-            imgui.TextColored(0.9, 0.5, 0.5, 1, '(not in book)')
-        end
-
-        -- Condition button
+        -- Condition button and label
         imgui.SameLine()
         local hasCondition = lineData.condition and lineData.condition.conditions and #lineData.condition.conditions > 0
+        local isEditingThis = (M.conditionEditLine == lineName)
+
         if hasCondition then
             imgui.PushStyleColor(ImGuiCol.Button, 0.2, 0.5, 0.2, 1)
         end
         if imgui.SmallButton('Cond##' .. lineName) then
-            M.conditionEditLine = lineName
-            M.showConditionPopup = true
+            if isEditingThis then
+                -- Close if already editing this line
+                M.conditionEditLine = nil
+                M.editingCondition = nil
+            else
+                -- Open inline editor for this line
+                M.conditionEditLine = lineName
+                M.editingCondition = lineData.condition or { conditions = {} }
+            end
         end
         if hasCondition then
             imgui.PopStyleColor()
+        end
+
+        -- Show condition summary label if has condition and not editing
+        if hasCondition and not isEditingThis and ConditionBuilder then
+            imgui.SameLine()
+            local summary = ConditionBuilder.getSummary and ConditionBuilder.getSummary(lineData.condition) or ''
+            if summary == '' then
+                summary = string.format('(%d conditions)', #lineData.condition.conditions)
+            end
+            imgui.TextColored(0.6, 0.8, 0.6, 1, summary)
         end
 
         -- Right-click context menu
@@ -288,6 +303,37 @@ function M.renderLineSection(SpellsetManager, allLines, set, slotType, atCapacit
                 end
             end
             imgui.EndPopup()
+        end
+
+        -- Inline condition builder (below the spell line)
+        if isEditingThis and ConditionBuilder then
+            imgui.Indent(20)
+            imgui.PushStyleColor(ImGuiCol.ChildBg, 0.15, 0.15, 0.2, 1)
+            if imgui.BeginChild('cond_' .. lineName, 0, 120, true) then
+                local uniqueId = 'spellset_' .. lineName
+                M.editingCondition = ConditionBuilder.drawInline(uniqueId, M.editingCondition, function(newData)
+                    M.editingCondition = newData
+                end)
+
+                imgui.Spacing()
+                if imgui.SmallButton('Save##cond') then
+                    SpellsetManager.setLineCondition(M.selectedSet, lineName, M.editingCondition)
+                    M.conditionEditLine = nil
+                    M.editingCondition = nil
+                end
+                imgui.SameLine()
+                if imgui.SmallButton('Clear##cond') then
+                    M.editingCondition = { conditions = {} }
+                end
+                imgui.SameLine()
+                if imgui.SmallButton('Cancel##cond') then
+                    M.conditionEditLine = nil
+                    M.editingCondition = nil
+                end
+            end
+            imgui.EndChild()
+            imgui.PopStyleColor()
+            imgui.Unindent(20)
         end
 
         imgui.PopID()
@@ -354,69 +400,6 @@ function M.renderDeleteConfirmPopup(SpellsetManager)
     end
 end
 
---- Render the condition editor popup
-function M.renderConditionPopup()
-    if not M.showConditionPopup or not M.conditionEditLine then return end
-
-    local ConditionBuilder = getConditionBuilder()
-    local SpellsetManager = getSpellsetManager()
-    if not ConditionBuilder or not SpellsetManager then return end
-
-    local set = SpellsetManager.getSet(M.selectedSet)
-    if not set then return end
-
-    local lineData = set.lines[M.conditionEditLine] or {}
-    local resolved = lineData.resolved or SpellsetManager.resolveSpellFromLine(M.conditionEditLine)
-
-    imgui.SetNextWindowSize(450, 300, ImGuiCond.FirstUseEver)
-
-    local title = string.format('Condition: %s → %s##CondPopup', M.conditionEditLine, resolved or '?')
-    local open = true
-    open, _ = imgui.Begin(title, open, ImGuiWindowFlags.NoCollapse)
-
-    if open then
-        -- Initialize condition data if needed
-        if not M.editingCondition then
-            M.editingCondition = lineData.condition or { conditions = {} }
-        end
-
-        -- Render condition builder
-        local uniqueId = 'spellset_' .. (M.conditionEditLine or 'unknown')
-        M.editingCondition = ConditionBuilder.drawInline(uniqueId, M.editingCondition, function(newData)
-            M.editingCondition = newData
-        end)
-
-        imgui.Spacing()
-        imgui.Separator()
-        imgui.Spacing()
-
-        if imgui.Button('Save', 80, 0) then
-            SpellsetManager.setLineCondition(M.selectedSet, M.conditionEditLine, M.editingCondition)
-            M.showConditionPopup = false
-            M.conditionEditLine = nil
-            M.editingCondition = nil
-        end
-
-        imgui.SameLine()
-        if imgui.Button('Clear', 80, 0) then
-            M.editingCondition = { conditions = {} }
-        end
-
-        imgui.SameLine()
-        if imgui.Button('Cancel', 80, 0) then
-            M.showConditionPopup = false
-            M.conditionEditLine = nil
-            M.editingCondition = nil
-        end
-    else
-        M.showConditionPopup = false
-        M.conditionEditLine = nil
-        M.editingCondition = nil
-    end
-
-    imgui.End()
-end
-
 --- Render the spell set editor window
 function M.render()
     if not M.isOpen then return end
@@ -440,10 +423,12 @@ function M.render()
 
     imgui.SetNextWindowSize(500, 600, ImGuiCond.FirstUseEver)
 
-    local open
-    open, M.isOpen = imgui.Begin('Spell Set Editor##SpellSetEditor', M.isOpen)
+    local open, shouldDraw = imgui.Begin('Spell Set Editor##SpellSetEditor', M.isOpen)
+    if not open then
+        M.isOpen = false
+    end
 
-    if open then
+    if shouldDraw then
         M.renderHeader(SpellsetManager)
         imgui.Separator()
         M.renderSpellLines(SpellsetManager, SpellsClr)
@@ -451,10 +436,9 @@ function M.render()
 
     imgui.End()
 
-    -- Render popups
+    -- Render popups (condition builder is now inline, not a popup)
     M.renderNewSetPopup(SpellsetManager)
     M.renderDeleteConfirmPopup(SpellsetManager)
-    M.renderConditionPopup()
 end
 
 return M
