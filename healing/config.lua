@@ -156,7 +156,34 @@ local M = {
         events = true,            -- Heal events (landed, HoT ticks, learning data)
         analytics = true,         -- Session statistics
         attribution = false,      -- Damage attribution (verbose, disabled by default)
+        hotCoverage = true,       -- HoT vs direct heal decision logging
     },
+
+    -- HoT Trust & Efficiency Settings
+    hotCoverageLogLevel = 2,          -- 0=off, 1=summary, 2=detailed, 3=verbose
+
+    -- Projection windows (seconds) for HoT trust calculation
+    projectionWindowLow = 8,
+    projectionWindowNormal = 6,
+    projectionWindowHigh = 3,
+
+    -- Heal thresholds by role and pressure (projected HP % to trigger direct heal)
+    healThresholds = {
+        tank    = { low = 50, normal = 60, high = 70 },
+        healer  = { low = 60, normal = 70, high = 80 },
+        dps     = { low = 55, normal = 65, high = 75 },
+        squishy = { low = 65, normal = 75, high = 85 },
+    },
+
+    -- HoT application gates
+    hotMinUsableTicks = 2,            -- Require at least 2 ticks to apply HoT
+    hotSingleMobMinDpsRatio = 0.8,    -- Single-mob: DPS must be >= 80% of HoT HPS
+    hotMultiMobMinDpsRatio = 0.3,     -- Multi-mob: DPS must be >= 30% of HoT HPS
+    hotMaxOverhealRatio = 1.5,        -- Skip HoT if expected healing > damage × this
+
+    -- Safety constraints (CRITICAL - see design constraints above)
+    hotMinDpsForTrust = 100,          -- Min DPS required to trust HoT (prevents over-trust with bad data)
+    hotTrustHardFloorPct = 35,        -- Below this HP%, BYPASS HoT trust entirely (safety backstop)
 
     -- Spells (user assigns)
     spells = {
