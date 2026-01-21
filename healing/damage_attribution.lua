@@ -19,6 +19,8 @@ end
 local _lastDamageEvent = 0
 local COMBAT_TIMEOUT = 5  -- seconds
 local WINDOW_DURATION = 3  -- seconds for DPS calculation
+local COMBAT_TIMEOUT_MS = COMBAT_TIMEOUT * 1000
+local WINDOW_DURATION_MS = WINDOW_DURATION * 1000
 
 -- Per-target damage attribution
 local _targetDamage = {}  -- [targetId] = { sources = {}, sourceCount, totalDps, ... }
@@ -33,18 +35,31 @@ function M.init(config)
     Config = config
     COMBAT_TIMEOUT = Config and Config.combatTimeoutSec or 5
     WINDOW_DURATION = Config and Config.dpsWindowSec or 3
+    COMBAT_TIMEOUT_MS = COMBAT_TIMEOUT * 1000
+    WINDOW_DURATION_MS = WINDOW_DURATION * 1000
     _targetDamage = {}
     _aeDamage = {}
     _mobNameCache = {}
     _lastDamageEvent = 0
 end
 
--- Refresh mob name cache from XTarget
+-- Cache TTL in milliseconds (30 seconds)
+local CACHE_TTL_MS = 30000
+
+-- Refresh mob name cache from XTarget and prune stale entries
 local function refreshMobCache()
     local now = mq.gettime()
     local me = mq.TLO.Me
     if not me or not me() then return end
 
+    -- Prune stale entries (older than TTL)
+    for name, entry in pairs(_mobNameCache) do
+        if entry.lastSeen and (now - entry.lastSeen) > CACHE_TTL_MS then
+            _mobNameCache[name] = nil
+        end
+    end
+
+    -- Refresh from XTarget (normalize to lowercase for consistent lookup)
     local xtCount = tonumber(me.XTarget()) or 0
     for i = 1, xtCount do
         local xt = me.XTarget(i)
@@ -52,7 +67,7 @@ local function refreshMobCache()
             local name = xt.CleanName() or xt.Name()
             local id = xt.ID()
             if name and id then
-                _mobNameCache[name] = { id = id, lastSeen = now }
+                _mobNameCache[name:lower()] = { id = id, lastSeen = now }
             end
         end
     end
@@ -62,7 +77,8 @@ end
 local function resolveMobId(attackerName)
     if not attackerName then return nil end
 
-    local cached = _mobNameCache[attackerName]
+    -- Normalize to lowercase for consistent cache lookup
+    local cached = _mobNameCache[attackerName:lower()]
     if cached then return cached.id end
 
     -- Fallback: direct spawn lookup
@@ -117,7 +133,7 @@ end
 -- Check if combat has timed out (no damage for N seconds)
 local function checkCombatTimeout()
     local now = mq.gettime()
-    if _lastDamageEvent > 0 and (now - _lastDamageEvent) > COMBAT_TIMEOUT then
+    if _lastDamageEvent > 0 and (now - _lastDamageEvent) > COMBAT_TIMEOUT_MS then
         -- Clear all attribution data
         _targetDamage = {}
         _aeDamage = {}
@@ -206,7 +222,7 @@ local function calculateTargetDps(targetId)
     if not targetData then return end
 
     local now = mq.gettime()
-    local cutoff = now - WINDOW_DURATION
+    local cutoff = now - WINDOW_DURATION_MS
 
     local activeSourceCount = 0
     local totalDps = 0
@@ -252,7 +268,7 @@ end
 -- Calculate AE status for all tracked mobs
 local function calculateAeStatus()
     local now = mq.gettime()
-    local cutoff = now - WINDOW_DURATION
+    local cutoff = now - WINDOW_DURATION_MS
 
     for mobId, aeData in pairs(_aeDamage) do
         -- Count targets hit recently
