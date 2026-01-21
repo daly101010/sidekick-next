@@ -10,6 +10,47 @@
 
 ---
 
+## Critical Design Constraints
+
+**IMPORTANT:** These constraints address identified risks and MUST be followed:
+
+### 1. Timebase: Milliseconds Internally
+- `mq.gettime()` returns milliseconds
+- All internal calculations use milliseconds
+- Convert to seconds only for logging display
+- Window configs stored as seconds, multiply by 1000 for calculations
+
+### 2. Single Trust Decision Point
+- **DO NOT** add HoT trust logic to `init.lua`
+- `init.lua` computes raw deficits only (no trust gating)
+- All HoT trust decisions happen in `heal_selector.lua` via HotAnalyzer
+- This prevents double-gating and heal loop starvation
+
+### 3. Never Zero Effective Deficit
+- Never set `effectiveDeficit = 0` when HoT is trusted
+- Instead: `effectiveDeficit = max(uncoveredGap, minDeficit)`
+- `minDeficit` = small positive value to keep target in priority queue
+- Target stays visible for monitoring even when HoT is trusted
+
+### 4. DPS Floor for Trust
+- Add `hotMinDpsForTrust = 100` config
+- If attributed DPS < floor, don't trust HoT alone (fallback to direct heal)
+- Prevents over-trusting when DPS data is missing/unreliable
+- Also prevents division-by-near-zero in coverage ratio
+
+### 5. Hard Safety Floor Bypass
+- Add `hotTrustHardFloorPct = 35` config
+- If target HP% < hard floor, BYPASS HoT trust entirely
+- Force direct heal regardless of projection math
+- This is a safety backstop, not a regular threshold
+
+### 6. Cap Trust Window by HoT Remaining
+- Projection window = `min(pressureWindow, TTK, hotRemainingTime)`
+- Don't project past when HoT expires
+- Ensures projection reflects actual HoT coverage available
+
+---
+
 ## Task 1: Add Configuration Options
 
 **Files:**
@@ -45,6 +86,10 @@ hotMinUsableTicks = 2,            -- Require at least 2 ticks to apply HoT
 hotSingleMobMinDpsRatio = 0.8,    -- Single-mob: DPS must be >= 80% of HoT HPS
 hotMultiMobMinDpsRatio = 0.3,     -- Multi-mob: DPS must be >= 30% of HoT HPS
 hotMaxOverhealRatio = 1.5,        -- Skip HoT if expected healing > damage × this
+
+-- Safety constraints (CRITICAL - see design constraints above)
+hotMinDpsForTrust = 100,          -- Min DPS required to trust HoT (prevents over-trust with bad data)
+hotTrustHardFloorPct = 35,        -- Below this HP%, BYPASS HoT trust entirely (safety backstop)
 ```
 
 **Step 2: Verify config loads correctly**
@@ -275,7 +320,8 @@ local function getPressureLevel()
 end
 
 -- Get projection window based on pressure
-local function getProjectionWindow(pressure, ttk)
+-- Returns seconds, capped by TTK and HoT remaining time
+local function getProjectionWindow(pressure, ttk, hotRemainingSec)
     local cfg = Config or {}
     local window
     if pressure == 'low' then
@@ -285,8 +331,12 @@ local function getProjectionWindow(pressure, ttk)
     else
         window = cfg.projectionWindowNormal or 6
     end
-    -- Cap at TTK
-    return math.min(window, ttk)
+    -- Cap at TTK and HoT remaining (constraint #6)
+    local cappedTTK = math.min(window, ttk)
+    if hotRemainingSec and hotRemainingSec > 0 then
+        return math.min(cappedTTK, hotRemainingSec)
+    end
+    return cappedTTK
 end
 
 -- Get heal threshold based on role and pressure
@@ -350,21 +400,32 @@ function M.shouldTrustHoT(targetInfo, situation)
     local targetId = targetInfo.id
     local targetName = targetInfo.name or '?'
 
+    -- CONSTRAINT #5: Hard safety floor bypass
+    local hardFloorPct = Config.hotTrustHardFloorPct or 35
+    local currentPct = targetInfo.pctHP or 100
+    if currentPct < hardFloorPct then
+        return false, { hardFloorBypass = true, currentPct = currentPct, hardFloorPct = hardFloorPct },
+            'hard_floor_bypass'
+    end
+
     -- Check if target has an active HoT
-    local hasHoT, hotSpell, hotRemaining = false, nil, 0
+    local hasHoT, hotSpell, hotRemainingMs = false, nil, 0
     if Proactive and Proactive.hasActiveHoT then
-        hasHoT, hotSpell, hotRemaining = Proactive.hasActiveHoT(targetId)
+        hasHoT, hotSpell, hotRemainingMs = Proactive.hasActiveHoT(targetId)
     end
 
     if not hasHoT then
         return false, nil, 'no_active_hot'
     end
 
+    -- Convert HoT remaining from ms to seconds for calculations
+    local hotRemainingSec = (hotRemainingMs or 0) / 1000
+
     -- Get pressure and combat state
     local pressure, mobs, ttk, survival = getPressureLevel()
 
-    -- Get projection window
-    local windowSec = getProjectionWindow(pressure, ttk)
+    -- Get projection window (capped by TTK and HoT remaining - constraint #6)
+    local windowSec = getProjectionWindow(pressure, ttk, hotRemainingSec)
 
     -- Get HoT healing rate
     local hotHps = getHotHps(hotSpell)
@@ -380,8 +441,15 @@ function M.shouldTrustHoT(targetInfo, situation)
         dps = targetInfo.recentDps or 0
     end
 
-    -- Calculate coverage ratio
-    local coverageRatio = dps > 0 and (hotHps / dps) or 999
+    -- CONSTRAINT #4: DPS floor check - don't trust HoT if DPS too low/unreliable
+    local minDpsForTrust = Config.hotMinDpsForTrust or 100
+    if dps < minDpsForTrust then
+        return false, { dpsFloor = true, dps = dps, minDpsForTrust = minDpsForTrust },
+            'dps_below_floor'
+    end
+
+    -- Calculate coverage ratio (safe now, dps >= minDpsForTrust)
+    local coverageRatio = hotHps / dps
 
     -- Calculate projected HP
     local currentHP = targetInfo.currentHP or 0
@@ -404,10 +472,12 @@ function M.shouldTrustHoT(targetInfo, situation)
     local threshold = getHealThreshold(role, pressure)
 
     -- Calculate uncovered gap if we need to heal
-    local uncoveredGap = 0
+    -- CONSTRAINT #3: Never return 0 gap - use minimum to keep target in priority queue
+    local minGap = 1  -- Minimum gap to prevent zero deficit
+    local uncoveredGap = minGap
     local recommendedSize = nil
     if projectedPct < threshold then
-        uncoveredGap = math.max(0, damageInWindow - healingInWindow)
+        uncoveredGap = math.max(minGap, damageInWindow - healingInWindow)
         -- Recommend heal size based on gap
         if uncoveredGap < maxHP * 0.15 then
             recommendedSize = 'small'
@@ -419,7 +489,7 @@ function M.shouldTrustHoT(targetInfo, situation)
     end
 
     -- Build analysis data for logging
-    local ticksRemaining = math.floor(hotRemaining / 6)
+    local ticksRemaining = math.floor(hotRemainingSec / 6)
     local tickAmount = hotHps * 6
 
     local analysis = {
@@ -446,7 +516,7 @@ function M.shouldTrustHoT(targetInfo, situation)
         hotHps = hotHps,
         ticksRemaining = ticksRemaining,
         tickAmount = tickAmount,
-        hotRemainingSec = hotRemaining,
+        hotRemainingSec = hotRemainingSec,
 
         -- Coverage
         coverageRatio = coverageRatio,
@@ -677,62 +747,38 @@ git commit -m "feat(healing): initialize hot_analyzer module"
 
 ---
 
-## Task 5: Integrate HoT Trust Check into Heal Selection
+## Task 5: Keep init.lua Deficit-Only (NO Trust Logic)
 
 **Files:**
-- Modify: `healing/init.lua` (tick function, target processing)
+- Modify: `healing/init.lua` (minor - just ensure deficit is computed cleanly)
 
-**Step 1: Factor HoT healing into effective deficit**
+**IMPORTANT:** Per design constraint #2, DO NOT add HoT trust logic to init.lua.
+Trust decisions happen in heal_selector.lua only.
 
-Find the target processing loop in tick() (around line 451-461) where `effectiveDeficit` is calculated. Modify to include HoT healing projection:
+**Step 1: Verify existing deficit calculation is clean**
+
+The existing code in tick() (around line 451-461) should remain as-is:
 
 ```lua
             entry.incomingTotal = incomingTotal
             entry.deficit = math.max(0, (entry.deficit or 0) - incomingTotal)
-
-            -- Factor in HoT healing for effective deficit
-            local hotAnalyzer = getHotAnalyzer()
-            if hotAnalyzer and hotAnalyzer.shouldTrustHoT then
-                local trustHoT, analysis, _ = hotAnalyzer.shouldTrustHoT(entry, situation)
-                if trustHoT and analysis then
-                    -- HoT is handling the healing, reduce effective deficit
-                    entry.effectiveDeficit = 0
-                    entry.hotTrusted = true
-                    entry.hotAnalysis = analysis
-                elseif analysis and analysis.uncoveredGap then
-                    -- HoT can't keep up, effective deficit is the uncovered gap
-                    entry.effectiveDeficit = analysis.uncoveredGap
-                    entry.hotTrusted = false
-                    entry.hotAnalysis = analysis
-                else
-                    entry.effectiveDeficit = entry.deficit
-                end
-            else
-                entry.effectiveDeficit = entry.deficit
-            end
-
+            entry.effectiveDeficit = entry.deficit
             if proactive and proactive.getIncomingHotRemaining then
                 entry.incomingHotRemaining = proactive.getIncomingHotRemaining(entry.name or entry.id)
             end
 ```
 
-**Step 2: Skip healing for targets where HoT is trusted**
+**DO NOT modify this to include trust logic.** Trust is evaluated in heal_selector.lua.
 
-In the healing priority sections (emergency, tank, group), add check:
+**Step 2: No changes needed**
 
-```lua
-            -- Skip if HoT is trusted to handle this target
-            if entry.hotTrusted then
-                -- Log skip at debug level
-                -- Continue to next target
-            end
-```
+If the existing code matches above, no modification required for this task.
 
-**Step 3: Commit**
+**Step 3: Commit (if any cleanup was needed)**
 
 ```bash
 git add healing/init.lua
-git commit -m "feat(healing): integrate HoT trust check into heal selection"
+git commit -m "refactor(healing): ensure init.lua computes deficits only (no trust logic)"
 ```
 
 ---
@@ -856,11 +902,20 @@ git commit -m "feat(healing): complete HoT trust and efficiency implementation"
 
 | Task | Description | Files |
 |------|-------------|-------|
-| 1 | Add configuration options | config.lua |
+| 1 | Add configuration options (incl. safety constraints) | config.lua |
 | 2 | Add logging functions | logger.lua |
-| 3 | Create HoT analyzer module | hot_analyzer.lua (new) |
+| 3 | Create HoT analyzer module (with safety constraints) | hot_analyzer.lua (new) |
 | 4 | Initialize HoT analyzer | init.lua |
-| 5 | Integrate trust check | init.lua |
+| 5 | Keep init.lua deficit-only (NO trust logic) | init.lua (verify only) |
 | 6 | Update HoT application | proactive.lua |
-| 7 | Use uncovered gap | heal_selector.lua |
+| 7 | Use uncovered gap (trust centralized here) | heal_selector.lua |
 | 8 | Test and verify | - |
+
+## Critical Safety Constraints Applied
+
+1. **Timebase:** All internal math in ms, convert to sec for logs only
+2. **Single decision point:** Trust logic ONLY in heal_selector.lua (via HotAnalyzer)
+3. **Never zero deficit:** Gap always >= 1 to keep target in priority queue
+4. **DPS floor:** Require >= 100 DPS to trust HoT (prevent over-trust with bad data)
+5. **Hard safety floor:** Below 35% HP, bypass HoT trust entirely
+6. **Window cap:** Projection window capped by min(pressure, TTK, HoT remaining)
