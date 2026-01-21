@@ -2,6 +2,7 @@ local imgui = require('ImGui')
 local ConditionBuilder = require('sidekick-next.ui.condition_builder')
 local Core = require('sidekick-next.utils.core')
 local Ability = require('sidekick-next.utils.abilities')
+local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
 
@@ -29,18 +30,9 @@ local LAYER_LABELS = {
     utility = 'Utility',
 }
 
-local function vecX(v)
-    if type(v) == 'number' then return tonumber(v) or 0 end
-    if type(v) == 'table' then return tonumber(v.x or v[1]) or 0 end
-    local ok, x = pcall(function() return v.x end)
-    if ok and x ~= nil then return tonumber(x) or 0 end
-    return 0
-end
-
-local function textWidth(txt)
-    local w = imgui.CalcTextSize(tostring(txt or ''))
-    return vecX(w)
-end
+-- Use shared functions from Helpers
+local vecX = Helpers.vecX
+local textWidth = Helpers.textWidth
 
 local function getAvailX()
     local a, b = imgui.GetContentRegionAvail()
@@ -49,16 +41,8 @@ local function getAvailX()
     return tonumber(a) or 0
 end
 
-local function cooldownTotalFor(def, cooldownProbe)
-    if not cooldownProbe then return nil end
-    local name = def and (def.discName or def.altName)
-    if type(name) ~= 'string' or name == '' then return nil end
-    local ok, _, total = pcall(function() return cooldownProbe({ label = name, key = name }) end)
-    if not ok then return nil end
-    total = tonumber(total) or 0
-    if total <= 0 then return nil end
-    return total
-end
+-- Use shared cooldownTotalFor from Helpers
+local cooldownTotalFor = Helpers.cooldownTotalFor
 
 local function drawDescription(desc)
     desc = tostring(desc or '')

@@ -1,51 +1,78 @@
 local mq = require('mq')
 local imgui = require('ImGui')
 
-local Core = require('utils.core')
-local Themes = require('themes')
-local Helpers = require('lib.helpers')
-local Cooldowns = require('abilities.cooldowns')
-local AbilityLoader = require('abilities.loader')
-local Abilities = require('utils.abilities')
-local SpecialAbilities = require('utils.special_abilities')
-local CombatAssist = require('utils.combatassist')
-local Chase = require('automation.chase')
-local Assist = require('automation.assist')
-local Burn = require('automation.burn')
-local Tank = require('automation.tank')
-local Meditation = require('automation.meditation')
-local Healing = require('automation.healing')
-local Cures = require('automation.cures')
-local ActorsCoordinator = require('utils.actors_coordinator')
-local SharedData = require('actors.shareddata')
-local Grids = require('ui.grids')
-local SettingsUI = require('ui.settings')
-local Bar = require('ui.bar_animated')
-local SpecialBar = require('ui.special_bar_animated')
-local DiscBar = require('ui.disc_bar_animated')
-local ItemBar = require('ui.item_bar_animated')
-local ImAnim = require('lib.imanim')
-local Anchor = require('ui.anchor')
-local Items = require('utils.items')
+local Core = require('sidekick-next.utils.core')
+local Themes = require('sidekick-next.themes')
+local Helpers = require('sidekick-next.lib.helpers')
+local Cooldowns = require('sidekick-next.abilities.cooldowns')
+local AbilityLoader = require('sidekick-next.abilities.loader')
+local Abilities = require('sidekick-next.utils.abilities')
+local SpecialAbilities = require('sidekick-next.utils.special_abilities')
+local CombatAssist = require('sidekick-next.utils.combatassist')
+local Chase = require('sidekick-next.automation.chase')
+local Assist = require('sidekick-next.automation.assist')
+local Burn = require('sidekick-next.automation.burn')
+local Tank = require('sidekick-next.automation.tank')
+local Meditation = require('sidekick-next.automation.meditation')
+local LegacyHealing = require('sidekick-next.automation.healing')
+local NewHealing = nil  -- Lazy-loaded for CLR
+
+-- Function to get the appropriate healing module based on class
+local function getHealingModule()
+    local me = mq.TLO.Me
+    if not me or not me() then return LegacyHealing end
+    local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
+    classShort = classShort:upper()
+
+    -- CLR uses new healing intelligence module
+    if classShort == 'CLR' then
+        if not NewHealing then
+            local ok, mod = pcall(require, 'sidekick-next.healing')
+            if ok then
+                NewHealing = mod
+                NewHealing.init()
+            end
+        end
+        return NewHealing or LegacyHealing
+    end
+
+    -- All other classes use legacy module
+    return LegacyHealing
+end
+
+local Healing = nil  -- Will be set dynamically by getHealingModule()
+
+local Cures = require('sidekick-next.automation.cures')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
+local SharedData = require('sidekick-next.actors.shareddata')
+local Grids = require('sidekick-next.ui.grids')
+local SettingsUI = require('sidekick-next.ui.settings')
+local Bar = require('sidekick-next.ui.bar_animated')
+local SpecialBar = require('sidekick-next.ui.special_bar_animated')
+local DiscBar = require('sidekick-next.ui.disc_bar_animated')
+local ItemBar = require('sidekick-next.ui.item_bar_animated')
+local ImAnim = require('sidekick-next.lib.imanim')
+local Anchor = require('sidekick-next.ui.anchor')
+local Items = require('sidekick-next.utils.items')
 
 -- New enhancement modules
-local RemoteAbilities = require('ui.remote_abilities')
-local AggroWarning = require('ui.aggro_warning')
-local ActorsDebug = require('ui.actors_debug')
+local RemoteAbilities = require('sidekick-next.ui.remote_abilities')
+local AggroWarning = require('sidekick-next.ui.aggro_warning')
+local ActorsDebug = require('sidekick-next.ui.actors_debug')
 
 -- Runtime cache, action executor, rotation engine, CC, and spell engine
-local RuntimeCache = require('utils.runtime_cache')
-local ActionExecutor = require('utils.action_executor')
-local RotationEngine = require('utils.rotation_engine')
-local CC = require('automation.cc')
-local Buff = require('automation.buff')
-local SpellEngine = require('utils.spell_engine')
-local SpellEvents = require('utils.spell_events')
-local ImmuneDB = require('utils.immune_database')
-local SpellLineup = require('utils.spell_lineup')
-local ClassConfigLoader = require('utils.class_config_loader')
-local SpellsetManager = require('utils.spellset_manager')
-local SpellSetEditor = require('ui.spell_set_editor')
+local RuntimeCache = require('sidekick-next.utils.runtime_cache')
+local ActionExecutor = require('sidekick-next.utils.action_executor')
+local RotationEngine = require('sidekick-next.utils.rotation_engine')
+local CC = require('sidekick-next.automation.cc')
+local Buff = require('sidekick-next.automation.buff')
+local SpellEngine = require('sidekick-next.utils.spell_engine')
+local SpellEvents = require('sidekick-next.utils.spell_events')
+local ImmuneDB = require('sidekick-next.utils.immune_database')
+local SpellLineup = require('sidekick-next.utils.spell_lineup')
+local ClassConfigLoader = require('sidekick-next.utils.class_config_loader')
+local SpellsetManager = require('sidekick-next.utils.spellset_manager')
+local SpellSetEditor = require('sidekick-next.ui.spell_set_editor')
 
 -- Throttled logging
 local _ThrottledLog = nil
@@ -58,7 +85,7 @@ local function getThrottledLog()
 end
 
 -- Debug logging flags for main automation loop
-local debugAutomationLogging = true
+local debugAutomationLogging = false
 
 
 local animSpellIcons = mq.FindTextureAnimation and mq.FindTextureAnimation('A_SpellIcons') or nil
@@ -284,17 +311,14 @@ local function _bindCmd(cmd, fn)
     pcall(mq.bind, withSlash, fn)
 end
 
-local function vec2xy(a, b)
-    if b ~= nil then
-        return tonumber(a) or 0, tonumber(b) or 0
-    end
-    if type(a) == 'table' then
-        return tonumber(a.x or a[1]) or 0, tonumber(a.y or a[2]) or 0
-    end
-    return tonumber(a) or 0, 0
-end
+-- Use shared vec2xy from Helpers
+local vec2xy = Helpers.vec2xy
 
 local function getStableGroupTargetBounds()
+    if Anchor and Anchor.getTargetBounds then
+        local gt = Anchor.getTargetBounds('grouptarget')
+        if gt then return gt end
+    end
     local gt = _G.GroupTargetBounds
     if not gt or not gt.loaded then return nil end
     if gt.timestamp and (os.clock() - gt.timestamp) > 5.0 then return nil end
@@ -357,8 +381,13 @@ local function draw()
     if matchGTW and tostring(mainAnchorTarget or '') == 'grouptarget' then
         local gt = getStableGroupTargetBounds()
         local gtW = gt and tonumber(gt.width) or nil
-        if gtW and gtW > 50 and imgui.SetNextWindowSizeConstraints then
-            imgui.SetNextWindowSizeConstraints(gtW, 10, gtW, 10000)
+        if gtW and gtW > 50 then
+            if imgui.SetNextWindowSizeConstraints then
+                imgui.SetNextWindowSizeConstraints(gtW, 10, gtW, 10000)
+            end
+            if imgui.SetNextWindowSize then
+                imgui.SetNextWindowSize(gtW, estH, (ImGuiCond and ImGuiCond.Always) or 0)
+            end
             estW = gtW
         end
     end
@@ -383,6 +412,9 @@ local function draw()
     end
 
     local flags = (ImGuiWindowFlags and ImGuiWindowFlags.AlwaysAutoResize) or 0
+    if matchGTW then
+        flags = 0
+    end
     if ImGuiWindowFlags and bit32 and bit32.bor then
         flags = bit32.bor(
             flags,
@@ -416,11 +448,8 @@ local function draw()
 
         -- Center the row contents in the bar (works with or without match-GT-width).
         do
-            local function vecX(v)
-                if type(v) == 'number' then return v end
-                if type(v) == 'table' then return tonumber(v.x or v[1]) or 0 end
-                return 0
-            end
+            -- Use shared vecX from Helpers
+            local vecX = Helpers.vecX
             local function visibleLabel(lbl)
                 lbl = tostring(lbl or '')
                 return (lbl:gsub('##.*$', ''))
@@ -870,8 +899,11 @@ local function tickAutomation()
     mq.doevents()
 
     local priorityHealingActive = false
-    if playStyle ~= 'manual' and Healing and Healing.tick then
-        priorityHealingActive = Healing.tick(Core.Settings) == true
+    if playStyle ~= 'manual' then
+        Healing = getHealingModule()  -- Get appropriate module for current class
+        if Healing and Healing.tick then
+            priorityHealingActive = Healing.tick(Core.Settings) == true
+        end
     end
 
     -- Cure tick (after healing, before rotation engine)
@@ -1242,6 +1274,13 @@ local function main()
             else
                 print('[Spell] Usage: /sidekick testcast <spellname>')
             end
+        elseif a1 == 'healmonitor' then
+            local mod = getHealingModule()
+            if mod and mod.toggleMonitor then
+                mod.toggleMonitor()
+            else
+                print('[SideKick] Heal monitor not available')
+            end
         elseif a1 == 'assistme' then
             -- Broadcast assist me to all peers in same zone
             enqueue(function()
@@ -1274,6 +1313,16 @@ local function main()
     end)
     _bindCmd('/skactors', function()
         ActorsDebug.toggle()
+    end)
+    _bindCmd('/skspells', function(cmd)
+        enqueue(function()
+            local ok, scanner = pcall(require, 'utils.spellbook_scanner')
+            if ok and scanner then
+                scanner.handleCommand(cmd)
+            else
+                mq.cmd('/echo [SideKick] Error loading spellbook scanner')
+            end
+        end)
     end)
 
     mq.imgui.init('SideKick', function()
@@ -1324,6 +1373,11 @@ local function main()
         ActorsDebug.render()
         SpellSetEditor.render()
 
+        -- Healing monitor (new healing intelligence module)
+        if NewHealing and NewHealing.drawMonitor then
+            NewHealing.drawMonitor()
+        end
+
         if State.shouldDraw then
             draw()
         end
@@ -1369,10 +1423,20 @@ local function main()
                 chase = Core.Settings.ChaseEnabled == true,
             })
             ActorsCoordinator.tick({ status = status })
+
+            -- Healing module actors tick (for multi-healer coordination)
+            if Healing and Healing.tickActors then
+                Healing.tickActors()
+            end
         end
 
         mq.doevents()
         mq.delay(1)
+    end
+
+    -- Shutdown: healing module (new healing intelligence)
+    if NewHealing and NewHealing.shutdown then
+        NewHealing.shutdown()
     end
 
     -- Shutdown: save immune database

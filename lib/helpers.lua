@@ -133,6 +133,47 @@ function M.textWidth(s)
   return a or 0
 end
 
+--- Extract x coordinate from various vec2 representations
+---@param v any ImVec2, table {x,y}, table {[1],[2]}, or number
+---@return number The x coordinate
+function M.vecX(v)
+  if type(v) == 'number' then return tonumber(v) or 0 end
+  if type(v) == 'table' then return tonumber(v.x or v[1]) or 0 end
+  local ok, x = pcall(function() return v.x end)
+  if ok and x ~= nil then return tonumber(x) or 0 end
+  return 0
+end
+
+--- Extract x,y coordinates from various vec2 representations
+---@param a any First argument (ImVec2, table, or x number)
+---@param b number|nil Second argument (y number if a is x)
+---@return number x The x coordinate
+---@return number y The y coordinate
+function M.vec2xy(a, b)
+  if b ~= nil then
+    return tonumber(a) or 0, tonumber(b) or 0
+  end
+  if type(a) == 'table' then
+    return tonumber(a.x or a[1]) or 0, tonumber(a.y or a[2]) or 0
+  end
+  return tonumber(a) or 0, 0
+end
+
+--- Get cooldown total for an ability definition
+---@param def table Ability definition with altName or discName
+---@param cooldownProbe function Cooldown probe function
+---@return number|nil The total cooldown time, or nil if unavailable
+function M.cooldownTotalFor(def, cooldownProbe)
+  if not cooldownProbe then return nil end
+  local name = def and (def.discName or def.altName)
+  if type(name) ~= 'string' or name == '' then return nil end
+  local ok, _, total = pcall(function() return cooldownProbe({ label = name, key = name }) end)
+  if not ok then return nil end
+  total = tonumber(total) or 0
+  if total <= 0 then return nil end
+  return total
+end
+
 --- Wrap text to fit within a maximum width
 ---@param text string|nil The text to wrap
 ---@param maxWidth number The maximum width in pixels

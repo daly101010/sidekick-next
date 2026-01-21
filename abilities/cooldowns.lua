@@ -3,7 +3,8 @@
 -- =========================================================================
 
 local mq = require('mq')
-local Helpers = require('lib.helpers')
+local Helpers = require('sidekick-next.lib.helpers')
+local Core = require('sidekick-next.utils.core')
 
 local M = {}
 
@@ -12,6 +13,11 @@ M._smooth = M._smooth or {}
 local function nowMs()
   if mq and mq.gettime then return mq.gettime() end
   return os.clock() * 1000
+end
+
+-- Use centralized game state check from Core
+local function can_query_items()
+  return Core.CanQueryItems()
 end
 
 local function smooth(name, rem, total)
@@ -111,7 +117,7 @@ function M.probe(row)
   end
 
   -- Try Item
-  if mq.TLO.FindItem then
+  if mq.TLO.FindItem and can_query_items() then
     local item = mq.TLO.FindItem(name)
     if item and item() then
       local remain = 0

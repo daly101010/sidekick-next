@@ -1,16 +1,10 @@
 local imgui = require('ImGui')
+local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
 
-local function vec2xy(a, b)
-    if b ~= nil then
-        return tonumber(a) or 0, tonumber(b) or 0
-    end
-    if type(a) == 'table' then
-        return tonumber(a.x or a[1]) or 0, tonumber(a.y or a[2]) or 0
-    end
-    return tonumber(a) or 0, 0
-end
+-- Use shared vec2xy from Helpers
+local vec2xy = Helpers.vec2xy
 
 local function normalizeTargetKey(target)
     target = tostring(target or 'grouptarget'):lower()

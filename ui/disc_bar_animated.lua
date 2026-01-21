@@ -6,6 +6,7 @@ local Core = require('sidekick-next.utils.core')
 local Themes = require('sidekick-next.themes')
 local Anchor = require('sidekick-next.ui.anchor')
 local Draw = require('sidekick-next.ui.draw_helpers')
+local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
 
@@ -196,16 +197,8 @@ local function swapOrder(orderKey, orderList, aKey, bKey)
     return true
 end
 
-local function cooldownTotalFor(def, cooldownProbe)
-    if not cooldownProbe then return nil end
-    local name = def and (def.discName or def.altName)
-    if type(name) ~= 'string' or name == '' then return nil end
-    local ok, _, total = pcall(function() return cooldownProbe({ label = name, key = name }) end)
-    if not ok then return nil end
-    total = tonumber(total) or 0
-    if total <= 0 then return nil end
-    return total
-end
+-- Use shared cooldownTotalFor from Helpers
+local cooldownTotalFor = Helpers.cooldownTotalFor
 
 local function drawDescription(desc)
     desc = tostring(desc or '')

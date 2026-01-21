@@ -3,8 +3,33 @@
 -- Prevents spam, ensures proper sequencing, enables future spell integration
 
 local mq = require('mq')
+local Core = require('sidekick-next.utils.core')
 
 local M = {}
+
+-- Optional buff logger for tracing executor-level spell casts
+local _BuffLogger = nil
+local function getBuffLogger()
+    if not _BuffLogger then
+        local ok, logger = pcall(require, 'automation.buff_logger')
+        if ok then
+            _BuffLogger = logger
+            if _BuffLogger and _BuffLogger.init then
+                _BuffLogger.init()
+            end
+        end
+    end
+    return _BuffLogger
+end
+
+local function isBuffSpell(opts)
+    if not opts then return false end
+    local cat = tostring(opts.spellCategory or opts.category or ''):lower()
+    if cat == 'buff' or cat == 'selfbuff' or cat == 'groupbuff' or cat == 'aura' then
+        return true
+    end
+    return tostring(opts.sourceLayer or ''):lower() == 'buff'
+end
 
 -- Channels with independent lockouts
 local CHANNELS = {
@@ -17,6 +42,11 @@ local CHANNELS = {
 -- Global casting lock (can't do most actions while casting)
 local _casting = false
 local _castEndTime = 0
+
+-- Use centralized game state check from Core
+local function can_query_items()
+    return Core.CanQueryItems()
+end
 
 function M.init()
     for _, ch in pairs(CHANNELS) do
@@ -143,7 +173,21 @@ function M.executeSpell(spellName, targetId, opts)
     -- Check if spell engine is already casting
     if SpellEngine.isBusy() then return false end
 
+    local buffLog = isBuffSpell(opts) and getBuffLogger() or nil
+    if buffLog then
+        buffLog.info('executor', 'Execute spell: spell=%s targetId=%d sourceLayer=%s',
+            tostring(spellName), tonumber(targetId) or 0, tostring(opts and opts.sourceLayer or ''))
+    end
     local success, reason = SpellEngine.cast(spellName, targetId, opts)
+    if buffLog then
+        if success then
+            buffLog.info('executor', 'Execute spell accepted: spell=%s targetId=%d',
+                tostring(spellName), tonumber(targetId) or 0)
+        else
+            buffLog.warn('executor', 'Execute spell rejected: spell=%s targetId=%d reason=%s',
+                tostring(spellName), tonumber(targetId) or 0, tostring(reason))
+        end
+    end
     return success == true
 end
 
@@ -166,6 +210,7 @@ function M.executeItem(itemName)
     if not itemName or itemName == '' then return false end
     if not M.isChannelReady('item') then return false end
 
+    if not can_query_items() then return false end
     local item = mq.TLO.FindItem(itemName)
     if not item or not item() then return false end
     if item.TimerReady() ~= 0 then return false end  -- 0 means ready
@@ -182,6 +227,7 @@ function M.executeItemSlot(slotName)
     if not slotName or slotName == '' then return false end
     if not M.isChannelReady('item') then return false end
 
+    if not can_query_items() then return false end
     local item = mq.TLO.InvSlot(slotName).Item
     if not item or not item() then return false end
     if item.TimerReady() ~= 0 then return false end

@@ -6,6 +6,7 @@ local Core = require('sidekick-next.utils.core')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 local Themes = require('sidekick-next.themes')
 local Draw = require('sidekick-next.ui.draw_helpers')
+local Helpers = require('sidekick-next.lib.helpers')
 
 -- Use centralized draw helpers for cross-build compatibility
 local IM_COL32 = Draw.IM_COL32
@@ -112,23 +113,8 @@ local function executeRemoteAbility(charName, ability)
     end
 end
 
--- Format cooldown time
-local function fmtCooldown(rem)
-    rem = tonumber(rem) or 0
-    rem = math.max(0, math.floor(rem + 0.5))
-    if rem >= 3600 then
-        local h = math.floor(rem / 3600)
-        local m = math.floor((rem % 3600) / 60)
-        local s = math.floor(rem % 60)
-        return string.format("%d:%02d:%02d", h, m, s)
-    elseif rem >= 60 then
-        local m = math.floor(rem / 60)
-        local s = math.floor(rem % 60)
-        return string.format("%d:%02d", m, s)
-    else
-        return string.format("%ds", rem)
-    end
-end
+-- Use shared fmtCooldown from Helpers
+local fmtCooldown = Helpers.fmtCooldown
 
 -- Draw outlined text (for button labels)
 -- Uses Draw.addText wrapper for proper API detection across MQ builds

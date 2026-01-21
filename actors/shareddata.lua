@@ -1,4 +1,5 @@
 local mq = require('mq')
+local Core = require('sidekick-next.utils.core')
 
 local M = {}
 
@@ -16,6 +17,11 @@ local function safeBool(fn, fallback)
     if type(v) == 'number' then return v ~= 0 end
     local s = tostring(v):lower()
     return (s == '1' or s == 'true' or s == 'yes' or s == 'on')
+end
+
+-- Use centralized game state check from Core
+local function can_query_items()
+    return Core.CanQueryItems()
 end
 
 -- Build buff status: what buffs this character currently HAS
@@ -122,7 +128,7 @@ local function buildAbilityStatus(abilities, cooldownProbe)
                     ready = me.AbilityReady(def.altName)() == true
                 end
             elseif kind == 'item' then
-                if me and mq.TLO.FindItem then
+                if me and mq.TLO.FindItem and can_query_items() then
                     local item = mq.TLO.FindItem(def.itemName or def.altName)
                     if item and item.TimerReady then
                         ready = item.TimerReady() == 0
