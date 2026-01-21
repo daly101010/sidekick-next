@@ -582,6 +582,16 @@ function M.shouldApplyHoT(target, hotSpellName)
         return false, 'disabled'
     end
 
+    -- Use HotAnalyzer for TTK and DPS ratio gates
+    local ok, HotAnalyzer = pcall(require, 'healing.hot_analyzer')
+    if ok and HotAnalyzer and HotAnalyzer.shouldApplyHoT then
+        local shouldApply, analysis, reason = HotAnalyzer.shouldApplyHoT(target, hotSpellName, nil)
+        if not shouldApply then
+            return false, reason
+        end
+        -- Analysis passed new gates, continue with existing checks
+    end
+
     local combatState = CombatAssessor and CombatAssessor.getState() or {}
 
     -- No HoTs during emergency
