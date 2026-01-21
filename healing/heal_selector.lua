@@ -842,6 +842,22 @@ function M.SelectHeal(targetInfo, situation)
         end
     end
 
+    -- Check HoT trust before selecting direct heal
+    local ok, HotAnalyzer = pcall(require, 'healing.hot_analyzer')
+    if ok and HotAnalyzer and HotAnalyzer.shouldTrustHoT then
+        local trustHoT, analysis, decision = HotAnalyzer.shouldTrustHoT(targetInfo, situation)
+        if trustHoT then
+            return nil, 'hot_trusted|' .. (analysis and string.format('projected=%.0f%% threshold=%.0f%%',
+                analysis.projectedPct or 0, analysis.threshold or 0) or '')
+        end
+
+        -- Use uncovered gap for sizing the heal
+        if analysis and analysis.uncoveredGap and analysis.uncoveredGap > 0 then
+            deficit = analysis.uncoveredGap
+            deficitPct = (deficit / (targetInfo.maxHP or 1)) * 100
+        end
+    end
+
     local minHealPct = config.minHealPct or 10
     if lowPressure and nonSquishy and config.lowPressureMinDeficitPct and deficitPct < config.lowPressureMinDeficitPct then
         return nil, 'below_min_pct_low_pressure'
