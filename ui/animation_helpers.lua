@@ -234,6 +234,86 @@ function M.getReadyGlowColor(uniqueId, isReady, baseColor)
 end
 
 -- ============================================================
+-- READY SHINE EFFECT (sweeping highlight)
+-- ============================================================
+
+-- Get the X offset for a shine sweep across a cell
+-- Returns nil if ability is not ready or shine is disabled
+function M.getReadyShineOffset(uniqueId, cellWidth, isReady)
+    if not isReady then return nil end
+    if not featureEnabled('ReadyPulseEnabled') then return nil end
+
+    -- Slow sweep: 2.5 second cycle
+    local cycleDuration = 2.5
+    local t = (os.clock() % cycleDuration) / cycleDuration
+
+    -- Ease in-out for smoother motion at edges
+    local eased
+    if t < 0.5 then
+        eased = 2 * t * t
+    else
+        eased = 1 - math.pow(-2 * t + 2, 2) / 2
+    end
+
+    -- Sweep from left edge past right edge
+    local shineWidth = cellWidth * 0.25
+    return -shineWidth + (cellWidth + shineWidth * 2) * eased
+end
+
+-- Draw the shine highlight effect on a ready ability
+-- Call this after drawing the icon but before other overlays
+function M.drawReadyShine(dl, minX, minY, maxX, maxY, isReady, themeName)
+    if not isReady then return end
+    if not featureEnabled('ReadyPulseEnabled') then return end
+    if not dl then return end
+
+    local cellWidth = maxX - minX
+    local shineOffset = M.getReadyShineOffset('shine', cellWidth, true)
+    if not shineOffset then return end
+
+    local shineWidth = cellWidth * 0.25
+    local sx = minX + shineOffset
+
+    -- Skip if shine is completely outside cell
+    if sx > maxX or sx + shineWidth < minX then return end
+
+    -- Get theme-aware ready color
+    local readyRGB = Colors.ready(themeName)
+
+    -- Calculate clipped bounds
+    local drawLeft = math.max(minX, sx)
+    local drawRight = math.min(maxX, sx + shineWidth)
+
+    -- Gradient alpha: peak in center, fade at edges
+    local centerX = sx + shineWidth / 2
+    local distFromCenter = math.abs((drawLeft + drawRight) / 2 - centerX)
+    local normalizedDist = distFromCenter / (shineWidth / 2)
+    local peakAlpha = 50 * (1 - normalizedDist * normalizedDist)
+
+    -- Draw gradient shine bar
+    local leftAlpha = sx < minX and 0 or math.floor(peakAlpha * 0.3)
+    local rightAlpha = (sx + shineWidth) > maxX and 0 or math.floor(peakAlpha * 0.3)
+    local centerAlpha = math.floor(peakAlpha)
+
+    -- Simple gradient approximation: draw 3 strips
+    local thirdWidth = (drawRight - drawLeft) / 3
+
+    if thirdWidth > 1 then
+        local col1 = Draw.IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], leftAlpha)
+        local col2 = Draw.IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], centerAlpha)
+        local col3 = Draw.IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], rightAlpha)
+
+        Draw.addRectFilled(dl, drawLeft, minY, drawLeft + thirdWidth, maxY, col1, 0)
+        Draw.addRectFilled(dl, drawLeft + thirdWidth, minY, drawLeft + thirdWidth * 2, maxY, col2, 0)
+        Draw.addRectFilled(dl, drawLeft + thirdWidth * 2, minY, drawRight, maxY, col3, 0)
+    else
+        -- Cell too small, just draw single rect
+        local col = Draw.IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], centerAlpha)
+        Draw.addRectFilled(dl, drawLeft, minY, drawRight, maxY, col, 0)
+    end
+end
+
+-- ============================================================
 -- LOW RESOURCE WARNING ANIMATION
 -- ============================================================
 
