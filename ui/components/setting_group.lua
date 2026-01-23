@@ -69,7 +69,21 @@ end
 -- SIMPLE SECTION WITH SEPARATOR
 -- ============================================================
 
-function M.section(label, drawFn, opts)
+function M.section(label, drawFnOrTheme, opts)
+    -- Handle flexible argument patterns:
+    -- section(label) - just header
+    -- section(label, themeName) - header with theme (ignored, for consistency)
+    -- section(label, drawFn) - header with callback
+    -- section(label, drawFn, opts) - full form
+
+    local drawFn = nil
+    if type(drawFnOrTheme) == 'function' then
+        drawFn = drawFnOrTheme
+    elseif type(drawFnOrTheme) == 'table' then
+        opts = drawFnOrTheme
+    end
+    -- If drawFnOrTheme is a string (theme name), we just ignore it
+
     opts = opts or {}
     local indent = opts.indent or 0
 
@@ -83,8 +97,8 @@ function M.section(label, drawFn, opts)
         imgui.Indent(indent)
     end
 
-    -- Draw content
-    if drawFn then
+    -- Draw content (only if actually a function)
+    if drawFn and type(drawFn) == 'function' then
         local ok, err = pcall(drawFn)
         if not ok then
             imgui.TextColored(1, 0.3, 0.3, 1, 'Error: ' .. tostring(err))
