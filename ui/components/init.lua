@@ -46,6 +46,7 @@ M.AnchorVisualizer = lazyLoad('anchor_visualizer')
 M.Tooltip = lazyLoad('tooltip')
 M.SettingCard = lazyLoad('setting_card')
 M.ResourceBar = lazyLoad('resource_bar')
+M.StatusBadge = lazyLoad('status_badge')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -114,6 +115,22 @@ end
 
 function M.resourceBar(...)
     return M.ResourceBar.draw(...)
+end
+
+function M.badge(...)
+    return M.StatusBadge.draw(...)
+end
+
+function M.badgeReady(...)
+    return M.StatusBadge.ready(...)
+end
+
+function M.badgeDebuff(...)
+    return M.StatusBadge.debuff(...)
+end
+
+function M.statusDot(...)
+    return M.StatusBadge.statusDot(...)
 end
 
 return M
