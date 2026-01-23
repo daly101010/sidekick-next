@@ -45,6 +45,7 @@ M.CheckboxRow = lazyLoad('checkbox_row')
 M.AnchorVisualizer = lazyLoad('anchor_visualizer')
 M.Tooltip = lazyLoad('tooltip')
 M.SettingCard = lazyLoad('setting_card')
+M.ResourceBar = lazyLoad('resource_bar')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -101,6 +102,18 @@ end
 
 function M.collapsibleCard(...)
     return M.SettingCard.collapsible(...)
+end
+
+function M.healthBar(...)
+    return M.ResourceBar.health(...)
+end
+
+function M.manaBar(...)
+    return M.ResourceBar.mana(...)
+end
+
+function M.resourceBar(...)
+    return M.ResourceBar.draw(...)
 end
 
 return M
