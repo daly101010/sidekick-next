@@ -51,6 +51,7 @@ M.LoadingSpinner = lazyLoad('loading_spinner')
 M.KeybindBadge = lazyLoad('keybind_badge')
 M.Toast = lazyLoad('toast')
 M.IconButton = lazyLoad('icon_button')
+M.DataTable = lazyLoad('data_table')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -195,6 +196,14 @@ end
 
 function M.iconButtonGroup(...)
     return M.IconButton.group(...)
+end
+
+function M.dataTable(...)
+    return M.DataTable.draw(...)
+end
+
+function M.simpleTable(...)
+    return M.DataTable.simple(...)
 end
 
 return M
