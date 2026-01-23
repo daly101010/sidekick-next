@@ -47,6 +47,7 @@ M.Tooltip = lazyLoad('tooltip')
 M.SettingCard = lazyLoad('setting_card')
 M.ResourceBar = lazyLoad('resource_bar')
 M.StatusBadge = lazyLoad('status_badge')
+M.LoadingSpinner = lazyLoad('loading_spinner')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -131,6 +132,18 @@ end
 
 function M.statusDot(...)
     return M.StatusBadge.statusDot(...)
+end
+
+function M.spinner(...)
+    return M.LoadingSpinner.circular(...)
+end
+
+function M.spinnerDots(...)
+    return M.LoadingSpinner.dots(...)
+end
+
+function M.progressBar(...)
+    return M.LoadingSpinner.bar(...)
 end
 
 return M
