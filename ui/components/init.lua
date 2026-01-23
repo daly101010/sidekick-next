@@ -53,6 +53,7 @@ M.Toast = lazyLoad('toast')
 M.IconButton = lazyLoad('icon_button')
 M.DataTable = lazyLoad('data_table')
 M.SearchInput = lazyLoad('search_input')
+M.Demo = lazyLoad('demo')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -213,6 +214,14 @@ end
 
 function M.searchFilter(...)
     return M.SearchInput.filter(...)
+end
+
+function M.showDemo()
+    return M.Demo.show()
+end
+
+function M.toggleDemo()
+    return M.Demo.toggle()
 end
 
 return M
