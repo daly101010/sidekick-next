@@ -97,6 +97,52 @@ local TABS = {
 local function renderButtonsTab()
     local theme = State.themeName
 
+    -- DIAGNOSTIC: Test DrawList directly
+    Components.SettingGroup.section('DrawList Diagnostic', theme)
+
+    local dl = imgui.GetWindowDrawList()
+    if dl then
+        imgui.Text('DrawList: OK')
+
+        -- Try to get cursor position
+        local cx, cy = imgui.GetCursorScreenPos()
+        if type(cx) == 'table' then
+            imgui.Text('CursorPos: table {x=' .. tostring(cx.x or cx[1]) .. ', y=' .. tostring(cx.y or cx[2]) .. '}')
+            cy = cx.y or cx[2]
+            cx = cx.x or cx[1]
+        else
+            imgui.Text('CursorPos: ' .. tostring(cx) .. ', ' .. tostring(cy))
+        end
+
+        -- Reserve space and try to draw
+        imgui.Dummy(100, 30)
+
+        -- Try direct DrawList call
+        local col = 0xFF00FF00  -- Green, ABGR format
+        local ok, err = pcall(function()
+            dl:AddRectFilled(cx, cy, cx + 80, cy + 20, col, 4)
+        end)
+        if ok then
+            imgui.Text('AddRectFilled (raw): OK')
+        else
+            imgui.TextColored(1, 0.3, 0.3, 1, 'AddRectFilled (raw): ' .. tostring(err))
+        end
+
+        -- Try with Draw helper
+        local Draw = require('sidekick-next.ui.draw_helpers')
+        local col2 = Draw.IM_COL32(0, 255, 0, 255)
+        imgui.Text('IM_COL32 result: ' .. tostring(col2))
+
+        local ok2 = Draw.addRectFilled(dl, cx, cy + 25, cx + 80, cy + 45, col2, 4)
+        imgui.Text('Draw.addRectFilled: ' .. tostring(ok2))
+    else
+        imgui.TextColored(1, 0.3, 0.3, 1, 'DrawList: NIL!')
+    end
+
+    imgui.Spacing()
+    imgui.Separator()
+    imgui.Spacing()
+
     -- Themed Toggle Buttons (these work - use standard imgui)
     Components.SettingGroup.section('Toggle Buttons', theme)
 
