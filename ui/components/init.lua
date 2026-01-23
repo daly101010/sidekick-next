@@ -50,6 +50,7 @@ M.StatusBadge = lazyLoad('status_badge')
 M.LoadingSpinner = lazyLoad('loading_spinner')
 M.KeybindBadge = lazyLoad('keybind_badge')
 M.Toast = lazyLoad('toast')
+M.IconButton = lazyLoad('icon_button')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -182,6 +183,18 @@ end
 
 function M.renderToasts(...)
     return M.Toast.render(...)
+end
+
+function M.iconButton(...)
+    return M.IconButton.draw(...)
+end
+
+function M.iconButtonToggle(...)
+    return M.IconButton.toggle(...)
+end
+
+function M.iconButtonGroup(...)
+    return M.IconButton.group(...)
 end
 
 return M
