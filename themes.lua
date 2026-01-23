@@ -244,6 +244,54 @@ M.presets = {
         ScrollbarBg = { 0.10, 0.10, 0.11 },
         ScrollbarGrab = { 0.22, 0.22, 0.26 },
     },
+
+    ['Velious'] = {
+        name = 'Velious',
+        description = 'Ice and stone Velious expansion theme',
+        -- Deep cold stone base with ice-blue accents
+        WindowBg = { 0.08, 0.10, 0.14 },
+        ChildBg = { 0.06, 0.08, 0.12 },
+        FrameBg = { 0.12, 0.15, 0.22 },
+        FrameBgHovered = { 0.16, 0.20, 0.30 },
+        FrameBgActive = { 0.20, 0.25, 0.38 },
+        -- Ice-blue buttons
+        Button = { 0.15, 0.22, 0.35 },
+        ButtonHovered = { 0.22, 0.35, 0.55 },
+        ButtonActive = { 0.18, 0.30, 0.48 },
+        -- Frost headers
+        Header = { 0.12, 0.18, 0.28 },
+        HeaderHovered = { 0.18, 0.28, 0.45 },
+        HeaderActive = { 0.22, 0.35, 0.55 },
+        -- Ice-blue accents
+        Border = { 0.35, 0.55, 0.75 },
+        Separator = { 0.25, 0.40, 0.55 },
+        ScrollbarBg = { 0.06, 0.08, 0.12 },
+        ScrollbarGrab = { 0.20, 0.32, 0.48 },
+    },
+
+    ['Kunark'] = {
+        name = 'Kunark',
+        description = 'Earthy volcanic Kunark expansion theme',
+        -- Dark volcanic rock base with ember accents
+        WindowBg = { 0.08, 0.06, 0.05 },
+        ChildBg = { 0.06, 0.05, 0.04 },
+        FrameBg = { 0.14, 0.10, 0.08 },
+        FrameBgHovered = { 0.20, 0.14, 0.10 },
+        FrameBgActive = { 0.26, 0.18, 0.12 },
+        -- Ember/lava buttons
+        Button = { 0.22, 0.12, 0.08 },
+        ButtonHovered = { 0.35, 0.18, 0.10 },
+        ButtonActive = { 0.45, 0.22, 0.12 },
+        -- Warm headers
+        Header = { 0.18, 0.12, 0.08 },
+        HeaderHovered = { 0.28, 0.18, 0.10 },
+        HeaderActive = { 0.38, 0.24, 0.14 },
+        -- Ember/copper accents
+        Border = { 0.65, 0.40, 0.20 },
+        Separator = { 0.50, 0.32, 0.18 },
+        ScrollbarBg = { 0.06, 0.05, 0.04 },
+        ScrollbarGrab = { 0.40, 0.25, 0.15 },
+    },
 }
 
 M._presetKeyByNormalized = M._presetKeyByNormalized or {}

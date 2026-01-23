@@ -31,6 +31,8 @@ local READY_GLOW_COLORS = {
     ['Light Blue'] = { 100, 180, 255 }, -- Blue
     Blue = { 80, 140, 255 },         -- Deep blue
     Light = { 120, 180, 255 },       -- Soft blue
+    Velious = { 140, 200, 255 },     -- Ice blue
+    Kunark = { 255, 140, 60 },       -- Ember orange
     Default = { 80, 200, 255 },      -- Cyan (fallback)
 }
 
@@ -46,6 +48,8 @@ local TOGGLE_ON_COLORS = {
     ['Light Blue'] = { 0.2, 0.5, 0.8, 1.0 },
     Blue = { 0.2, 0.4, 0.8, 1.0 },
     Light = { 0.3, 0.6, 0.3, 1.0 },
+    Velious = { 0.3, 0.5, 0.8, 1.0 },    -- Frost blue
+    Kunark = { 0.7, 0.4, 0.2, 1.0 },     -- Ember orange
     Default = { 0.3, 0.8, 0.3, 1.0 },
 }
 
@@ -61,6 +65,8 @@ local TOGGLE_OFF_COLORS = {
     ['Light Blue'] = { 0.4, 0.45, 0.5, 1.0 },
     Blue = { 0.35, 0.4, 0.5, 1.0 },
     Light = { 0.5, 0.5, 0.52, 1.0 },
+    Velious = { 0.30, 0.35, 0.45, 1.0 },  -- Cold gray-blue
+    Kunark = { 0.35, 0.28, 0.22, 1.0 },   -- Volcanic gray-brown
     Default = { 0.5, 0.5, 0.5, 1.0 },
 }
 
@@ -76,6 +82,8 @@ local TEXT_COLORS = {
     ['Light Blue'] = { 0.9, 0.95, 1.0, 1.0 },
     Blue = { 0.9, 0.95, 1.0, 1.0 },
     Light = { 0.95, 0.95, 0.95, 1.0 },
+    Velious = { 0.88, 0.94, 1.0, 1.0 },   -- Frosty white-blue
+    Kunark = { 1.0, 0.95, 0.88, 1.0 },    -- Warm white
     Default = { 1.0, 1.0, 1.0, 1.0 },
 }
 
