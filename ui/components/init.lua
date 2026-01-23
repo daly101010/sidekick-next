@@ -52,6 +52,7 @@ M.KeybindBadge = lazyLoad('keybind_badge')
 M.Toast = lazyLoad('toast')
 M.IconButton = lazyLoad('icon_button')
 M.DataTable = lazyLoad('data_table')
+M.SearchInput = lazyLoad('search_input')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -204,6 +205,14 @@ end
 
 function M.simpleTable(...)
     return M.DataTable.simple(...)
+end
+
+function M.search(...)
+    return M.SearchInput.draw(...)
+end
+
+function M.searchFilter(...)
+    return M.SearchInput.filter(...)
 end
 
 return M
