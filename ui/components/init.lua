@@ -49,6 +49,7 @@ M.ResourceBar = lazyLoad('resource_bar')
 M.StatusBadge = lazyLoad('status_badge')
 M.LoadingSpinner = lazyLoad('loading_spinner')
 M.KeybindBadge = lazyLoad('keybind_badge')
+M.Toast = lazyLoad('toast')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -157,6 +158,30 @@ end
 
 function M.actionHint(...)
     return M.KeybindBadge.actionHint(...)
+end
+
+function M.toast(...)
+    return M.Toast.show(...)
+end
+
+function M.toastInfo(...)
+    return M.Toast.info(...)
+end
+
+function M.toastSuccess(...)
+    return M.Toast.success(...)
+end
+
+function M.toastWarning(...)
+    return M.Toast.warning(...)
+end
+
+function M.toastError(...)
+    return M.Toast.error(...)
+end
+
+function M.renderToasts(...)
+    return M.Toast.render(...)
 end
 
 return M
