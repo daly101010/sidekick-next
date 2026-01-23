@@ -505,6 +505,112 @@ function M.getStaggerAlpha(gridKey, idx, total, delay)
 end
 
 -- ============================================================
+-- ENHANCED STAGGERED ENTRY ANIMATIONS
+-- ============================================================
+
+-- Track grid visibility for entry detection
+local _gridVisibility = {}
+local _gridEntryTime = {}
+
+-- Check if grid just became visible (for triggering entry animations)
+function M.checkGridEntry(gridKey, isVisible)
+    local wasVisible = _gridVisibility[gridKey]
+    _gridVisibility[gridKey] = isVisible
+
+    if isVisible and not wasVisible then
+        -- Grid just appeared - record entry time
+        _gridEntryTime[gridKey] = os.clock()
+        M.resetStagger(gridKey)
+        return true
+    end
+    return false
+end
+
+-- Get time since grid entry (for manual animation control)
+function M.getGridEntryElapsed(gridKey)
+    local entryTime = _gridEntryTime[gridKey]
+    if not entryTime then return 999 end  -- Large value = fully entered
+    return os.clock() - entryTime
+end
+
+-- Staggered scale-in for grid items (elastic ease-out)
+function M.getStaggeredEntryScale(gridKey, idx, total)
+    if not featureEnabled('StaggerAnimationEnabled') then return 1.0 end
+
+    local alpha = M.getStaggerAlpha(gridKey, idx, total, C.ANIMATION.STAGGER_DELAY)
+
+    if alpha >= 1.0 then return 1.0 end
+    if alpha <= 0 then return 0.5 end
+
+    -- Elastic ease-out for bouncy scale-in
+    local t = alpha
+    local elasticT
+    if t == 0 or t == 1 then
+        elasticT = t
+    else
+        -- Attempt elastic with reduced overshoot for subtlety
+        local p = 0.4
+        elasticT = math.pow(2, -10 * t) * math.sin((t - p / 4) * (2 * math.pi) / p) + 1
+    end
+
+    -- Scale from 0.7 to 1.0
+    return 0.7 + 0.3 * math.min(1, math.max(0, elasticT))
+end
+
+-- Staggered Y offset for slide-up effect
+function M.getStaggeredEntryOffsetY(gridKey, idx, total, maxOffset)
+    if not featureEnabled('StaggerAnimationEnabled') then return 0 end
+
+    maxOffset = maxOffset or 12
+    local alpha = M.getStaggerAlpha(gridKey, idx, total, C.ANIMATION.STAGGER_DELAY)
+
+    if alpha >= 1.0 then return 0 end
+    if alpha <= 0 then return maxOffset end
+
+    -- Ease-out cubic for smooth deceleration
+    local t = alpha
+    local eased = 1 - math.pow(1 - t, 3)
+
+    return maxOffset * (1 - eased)
+end
+
+-- Combined entry transform: returns scale, offsetX, offsetY, alpha
+function M.getStaggeredEntryTransform(gridKey, idx, total, opts)
+    opts = opts or {}
+    local maxOffsetY = opts.maxOffsetY or 12
+    local maxOffsetX = opts.maxOffsetX or 0
+
+    if not featureEnabled('StaggerAnimationEnabled') then
+        return 1.0, 0, 0, 1.0
+    end
+
+    local alpha = M.getStaggerAlpha(gridKey, idx, total, C.ANIMATION.STAGGER_DELAY)
+
+    if alpha >= 1.0 then return 1.0, 0, 0, 1.0 end
+    if alpha <= 0 then return 0.7, maxOffsetX, maxOffsetY, 0 end
+
+    -- Ease-out for position
+    local t = alpha
+    local posEased = 1 - math.pow(1 - t, 3)
+
+    -- Elastic for scale (subtle)
+    local scaleT = alpha
+    local scale
+    if scaleT >= 0.99 then
+        scale = 1.0
+    else
+        local p = 0.5
+        local elastic = math.pow(2, -8 * scaleT) * math.sin((scaleT - p / 4) * (2 * math.pi) / p) + 1
+        scale = 0.7 + 0.3 * math.min(1.05, math.max(0, elastic))
+    end
+
+    local offsetX = maxOffsetX * (1 - posEased)
+    local offsetY = maxOffsetY * (1 - posEased)
+
+    return scale, offsetX, offsetY, alpha
+end
+
+-- ============================================================
 -- STYLE ALPHA HELPER (for stagger fade-in)
 -- ============================================================
 
@@ -585,6 +691,8 @@ function M.cleanup()
     _damageFlashState = {}
     _toggleStates = {}
     _staggerGrids = {}
+    _gridVisibility = {}
+    _gridEntryTime = {}
     M.clearIdCache()
 end
 
