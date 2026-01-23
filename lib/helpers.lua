@@ -156,6 +156,23 @@ function M.vec2xy(a, b)
   if type(a) == 'table' then
     return tonumber(a.x or a[1]) or 0, tonumber(a.y or a[2]) or 0
   end
+  if type(a) == 'userdata' then
+    local okx, x = pcall(function() return a.x end)
+    local oky, y = pcall(function() return a.y end)
+    if okx and oky then
+      if type(x) == 'function' then
+        local ok, v = pcall(x)
+        if ok then x = v end
+      end
+      if type(y) == 'function' then
+        local ok, v = pcall(y)
+        if ok then y = v end
+      end
+      if x ~= nil or y ~= nil then
+        return tonumber(x) or 0, tonumber(y) or 0
+      end
+    end
+  end
   return tonumber(a) or 0, 0
 end
 

@@ -1,13 +1,13 @@
 local mq = require('mq')
-local Targeting = require('utils.targeting')
-local Aggro = require('utils.aggro')
-local Positioning = require('utils.positioning')
-local Actors = require('utils.actors_coordinator')
-local Abilities = require('utils.abilities')
-local Helpers = require('lib.helpers')
-local Cache = require('utils.runtime_cache')
-local Executor = require('utils.action_executor')
-local CC = require('automation.cc')
+local Targeting = require('sidekick-next.utils.targeting')
+local Aggro = require('sidekick-next.utils.aggro')
+local Positioning = require('sidekick-next.utils.positioning')
+local Actors = require('sidekick-next.utils.actors_coordinator')
+local Abilities = require('sidekick-next.utils.abilities')
+local Helpers = require('sidekick-next.lib.helpers')
+local Cache = require('sidekick-next.utils.runtime_cache')
+local Executor = require('sidekick-next.utils.action_executor')
+local CC = require('sidekick-next.automation.cc')
 
 local M = {}
 

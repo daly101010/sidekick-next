@@ -13,7 +13,7 @@ M._settings = nil
 local _Targeting = nil
 local function getTargeting()
     if not _Targeting then
-        local ok, targeting = pcall(require, 'utils.targeting')
+        local ok, targeting = pcall(require, 'sidekick-next.utils.targeting')
         if ok then _Targeting = targeting end
     end
     return _Targeting
@@ -364,7 +364,7 @@ end
 --- Check if any XTarget mob is mezzed
 -- Uses CC module if available, falls back to TLO check
 function M.hasAnyMezzedOnXTarget()
-    local ok, CC = pcall(require, 'automation.cc')
+    local ok, CC = pcall(require, 'sidekick-next.automation.cc')
     if ok and CC and CC.hasAnyMezzedOnXTarget then
         return CC.hasAnyMezzedOnXTarget()
     end
@@ -383,7 +383,7 @@ end
 -- @param mobId number Mob spawn ID
 -- @return boolean True if mezzed
 function M.isMobMezzed(mobId)
-    local ok, CC = pcall(require, 'automation.cc')
+    local ok, CC = pcall(require, 'sidekick-next.automation.cc')
     if ok and CC and CC.isMobMezzed then
         return CC.isMobMezzed(mobId)
     end
@@ -434,7 +434,8 @@ function M.checkBuff(targetId, spellId, buffCategory)
     local buff = mq.TLO.Target.FindBuff('id ' .. spellId)
     if buff and buff() then
         result.present = true
-        result.remaining = tonumber(buff.Duration.TotalSeconds()) or 0
+        local dur = buff.Duration
+        result.remaining = dur and dur.TotalSeconds and (tonumber(dur.TotalSeconds()) or 0) or 0
         result.spellId = spellId
     end
 
@@ -515,7 +516,9 @@ function M.getMembersNeedingBuff(buffCategory, rebuffWindow)
     if myId > 0 then
         ensureSelfInBuffState()
         local selfState = M.buffState[myId] and M.buffState[myId][buffCategory]
-        if not selfState or not selfState.present or (selfState.remaining or 0) < rebuffWindow then
+        if selfState and selfState.pending then
+            -- Skip pending buffs (recently cast, awaiting confirmation)
+        elseif not selfState or not selfState.present or (selfState.remaining or 0) < rebuffWindow then
             table.insert(needing, {
                 member = {
                     id = myId,
@@ -533,8 +536,12 @@ function M.getMembersNeedingBuff(buffCategory, rebuffWindow)
 
     -- Check group members
     for _, member in pairs(M.group.members or {}) do
-        local state = member.buffs and member.buffs[buffCategory]
-        if not state or not state.present or (state.remaining or 0) < rebuffWindow then
+        -- Check buffState directly (member.buffs may be stale nil reference)
+        local memberId = member.id
+        local state = M.buffState[memberId] and M.buffState[memberId][buffCategory]
+        if state and state.pending then
+            -- Skip pending buffs (recently cast, awaiting confirmation)
+        elseif not state or not state.present or (state.remaining or 0) < rebuffWindow then
             table.insert(needing, {
                 member = member,
                 remaining = state and state.remaining or 0,
@@ -564,8 +571,12 @@ function M.getPetsNeedingBuff(buffCategory, rebuffWindow)
 
     -- Check self pet first
     if M.me.pet and M.me.pet.id and M.me.pet.id > 0 then
-        local petState = M.me.pet.buffs and M.me.pet.buffs[buffCategory]
-        if not petState or not petState.present or (petState.remaining or 0) < rebuffWindow then
+        local petId = M.me.pet.id
+        -- Check buffState directly (pet.buffs may be stale nil reference)
+        local petState = M.buffState[petId] and M.buffState[petId][buffCategory]
+        if petState and petState.pending then
+            -- Skip pending buffs (recently cast, awaiting confirmation)
+        elseif not petState or not petState.present or (petState.remaining or 0) < rebuffWindow then
             table.insert(needing, {
                 pet = M.me.pet,
                 owner = {
@@ -582,8 +593,12 @@ function M.getPetsNeedingBuff(buffCategory, rebuffWindow)
     -- Check group member pets
     for _, member in pairs(M.group.members or {}) do
         if member.pet and member.pet.id and member.pet.id > 0 then
-            local petState = member.pet.buffs and member.pet.buffs[buffCategory]
-            if not petState or not petState.present or (petState.remaining or 0) < rebuffWindow then
+            local petId = member.pet.id
+            -- Check buffState directly (pet.buffs may be stale nil reference)
+            local petState = M.buffState[petId] and M.buffState[petId][buffCategory]
+            if petState and petState.pending then
+                -- Skip pending buffs (recently cast, awaiting confirmation)
+            elseif not petState or not petState.present or (petState.remaining or 0) < rebuffWindow then
                 table.insert(needing, {
                     pet = member.pet,
                     owner = member,

@@ -69,6 +69,7 @@ M.properties = {
     { key = "PctEndurance", label = "Endurance",  type = "numeric", isPercent = true, min = 0, max = 100 },
     { key = "Invis",        label = "Invisibility", type = "boolean" },
     { key = "Combat",       label = "In Combat",  type = "boolean" },
+    { key = "Pet",          label = "Pet",        type = "boolean" },
     { key = "PctAggro",     label = "Aggro %",    type = "numeric", isPercent = true, min = 0, max = 100 },
     { key = "SecondaryPctAggro", label = "Secondary Aggro %", type = "numeric", isPercent = true, min = 0, max = 100 },
     { key = "XTargetHaterCount", label = "XTarget Haters", type = "numeric", min = 0, max = 20 },
@@ -916,7 +917,7 @@ local function evaluateSingleCondition(cond)
   elseif cond.type == "beneficial" then
     if cond.subject == "Me" then
       -- Try to get values from runtime cache first (more efficient)
-      local ok, Cache = pcall(require, 'utils.runtime_cache')
+      local ok, Cache = pcall(require, 'sidekick-next.utils.runtime_cache')
       if ok and Cache and Cache.me then
         if cond.property == 'PctAggro' then
           value = Cache.me.pctAggro or 0
@@ -926,19 +927,27 @@ local function evaluateSingleCondition(cond)
           value = Cache.xtarget.count or 0
         elseif cond.property == 'XTargetHasMezzed' then
           -- Check CC module for mezzed mobs on XTarget
-          local ccOk, CC = pcall(require, 'automation.cc')
+          local ccOk, CC = pcall(require, 'sidekick-next.automation.cc')
           if ccOk and CC and CC.hasAnyMezzedOnXTarget then
             value = CC.hasAnyMezzedOnXTarget()
           else
             value = Cache.hasAnyMezzedOnXTarget and Cache.hasAnyMezzedOnXTarget() or false
           end
+        elseif cond.property == 'Pet' then
+          -- Pet is "active" if Me.Pet() is not "NO PET"
+          local petName = mq.TLO.Me.Pet()
+          value = petName ~= nil and petName ~= 'NO PET'
         end
       end
 
       -- Fall back to direct TLO access if not from cache
       if value == nil then
         local Me = mq.TLO.Me
-        if propType == "boolean" then
+        if cond.property == 'Pet' then
+          -- Special handling for Pet - check if we have an active pet
+          local petName = Me.Pet()
+          value = petName ~= nil and petName ~= 'NO PET'
+        elseif propType == "boolean" then
           value = Me[cond.property]() == true
         else
           value = Me[cond.property]() or 0
@@ -1048,6 +1057,12 @@ function M.evaluateWithContext(conditionData, ctx)
         elseif cond.property == "Invis" then
           actual = ctx.isInvis
           if actual == nil then actual = mq.TLO.Me.Invis() or false end
+        elseif cond.property == "Pet" then
+          actual = ctx.hasPet
+          if actual == nil then
+            local petName = mq.TLO.Me.Pet()
+            actual = petName ~= nil and petName ~= 'NO PET'
+          end
         elseif cond.property == "PctAggro" then
           actual = ctx.pctAggro
           if actual == nil then actual = mq.TLO.Me.PctAggro() or 0 end
@@ -1293,15 +1308,79 @@ function M.evaluateWithContext(conditionData, ctx)
 end
 
 -- =========================================================================
--- Serialization (for INI storage)
+-- Serialization (for storage)
 -- =========================================================================
+
+--- Serialize a Lua value to a string representation
+---@param val any The value to serialize
+---@param indent number|nil Current indentation level (for recursion)
+---@return string The serialized string
+local function serializeValue(val, indent)
+  indent = indent or 0
+  local t = type(val)
+
+  if t == "nil" then
+    return "nil"
+  elseif t == "boolean" then
+    return val and "true" or "false"
+  elseif t == "number" then
+    return tostring(val)
+  elseif t == "string" then
+    -- Escape special characters and wrap in quotes
+    return string.format("%q", val)
+  elseif t == "table" then
+    local parts = {}
+    local isArray = true
+    local maxIdx = 0
+
+    -- Check if it's an array (sequential integer keys starting at 1)
+    for k, _ in pairs(val) do
+      if type(k) ~= "number" or k < 1 or math.floor(k) ~= k then
+        isArray = false
+        break
+      end
+      if k > maxIdx then maxIdx = k end
+    end
+
+    -- Verify no gaps in array
+    if isArray then
+      for i = 1, maxIdx do
+        if val[i] == nil then
+          isArray = false
+          break
+        end
+      end
+    end
+
+    if isArray and maxIdx > 0 then
+      -- Serialize as array
+      for i = 1, maxIdx do
+        table.insert(parts, serializeValue(val[i], indent + 1))
+      end
+      return "{" .. table.concat(parts, ",") .. "}"
+    else
+      -- Serialize as dictionary
+      for k, v in pairs(val) do
+        local keyStr
+        if type(k) == "string" and k:match("^[%a_][%w_]*$") then
+          keyStr = k
+        else
+          keyStr = "[" .. serializeValue(k, indent + 1) .. "]"
+        end
+        table.insert(parts, keyStr .. "=" .. serializeValue(v, indent + 1))
+      end
+      return "{" .. table.concat(parts, ",") .. "}"
+    end
+  else
+    -- Unsupported type (function, userdata, thread)
+    return "nil"
+  end
+end
 
 function M.serialize(conditionData)
   if not conditionData then return "" end
-  local ok, result = pcall(function()
-    return mq.pickle("", conditionData)
-  end)
-  if ok and result then
+  local ok, result = pcall(serializeValue, conditionData)
+  if ok and result and result ~= "" then
     return result
   end
   return ""

@@ -1,0 +1,28 @@
+Removed options (sidekick-next)
+Date: 2026-01-22
+
+These settings were removed because they existed in the Settings UI but had no functional implementation (no references outside settings UI/registry), so changing them could not affect runtime behavior.
+
+Removed setting keys:
+- AuraSelection
+- AutoStandFD
+- BuffAllowInCombat
+- BuffCoordinateActors
+- BuffFellowshipEnabled
+- BuffGroupEnabled
+- BuffRaidEnabled
+- BuffRebuffWindow
+- BuffSelfOnly
+- CooldownSweepEnabled
+- DoCombatRez
+- DoOutOfCombatRez
+- EmergencyHealPct
+- LowResourceThreshold
+- MAScanZRange
+
+Files updated to remove the UI/registry surfaces:
+- sidekick-next/ui/settings.lua
+- sidekick-next/ui/settings/tab_buffs.lua
+- sidekick-next/ui/settings/tab_healing.lua
+- sidekick-next/ui/settings/tab_integration.lua
+- sidekick-next/registry.lua

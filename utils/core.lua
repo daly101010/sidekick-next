@@ -1,7 +1,20 @@
 local mq = require('mq')
 local lip = require('LIP')
 
-local Registry = require('registry')
+local Registry = require('sidekick-next.registry')
+local Paths = require('sidekick-next.utils.paths')
+
+local _TL = nil
+local function TL()
+    if _TL ~= nil then return _TL end
+    local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
+    if ok then _TL = tl else _TL = false end
+    return _TL
+end
+
+local function debugEcho(fmt, ...)
+    -- Debug logging disabled
+end
 
 local Core = {}
 
@@ -9,9 +22,7 @@ Core.Settings = Core.Settings or {}
 Core.Ini = Core.Ini or {}
 
 local function iniPath()
-    local server = (mq.TLO.EverQuest and mq.TLO.EverQuest.Server and mq.TLO.EverQuest.Server()) or 'Server'
-    local name = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or 'Character'
-    return mq.configDir .. '\\' .. server .. '_' .. name .. '_SideKick.ini'
+    return Paths.getMainConfigPath()
 end
 
 local function toBool(v)
@@ -23,6 +34,21 @@ local function toBool(v)
         return (v == '1' or v == 'true' or v == 'yes' or v == 'on')
     end
     return false
+end
+
+function Core.CanQueryItems()
+    local mqTLO = mq.TLO
+    if not mqTLO or not mqTLO.MacroQuest or not mqTLO.MacroQuest.GameState then
+        return false
+    end
+    local gs = mqTLO.MacroQuest.GameState()
+    if gs ~= 'INGAME' then
+        return false
+    end
+    if mqTLO.Me and mqTLO.Me.Zoning and mqTLO.Me.Zoning() then
+        return false
+    end
+    return true
 end
 
 local function writeValue(section, key, value)
@@ -106,19 +132,21 @@ function Core.load()
 end
 
 function Core.save()
-    local ok, err = pcall(lip.save, iniPath(), Core.Ini)
-    if not ok then
-        if mq and mq.cmdf then
-            mq.cmdf('/echo [SideKick] INI save failed: %s', tostring(err))
-        elseif mq and mq.cmd then
-            mq.cmd('/echo [SideKick] INI save failed: ' .. tostring(err))
-        end
+    if Core.Settings and Core.Settings.SideKickDebugSettings == true then
+        debugEcho('Core.save() path=%s', tostring(iniPath()))
     end
+    local ok, err = pcall(lip.save, iniPath(), Core.Ini)
+    -- Errors logged to file only, not in-game
 end
 
 function Core.set(key, value)
     if key == nil then return end
     local k = tostring(key)
+    local debug = Core.Settings and Core.Settings.SideKickDebugSettings == true
+    if debug then
+        local prev = Core.Settings[k]
+        debugEcho('Core.set(%s): %s -> %s', k, tostring(prev), tostring(value))
+    end
     Core.Settings[k] = value
     -- Ability toggles/modes/conditions always begin with "do" (e.g. doFoo, doFooMode, doFooCondition).
     -- Global settings like AssistMode/CombatMode must stay in the SideKick section.
@@ -127,11 +155,18 @@ function Core.set(key, value)
     else
         writeValue('SideKick', k, value)
     end
+    if debug then
+        local sec = k:match('^do') and 'SideKick-Abilities' or 'SideKick'
+        local stored = Core.Ini and Core.Ini[sec] and Core.Ini[sec][k]
+        debugEcho('INI[%s].%s=%s', sec, k, tostring(stored))
+    end
     Core.save()
 end
 
 function Core.ensureSeeded(abilities, MODE)
     MODE = MODE or {}
+    -- Hardcode ON_DEMAND = 1 as fallback to avoid invalid mode values (like 4)
+    local ON_DEMAND_DEFAULT = MODE.ON_DEMAND or 1
     Core.Ini['SideKick'] = Core.Ini['SideKick'] or {}
     Core.Ini['SideKick-Abilities'] = Core.Ini['SideKick-Abilities'] or {}
 
@@ -147,7 +182,7 @@ function Core.ensureSeeded(abilities, MODE)
                 dirty = true
             end
             if mKey and abilitySection[mKey] == nil then
-                abilitySection[mKey] = tostring(MODE.ON_DEMAND or 4)
+                abilitySection[mKey] = tostring(ON_DEMAND_DEFAULT)
                 dirty = true
             end
         end
@@ -155,7 +190,7 @@ function Core.ensureSeeded(abilities, MODE)
 
     for k, v in pairs(abilitySection) do
         if k:match('Mode$') then
-            Core.Settings[k] = tonumber(v) or (MODE.ON_DEMAND or 4)
+            Core.Settings[k] = tonumber(v) or ON_DEMAND_DEFAULT
         elseif k:match('Condition$') then
             -- Preserve condition data as deserialized table (not boolean)
             if v and v ~= '' and v ~= '0' and v ~= 'false' then

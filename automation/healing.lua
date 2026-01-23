@@ -1,9 +1,9 @@
 local mq = require('mq')
 
-local Core = require('utils.core')
-local RuntimeCache = require('utils.runtime_cache')
-local HealTargeting = require('utils.heal_targeting')
-local ActorsCoordinator = require('utils.actors_coordinator')
+local Core = require('sidekick-next.utils.core')
+local RuntimeCache = require('sidekick-next.utils.runtime_cache')
+local HealTargeting = require('sidekick-next.utils.heal_targeting')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 
 local M = {}
 
@@ -11,13 +11,13 @@ local M = {}
 local _ThrottledLog = nil
 local function getThrottledLog()
     if not _ThrottledLog then
-        local ok, tl = pcall(require, 'utils.throttled_log')
+        local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
         if ok then _ThrottledLog = tl end
     end
     return _ThrottledLog
 end
 
-M.debugHealLineMapping = true
+M.debugHealLineMapping = false
 
 local _state = {
     priorityActive = false,
@@ -263,7 +263,7 @@ local function can_heal_now(settings)
         return false
     end
 
-    local ok, ActionExecutor = pcall(require, 'utils.action_executor')
+    local ok, ActionExecutor = pcall(require, 'sidekick-next.utils.action_executor')
     if ok and ActionExecutor and ActionExecutor.isSpellBusy and ActionExecutor.isSpellBusy() then
         return false
     end
@@ -417,7 +417,7 @@ function M.tick(settings)
         return _state.priorityActive
     end
 
-    local okSE, SpellEngine = pcall(require, 'utils.spell_engine')
+    local okSE, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
     if not okSE or not SpellEngine or not SpellEngine.cast then
         return _state.priorityActive
     end

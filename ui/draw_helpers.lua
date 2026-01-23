@@ -23,9 +23,8 @@ local _apiDetected = false
 local _useImVec2 = false
 local _imVec2Func = nil
 
-local function detectApiSignature()
+local function detectApiSignature(dl)
     if _apiDetected then return end
-    _apiDetected = true
 
     -- Check for ImVec2 constructor
     local ImVec2 = _G.ImVec2 or (imgui and imgui.ImVec2)
@@ -34,9 +33,10 @@ local function detectApiSignature()
     end
 
     -- Try to detect which signature works by probing with safe dummy values
-    -- This happens once at module load, not per-frame
-    local dl = imgui.GetBackgroundDrawList and imgui.GetBackgroundDrawList()
+    -- Only run when a valid draw list is provided
     if not dl then return end
+    _apiDetected = true
+    _useImVec2 = false
 
     -- Test raw coordinates first (most common)
     local ok = pcall(function()
@@ -53,9 +53,6 @@ local function detectApiSignature()
         end
     end
 end
-
--- Run detection on module load
-detectApiSignature()
 
 -- ============================================================
 -- IM_COL32 - Convert RGBA (0-255) to packed uint32
@@ -107,6 +104,10 @@ end
 local function callDl(dl, method, x1, y1, x2, y2, ...)
     if not dl or not dl[method] then return false end
 
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
+
     if _useImVec2 and _imVec2Func then
         local ok = pcall(dl[method], dl, _imVec2Func(x1, y1), _imVec2Func(x2, y2), ...)
         if ok then return true end
@@ -148,6 +149,10 @@ end
 function M.addLine(dl, x1, y1, x2, y2, col, thickness)
     if not dl then return false end
     thickness = tonumber(thickness) or 1
+
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
 
     if _useImVec2 and _imVec2Func then
         local ok = pcall(function()
@@ -195,6 +200,10 @@ end
 function M.addText(dl, x, y, col, text)
     if not dl then return false end
     text = tostring(text or '')
+
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
 
     if _useImVec2 and _imVec2Func then
         local ok = pcall(function() dl:AddText(_imVec2Func(x, y), col, text) end)
@@ -274,9 +283,10 @@ end
 -- RE-DETECTION (for runtime debugging)
 -- ============================================================
 
-function M.redetectApi()
+function M.redetectApi(dl)
     _apiDetected = false
-    detectApiSignature()
+    _useImVec2 = false
+    detectApiSignature(dl)
 end
 
 function M.getApiInfo()

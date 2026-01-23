@@ -10,7 +10,7 @@ local TargetMonitor = nil
 local Logger = nil
 local function getLogger()
     if Logger == nil then
-        local ok, l = pcall(require, 'healing.logger')
+        local ok, l = pcall(require, 'sidekick-next.healing.logger')
         Logger = ok and l or false
     end
     return Logger or nil
@@ -20,14 +20,35 @@ end
 local DamageAttribution = nil
 local function getDamageAttribution()
     if DamageAttribution == nil then
-        local ok, da = pcall(require, 'healing.damage_attribution')
+        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
         DamageAttribution = ok and da or false
     end
     return DamageAttribution or nil
 end
 
+-- Lazy-load MobAssessor for named/raid mob detection
+local MobAssessor = nil
+local function getMobAssessor()
+    if MobAssessor == nil then
+        local ok, ma = pcall(require, 'sidekick-next.healing.mob_assessor')
+        MobAssessor = ok and ma or false
+    end
+    return MobAssessor or nil
+end
+
 -- Mob HP tracking for TTK calculation
 local _mobSnapshots = {}  -- mobId -> { snapshots = [{hpPct, time}], name }
+
+-- Track mob IDs we've already checked for named status (prevents repeated checks)
+local _checkedMobIds = {}  -- mobId -> true
+
+-- Adaptive throttle tracking (rolling window during fight)
+local _fightHealing = {
+    healed = 0,
+    overhealed = 0,
+    healCount = 0,
+    fightStartTime = 0,
+}
 
 local _state = {
     fightPhase = 'none',
@@ -41,6 +62,14 @@ local _state = {
     mezzedMobCount = 0,
     totalIncomingDps = 0,
     tankDpsPct = 0,
+    -- Named/raid mob tracking
+    hasNamedMob = false,
+    hasRaidMob = false,
+    mobDpsMultiplier = 1.0,      -- Highest multiplier from engaged mobs
+    mobDifficultyTier = 'normal', -- Tier of the hardest mob (raid, impossible, extreme, etc.)
+    -- Adaptive throttle state
+    fightOverhealPct = 0,        -- Overheal % during current fight
+    throttleLevel = 0,           -- 0 = no throttle, 1.0 = max throttle
 }
 
 local _lastUpdate = 0
@@ -51,10 +80,69 @@ function M.init(config, targetMonitor)
     Config = config
     TargetMonitor = targetMonitor
     _mobSnapshots = {}
+    _checkedMobIds = {}
 end
 
 function M.getState()
     return _state
+end
+
+-- Record a heal for adaptive throttle tracking
+-- Called from spell_events when a heal lands
+function M.recordHealForThrottle(healed, overhealed)
+    if not _state.inCombat then return end
+
+    healed = tonumber(healed) or 0
+    overhealed = tonumber(overhealed) or 0
+
+    _fightHealing.healed = _fightHealing.healed + healed
+    _fightHealing.overhealed = _fightHealing.overhealed + overhealed
+    _fightHealing.healCount = _fightHealing.healCount + 1
+
+    -- Update overheal percentage
+    local totalPotential = _fightHealing.healed + _fightHealing.overhealed
+    if totalPotential > 0 then
+        _state.fightOverhealPct = (_fightHealing.overhealed / totalPotential) * 100
+    end
+
+    -- Calculate throttle level for raid fights
+    -- Only throttle if: raid fight + enough heals to have data + high overheal
+    local minHealsForThrottle = (Config and Config.throttleMinHeals) or 5
+    local overhealThreshold = (Config and Config.throttleOverhealPct) or 40
+    local maxThrottle = (Config and Config.throttleMaxLevel) or 0.5
+
+    if (_state.hasRaidMob or _state.hasNamedMob) and
+       _fightHealing.healCount >= minHealsForThrottle and
+       _state.fightOverhealPct > overhealThreshold then
+        -- Scale throttle: 40% overheal = 0 throttle, 70% overheal = max throttle
+        local overhealExcess = _state.fightOverhealPct - overhealThreshold
+        local throttleRange = 30  -- 40% to 70%
+        _state.throttleLevel = math.min(maxThrottle, (overhealExcess / throttleRange) * maxThrottle)
+    else
+        _state.throttleLevel = 0
+    end
+end
+
+-- Reset fight healing stats (called when combat ends or new fight starts)
+local function resetFightHealing()
+    _fightHealing.healed = 0
+    _fightHealing.overhealed = 0
+    _fightHealing.healCount = 0
+    _fightHealing.fightStartTime = mq.gettime()
+    _state.fightOverhealPct = 0
+    _state.throttleLevel = 0
+end
+
+-- Get the current throttle adjustment info
+function M.getThrottleInfo()
+    return {
+        overhealPct = _state.fightOverhealPct,
+        throttleLevel = _state.throttleLevel,
+        healCount = _fightHealing.healCount,
+        healed = _fightHealing.healed,
+        overhealed = _fightHealing.overhealed,
+        isActive = _state.throttleLevel > 0,
+    }
 end
 
 -- Record a mob's HP% snapshot for TTK calculation
@@ -268,6 +356,13 @@ local function checkSurvivalMode()
     local tankFullPct = (Config and Config.survivalModeTankFullPct) or 90
     local survivalDpsPct = (Config and Config.survivalModeDpsPct) or 5
 
+    -- Lower threshold when fighting raid/high-tier mobs (trigger survival earlier)
+    -- Raid mobs hit harder, so we want to be more defensive sooner
+    if _state.hasRaidMob then
+        local reduction = (Config and Config.raidMobSurvivalDpsPctReduction) or 2
+        survivalDpsPct = math.max(1, survivalDpsPct - reduction)
+    end
+
     return dpsPct >= survivalDpsPct and tank.pctHP < tankFullPct
 end
 
@@ -277,6 +372,13 @@ local function checkHighPressure(totalDps)
 
     -- Primary check: Total incoming DPS to group
     if totalDps >= minDps then
+        return true
+    end
+
+    -- Check mob difficulty tier - raid/impossible mobs mean high pressure
+    -- regardless of observed DPS (they hit hard and we may not have full data yet)
+    local highPressureMultiplier = (Config and Config.highPressureMobMultiplier) or 3.0
+    if _state.mobDpsMultiplier >= highPressureMultiplier then
         return true
     end
 
@@ -339,7 +441,24 @@ function M.tick()
     local mobs = getXTargetData()
 
     _state.activeMobCount, _state.mezzedMobCount, _state.totalMobCount = countMobs(mobs)
+    local wasInCombat = _state.inCombat
     _state.inCombat = _state.activeMobCount > 0
+
+    -- Reset fight healing tracking when combat state changes
+    if _state.inCombat and not wasInCombat then
+        -- Entering combat - reset for new fight
+        resetFightHealing()
+    elseif not _state.inCombat and wasInCombat then
+        -- Exiting combat - log final throttle stats if any
+        local log = getLogger()
+        if log and _fightHealing.healCount > 0 then
+            log.info('combat_assessor', 'Fight ended: heals=%d healed=%d overheal=%d (%.1f%%) finalThrottle=%.2f',
+                _fightHealing.healCount, _fightHealing.healed, _fightHealing.overhealed,
+                _state.fightOverhealPct, _state.throttleLevel)
+        end
+        resetFightHealing()
+    end
+
     _state.estimatedTTK, _state.fightPhase, _state.avgMobHP = estimateFightDuration(mobs)
     _state.totalIncomingDps = calcTotalIncomingDps()
     _state.survivalMode = checkSurvivalMode()
@@ -354,6 +473,36 @@ function M.tick()
                 break
             end
         end
+    end
+
+    -- Query MobAssessor for named/raid mob status
+    local ma = getMobAssessor()
+    if ma and #mobs > 0 then
+        local mobIds = {}
+        for _, mob in ipairs(mobs) do
+            table.insert(mobIds, mob.id)
+
+            -- Check newly engaged mobs for named status (event spawns, etc.)
+            if not _checkedMobIds[mob.id] then
+                _checkedMobIds[mob.id] = true
+                -- checkEngagedMob will do an immediate consider if it's an uncached named
+                if ma.checkEngagedMob then
+                    ma.checkEngagedMob(mob.id)
+                end
+            end
+        end
+        local maxMult, maxTier, hasNamed = ma.getMaxMobMultiplier(mobIds)
+        _state.mobDpsMultiplier = maxMult
+        _state.mobDifficultyTier = maxTier
+        _state.hasNamedMob = hasNamed
+        _state.hasRaidMob = ma.hasRaidMob(mobIds)
+    else
+        _state.mobDpsMultiplier = 1.0
+        _state.mobDifficultyTier = 'normal'
+        _state.hasNamedMob = false
+        _state.hasRaidMob = false
+        -- Clear checked mob IDs when out of combat (prepare for next fight)
+        _checkedMobIds = {}
     end
 
     -- Log combat state changes
@@ -371,23 +520,96 @@ end
 
 function M.getScoringWeights()
     if not Config or not Config.scoringPresets then
-        return { coverage = 2.0, manaEff = 1.0, overheal = -1.5 }
+        return { coverage = 2.0, manaEff = 1.0, overheal = -1.5, throttled = false }
     end
 
+    local weights
+
+    -- Emergency/survival mode takes highest priority (never throttled)
     if _state.survivalMode then
-        return Config.scoringPresets.emergency
+        weights = Config.scoringPresets.emergency
+        return {
+            coverage = weights.coverage,
+            manaEff = weights.manaEff,
+            overheal = weights.overheal,
+            throttled = false,
+            preset = 'emergency',
+        }
     end
 
-    if _state.activeMobCount <= 1 then
-        return Config.scoringPresets.lowPressure
+    -- Determine base preset
+    local preset = 'normal'
+    if _state.hasRaidMob or (_state.hasNamedMob and _state.mobDpsMultiplier >= 2.0) then
+        weights = Config.scoringPresets.raidFight or Config.scoringPresets.normal
+        preset = 'raidFight'
+    elseif _state.activeMobCount <= 1 then
+        weights = Config.scoringPresets.lowPressure
+        preset = 'lowPressure'
+    else
+        weights = Config.scoringPresets.normal
+        preset = 'normal'
     end
 
-    return Config.scoringPresets.normal
+    -- Apply adaptive throttle for raid fights with high overheal
+    local throttled = false
+    local throttleLevel = _state.throttleLevel or 0
+    local adjustedCoverage = weights.coverage
+    local adjustedOverheal = weights.overheal
+
+    if throttleLevel > 0 and preset == 'raidFight' then
+        -- Throttle down: reduce coverage weight, increase overheal penalty
+        -- This makes us pick smaller heals and penalize overheal more
+        adjustedCoverage = weights.coverage * (1 - throttleLevel * 0.5)  -- Up to 25% reduction at max throttle
+        adjustedOverheal = weights.overheal * (1 + throttleLevel)        -- Up to 50% more penalty at max throttle
+        throttled = true
+
+        local log = getLogger()
+        if log then
+            log.debug('combat_assessor', 'Throttle active: level=%.2f overhealPct=%.1f coverage=%.2f->%.2f overheal=%.2f->%.2f',
+                throttleLevel, _state.fightOverhealPct, weights.coverage, adjustedCoverage, weights.overheal, adjustedOverheal)
+        end
+    end
+
+    return {
+        coverage = adjustedCoverage,
+        manaEff = weights.manaEff,
+        overheal = adjustedOverheal,
+        throttled = throttled,
+        throttleLevel = throttleLevel,
+        preset = preset,
+    }
 end
 
 -- Check if high pressure (multiple mobs or high DPS)
 function M.isHighPressure()
     return _state.highPressure, _state.activeMobCount, _state.totalIncomingDps
+end
+
+-- Get adjusted DPS expectation based on mob difficulty
+-- baseDps: The observed/calculated DPS
+-- Returns: adjustedDps factoring in raid/named mob multipliers
+function M.getAdjustedDps(baseDps)
+    return (baseDps or 0) * (_state.mobDpsMultiplier or 1.0)
+end
+
+-- Check if fighting raid-tier mobs
+function M.isRaidFight()
+    return _state.hasRaidMob == true
+end
+
+-- Check if fighting any named mobs
+function M.hasNamedInFight()
+    return _state.hasNamedMob == true
+end
+
+-- Get the mob difficulty info
+function M.getMobDifficulty()
+    return {
+        multiplier = _state.mobDpsMultiplier or 1.0,
+        tier = _state.mobDifficultyTier or 'normal',
+        hasNamed = _state.hasNamedMob or false,
+        hasRaid = _state.hasRaidMob or false,
+    }
 end
 
 -- Check if HoT should be allowed based on fight state
@@ -444,10 +666,21 @@ end
 function M.getPromisedSafetyFloor()
     local baseSafetyFloor = (Config and Config.promisedSafetyFloorPct) or 35
     local survivalSafetyFloor = (Config and Config.promisedSurvivalSafetyFloorPct) or 55
+
+    local floor
     if _state and _state.survivalMode then
-        return survivalSafetyFloor
+        floor = survivalSafetyFloor
+    else
+        floor = baseSafetyFloor
     end
-    return baseSafetyFloor
+
+    -- Raise floor when fighting raid mobs (they can spike damage quickly)
+    if _state and _state.hasRaidMob then
+        local increase = (Config and Config.raidMobPromisedFloorIncrease) or 10
+        floor = floor + increase
+    end
+
+    return math.min(floor, 80)  -- Cap at 80% to avoid blocking promised entirely
 end
 
 -- Backward/DeficitHealer-style aliases

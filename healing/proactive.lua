@@ -25,7 +25,7 @@ local CombatAssessor = nil
 local ActorsCoordinator = nil
 local function getActorsCoordinator()
     if ActorsCoordinator == nil then
-        local ok, ac = pcall(require, 'utils.actors_coordinator')
+        local ok, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
         ActorsCoordinator = ok and ac or false
     end
     return ActorsCoordinator or nil
@@ -339,7 +339,7 @@ function M.getIncomingHotRemaining(targetIdOrName)
     local now = mq.gettime()
 
     -- Prefer spell_events pending HoT ledger when available
-    local okSe, se = pcall(require, 'healing.spell_events')
+    local okSe, se = pcall(require, 'sidekick-next.healing.spell_events')
     if okSe and se and se.getIncomingHotRemaining then
         local pendingTotal = 0
         local pendingDetails = nil
@@ -498,7 +498,7 @@ function M.ShouldApplyGroupHot(targets, situation)
     end
 
     local selector = nil
-    local ok, hs = pcall(require, 'healing.heal_selector')
+    local ok, hs = pcall(require, 'sidekick-next.healing.heal_selector')
     if ok then selector = hs end
 
     if selector and selector.SelectBestGroupHot then
@@ -596,7 +596,7 @@ function M.shouldApplyHoT(target, hotSpellName)
     end
 
     -- Use HotAnalyzer for TTK and DPS ratio gates (expensive, run after cheap guards)
-    local ok, HotAnalyzer = pcall(require, 'healing.hot_analyzer')
+    local ok, HotAnalyzer = pcall(require, 'sidekick-next.healing.hot_analyzer')
     if ok and HotAnalyzer and HotAnalyzer.shouldApplyHoT then
         local shouldApply, analysis, reason = HotAnalyzer.shouldApplyHoT(target, hotSpellName, nil)
         if not shouldApply then

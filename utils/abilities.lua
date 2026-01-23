@@ -1,5 +1,5 @@
 local mq = require('mq')
-local Helpers = require('lib.helpers')
+local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
 
@@ -7,7 +7,7 @@ local M = {}
 local _ConditionBuilder = nil
 local function getConditionBuilder()
     if not _ConditionBuilder then
-        local ok, cb = pcall(require, 'ui.condition_builder')
+        local ok, cb = pcall(require, 'sidekick-next.ui.condition_builder')
         if ok then _ConditionBuilder = cb end
     end
     return _ConditionBuilder
@@ -16,7 +16,7 @@ end
 local _Core = nil
 local function getCore()
     if not _Core then
-        local ok, core = pcall(require, 'utils.core')
+        local ok, core = pcall(require, 'sidekick-next.utils.core')
         if ok then _Core = core end
     end
     return _Core
@@ -264,7 +264,7 @@ function M.activate(def)
         if spellName == '' then return end
 
         -- Use spell engine for proper state machine handling
-        local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+        local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
         if ok and SpellEngine then
             SpellEngine.cast(spellName, def.targetId, def)
         else

@@ -4,6 +4,16 @@
 
 local mq = require('mq')
 
+-- Lazy-load Logger to avoid circular requires
+local Logger = nil
+local function getLogger()
+    if Logger == nil then
+        local ok, l = pcall(require, 'sidekick-next.healing.logger')
+        Logger = ok and l or false
+    end
+    return Logger or nil
+end
+
 local M = {}
 
 -------------------------------------------------------------------------------
@@ -58,12 +68,13 @@ local function getDataPath()
 
     if mq.TLO.EverQuest and mq.TLO.EverQuest.Server then
         server = mq.TLO.EverQuest.Server() or 'Server'
+        server = server:gsub(" ", "_")  -- Normalize server name (matches config.lua)
     end
     if mq.TLO.Me and mq.TLO.Me.CleanName then
         charName = mq.TLO.Me.CleanName() or 'Character'
     end
 
-    return string.format('%s\\SideKick_HealData_%s_%s.lua', mq.configDir, server, charName)
+    return string.format('%s/SideKick_HealData_%s_%s.lua', mq.configDir, server, charName)
 end
 
 -------------------------------------------------------------------------------
@@ -194,7 +205,8 @@ local function pruneStaleData(maxAge)
     end
 
     if #spellsToRemove > 0 or #targetsToRemove > 0 then
-        print(string.format('[Healing] Pruned %d stale spells, %d stale targets', #spellsToRemove, #targetsToRemove))
+        local log = getLogger()
+        if log then log.info('persistence', 'Pruned %d stale spells, %d stale targets', #spellsToRemove, #targetsToRemove) end
     end
 end
 
@@ -206,6 +218,7 @@ end
 -- @param maxAge number Optional maximum age for data (default 7 days)
 -- @return table The loaded heal data
 function M.loadHealData(maxAge)
+    local log = getLogger()
     local path = getDataPath()
     local file = io.open(path, 'r')
 
@@ -226,23 +239,21 @@ function M.loadHealData(maxAge)
                     -- Prune stale data
                     pruneStaleData(maxAge)
 
-                    print(string.format('[Healing] Loaded heal data from %s (%d spells, %d targets)',
-                        path,
-                        M.countSpells(),
-                        M.countTargets()))
+                    if log then log.info('persistence', 'Loaded heal data from %s (%d spells, %d targets)',
+                        path, M.countSpells(), M.countTargets()) end
                 else
-                    print(string.format('[Healing] Heal data parse error: %s', tostring(loaded)))
+                    if log then log.error('persistence', 'Heal data parse error: %s', tostring(loaded)) end
                     M.data = { version = 1, lastSaved = 0, spells = {}, targets = {} }
                 end
             else
-                print(string.format('[Healing] Heal data load error: %s', tostring(err)))
+                if log then log.error('persistence', 'Heal data load error: %s', tostring(err)) end
                 M.data = { version = 1, lastSaved = 0, spells = {}, targets = {} }
             end
         else
             M.data = { version = 1, lastSaved = 0, spells = {}, targets = {} }
         end
     else
-        print('[Healing] No heal data found, starting fresh')
+        if log then log.info('persistence', 'No heal data found, starting fresh') end
         M.data = { version = 1, lastSaved = 0, spells = {}, targets = {} }
     end
 
@@ -250,24 +261,29 @@ function M.loadHealData(maxAge)
 end
 
 --- Save heal data to file
+-- @param data table Optional data to save (uses M.data if not provided)
 -- @return boolean True if save succeeded
-function M.saveHealData()
+function M.saveHealData(data)
+    local log = getLogger()
     local path = getDataPath()
 
-    -- Update timestamp
-    M.data.lastSaved = os.time()
+    -- Use provided data or fall back to M.data
+    local dataToSave = data or M.data
 
-    local content = serializeValue(M.data)
+    -- Update timestamp
+    dataToSave.lastSaved = os.time()
+
+    local content = serializeValue(dataToSave)
 
     local file, err = io.open(path, 'w')
     if not file then
-        print(string.format('[Healing] Heal data save error: %s', tostring(err)))
+        if log then log.error('persistence', 'Heal data save error: %s', tostring(err)) end
         return false
     end
 
     file:write(content)
     file:close()
-    print(string.format('[Healing] Heal data saved to %s', path))
+    if log then log.info('persistence', 'Heal data saved to %s', path) end
     return true
 end
 
@@ -285,9 +301,11 @@ end
 -- @param castTime number The actual cast time (seconds)
 -- @param wasCrit boolean Whether this was a critical heal
 -- @param targetType string Optional target type (tank/squishy/normal)
-function M.updateSpellData(spellName, healAmount, castTime, wasCrit, targetType)
+-- @param learningWeight number Optional learning rate (default 0.1, from config.learningWeight)
+function M.updateSpellData(spellName, healAmount, castTime, wasCrit, targetType, learningWeight)
     if not spellName or not healAmount then return end
 
+    local alpha = learningWeight or 0.1  -- EMA learning rate (caller passes config.learningWeight)
     local now = os.time()
     local existing = M.data.spells[spellName]
 
@@ -306,7 +324,6 @@ function M.updateSpellData(spellName, healAmount, castTime, wasCrit, targetType)
         }
     else
         -- Update with exponential moving average
-        local alpha = 0.1 -- Learning rate (from config.learningDecayFactor)
         local prevAvg = existing.avgHeal
 
         -- Update average
@@ -358,7 +375,6 @@ function M.updateSpellData(spellName, healAmount, castTime, wasCrit, targetType)
                 castCount = 1,
             }
         else
-            local alpha = 0.1
             td.avgHeal = (1 - alpha) * td.avgHeal + alpha * healAmount
             td.castCount = td.castCount + 1
         end
@@ -457,7 +473,8 @@ function M.clear()
         spells = {},
         targets = {},
     }
-    print('[Healing] Learned data cleared')
+    local log = getLogger()
+    if log then log.info('persistence', 'Learned data cleared') end
 end
 
 return M

@@ -12,7 +12,7 @@ local M = {}
 local _RemoteAbilities = nil
 local function getRemoteAbilities()
     if not _RemoteAbilities then
-        local ok, mod = pcall(require, 'ui.remote_abilities')
+        local ok, mod = pcall(require, 'sidekick-next.ui.remote_abilities')
         if ok then _RemoteAbilities = mod end
     end
     return _RemoteAbilities

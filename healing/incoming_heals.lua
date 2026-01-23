@@ -10,7 +10,7 @@ local TargetMonitor = nil
 local Analytics = nil
 local function getAnalytics()
     if Analytics == nil then
-        local ok, a = pcall(require, 'healing.analytics')
+        local ok, a = pcall(require, 'sidekick-next.healing.analytics')
         Analytics = ok and a or false
     end
     return Analytics or nil

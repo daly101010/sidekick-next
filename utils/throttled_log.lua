@@ -29,8 +29,7 @@ function M.log(key, interval, format, ...)
 
     M._lastLogTime[key] = now
 
-    local message = string.format(format, ...)
-    mq.cmdf('/echo [SideKick] %s', message)
+    -- In-game echo disabled
     return true
 end
 
@@ -47,8 +46,7 @@ end
 -- @param format string Format string for message
 -- @param ... Additional arguments for format
 function M.logImmediate(format, ...)
-    local message = string.format(format, ...)
-    mq.cmdf('/echo [SideKick] %s', message)
+    -- In-game echo disabled
 end
 
 --- Check if a key is currently throttled

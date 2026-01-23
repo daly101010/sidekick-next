@@ -3,7 +3,7 @@
 
 local mq = require('mq')
 
-local AbilityResolver = require('utils.ability_resolver')
+local AbilityResolver = require('sidekick-next.utils.ability_resolver')
 
 local M = {}
 
@@ -170,14 +170,13 @@ function M.buildConditionFunction(luaExpr)
 
     local fn, err = load(fnStr)
     if not fn then
-        print(string.format('[IniImporter] Failed to compile condition: %s', err or 'unknown error'))
-        print(string.format('[IniImporter] Expression was: %s', luaExpr))
+        -- Print disabled
         return nil
     end
 
     local ok, result = pcall(fn)
     if not ok then
-        print(string.format('[IniImporter] Failed to execute condition builder: %s', result or 'unknown error'))
+        -- Print disabled
         return nil
     end
 
@@ -199,7 +198,7 @@ function M.parseKissAssist(iniPath)
 
     local ini = mq.TLO.Ini
     if not ini then
-        print('[IniImporter] MQ2 Ini TLO not available')
+        -- Print disabled
         return config
     end
 
@@ -357,7 +356,7 @@ function M.parseMuleAssist(iniPath)
 
     local ini = mq.TLO.Ini
     if not ini then
-        print('[IniImporter] MQ2 Ini TLO not available')
+        -- Print disabled
         return config
     end
 
@@ -548,7 +547,7 @@ function M.parseIni(iniPath)
     elseif iniType == 'muleassist' then
         return M.parseMuleAssist(iniPath)
     else
-        print(string.format('[IniImporter] Unknown INI type for: %s', iniPath))
+        -- Print disabled
         return {
             spells = {},
             conditions = {},

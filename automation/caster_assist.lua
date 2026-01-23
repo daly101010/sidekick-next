@@ -33,7 +33,7 @@ M.escapeState = {
 local _Core = nil
 local function getCore()
     if not _Core then
-        local ok, c = pcall(require, 'utils.core')
+        local ok, c = pcall(require, 'sidekick-next.utils.core')
         if ok then _Core = c end
     end
     return _Core
@@ -42,7 +42,7 @@ end
 local _CombatAssist = nil
 local function getCombatAssist()
     if not _CombatAssist then
-        local ok, ca = pcall(require, 'utils.combatassist')
+        local ok, ca = pcall(require, 'sidekick-next.utils.combatassist')
         if ok then _CombatAssist = ca end
     end
     return _CombatAssist

@@ -10,7 +10,7 @@ local M = {}
 local _Actors = nil
 local function getActors()
     if not _Actors then
-        local ok, a = pcall(require, 'utils.actors_coordinator')
+        local ok, a = pcall(require, 'sidekick-next.utils.actors_coordinator')
         if ok then _Actors = a end
     end
     return _Actors
@@ -20,7 +20,7 @@ end
 local _Cache = nil
 local function getCache()
     if not _Cache then
-        local ok, c = pcall(require, 'utils.runtime_cache')
+        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
         if ok then _Cache = c end
     end
     return _Cache
@@ -566,7 +566,7 @@ end
 local _Core = nil
 local function getCore()
     if not _Core then
-        local ok, c = pcall(require, 'utils.core')
+        local ok, c = pcall(require, 'sidekick-next.utils.core')
         if ok then _Core = c end
     end
     return _Core
@@ -576,7 +576,7 @@ end
 local _SpellEngine = nil
 local function getSpellEngine()
     if not _SpellEngine then
-        local ok, se = pcall(require, 'utils.spell_engine')
+        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
         if ok then _SpellEngine = se end
     end
     return _SpellEngine
@@ -792,9 +792,10 @@ function M.castMez(mobId, mobName, spellName, opts)
         return false, 'spell_engine_busy'
     end
 
-    -- Check if we're already casting
+    -- Check if we're already casting (Casting() returns spell name string, empty if not)
     local me = mq.TLO.Me
-    if me and me.Casting() then
+    local casting = me and me.Casting() or ''
+    if casting ~= '' then
         return false, 'already_casting'
     end
 

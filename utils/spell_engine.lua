@@ -6,11 +6,32 @@ local mq = require('mq')
 
 local M = {}
 
+-- Debug logging to file (using centralized Paths)
+local _Paths = nil
+local function getPaths()
+    if not _Paths then
+        local ok, p = pcall(require, 'sidekick-next.utils.paths')
+        if ok then _Paths = p end
+    end
+    return _Paths
+end
+
+local function debugLog(fmt, ...)
+    local msg = string.format(fmt, ...)
+    local Paths = getPaths()
+    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_SpellEngine.log')
+    local f = io.open(logPath, 'a')
+    if f then
+        f:write(string.format('[%s] [SpellEngine] %s\n', os.date('%H:%M:%S'), msg))
+        f:close()
+    end
+end
+
 -- Lazy-load dependencies to avoid circular requires
 local _SpellEvents = nil
 local function getSpellEvents()
     if not _SpellEvents then
-        local ok, se = pcall(require, 'utils.spell_events')
+        local ok, se = pcall(require, 'sidekick-next.utils.spell_events')
         if ok then _SpellEvents = se end
     end
     return _SpellEvents
@@ -19,7 +40,7 @@ end
 local _Cache = nil
 local function getCache()
     if not _Cache then
-        local ok, c = pcall(require, 'utils.runtime_cache')
+        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
         if ok then _Cache = c end
     end
     return _Cache
@@ -28,10 +49,25 @@ end
 local _Core = nil
 local function getCore()
     if not _Core then
-        local ok, c = pcall(require, 'utils.core')
+        local ok, c = pcall(require, 'sidekick-next.utils.core')
         if ok then _Core = c end
     end
     return _Core
+end
+
+-- Optional buff logger for cast tracing
+local _BuffLogger = nil
+local function getBuffLogger()
+    if not _BuffLogger then
+        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
+        if ok then
+            _BuffLogger = logger
+            if _BuffLogger and _BuffLogger.init then
+                _BuffLogger.init()
+            end
+        end
+    end
+    return _BuffLogger
 end
 
 -- Cast states
@@ -151,8 +187,9 @@ local function preCastChecks(spellName, targetId, opts)
         return false, 'insufficient_endurance'
     end
 
-    -- Check not already casting
-    if me.Casting() then
+    -- Check not already casting (Casting() returns spell name string, empty if not)
+    local casting = me.Casting() or ''
+    if casting ~= '' then
         return false, 'already_casting'
     end
 
@@ -261,25 +298,47 @@ end
 function M.cast(spellName, targetId, opts)
     opts = opts or {}
 
+    local buffLog = (opts.spellCategory == 'buff') and getBuffLogger() or nil
+    if buffLog then
+        buffLog.info('spell_engine', 'Cast request: spell=%s targetId=%d category=%s',
+            tostring(spellName), tonumber(targetId) or 0, tostring(opts.spellCategory))
+    end
+
     -- Already casting something
     if _state ~= M.STATE.IDLE then
+        if buffLog then
+            buffLog.warn('spell_engine', 'Cast rejected: spell=%s reason=busy state=%s',
+                tostring(spellName), tostring(M.STATE_NAMES[_state] or _state))
+        end
         return false, 'busy'
     end
 
     -- Blocking pre-checks
     local ok, reason = preCastChecks(spellName, targetId, opts)
     if not ok then
+        if buffLog then
+            buffLog.warn('spell_engine', 'Cast rejected: spell=%s reason=%s',
+                tostring(spellName), tostring(reason))
+        end
         return false, reason
     end
 
     -- Check spell is memorized (no auto-memorization)
     ok, reason = checkMemorized(spellName)
     if not ok then
+        if buffLog then
+            buffLog.warn('spell_engine', 'Cast rejected: spell=%s reason=%s',
+                tostring(spellName), tostring(reason))
+        end
         return false, reason
     end
 
     -- Wait for spell to be ready (blocking)
     if not waitSpellReady(spellName, getSetting('SpellReadyTimeout', 5000)) then
+        if buffLog then
+            buffLog.warn('spell_engine', 'Cast rejected: spell=%s reason=not_ready',
+                tostring(spellName))
+        end
         return false, 'not_ready'
     end
 
@@ -323,8 +382,13 @@ function M.cast(spellName, targetId, opts)
     }
     _state = M.STATE.WAITING_START
 
+    if buffLog then
+        buffLog.info('spell_engine', 'Cast issued: spell=%s targetId=%d category=%s retries=%d',
+            tostring(spellName), tonumber(targetId) or 0, tostring(_castData.spellCategory), _castData.retries or 0)
+    end
+
     -- Mark spell channel as used
-    local ok2, Executor = pcall(require, 'utils.action_executor')
+    local ok2, Executor = pcall(require, 'sidekick-next.utils.action_executor')
     if ok2 and Executor then
         Executor.markChannelUsed('spell')
         Executor.setCasting(true, _castData.castTime + 0.5)
@@ -414,9 +478,15 @@ local function handleResult(result)
     local SpellEvents = getSpellEvents()
     if not SpellEvents then return end
 
+    local buffLog = (_castData and _castData.spellCategory == 'buff') and getBuffLogger() or nil
+
     -- Check if retriable
     if SpellEvents.isRetriable(result) and _castData and _castData.retries > 0 then
         -- Retry the cast
+        if buffLog then
+            buffLog.warn('spell_engine', 'Cast retry: spell=%s result=%s retriesLeft=%d',
+                tostring(_castData.spellName), SpellEvents.getResultName(result), _castData.retries)
+        end
         _castData.retries = _castData.retries - 1
         SpellEvents.resetResult()
         mq.cmdf('/cast "%s"', _castData.spellName)
@@ -424,6 +494,10 @@ local function handleResult(result)
         _state = M.STATE.WAITING_START
     else
         -- Cast complete (success or unrecoverable failure)
+        if buffLog and _castData then
+            buffLog.info('spell_engine', 'Cast completed: spell=%s result=%s',
+                tostring(_castData.spellName), SpellEvents.getResultName(result))
+        end
         _state = M.STATE.IDLE
         _castData = nil
     end
@@ -437,6 +511,7 @@ function M.tick()
 
     local me = mq.TLO.Me
     if not me or not me() then
+        debugLog('[Tick] no me, resetting to IDLE')
         _state = M.STATE.IDLE
         _castData = nil
         return
@@ -449,29 +524,37 @@ function M.tick()
         result, resultTime = SpellEvents.getLastResult()
     end
 
+    local stateName = M.STATE_NAMES[_state] or 'UNKNOWN'
+    debugLog('[Tick] state=%s result=%s spell=%s', stateName, tostring(result), tostring(_castData and _castData.spellName or 'nil'))
+
     -- State: WAITING_START (waiting for "You begin casting...")
     if _state == M.STATE.WAITING_START then
         -- Check for cast begin event
         if SpellEvents and result == SpellEvents.RESULT.SUCCESS then
+            debugLog('[Tick] WAITING_START -> CASTING (success event)')
             _state = M.STATE.CASTING
             return
         end
 
         -- Check for immediate failure
         if SpellEvents and result ~= SpellEvents.RESULT.NONE then
+            debugLog('[Tick] WAITING_START -> handleResult (failure result=%d)', result)
             handleResult(result)
             return
         end
 
         -- Timeout waiting for cast to start (1 second)
         if _castData and (now - _castData.startTime) > 1.0 then
+            debugLog('[Tick] WAITING_START timeout (%.2fs elapsed)', now - _castData.startTime)
             -- No cast started, retry or fail
             if _castData.retries > 0 then
                 _castData.retries = _castData.retries - 1
                 if SpellEvents then SpellEvents.resetResult() end
+                debugLog('[Tick] retrying cast, retries left=%d', _castData.retries)
                 mq.cmdf('/cast "%s"', _castData.spellName)
                 _castData.startTime = now
             else
+                debugLog('[Tick] WAITING_START -> IDLE (no retries left)')
                 _state = M.STATE.IDLE
                 _castData = nil
             end
@@ -481,9 +564,11 @@ function M.tick()
 
     -- State: CASTING (non-blocking monitoring)
     if _state == M.STATE.CASTING then
-        -- Check if still casting
-        local isCasting = me.Casting() or mq.TLO.Window("CastingWindow").Open()
+        -- Check if still casting (Casting() returns spell name string, empty if not casting)
+        local castingSpell = me.Casting() or ''
+        local isCasting = castingSpell ~= '' or mq.TLO.Window("CastingWindow").Open()
         if not isCasting then
+            debugLog('[Tick] CASTING -> handleResult (cast finished)')
             -- Cast finished, check result
             handleResult(result)
             return
@@ -491,6 +576,7 @@ function M.tick()
 
         -- Check for failure events during cast
         if SpellEvents and result ~= SpellEvents.RESULT.NONE and result ~= SpellEvents.RESULT.SUCCESS then
+            debugLog('[Tick] CASTING -> handleResult (failure during cast result=%d)', result)
             -- Failed during cast (interrupt, etc.)
             handleResult(result)
             return
@@ -499,6 +585,7 @@ function M.tick()
         -- Auto-interrupt checks
         local shouldStop, stopReason = M.shouldInterrupt()
         if shouldStop then
+            debugLog('[Tick] CASTING interrupted reason=%s', tostring(stopReason))
             mq.TLO.Me.StopCast()
             _state = M.STATE.IDLE
             _castData = nil
@@ -511,6 +598,7 @@ function M.tick()
 
     -- State: COMPLETED (cleanup)
     if _state == M.STATE.COMPLETED then
+        debugLog('[Tick] COMPLETED -> IDLE')
         _state = M.STATE.IDLE
         _castData = nil
     end
@@ -556,7 +644,8 @@ end
 function M.abort()
     if _state ~= M.STATE.IDLE then
         local me = mq.TLO.Me
-        if me and me.Casting() then
+        local casting = me and me.Casting() or ''
+        if casting ~= '' then
             mq.TLO.Me.StopCast()
         end
         _state = M.STATE.IDLE

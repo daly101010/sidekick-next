@@ -10,20 +10,20 @@ local M = {}
 local _ThrottledLog = nil
 local function getThrottledLog()
     if not _ThrottledLog then
-        local ok, tl = pcall(require, 'utils.throttled_log')
+        local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
         if ok then _ThrottledLog = tl end
     end
     return _ThrottledLog
 end
 
 -- Enable/disable debug logging for rotation engine
-M.debugLogging = true  -- Set to true to enable layer/ability logging
+M.debugLogging = false -- Set to true to enable layer/ability logging
 
 -- Lazy-load dependencies to avoid circular requires
 local _Cache = nil
 local function getCache()
     if not _Cache then
-        local ok, c = pcall(require, 'utils.runtime_cache')
+        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
         if ok then _Cache = c end
     end
     return _Cache
@@ -32,7 +32,7 @@ end
 local _Executor = nil
 local function getExecutor()
     if not _Executor then
-        local ok, e = pcall(require, 'utils.action_executor')
+        local ok, e = pcall(require, 'sidekick-next.utils.action_executor')
         if ok then _Executor = e end
     end
     return _Executor
@@ -41,7 +41,7 @@ end
 local _Abilities = nil
 local function getAbilities()
     if not _Abilities then
-        local ok, a = pcall(require, 'utils.abilities')
+        local ok, a = pcall(require, 'sidekick-next.utils.abilities')
         if ok then _Abilities = a end
     end
     return _Abilities
@@ -50,7 +50,7 @@ end
 local _ConditionBuilder = nil
 local function getConditionBuilder()
     if not _ConditionBuilder then
-        local ok, cb = pcall(require, 'ui.condition_builder')
+        local ok, cb = pcall(require, 'sidekick-next.ui.condition_builder')
         if ok then _ConditionBuilder = cb end
     end
     return _ConditionBuilder
@@ -59,7 +59,7 @@ end
 local _SpellRotation = nil
 local function getSpellRotation()
     if not _SpellRotation then
-        local ok, sr = pcall(require, 'utils.spell_rotation')
+        local ok, sr = pcall(require, 'sidekick-next.utils.spell_rotation')
         if ok then _SpellRotation = sr end
     end
     return _SpellRotation
@@ -68,10 +68,25 @@ end
 local _ConditionContext = nil
 local function getConditionContext()
     if not _ConditionContext then
-        local ok, cc = pcall(require, 'utils.condition_context')
+        local ok, cc = pcall(require, 'sidekick-next.utils.condition_context')
         if ok then _ConditionContext = cc end
     end
     return _ConditionContext
+end
+
+-- Optional buff logger for tracing rotation-based buff casts
+local _BuffLogger = nil
+local function getBuffLogger()
+    if not _BuffLogger then
+        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
+        if ok then
+            _BuffLogger = logger
+            if _BuffLogger and _BuffLogger.init then
+                _BuffLogger.init()
+            end
+        end
+    end
+    return _BuffLogger
 end
 
 local _ClassConfigs = {}
@@ -430,13 +445,10 @@ function M.checkModeGate(def, settings, state, ctx, classConfig)
 
     local mode = def.modeKey and tonumber(settings[def.modeKey]) or Abilities.MODE.ON_DEMAND
 
-    -- On-demand: never auto-fire (user must click)
-    if mode == Abilities.MODE.ON_DEMAND then
-        return false
-    end
-
-    -- On-cooldown: handled by separate mash queue, not in normal rotation
-    if mode == Abilities.MODE.ON_COOLDOWN then
+    -- Only ON_CONDITION mode auto-fires through the rotation engine.
+    -- Any other mode (ON_DEMAND, ON_COOLDOWN, or invalid values like 4) should not auto-fire here.
+    -- ON_COOLDOWN is handled by the separate mash queue.
+    if mode ~= Abilities.MODE.ON_CONDITION then
         return false
     end
 
@@ -550,14 +562,41 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
         if M.debugLogging and TL then
             TL.log('ability_exec_' .. abilityName, 5, '  %s: EXECUTING (all gates passed)', abilityName)
         end
+        if def.sourceLayer ~= layer.name then
+            def.sourceLayer = layer.name
+        end
+        if layer.name == 'buff' and tostring(def.kind or ''):lower() == 'spell' then
+            local log = getBuffLogger()
+            if log then
+                log.info('rotation', 'Buff layer cast attempt: ability=%s spell=%s targetId=%d modeKey=%s settingKey=%s',
+                    tostring(def.name or def.settingKey or 'unknown'), tostring(def.spellName or ''),
+                    tonumber(def.targetId) or 0, tostring(def.modeKey or ''), tostring(def.settingKey or ''))
+            end
+        end
         if M.tryExecute(def) then
             executed = executed + 1
             if M.debugLogging and TL then
                 TL.log('ability_success_' .. abilityName, 5, '  %s: SUCCESS', abilityName)
             end
+            if layer.name == 'buff' and tostring(def.kind or ''):lower() == 'spell' then
+                local log = getBuffLogger()
+                if log then
+                    log.info('rotation', 'Buff layer cast accepted: ability=%s spell=%s targetId=%d',
+                        tostring(def.name or def.settingKey or 'unknown'), tostring(def.spellName or ''),
+                        tonumber(def.targetId) or 0)
+                end
+            end
         else
             if M.debugLogging and TL then
                 TL.log('ability_fail_' .. abilityName, 5, '  %s: FAILED (executor returned false)', abilityName)
+            end
+            if layer.name == 'buff' and tostring(def.kind or ''):lower() == 'spell' then
+                local log = getBuffLogger()
+                if log then
+                    log.warn('rotation', 'Buff layer cast rejected: ability=%s spell=%s targetId=%d',
+                        tostring(def.name or def.settingKey or 'unknown'), tostring(def.spellName or ''),
+                        tonumber(def.targetId) or 0)
+                end
             end
         end
 

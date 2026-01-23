@@ -66,7 +66,7 @@ local function discover(maxId)
     local excludedById = {}
     local excludedByName = {}
     do
-        local ok, spec = pcall(require, 'utils.special_abilities')
+        local ok, spec = pcall(require, 'sidekick-next.utils.special_abilities')
         if ok and spec and spec.excludedAltIDs and spec.excludedNames then
             excludedById = spec.excludedAltIDs() or {}
             excludedByName = spec.excludedNames() or {}

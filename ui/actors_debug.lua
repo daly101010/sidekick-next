@@ -14,7 +14,7 @@ M._showWindow = false
 local _ActorsCoord = nil
 local function getActorsCoord()
     if not _ActorsCoord then
-        local ok, ac = pcall(require, 'utils.actors_coordinator')
+        local ok, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
         if ok then _ActorsCoord = ac end
     end
     return _ActorsCoord

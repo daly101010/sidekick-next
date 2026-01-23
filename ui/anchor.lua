@@ -22,8 +22,12 @@ end
 
 local function getStableGroupTargetBounds()
     local gt = _G.GroupTargetBounds
-    if not gt or not gt.loaded then return nil end
-    if gt.timestamp and (os.clock() - gt.timestamp) > 5.0 then return nil end
+    if not gt then return nil end
+    -- Accept bounds even if 'loaded' is missing/false as long as required fields exist.
+    local hasCore = (gt.x ~= nil and gt.y ~= nil and gt.width ~= nil and gt.height ~= nil)
+    if not gt.loaded and not hasCore then return nil end
+    -- Avoid hard-expiring bounds; GroupTarget may only broadcast on changes.
+    -- If stale, keep last known bounds rather than breaking docking entirely.
     return gt
 end
 
@@ -33,7 +37,7 @@ local function getStableSideKickBounds(key)
     key = normalizeTargetKey(key)
     local b = sk[key]
     if not b then return nil end
-    if b.timestamp and (os.clock() - b.timestamp) > 5.0 then return nil end
+    -- Avoid hard-expiring bounds; windows may not update while hidden.
     return b
 end
 
@@ -112,4 +116,3 @@ function M.normalizeTargetKey(key)
 end
 
 return M
-

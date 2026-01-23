@@ -73,12 +73,17 @@ end
 function M.findTargetIdByName(name)
     if not name or name == '' then return nil end
 
+    local lname = tostring(name):lower()
+
     -- Check self (with pcall for safety)
     local ok, selfId = pcall(function()
         local me = mq.TLO.Me
         if me and me() then
+            if lname == 'you' then
+                return me.ID()
+            end
             local cleanName = me.CleanName()
-            if cleanName and cleanName == name then
+            if cleanName and cleanName:lower() == lname then
                 return me.ID()
             end
         end
@@ -103,7 +108,7 @@ function M.findTargetIdByName(name)
             end
             if spawn and spawn() then
                 local cleanName = spawn.CleanName()
-                if cleanName and cleanName == name then
+                if cleanName and cleanName:lower() == lname then
                     return spawn.ID()
                 end
             end

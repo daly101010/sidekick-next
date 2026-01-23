@@ -11,7 +11,7 @@ M.inSoftPause = false
 local _Core = nil
 local function getCore()
     if not _Core then
-        local ok, core = pcall(require, 'utils.core')
+        local ok, core = pcall(require, 'sidekick-next.utils.core')
         if ok then _Core = core end
     end
     return _Core

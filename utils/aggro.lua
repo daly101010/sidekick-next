@@ -1,5 +1,5 @@
 local mq = require('mq')
-local Targeting = require('utils.targeting')
+local Targeting = require('sidekick-next.utils.targeting')
 
 local M = {}
 

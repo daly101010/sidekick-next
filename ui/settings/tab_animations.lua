@@ -14,11 +14,8 @@ function M.draw(settings, themeNames, onChange)
 
     -- Master toggle
     local animEnabled = settings.AnimationsEnabled ~= false
-    animEnabled, changed = imgui.Checkbox('Enable Animations', animEnabled)
+    animEnabled, changed = Settings.labeledCheckbox('Enable Animations', animEnabled, 'Master toggle for all animation effects')
     if changed and onChange then onChange('AnimationsEnabled', animEnabled) end
-    if imgui.IsItemHovered() then
-        Settings.safeTooltip('Master toggle for all animation effects')
-    end
 
     if animEnabled then
         imgui.Separator()
@@ -26,81 +23,54 @@ function M.draw(settings, themeNames, onChange)
 
         -- Hover scale
         local hoverScale = settings.HoverScaleEnabled ~= false
-        hoverScale, changed = imgui.Checkbox('Hover Scale', hoverScale)
+        hoverScale, changed = Settings.labeledCheckbox('Hover Scale', hoverScale, 'Buttons grow slightly when hovered')
         if changed and onChange then onChange('HoverScaleEnabled', hoverScale) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Buttons grow slightly when hovered')
-        end
 
         -- Click bounce
         local clickBounce = settings.ClickBounceEnabled ~= false
-        clickBounce, changed = imgui.Checkbox('Click Bounce', clickBounce)
+        clickBounce, changed = Settings.labeledCheckbox('Click Bounce', clickBounce, 'Buttons bounce when cooldown completes')
         if changed and onChange then onChange('ClickBounceEnabled', clickBounce) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Buttons bounce when cooldown completes')
-        end
 
         -- Toggle pop
         local togglePop = settings.TogglePopEnabled ~= false
-        togglePop, changed = imgui.Checkbox('Toggle Pop', togglePop)
+        togglePop, changed = Settings.labeledCheckbox('Toggle Pop', togglePop, 'Toggle buttons pop when activated')
         if changed and onChange then onChange('TogglePopEnabled', togglePop) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Toggle buttons pop when activated')
-        end
 
         imgui.Separator()
         imgui.Text('Visual Effects')
 
         -- Ready pulse
         local readyPulse = settings.ReadyPulseEnabled ~= false
-        readyPulse, changed = imgui.Checkbox('Ready Pulse', readyPulse)
+        readyPulse, changed = Settings.labeledCheckbox('Ready Pulse', readyPulse, 'Ready abilities glow with a subtle pulse')
         if changed and onChange then onChange('ReadyPulseEnabled', readyPulse) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Ready abilities glow with a subtle pulse')
-        end
 
         -- Cooldown color tween
         local cdColorTween = settings.CooldownColorTweenEnabled ~= false
-        cdColorTween, changed = imgui.Checkbox('Cooldown Color Transition', cdColorTween)
+        cdColorTween, changed = Settings.labeledCheckbox('Cooldown Color Transition', cdColorTween, 'Smooth color transitions as cooldown progresses')
         if changed and onChange then onChange('CooldownColorTweenEnabled', cdColorTween) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Smooth color transitions as cooldown progresses')
-        end
 
         -- Toggle color tween
         local toggleColorTween = settings.ToggleColorTweenEnabled ~= false
-        toggleColorTween, changed = imgui.Checkbox('Toggle Color Transition', toggleColorTween)
+        toggleColorTween, changed = Settings.labeledCheckbox('Toggle Color Transition', toggleColorTween, 'Smooth color transitions when toggling buttons')
         if changed and onChange then onChange('ToggleColorTweenEnabled', toggleColorTween) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Smooth color transitions when toggling buttons')
-        end
 
         -- Stagger animation
         local staggerAnim = settings.StaggerAnimationEnabled ~= false
-        staggerAnim, changed = imgui.Checkbox('Stagger Animation', staggerAnim)
+        staggerAnim, changed = Settings.labeledCheckbox('Stagger Animation', staggerAnim, 'Grid items fade in with staggered timing')
         if changed and onChange then onChange('StaggerAnimationEnabled', staggerAnim) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Grid items fade in with staggered timing')
-        end
 
         imgui.Separator()
         imgui.Text('Warning Effects')
 
         -- Low resource warning
         local lowResWarning = settings.LowResourceWarningEnabled ~= false
-        lowResWarning, changed = imgui.Checkbox('Low Resource Warning', lowResWarning)
+        lowResWarning, changed = Settings.labeledCheckbox('Low Resource Warning', lowResWarning, 'Pulse effect when resources are low')
         if changed and onChange then onChange('LowResourceWarningEnabled', lowResWarning) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Pulse effect when resources are low')
-        end
 
         -- Damage flash
         local damageFlash = settings.DamageFlashEnabled ~= false
-        damageFlash, changed = imgui.Checkbox('Damage Flash', damageFlash)
+        damageFlash, changed = Settings.labeledCheckbox('Damage Flash', damageFlash, 'Flash effect when taking significant damage')
         if changed and onChange then onChange('DamageFlashEnabled', damageFlash) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Flash effect when taking significant damage')
-        end
 
         -- Configuration
         if imgui.CollapsingHeader('Animation Parameters') then

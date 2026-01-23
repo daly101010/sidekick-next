@@ -46,7 +46,7 @@ M.DEBUFF_CATEGORIES = {
 local _SpellEngine = nil
 local function getSpellEngine()
     if not _SpellEngine then
-        local ok, se = pcall(require, 'utils.spell_engine')
+        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
         if ok then _SpellEngine = se end
     end
     return _SpellEngine
@@ -55,7 +55,7 @@ end
 local _SpellEvents = nil
 local function getSpellEvents()
     if not _SpellEvents then
-        local ok, se = pcall(require, 'utils.spell_events')
+        local ok, se = pcall(require, 'sidekick-next.utils.spell_events')
         if ok then _SpellEvents = se end
     end
     return _SpellEvents
@@ -64,7 +64,7 @@ end
 local _ImmuneDB = nil
 local function getImmuneDB()
     if not _ImmuneDB then
-        local ok, db = pcall(require, 'utils.immune_database')
+        local ok, db = pcall(require, 'sidekick-next.utils.immune_database')
         if ok then _ImmuneDB = db end
     end
     return _ImmuneDB
@@ -73,7 +73,7 @@ end
 local _SpellLineup = nil
 local function getSpellLineup()
     if not _SpellLineup then
-        local ok, sl = pcall(require, 'utils.spell_lineup')
+        local ok, sl = pcall(require, 'sidekick-next.utils.spell_lineup')
         if ok then _SpellLineup = sl end
     end
     return _SpellLineup
@@ -82,7 +82,7 @@ end
 local _Cache = nil
 local function getCache()
     if not _Cache then
-        local ok, c = pcall(require, 'utils.runtime_cache')
+        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
         if ok then _Cache = c end
     end
     return _Cache
@@ -433,7 +433,7 @@ function M.init()
     local SpellEvents = getSpellEvents()
     if SpellEvents and type(SpellEvents.setResultCallback) == 'function' then
         SpellEvents.setResultCallback(function(result, extra)
-            local Core = require('utils.core')
+            local Core = require('sidekick-next.utils.core')
             local settings = Core and Core.Settings or {}
             M.handleCastResult(result, settings)
         end)

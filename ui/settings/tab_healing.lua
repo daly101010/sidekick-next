@@ -14,6 +14,7 @@ local _healingMod = nil
 local _healingSettingsUI = nil
 local _healingModChecked = false
 local _healingLoadError = nil
+local _settingsSynced = false
 
 local function initHealingTab()
     if _healingModChecked then return end
@@ -47,6 +48,9 @@ local function initHealingTab()
 
     _healingMod = mod
 
+    -- Sync Config.enabled with DoHeals on init (DoHeals is the source of truth)
+    -- This will be done in draw() when settings are available
+
     local ok2, uiOrErr = pcall(require, 'sidekick-next.healing.ui.settings')
     if ok2 and uiOrErr then
         _healingSettingsUI = uiOrErr
@@ -74,53 +78,76 @@ function M.draw(settings, themeNames, onChange)
     -- Try to load healing module
     initHealingTab()
 
+    -- Healing Intelligence is the only healing system - sync DoHeals with Config.enabled
+    local hiConfig = _healingMod and _healingMod.Config or nil
+
+    -- On first draw, sync Config.enabled to match DoHeals (DoHeals is source of truth)
+    if not _settingsSynced and hiConfig then
+        _settingsSynced = true
+        local doHealsValue = settings.DoHeals == true
+        if hiConfig.enabled ~= doHealsValue then
+            hiConfig.enabled = doHealsValue
+            if hiConfig.save then hiConfig.save() end
+        end
+    end
+
+    local hiEnabled = hiConfig and hiConfig.enabled == true
+
     -- ========== BASIC HEALING SETTINGS ==========
     imgui.TextColored(0.7, 0.9, 1.0, 1.0, 'Healing')
     imgui.Separator()
 
-    -- Main toggle
+    -- Main toggle - controls both DoHeals and Healing Intelligence
     local doHeals = settings.DoHeals == true
-    doHeals, changed = imgui.Checkbox('Enable Heals', doHeals)
-    if changed and onChange then onChange('DoHeals', doHeals) end
+    doHeals, changed = Settings.labeledCheckbox('Enable Heals', doHeals)
+    if changed then
+        if onChange then onChange('DoHeals', doHeals) end
+        -- Sync with Healing Intelligence Config
+        if hiConfig then
+            hiConfig.enabled = doHeals
+            if hiConfig.save then hiConfig.save() end
+        end
+    end
+
+    -- Sync hiEnabled for conditional display below
+    hiEnabled = doHeals and hiConfig ~= nil
 
     if doHeals then
         imgui.Indent()
 
-        -- Priority healing
-        local priority = settings.PriorityHealing ~= false
-        priority, changed = imgui.Checkbox('Priority Healing', priority)
-        if changed and onChange then onChange('PriorityHealing', priority) end
-        if imgui.IsItemHovered() then
-            Settings.safeTooltip('Heal lowest HP targets first')
+        -- Priority healing (hidden when HI enabled - HI has its own priority system)
+        if not hiEnabled then
+            local priority = settings.PriorityHealing ~= false
+            priority, changed = Settings.labeledCheckbox('Priority Healing', priority, 'Heal lowest HP targets first')
+            if changed and onChange then onChange('PriorityHealing', priority) end
         end
 
         -- Break invis OOC
         local breakInvis = settings.HealBreakInvisOOC == true
-        breakInvis, changed = imgui.Checkbox('Break Invis OOC To Heal', breakInvis)
+        breakInvis, changed = Settings.labeledCheckbox('Break Invis OOC To Heal', breakInvis)
         if changed and onChange then onChange('HealBreakInvisOOC', breakInvis) end
 
-        imgui.Separator()
-        imgui.Text('Heal Points')
+        -- Heal Points (hidden when HI enabled - HI uses its own thresholds)
+        if not hiEnabled then
+            imgui.Separator()
+            imgui.Text('Heal Points')
 
-        local mainHeal = tonumber(settings.MainHealPoint) or 80
-        mainHeal, changed = imgui.SliderInt('Main Heal Point %%', mainHeal, 50, 99)
-        if changed and onChange then onChange('MainHealPoint', mainHeal) end
+            local mainHeal = tonumber(settings.MainHealPoint) or 80
+            mainHeal, changed = Settings.labeledSliderInt('Main Heal Point %', mainHeal, 50, 99)
+            if changed and onChange then onChange('MainHealPoint', mainHeal) end
 
-        local bigHeal = tonumber(settings.BigHealPoint) or 50
-        bigHeal, changed = imgui.SliderInt('Big Heal Point %%', bigHeal, 20, 80)
-        if changed and onChange then onChange('BigHealPoint', bigHeal) end
+            local bigHeal = tonumber(settings.BigHealPoint) or 50
+            bigHeal, changed = Settings.labeledSliderInt('Big Heal Point %', bigHeal, 20, 80)
+            if changed and onChange then onChange('BigHealPoint', bigHeal) end
 
-        local groupHeal = tonumber(settings.GroupHealPoint) or 75
-        groupHeal, changed = imgui.SliderInt('Group Heal Point %%', groupHeal, 50, 95)
-        if changed and onChange then onChange('GroupHealPoint', groupHeal) end
+            local groupHeal = tonumber(settings.GroupHealPoint) or 75
+            groupHeal, changed = Settings.labeledSliderInt('Group Heal Point %', groupHeal, 50, 95)
+            if changed and onChange then onChange('GroupHealPoint', groupHeal) end
 
-        local injureCnt = tonumber(settings.GroupInjureCnt) or 2
-        injureCnt, changed = imgui.SliderInt('Group Injured Count', injureCnt, 1, 5)
-        if changed and onChange then onChange('GroupInjureCnt', injureCnt) end
-
-        local emergencyPct = tonumber(settings.EmergencyHealPct) or 20
-        emergencyPct, changed = imgui.SliderInt('Emergency Heal %%', emergencyPct, 10, 40)
-        if changed and onChange then onChange('EmergencyHealPct', emergencyPct) end
+            local injureCnt = tonumber(settings.GroupInjureCnt) or 2
+            injureCnt, changed = Settings.labeledSliderInt('Group Injured Count', injureCnt, 1, 5)
+            if changed and onChange then onChange('GroupInjureCnt', injureCnt) end
+        end
 
         imgui.Unindent()
     end
@@ -131,12 +158,13 @@ function M.draw(settings, themeNames, onChange)
     imgui.Separator()
 
     local doPetHeals = settings.DoPetHeals == true
-    doPetHeals, changed = imgui.Checkbox('Enable Pet Heals', doPetHeals)
+    doPetHeals, changed = Settings.labeledCheckbox('Enable Pet Heals', doPetHeals)
     if changed and onChange then onChange('DoPetHeals', doPetHeals) end
 
-    if doPetHeals then
+    -- Pet Heal Point (hidden when HI enabled - HI uses its own petHealMinPct)
+    if doPetHeals and not hiEnabled then
         local petHealPt = tonumber(settings.PetHealPoint) or 50
-        petHealPt, changed = imgui.SliderInt('Pet Heal Point %%', petHealPt, 20, 80)
+        petHealPt, changed = Settings.labeledSliderInt('Pet Heal Point %', petHealPt, 20, 80)
         if changed and onChange then onChange('PetHealPoint', petHealPt) end
     end
 
@@ -147,52 +175,38 @@ function M.draw(settings, themeNames, onChange)
 
     -- Watch MA
     local watchMA = settings.HealWatchMA == true
-    watchMA, changed = imgui.Checkbox('Watch Main Assist (OOG OK)', watchMA)
+    watchMA, changed = Settings.labeledCheckbox('Watch Main Assist (OOG OK)', watchMA, 'Heal the MA even if outside group')
     if changed and onChange then onChange('HealWatchMA', watchMA) end
-    if imgui.IsItemHovered() then
-        Settings.safeTooltip('Heal the MA even if outside group')
-    end
 
     -- XTarget healing
     local healXT = settings.HealXTargetEnabled == true
-    healXT, changed = imgui.Checkbox('Heal XTarget Slots', healXT)
+    healXT, changed = Settings.labeledCheckbox('Heal XTarget Slots', healXT)
     if changed and onChange then onChange('HealXTargetEnabled', healXT) end
 
     if healXT then
         local xtSlots = settings.HealXTargetSlots or ''
-        local buf = imgui.InputText('XTarget Slots (e.g. 1|2|3)', xtSlots, 64)
+        local buf = Settings.labeledInputText('XTarget Slots (e.g. 1|2|3)', xtSlots)
         if buf ~= xtSlots and onChange then
             onChange('HealXTargetSlots', buf)
         end
     end
 
-    -- ========== HOTS ==========
-    imgui.Spacing()
-    imgui.TextColored(0.7, 0.9, 1.0, 1.0, 'HoTs')
-    imgui.Separator()
+    -- ========== HOTS (hidden when HI enabled - HI has its own HoT logic) ==========
+    if not hiEnabled then
+        imgui.Spacing()
+        imgui.TextColored(0.7, 0.9, 1.0, 1.0, 'HoTs')
+        imgui.Separator()
 
-    local useHoTs = settings.HealUseHoTs ~= false
-    useHoTs, changed = imgui.Checkbox('Use HoTs', useHoTs)
-    if changed and onChange then onChange('HealUseHoTs', useHoTs) end
+        local useHoTs = settings.HealUseHoTs ~= false
+        useHoTs, changed = Settings.labeledCheckbox('Use HoTs', useHoTs)
+        if changed and onChange then onChange('HealUseHoTs', useHoTs) end
 
-    if useHoTs then
-        local hotRefresh = tonumber(settings.HealHoTMinSeconds) or 6
-        hotRefresh, changed = imgui.SliderInt('HoT Refresh Window (sec)', hotRefresh, 2, 15)
-        if changed and onChange then onChange('HealHoTMinSeconds', hotRefresh) end
+        if useHoTs then
+            local hotRefresh = tonumber(settings.HealHoTMinSeconds) or 6
+            hotRefresh, changed = Settings.labeledSliderInt('HoT Refresh Window (sec)', hotRefresh, 2, 15)
+            if changed and onChange then onChange('HealHoTMinSeconds', hotRefresh) end
+        end
     end
-
-    -- ========== REZ ==========
-    imgui.Spacing()
-    imgui.TextColored(0.7, 0.9, 1.0, 1.0, 'Resurrection')
-    imgui.Separator()
-
-    local combatRez = settings.DoCombatRez == true
-    combatRez, changed = imgui.Checkbox('Combat Rez', combatRez)
-    if changed and onChange then onChange('DoCombatRez', combatRez) end
-
-    local oocRez = settings.DoOutOfCombatRez ~= false
-    oocRez, changed = imgui.Checkbox('Out of Combat Rez', oocRez)
-    if changed and onChange then onChange('DoOutOfCombatRez', oocRez) end
 
     -- ========== CURES ==========
     imgui.Spacing()
@@ -200,16 +214,16 @@ function M.draw(settings, themeNames, onChange)
     imgui.Separator()
 
     local doCures = settings.DoCures ~= false
-    doCures, changed = imgui.Checkbox('Enable Cures', doCures)
+    doCures, changed = Settings.labeledCheckbox('Enable Cures', doCures)
     if changed and onChange then onChange('DoCures', doCures) end
 
     if doCures then
         local cureSelf = settings.CurePrioritySelf == true
-        cureSelf, changed = imgui.Checkbox('Cure Self First', cureSelf)
+        cureSelf, changed = Settings.labeledCheckbox('Cure Self First', cureSelf)
         if changed and onChange then onChange('CurePrioritySelf', cureSelf) end
 
         local cureInCombat = settings.CureInCombat ~= false
-        cureInCombat, changed = imgui.Checkbox('Cure During Combat', cureInCombat)
+        cureInCombat, changed = Settings.labeledCheckbox('Cure During Combat', cureInCombat)
         if changed and onChange then onChange('CureInCombat', cureInCombat) end
     end
 

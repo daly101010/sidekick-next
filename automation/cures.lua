@@ -10,7 +10,7 @@ local M = {}
 local _SpellEngine = nil
 local function getSpellEngine()
     if not _SpellEngine then
-        local ok, se = pcall(require, 'utils.spell_engine')
+        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
         if ok then _SpellEngine = se end
     end
     return _SpellEngine
@@ -19,7 +19,7 @@ end
 local _RuntimeCache = nil
 local function getRuntimeCache()
     if not _RuntimeCache then
-        local ok, rc = pcall(require, 'utils.runtime_cache')
+        local ok, rc = pcall(require, 'sidekick-next.utils.runtime_cache')
         if ok then _RuntimeCache = rc end
     end
     return _RuntimeCache
@@ -28,7 +28,7 @@ end
 local _Core = nil
 local function getCore()
     if not _Core then
-        local ok, c = pcall(require, 'utils.core')
+        local ok, c = pcall(require, 'sidekick-next.utils.core')
         if ok then _Core = c end
     end
     return _Core
@@ -37,7 +37,7 @@ end
 local _ActorsCoordinator = nil
 local function getActors()
     if not _ActorsCoordinator then
-        local ok, ac = pcall(require, 'utils.actors_coordinator')
+        local ok, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
         if ok then _ActorsCoordinator = ac end
     end
     return _ActorsCoordinator
@@ -640,8 +640,9 @@ local function canCureNow(settings)
     -- Not if dead
     if me.Hovering and me.Hovering() then return false end
 
-    -- Not if already casting
-    if me.Casting() then return false end
+    -- Not if already casting (Casting() returns spell name string, empty if not)
+    local casting = me.Casting() or ''
+    if casting ~= '' then return false end
 
     -- Not if spell engine is busy
     local SpellEngine = getSpellEngine()

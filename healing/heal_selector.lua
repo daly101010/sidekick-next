@@ -50,7 +50,7 @@ local CombatAssessor = nil
 local Proactive = nil
 local function getProactive()
     if Proactive == nil then
-        local ok, p = pcall(require, 'healing.proactive')
+        local ok, p = pcall(require, 'sidekick-next.healing.proactive')
         Proactive = ok and p or false
     end
     return Proactive or nil
@@ -59,7 +59,7 @@ end
 local Logger = nil
 local function getLogger()
     if Logger == nil then
-        local ok, l = pcall(require, 'healing.logger')
+        local ok, l = pcall(require, 'sidekick-next.healing.logger')
         Logger = ok and l or false
     end
     return Logger or nil
@@ -163,25 +163,74 @@ local function predictedDeficit(deficit, dps, timeSec, maxHP)
     return predicted
 end
 
+-- Lazy-load CombatAssessor for centralized scoring weights (includes throttle logic)
+local CombatAssessor = nil
+local function getCombatAssessor()
+    if CombatAssessor == nil then
+        local ok, ca = pcall(require, 'sidekick-next.healing.combat_assessor')
+        CombatAssessor = ok and ca or false
+    end
+    return CombatAssessor or nil
+end
+
 local function getSingleWeights(config, situation)
     local defaults = { coverage = 3.0, manaEff = 0.5, overheal = -1.5 }
+
+    -- Try to get weights from combat_assessor (includes adaptive throttle)
+    local ca = getCombatAssessor()
+    if ca and ca.getScoringWeights then
+        local weights = ca.getScoringWeights()
+        if weights then
+            return {
+                coverage = tonumber(weights.coverage) or defaults.coverage,
+                manaEff = tonumber(weights.manaEff) or defaults.manaEff,
+                overheal = tonumber(weights.overheal) or defaults.overheal,
+                preset = weights.preset,
+                throttled = weights.throttled,
+                throttleLevel = weights.throttleLevel,
+            }
+        end
+    end
+
+    -- Fallback: determine weights locally (without throttle)
     local presets = config and config.scoringPresets or nil
     local weights = (presets and presets.normal) or defaults
+    local preset = 'normal'
+
+    -- Priority order: emergency > raidFight > lowPressure > normal
     if situation and (situation.hasEmergency or situation.survivalMode) and presets and presets.emergency then
         weights = presets.emergency
+        preset = 'emergency'
+    elseif situation and situation.raidFight and presets and presets.raidFight then
+        weights = presets.raidFight
+        preset = 'raidFight'
     elseif situation and situation.lowPressure and presets and presets.lowPressure then
         weights = presets.lowPressure
+        preset = 'lowPressure'
     end
     return {
         coverage = tonumber(weights.coverage) or defaults.coverage,
         manaEff = tonumber(weights.manaEff) or defaults.manaEff,
         overheal = tonumber(weights.overheal) or defaults.overheal,
+        preset = preset,
+        throttled = false,
     }
 end
 
 local function formatSingleWeights(weights)
-    return string.format('weights=cov%.1f,mana%.1f,overheal%.1f,cast-0.2,recast-0.1',
+    local base = string.format('weights=cov%.1f,mana%.1f,overheal%.1f,cast-0.2,recast-0.1',
         weights.coverage, weights.manaEff, weights.overheal)
+
+    -- Add throttle/preset info if present
+    local extra = ''
+    if weights.preset then
+        extra = extra .. string.format(' preset=%s', weights.preset)
+    end
+    if weights.throttled then
+        extra = extra .. string.format(' throttled=%.2f', weights.throttleLevel or 0)
+    end
+
+    return base .. extra
 end
 
 local function scoreSingle(meta, expected, deficit, dps, maxHP, situation, targetInfo, category)
@@ -843,7 +892,7 @@ function M.SelectHeal(targetInfo, situation)
     end
 
     -- Check HoT trust before selecting direct heal
-    local ok, HotAnalyzer = pcall(require, 'healing.hot_analyzer')
+    local ok, HotAnalyzer = pcall(require, 'sidekick-next.healing.hot_analyzer')
     if ok and HotAnalyzer and HotAnalyzer.shouldTrustHoT then
         local trustHoT, analysis, decision = HotAnalyzer.shouldTrustHoT(targetInfo, situation)
         if trustHoT then

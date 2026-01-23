@@ -14,7 +14,7 @@ M.lastLoadout = ''
 local _ConfigLoader = nil
 local function getConfigLoader()
     if not _ConfigLoader then
-        local ok, cl = pcall(require, 'utils.class_config_loader')
+        local ok, cl = pcall(require, 'sidekick-next.utils.class_config_loader')
         if ok then _ConfigLoader = cl end
     end
     return _ConfigLoader

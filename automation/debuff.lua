@@ -10,7 +10,7 @@ local M = {}
 local _Actors = nil
 local function getActors()
     if not _Actors then
-        local ok, a = pcall(require, 'utils.actors_coordinator')
+        local ok, a = pcall(require, 'sidekick-next.utils.actors_coordinator')
         if ok then _Actors = a end
     end
     return _Actors
@@ -20,7 +20,7 @@ end
 local _Cache = nil
 local function getCache()
     if not _Cache then
-        local ok, c = pcall(require, 'utils.runtime_cache')
+        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
         if ok then _Cache = c end
     end
     return _Cache

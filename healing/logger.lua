@@ -203,9 +203,27 @@ end
 function M.logCombatState(state)
     if not shouldLog('debug', 'combatState') then return end
 
-    write('debug', 'combatState', 'COMBAT: phase=%s inCombat=%s survival=%s mobs=%d avgMobHP=%d%% TTK=%.1fs tankDPS=%d%%',
-        state.fightPhase or '?', tostring(state.inCombat), tostring(state.survivalMode),
+    -- Base combat state
+    local baseMsg = string.format('COMBAT: phase=%s inCombat=%s survival=%s highPressure=%s mobs=%d avgMobHP=%d%% TTK=%.1fs tankDPS=%d%%',
+        state.fightPhase or '?', tostring(state.inCombat), tostring(state.survivalMode), tostring(state.highPressure),
         state.activeMobCount or 0, state.avgMobHP or 0, state.estimatedTTK or 0, state.tankDpsPct or 0)
+
+    -- Add mob difficulty info if fighting named/raid
+    local mobInfo = ''
+    if state.hasRaidMob or state.hasNamedMob then
+        mobInfo = string.format(' | mob: tier=%s mult=%.1f raid=%s named=%s',
+            state.mobDifficultyTier or 'normal', state.mobDpsMultiplier or 1.0,
+            tostring(state.hasRaidMob), tostring(state.hasNamedMob))
+    end
+
+    -- Add throttle info if active
+    local throttleInfo = ''
+    if state.throttleLevel and state.throttleLevel > 0 then
+        throttleInfo = string.format(' | throttle: level=%.2f overheal=%.1f%%',
+            state.throttleLevel, state.fightOverhealPct or 0)
+    end
+
+    write('debug', 'combatState', baseMsg .. mobInfo .. throttleInfo)
 end
 
 function M.logHotDecision(targetName, spellName, shouldApply, reason)
@@ -297,6 +315,15 @@ function M.logHotCoverageDecision(targetName, analysis, decision, level)
         a.currentPct or 0, a.currentHP or 0, a.maxHP or 0, a.deficit or 0, a.role or '?'))
     table.insert(lines, string.format('  Pressure: %s (mobs=%d TTK=%.0fs survival=%s)',
         a.pressure or '?', a.mobCount or 0, a.ttk or 0, tostring(a.survivalMode or false)))
+
+    -- Mob difficulty info
+    if a.mobDifficulty then
+        local md = a.mobDifficulty
+        if md.hasRaidMob or md.hasNamedMob then
+            table.insert(lines, string.format('  Mob Difficulty: tier=%s multiplier=%.1f raid=%s named=%s',
+                md.tier or 'normal', md.multiplier or 1.0, tostring(md.hasRaidMob), tostring(md.hasNamedMob)))
+        end
+    end
 
     -- DPS Attribution breakdown
     table.insert(lines, string.format('  DPS Attribution: total=%.0f sources=%d',

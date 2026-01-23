@@ -17,8 +17,22 @@ M.currentZone = ''
 -- Dirty flag for persistence
 M.dirty = false
 
+-- Lazy-load Paths module
+local _Paths = nil
+local function getPaths()
+    if not _Paths then
+        local ok, p = pcall(require, 'sidekick-next.utils.paths')
+        if ok then _Paths = p end
+    end
+    return _Paths
+end
+
 -- Database file path
 local function getDbPath()
+    local Paths = getPaths()
+    if Paths then
+        return Paths.getImmuneDatabasePath()
+    end
     return mq.configDir .. '/SideKick/immune_database.lua'
 end
 
@@ -57,8 +71,13 @@ function M.saveDatabase()
     if not M.dirty then return end
 
     -- Ensure directory exists
-    local dir = mq.configDir .. '/SideKick'
-    os.execute('mkdir "' .. dir .. '" 2>nul')
+    local Paths = getPaths()
+    if Paths then
+        Paths.ensureDir(Paths.getDataDir())
+    else
+        local dir = mq.configDir .. '/SideKick'
+        os.execute('mkdir "' .. dir .. '" 2>nul')
+    end
 
     local path = getDbPath()
     local file = io.open(path, 'w')

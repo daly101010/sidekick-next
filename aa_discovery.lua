@@ -1,4 +1,4 @@
-local tool = require('tools.aa_discovery')
+local tool = require('sidekick-next.tools.aa_discovery')
 if tool and tool.main then
     tool.main(...)
 end

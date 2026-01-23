@@ -9,7 +9,7 @@ local Config = nil
 local DamageParser = nil
 local function getDamageParser()
     if DamageParser == nil then
-        local ok, dp = pcall(require, 'healing.damage_parser')
+        local ok, dp = pcall(require, 'sidekick-next.healing.damage_parser')
         DamageParser = ok and dp or false
     end
     return DamageParser or nil
@@ -19,7 +19,7 @@ end
 local DamageAttribution = nil
 local function getDamageAttribution()
     if DamageAttribution == nil then
-        local ok, da = pcall(require, 'healing.damage_attribution')
+        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
         DamageAttribution = ok and da or false
     end
     return DamageAttribution or nil
@@ -218,7 +218,7 @@ local function updateTargetData(spawnId, spawn, roleOverride)
     end
 
     -- Prune old damage entries
-    local cutoff = now - DAMAGE_WINDOW_SEC
+    local cutoff = now - (DAMAGE_WINDOW_SEC * 1000)
     local newDamage = {}
     for _, entry in ipairs(recentDamage) do
         if entry.time >= cutoff then
@@ -232,8 +232,8 @@ local function updateTargetData(spawnId, spawn, roleOverride)
     for _, entry in ipairs(recentDamage) do
         totalDamage = totalDamage + entry.amount
     end
-    local windowDuration = math.max(1, #recentDamage > 0 and (now - recentDamage[1].time) or DAMAGE_WINDOW_SEC)
-    local hpDeltaDps = totalDamage / windowDuration
+    local windowDurationSec = math.max(1, #recentDamage > 0 and ((now - recentDamage[1].time) / 1000) or DAMAGE_WINDOW_SEC)
+    local hpDeltaDps = totalDamage / windowDurationSec
 
     -- Get log-based DPS
     local logDps = 0

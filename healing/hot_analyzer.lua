@@ -15,7 +15,7 @@ local Proactive = nil
 local Logger = nil
 local function getLogger()
     if Logger == nil then
-        local ok, l = pcall(require, 'healing.logger')
+        local ok, l = pcall(require, 'sidekick-next.healing.logger')
         Logger = ok and l or false
     end
     return Logger or nil
@@ -25,7 +25,7 @@ end
 local DamageAttribution = nil
 local function getDamageAttribution()
     if DamageAttribution == nil then
-        local ok, da = pcall(require, 'healing.damage_attribution')
+        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
         DamageAttribution = ok and da or false
     end
     return DamageAttribution or nil
@@ -47,7 +47,7 @@ end
 --------------------------------------------------------------------------------
 
 -- Get pressure level from combat state
--- Returns: pressure ('low'/'normal'/'high'), mobCount, ttk, survivalMode
+-- Returns: pressure ('low'/'normal'/'high'), mobCount, ttk, survivalMode, mobDifficulty
 local function getPressureLevel()
     local state = CombatAssessor and CombatAssessor.getState() or {}
 
@@ -55,15 +55,34 @@ local function getPressureLevel()
     local ttk = state.estimatedTTK or 999
     local survival = state.survivalMode or false
     local highPressure = state.highPressure or false
+    local hasRaidMob = state.hasRaidMob or false
+    local hasNamedMob = state.hasNamedMob or false
+    local mobMultiplier = state.mobDpsMultiplier or 1.0
+    local mobTier = state.mobDifficultyTier or 'normal'
 
     local pressure = 'normal'
     if survival or highPressure then
         pressure = 'high'
+    elseif hasRaidMob or mobMultiplier >= 2.5 then
+        -- Raid/extreme mobs: treat as high pressure even if other indicators are normal
+        -- We expect heavier damage that may not be fully captured in DPS tracking yet
+        pressure = 'high'
+    elseif mobMultiplier >= 1.5 then
+        -- Named mobs (difficult/formidable): at least normal pressure, never low
+        pressure = 'normal'
     elseif mobCount <= (Config and Config.lowPressureMobCount or 1) then
         pressure = 'low'
     end
 
-    return pressure, mobCount, ttk, survival
+    -- Return mob difficulty info for logging
+    local mobDifficulty = {
+        hasRaidMob = hasRaidMob,
+        hasNamedMob = hasNamedMob,
+        multiplier = mobMultiplier,
+        tier = mobTier,
+    }
+
+    return pressure, mobCount, ttk, survival, mobDifficulty
 end
 
 -- Get projection window capped by pressure, TTK, and HoT remaining time
@@ -269,11 +288,12 @@ function M.shouldTrustHoT(targetInfo, situation)
     end
 
     -- 6. Get pressure level and projection window
-    local pressure, mobCount, ttk, survival = getPressureLevel()
+    local pressure, mobCount, ttk, survival, mobDifficulty = getPressureLevel()
     analysis.pressure = pressure
     analysis.mobCount = mobCount
     analysis.ttk = ttk
     analysis.survivalMode = survival
+    analysis.mobDifficulty = mobDifficulty
 
     -- 7. Calculate projection window (capped by pressure, TTK, and HoT remaining)
     local windowSec = getProjectionWindow(pressure, ttk, hotRemainingSec)
@@ -366,10 +386,11 @@ function M.shouldApplyHoT(targetInfo, hotSpellName, situation)
     }
 
     -- Get combat state
-    local pressure, mobCount, ttk, survival = getPressureLevel()
+    local pressure, mobCount, ttk, survival, mobDifficulty = getPressureLevel()
     analysis.pressure = pressure
     analysis.mobCount = mobCount
     analysis.ttk = ttk
+    analysis.mobDifficulty = mobDifficulty
 
     -- Get spell duration
     local spell = mq.TLO.Spell(hotSpellName)

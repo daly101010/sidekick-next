@@ -3,6 +3,7 @@ local M = {}
 M.defaults = {
     SideKickTheme = { type = 'text', Default = 'Classic', Category = 'UI', DisplayName = 'Theme' },
     SideKickSyncThemeWithGT = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Sync Theme With GroupTarget' },
+    SideKickDebugSettings = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Debug Settings Logging' },
     SideKickMainAnchor = { type = 'text', Default = 'none', Category = 'UI', DisplayName = 'Main Anchor (GroupTarget)' },
     SideKickMainAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'UI', DisplayName = 'Main Anchor Target' },
     SideKickMainAnchorGap = { type = 'number', Default = 2, Category = 'UI', DisplayName = 'Main Anchor Gap' },
@@ -54,6 +55,7 @@ M.defaults = {
     ChaseDistance = { type = 'number', Default = 30, Category = 'Automation', DisplayName = 'Chase Distance' },
 
     AutomationLevel = { type = 'text', Default = 'auto', Category = 'Automation', DisplayName = 'Play Style (manual/hybrid/auto)' },
+    AutomationPaused = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Global Pause' },
     AutoAbilitiesEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Abilities (AAs/Discs)' },
     AutoItemsEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Items (Clickies)' },
 
@@ -209,14 +211,7 @@ M.defaults = {
 
     -- Buff Settings
     BuffingEnabled = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Enable Buffing' },
-    BuffRebuffWindow = { type = 'number', Default = 60, Category = 'Buffs', DisplayName = 'Rebuff Window (seconds)' },
-    BuffSelfOnly = { type = 'bool', Default = false, Category = 'Buffs', DisplayName = 'Self Buffs Only' },
-    BuffAllowInCombat = { type = 'bool', Default = false, Category = 'Buffs', DisplayName = 'Allow Buffing In Combat' },
-    BuffGroupEnabled = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Buff Group Members' },
     BuffPetsEnabled = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Buff Pets' },
-    BuffRaidEnabled = { type = 'bool', Default = false, Category = 'Buffs', DisplayName = 'Buff Raid Members' },
-    BuffFellowshipEnabled = { type = 'bool', Default = false, Category = 'Buffs', DisplayName = 'Buff Fellowship' },
-    BuffCoordinateActors = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Coordinate via Actors' },
 
     ActorsEnabled = { type = 'bool', Default = true, Category = 'Integration', DisplayName = 'Enable Actors' },
 
@@ -225,36 +220,100 @@ M.defaults = {
     SafeTargetingCheckRaid = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Safe Targeting: Check Raid Members' },
     SafeTargetingCheckPeers = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Safe Targeting: Check Actor Peers' },
 
-    -- Combat/Targeting: Auto Stand from Feign Death
-    AutoStandFD = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Auto Stand from FD' },
-
-    -- Combat/Targeting: MA Scan Z-Axis Range
-    MAScanZRange = { type = 'number', Default = 100, Category = 'Combat', DisplayName = 'MA Scan Z Range' },
-
     -- AssistOutside: Enable assisting group, raid, and actor peers
     AssistOutsideGroup = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Assist Outside: Group Members' },
     AssistOutsideRaid = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Assist Outside: Raid Members' },
     AssistOutsidePeers = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Assist Outside: Actor Peers (Same Zone)' },
-
-    -- Healing: Rez Settings
-    DoCombatRez = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Combat Rez Enabled' },
-    DoOutOfCombatRez = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Out of Combat Rez Enabled' },
-
-    -- Healing: Emergency Settings
-    EmergencyHealPct = { type = 'number', Default = 20, Category = 'Heal/Rez', DisplayName = 'Emergency Heal Pct' },
-
-    -- Buffing: Aura Selection
-    AuraSelection = { type = 'text', Default = '', Category = 'Buffs', DisplayName = 'Aura Selection' },
 
     -- Cure Settings
     DoCures = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Enable Cures' },
     CurePrioritySelf = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Cure Self First' },
     CureInCombat = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Cure During Combat' },
     CureCoordinateActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Coordinate Cures via Actors' },
+
+    -- Animation Settings
+    AnimationsEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Enable Animations' },
+    HoverScaleEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Hover Scale' },
+    ClickBounceEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Click Bounce' },
+    TogglePopEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Toggle Pop' },
+    ReadyPulseEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Ready Pulse' },
+    CooldownColorTweenEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Cooldown Color Transition' },
+    ToggleColorTweenEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Toggle Color Transition' },
+    StaggerAnimationEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Stagger Animation' },
+    LowResourceWarningEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Low Resource Warning' },
+    DamageFlashEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Damage Flash' },
+}
+
+-- ============================================================
+-- VALIDATORS
+-- ============================================================
+
+local VALIDATORS = {
+    -- Anchor gap: 0-48
+    SideKickMainAnchorGap = { min = 0, max = 48 },
+    SideKickBarAnchorGap = { min = 0, max = 48 },
+    SideKickSpecialAnchorGap = { min = 0, max = 48 },
+    SideKickDiscBarAnchorGap = { min = 0, max = 48 },
+    SideKickItemBarAnchorGap = { min = 0, max = 48 },
+
+    -- Cell sizes: 32-120
+    SideKickBarCell = { min = 32, max = 120 },
+    SideKickSpecialCell = { min = 32, max = 120 },
+    SideKickDiscBarCell = { min = 32, max = 120 },
+    SideKickItemBarCell = { min = 32, max = 120 },
+
+    -- Rows: 1-6
+    SideKickBarRows = { min = 1, max = 6 },
+    SideKickSpecialRows = { min = 1, max = 6 },
+    SideKickDiscBarRows = { min = 1, max = 6 },
+    SideKickItemBarRows = { min = 1, max = 6 },
+
+    -- Alpha: 0-1
+    SideKickBarBgAlpha = { min = 0.0, max = 1.0 },
+    SideKickSpecialBgAlpha = { min = 0.0, max = 1.0 },
+    SideKickDiscBarBgAlpha = { min = 0.0, max = 1.0 },
+    SideKickItemBarBgAlpha = { min = 0.0, max = 1.0 },
+
+    -- Percentages: 0-100
+    AssistAt = { min = 0, max = 100 },
+    MeditationAggroPct = { min = 0, max = 100 },
+    MeditationHPStartPct = { min = 0, max = 100 },
+    MeditationHPStopPct = { min = 0, max = 100 },
+    MeditationManaStartPct = { min = 0, max = 100 },
+    MeditationManaStopPct = { min = 0, max = 100 },
+    MeditationEndStartPct = { min = 0, max = 100 },
+    MeditationEndStopPct = { min = 0, max = 100 },
+    MainHealPoint = { min = 0, max = 100 },
+    BigHealPoint = { min = 0, max = 100 },
+    GroupHealPoint = { min = 0, max = 100 },
+    EmergencyHpThreshold = { min = 0, max = 100 },
+    AssistEngageHpThreshold = { min = 0, max = 100 },
 }
 
 function M.meta(key)
     return M.defaults[key]
+end
+
+function M.validate(key, value)
+    local validator = VALIDATORS[key]
+    if not validator then return value end
+
+    local meta = M.defaults[key]
+    local valType = meta and meta.type or 'text'
+
+    if valType == 'number' then
+        local num = tonumber(value)
+        if not num then return meta and meta.Default or 0 end
+        if validator.min and num < validator.min then num = validator.min end
+        if validator.max and num > validator.max then num = validator.max end
+        return num
+    end
+
+    return value
+end
+
+function M.getValidator(key)
+    return VALIDATORS[key]
 end
 
 function M.iter_all()

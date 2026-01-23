@@ -5,7 +5,7 @@ local mq = require('mq')
 local Logger = nil
 local function getLogger()
     if Logger == nil then
-        local ok, l = pcall(require, 'healing.logger')
+        local ok, l = pcall(require, 'sidekick-next.healing.logger')
         Logger = ok and l or false
     end
     return Logger or nil
@@ -42,6 +42,7 @@ local M = {
     -- ManaEff reduced in normal mode - right-sizing heals matters more than raw efficiency
     scoringPresets = {
         emergency = { coverage = 4.0, manaEff = 0.1, overheal = -0.5 },  -- Save the target, efficiency doesn't matter
+        raidFight = { coverage = 3.0, manaEff = 0.3, overheal = -1.5 },  -- Named/raid mobs: favor throughput, tolerate overheal
         normal = { coverage = 2.0, manaEff = 0.5, overheal = -3.0 },     -- Balance coverage with minimal waste
         lowPressure = { coverage = 1.0, manaEff = 1.5, overheal = -4.0 }, -- Maximize efficiency, heavily penalize overheal
     },
@@ -111,6 +112,16 @@ local M = {
     -- High pressure detection
     highPressureMinMobs = 3,         -- Min active mobs for high pressure
     highPressureMinDps = 3000,       -- OR min total DPS for high pressure
+    highPressureMobMultiplier = 3.0, -- Mob difficulty multiplier that triggers high pressure (impossible+ tier)
+
+    -- Mob difficulty adjustments (from mob_assessor tiers)
+    raidMobSurvivalDpsPctReduction = 2,   -- Lower survival threshold by this % for raid mobs
+    raidMobPromisedFloorIncrease = 10,    -- Raise promised safety floor by this % for raid fights
+
+    -- Adaptive throttle for raid fights (reduces aggressiveness if overhealing)
+    throttleMinHeals = 5,           -- Min heals in fight before throttle can activate
+    throttleOverhealPct = 40,       -- Overheal % threshold to start throttling
+    throttleMaxLevel = 0.5,         -- Max throttle level (0-1, affects weight adjustments)
     -- TTK tracking
     ttkWindowSec = 5,                -- Window for tracking mob HP decline
 

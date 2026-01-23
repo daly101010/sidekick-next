@@ -1,7 +1,7 @@
 local mq = require('mq')
-local Core = require('utils.core')
-local Helpers = require('lib.helpers')
-local ConditionBuilder = require('ui.condition_builder')
+local Core = require('sidekick-next.utils.core')
+local Helpers = require('sidekick-next.lib.helpers')
+local ConditionBuilder = require('sidekick-next.ui.condition_builder')
 
 local M = {}
 
@@ -53,9 +53,28 @@ local function safeCall(fn)
     return nil
 end
 
+local function can_query_items()
+    if Core and Core.CanQueryItems then
+        return Core.CanQueryItems()
+    end
+    local mqTLO = mq.TLO
+    if not mqTLO or not mqTLO.MacroQuest or not mqTLO.MacroQuest.GameState then
+        return false
+    end
+    local gs = mqTLO.MacroQuest.GameState()
+    if gs ~= 'INGAME' then
+        return false
+    end
+    if mqTLO.Me and mqTLO.Me.Zoning and mqTLO.Me.Zoning() then
+        return false
+    end
+    return true
+end
+
 local function buildClickyInfo(itemName)
     itemName = trim(itemName)
     if itemName == '' then return nil end
+    if not can_query_items() then return nil end
     if not (mq and mq.TLO and mq.TLO.FindItem) then return nil end
 
     local item = mq.TLO.FindItem(itemName)
@@ -109,6 +128,7 @@ end
 local function itemReady(itemName)
     itemName = trim(itemName)
     if itemName == '' then return false end
+    if not can_query_items() then return false end
     local item = safeCall(function() return mq.TLO.FindItem(itemName) end)
     if not (item and item()) then return false end
     local ready = safeCall(function() return item.TimerReady and item.TimerReady() end)
@@ -227,6 +247,51 @@ function M.clearSlot(i)
     M.setSlot(i, '')
 end
 
+function M.clearAll()
+    for i = 1, M.SLOT_COUNT do
+        M.clearSlot(i)
+    end
+end
+
+function M.setSlots(slots)
+    if not slots then return end
+    for i = 1, M.SLOT_COUNT do
+        local slot = slots[i]
+        if slot then
+            local name = slot.name or slot.itemName or ''
+            M.setSlot(i, name)
+            if slot.mode then
+                M.setSlotMode(i, slot.mode)
+            end
+            if slot.combatHpPct then
+                M.setSlotCombatHpPct(i, slot.combatHpPct)
+            end
+        else
+            M.clearSlot(i)
+        end
+    end
+end
+
+function M.addSlot(config)
+    if not config then return false end
+    local name = config.itemName or config.name or ''
+    if name == '' then return false end
+
+    -- Find first empty slot
+    local slots = M.getSlots()
+    for i = 1, M.SLOT_COUNT do
+        local slot = slots[i]
+        if not slot.name or slot.name == '' then
+            M.setSlot(i, name)
+            if config.mode then
+                M.setSlotMode(i, config.mode)
+            end
+            return true
+        end
+    end
+    return false -- No empty slots
+end
+
 function M.setSlotMode(i, modeKey)
     local sec = ensureSection()
     modeKey = modeKeyFromValue(modeKey)
@@ -324,6 +389,7 @@ end
 function M.useItem(itemName, opts)
     itemName = trim(itemName)
     if itemName == '' then return end
+    if not can_query_items() then return end
     opts = opts or {}
     local throttleKey = tostring(opts.throttleKey or itemName)
     local now = os.clock()

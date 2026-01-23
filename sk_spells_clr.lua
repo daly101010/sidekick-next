@@ -603,12 +603,30 @@ M.SelfBuffs = {
         'Vow of Valor',           -- 71
     },
 
-    -- Aegolism line (HP buff)
+    -- Aegolism / Hand line (HP buff, consolidated)
     Aegolism = {
-        'Aegolism XV',            -- 127
-        'Ancient Gift of Aegolism', -- 60
+        'Unified Hand of Infallibility', -- 125
+        'Unified Hand of Persistence', -- 120
+        'Unified Hand of Righteousness', -- 115
+        'Unified Hand of Assurance', -- 110
+        'Unified Hand of Surety', -- 105
+        'Unified Hand of Certitude', -- 100
+        'Unified Hand of Credence', -- 95
+        'Hand of Reliance',       -- 90
+        'Hand of Gallantry',      -- 85
+        'Hand Of Temerity',       -- 80
+        'Hand of Tenacity',       -- 75
+        'Hand of Conviction',     -- 70
+        'Hand of Virtue',         -- 65
         'Blessing of Aegolism',   -- 60
+        'Blessing of Temperance', -- 60
         'Aegolism',               -- 60
+        'Temperance',             -- 60
+        'Valor',                  -- 55
+        'Bravery',                -- 50
+        'Daring',                 -- 45
+        'Center',                 -- 40
+        'Courage',                -- 30
     },
 }
 
@@ -795,26 +813,6 @@ M.Damage.Glorious = {
 
 -- Unified group buff lines
 M.GroupBuffs = {
-    -- Unified Hand (combined group buff)
-    UnifiedHand = {
-        'Unified Hand of Sharosh', -- 130
-        'Unified Hand of Aegolism XV', -- 130
-        'Unified Hand of Helmsbane', -- 125
-        'Unified Hand of Infallibility', -- 125
-        'Unified Hand of the Diabo', -- 120
-        'Unified Hand of Persistence', -- 120
-        'Unified Hand of Jorlleag', -- 115
-        'Unified Hand of Righteousness', -- 115
-        'Unified Hand of Emra',   -- 110
-        'Unified Hand of Assurance', -- 110
-        'Unified Hand of Surety', -- 105
-        'Unified Hand of Nonia',  -- 105
-        'Unified Hand of Certitude', -- 100
-        'Unified Hand of Gezat',  -- 100
-        'Unified Hand of Credence', -- 95
-        'Unified Hand of the Triumvirate', -- 95
-    },
-
     -- Unified self buff (combined self buff)
     Unified = {
         'Unified Aegolism XV',    -- 127

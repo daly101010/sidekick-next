@@ -9,7 +9,7 @@ local Config = nil
 local Logger = nil
 local function getLogger()
     if Logger == nil then
-        local ok, l = pcall(require, 'healing.logger')
+        local ok, l = pcall(require, 'sidekick-next.healing.logger')
         Logger = ok and l or false
     end
     return Logger or nil
@@ -94,8 +94,9 @@ end
 local function findTargetIdByName(name)
     if not name or name == '' then return nil end
 
-    -- Handle "YOU" as self
-    if name == 'YOU' or name == 'you' then
+    local lname = tostring(name):lower()
+    -- Handle "YOU"/"You" as self
+    if lname == 'you' then
         local me = mq.TLO.Me
         if me and me() and me.ID() then
             return me.ID()
@@ -107,7 +108,7 @@ local function findTargetIdByName(name)
     local me = mq.TLO.Me
     if me and me() then
         local myName = me.CleanName()
-        if myName and myName == name then
+        if myName and myName:lower() == lname then
             return me.ID()
         end
     end
@@ -117,11 +118,12 @@ local function findTargetIdByName(name)
     for i = 1, groupCount do
         local member = mq.TLO.Group.Member(i)
         if member and member() then
-            local memberName = member.CleanName() or member.Name()
-            if memberName and memberName == name then
-                local spawn = member.Spawn and member.Spawn() or member
-                if spawn and spawn() and spawn.ID then
-                    return spawn.ID()
+            local memberName = member.CleanName and member.CleanName() or (member.Name and member.Name())
+            if memberName and memberName:lower() == lname then
+                -- Group.Member has ID directly, no need to go through Spawn
+                local id = member.ID and member.ID()
+                if id and id > 0 then
+                    return id
                 end
             end
         end

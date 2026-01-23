@@ -1,10 +1,67 @@
-local imgui = require('ImGui')
+local _imgui = require('ImGui')
+local imgui = setmetatable({}, { __index = _imgui })
 local mq = require('mq')
 local Items = require('sidekick-next.utils.items')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 local RemoteAbilities = require('sidekick-next.ui.remote_abilities')
 local ConditionBuilder = require('sidekick-next.ui.condition_builder')
 local Core = require('sidekick-next.utils.core')
+
+-- Normalize ImGui value-returning widgets to also report change state.
+-- Some MQ ImGui bindings return only the new value.
+local function normalizeValue(value, oldVal)
+    local oldType = type(oldVal)
+    local newType = type(value)
+    if oldType == 'boolean' then
+        if newType == 'number' then
+            return value ~= 0
+        end
+        if newType == 'string' then
+            local v = value:lower()
+            if v == '1' or v == 'true' or v == 'yes' or v == 'on' then return true end
+            if v == '0' or v == 'false' or v == 'no' or v == 'off' then return false end
+        end
+    elseif oldType == 'number' then
+        if newType == 'boolean' then
+            return value and 1 or 0
+        end
+        if newType == 'string' then
+            local n = tonumber(value)
+            if n ~= nil then return n end
+        end
+    elseif oldType == 'string' then
+        if value == nil then return '' end
+        return tostring(value)
+    end
+    return value
+end
+
+local function wrapChanged(fn, valueIndex)
+    return function(...)
+        local args = { ... }
+        local oldVal = args[valueIndex]
+        local newVal, changed = fn(...)
+
+        -- Handle return order mismatch (value vs changed)
+        if changed ~= nil and oldVal ~= nil and type(newVal) ~= type(oldVal) and type(changed) == type(oldVal) then
+            newVal, changed = changed, newVal
+        end
+
+        if oldVal ~= nil and newVal ~= nil then
+            newVal = normalizeValue(newVal, oldVal)
+        end
+
+        if changed == nil or type(changed) ~= 'boolean' then
+            changed = (newVal ~= oldVal)
+        end
+        return newVal, changed
+    end
+end
+
+imgui.Checkbox = wrapChanged(_imgui.Checkbox, 2)
+imgui.SliderInt = wrapChanged(_imgui.SliderInt, 2)
+imgui.SliderFloat = wrapChanged(_imgui.SliderFloat, 2)
+imgui.InputText = wrapChanged(_imgui.InputText, 2)
 
 local M = {}
 
@@ -69,21 +126,25 @@ end
 local function comboString(label, current, options)
     current = tostring(current or '')
     options = options or {}
-
-    -- Build null-separated labels string and find current index
-    local currentIdx = 1
-    for i, opt in ipairs(options) do
-        if opt == current then
-            currentIdx = i
-            break
-        end
+    if #options == 0 then
+        imgui.Text(tostring(label or '') .. ':')
+        imgui.SameLine()
+        imgui.TextDisabled(current ~= '' and current or '(none)')
+        return current
     end
-    local labelStr = table.concat(options, '\0') .. '\0\0'
 
-    -- Use imgui.Combo which returns new index directly (1-based in MQ)
-    local newIdx = imgui.Combo(label, currentIdx, labelStr)
-    if newIdx ~= currentIdx and options[newIdx] then
-        return options[newIdx]
+    local preview = current
+    if preview == '' then preview = '(none)' end
+    if imgui.BeginCombo(label, preview) then
+        for _, opt in ipairs(options) do
+            local v = tostring(opt or '')
+            local selected = (v == current)
+            if imgui.Selectable(v, selected) then
+                current = v
+            end
+            if selected then imgui.SetItemDefaultFocus() end
+        end
+        imgui.EndCombo()
     end
     return current
 end
@@ -91,22 +152,32 @@ end
 local function comboKeyed(label, currentKey, options)
     currentKey = tostring(currentKey or '')
     options = options or {}
+    if #options == 0 then
+        imgui.Text(tostring(label or '') .. ':')
+        imgui.SameLine()
+        imgui.TextDisabled(currentKey ~= '' and currentKey or '(none)')
+        return currentKey
+    end
 
-    -- Build null-separated labels string and find current index
-    local labels = {}
-    local currentIdx = 1
-    for i, opt in ipairs(options) do
-        table.insert(labels, opt.label)
-        if opt.key == currentKey then
-            currentIdx = i
+    local preview = currentKey
+    for _, opt in ipairs(options) do
+        if tostring(opt.key) == currentKey then
+            preview = tostring(opt.label or opt.key or currentKey)
+            break
         end
     end
-    local labelStr = table.concat(labels, '\0') .. '\0\0'
-
-    -- Use imgui.Combo which returns new index directly (1-based in MQ)
-    local newIdx = imgui.Combo(label, currentIdx, labelStr)
-    if newIdx ~= currentIdx and options[newIdx] then
-        return options[newIdx].key
+    if preview == '' then preview = '(none)' end
+    if imgui.BeginCombo(label, preview) then
+        for _, opt in ipairs(options) do
+            local k = tostring(opt.key or '')
+            local v = tostring(opt.label or k)
+            local selected = (k == currentKey)
+            if imgui.Selectable(v, selected) then
+                currentKey = k
+            end
+            if selected then imgui.SetItemDefaultFocus() end
+        end
+        imgui.EndCombo()
     end
     return currentKey
 end
@@ -121,7 +192,12 @@ local ANCHOR_TARGETS = {
 }
 
 local function drawUI(settings, themeNames, onChange)
-    local theme = comboString('Theme', settings.SideKickTheme or 'Classic', themeNames)
+    local controlWidth = 150
+
+    imgui.Text('Theme')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    local theme = comboString('##Theme', settings.SideKickTheme or 'Classic', themeNames)
     if theme ~= (settings.SideKickTheme or 'Classic') and onChange then
         onChange('SideKickTheme', theme)
     end
@@ -134,16 +210,23 @@ local function drawUI(settings, themeNames, onChange)
     end
 
     imgui.Separator()
-    imgui.Text('Docking')
+    imgui.Text('Main Window Docking')
 
     local anchors = { 'none', 'left', 'right', 'above', 'below', 'left_bottom', 'right_bottom' }
-    local mainTarget = comboKeyed('Main Anchor To', settings.SideKickMainAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
+
+    imgui.Text('Anchor To')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    local mainTarget = comboKeyed('##MainAnchorTo', settings.SideKickMainAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
     if mainTarget ~= tostring(settings.SideKickMainAnchorTarget or 'grouptarget') and onChange then
         onChange('SideKickMainAnchorTarget', mainTarget)
     end
 
+    imgui.Text('Anchor Mode')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
     local mainAnchor = tostring(settings.SideKickMainAnchor or 'none')
-    mainAnchor = comboString('Main Anchor Mode', mainAnchor, anchors)
+    mainAnchor = comboString('##MainAnchorMode', mainAnchor, anchors)
     if mainAnchor ~= tostring(settings.SideKickMainAnchor or 'none') and onChange then
         onChange('SideKickMainAnchor', mainAnchor)
     end
@@ -154,8 +237,11 @@ local function drawUI(settings, themeNames, onChange)
         onChange('SideKickMainMatchGTWidth', matchW)
     end
 
+    imgui.Text('Anchor Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
     local gap = tonumber(settings.SideKickMainAnchorGap) or 2
-    gap, changed = imgui.SliderInt('Main Anchor Gap', gap, 0, 24)
+    gap, changed = imgui.SliderInt('##MainAnchorGap', gap, 0, 24)
     if changed and onChange then
         onChange('SideKickMainAnchorGap', gap)
     end
@@ -163,6 +249,7 @@ end
 
 local function drawBar(settings, onChange)
     local changed
+    local controlWidth = 150
 
     local barEnabled = settings.SideKickBarEnabled ~= false
     barEnabled, changed = imgui.Checkbox('Show ability bar', barEnabled)
@@ -175,38 +262,65 @@ local function drawBar(settings, onChange)
     local pad = tonumber(settings.SideKickBarPad) or 6
     local anchorGap = tonumber(settings.SideKickBarAnchorGap) or 2
 
-    cell, changed = imgui.SliderInt('Cell Size', cell, 36, 120)
+    imgui.Text('Cell Size')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    cell, changed = imgui.SliderInt('##BarCellSize', cell, 36, 120)
     if changed and onChange then onChange('SideKickBarCell', cell) end
 
-    rows, changed = imgui.SliderInt('Rows', rows, 1, 6)
+    imgui.Text('Rows')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    rows, changed = imgui.SliderInt('##BarRows', rows, 1, 6)
     if changed and onChange then onChange('SideKickBarRows', rows) end
 
-    gap, changed = imgui.SliderInt('Gap', gap, 0, 12)
+    imgui.Text('Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    gap, changed = imgui.SliderInt('##BarGap', gap, 0, 12)
     if changed and onChange then onChange('SideKickBarGap', gap) end
 
-    pad, changed = imgui.SliderInt('Padding', pad, 0, 24)
+    imgui.Text('Padding')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    pad, changed = imgui.SliderInt('##BarPadding', pad, 0, 24)
     if changed and onChange then onChange('SideKickBarPad', pad) end
 
-    alpha, changed = imgui.SliderFloat('Background Alpha', alpha, 0.2, 1.0)
+    imgui.Text('Background Alpha')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    alpha, changed = imgui.SliderFloat('##BarBgAlpha', alpha, 0.2, 1.0)
     if changed and onChange then onChange('SideKickBarBgAlpha', alpha) end
 
     local anchors = { 'none', 'left', 'right', 'above', 'below', 'left_bottom', 'right_bottom' }
-    local target = comboKeyed('Anchor To', settings.SideKickBarAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
+
+    imgui.Text('Anchor To')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    local target = comboKeyed('##BarAnchorTo', settings.SideKickBarAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
     if target ~= tostring(settings.SideKickBarAnchorTarget or 'grouptarget') and onChange then
         onChange('SideKickBarAnchorTarget', target)
     end
+
+    imgui.Text('Anchor Mode')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
     local anchor = tostring(settings.SideKickBarAnchor or 'none')
-    anchor = comboString('Anchor Mode', anchor, anchors)
+    anchor = comboString('##BarAnchorMode', anchor, anchors)
     if anchor ~= tostring(settings.SideKickBarAnchor or 'none') and onChange then
         onChange('SideKickBarAnchor', anchor)
     end
 
-    anchorGap, changed = imgui.SliderInt('Anchor Gap', anchorGap, 0, 24)
+    imgui.Text('Anchor Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    anchorGap, changed = imgui.SliderInt('##BarAnchorGap', anchorGap, 0, 24)
     if changed and onChange then onChange('SideKickBarAnchorGap', anchorGap) end
 end
 
 local function drawSpecial(settings, onChange)
     local changed
+    local controlWidth = 150
 
     local specEnabled = settings.SideKickSpecialEnabled ~= false
     specEnabled, changed = imgui.Checkbox('Show special abilities', specEnabled)
@@ -219,38 +333,65 @@ local function drawSpecial(settings, onChange)
     local specPad = tonumber(settings.SideKickSpecialPad) or 6
     local specAnchorGap = tonumber(settings.SideKickSpecialAnchorGap) or 2
 
-    specCell, changed = imgui.SliderInt('Cell Size', specCell, 36, 120)
+    imgui.Text('Cell Size')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    specCell, changed = imgui.SliderInt('##SpecCellSize', specCell, 36, 120)
     if changed and onChange then onChange('SideKickSpecialCell', specCell) end
 
-    specRows, changed = imgui.SliderInt('Rows', specRows, 1, 6)
+    imgui.Text('Rows')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    specRows, changed = imgui.SliderInt('##SpecRows', specRows, 1, 6)
     if changed and onChange then onChange('SideKickSpecialRows', specRows) end
 
-    specGap, changed = imgui.SliderInt('Gap', specGap, 0, 12)
+    imgui.Text('Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    specGap, changed = imgui.SliderInt('##SpecGap', specGap, 0, 12)
     if changed and onChange then onChange('SideKickSpecialGap', specGap) end
 
-    specPad, changed = imgui.SliderInt('Padding', specPad, 0, 24)
+    imgui.Text('Padding')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    specPad, changed = imgui.SliderInt('##SpecPadding', specPad, 0, 24)
     if changed and onChange then onChange('SideKickSpecialPad', specPad) end
 
-    specAlpha, changed = imgui.SliderFloat('Background Alpha', specAlpha, 0.2, 1.0)
+    imgui.Text('Background Alpha')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    specAlpha, changed = imgui.SliderFloat('##SpecBgAlpha', specAlpha, 0.2, 1.0)
     if changed and onChange then onChange('SideKickSpecialBgAlpha', specAlpha) end
 
     local anchors = { 'none', 'left', 'right', 'above', 'below', 'left_bottom', 'right_bottom' }
-    local target = comboKeyed('Anchor To', settings.SideKickSpecialAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
+
+    imgui.Text('Anchor To')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    local target = comboKeyed('##SpecAnchorTo', settings.SideKickSpecialAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
     if target ~= tostring(settings.SideKickSpecialAnchorTarget or 'grouptarget') and onChange then
         onChange('SideKickSpecialAnchorTarget', target)
     end
+
+    imgui.Text('Anchor Mode')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
     local specAnchor = tostring(settings.SideKickSpecialAnchor or 'none')
-    specAnchor = comboString('Anchor Mode', specAnchor, anchors)
+    specAnchor = comboString('##SpecAnchorMode', specAnchor, anchors)
     if specAnchor ~= tostring(settings.SideKickSpecialAnchor or 'none') and onChange then
         onChange('SideKickSpecialAnchor', specAnchor)
     end
 
-    specAnchorGap, changed = imgui.SliderInt('Anchor Gap', specAnchorGap, 0, 24)
+    imgui.Text('Anchor Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    specAnchorGap, changed = imgui.SliderInt('##SpecAnchorGap', specAnchorGap, 0, 24)
     if changed and onChange then onChange('SideKickSpecialAnchorGap', specAnchorGap) end
 end
 
 local function drawDisciplines(settings, onChange)
     local changed
+    local controlWidth = 150
 
     local discBar = settings.SideKickDiscBarEnabled ~= false
     discBar, changed = imgui.Checkbox('Show disciplines bar (BER)', discBar)
@@ -263,33 +404,59 @@ local function drawDisciplines(settings, onChange)
     local discPad = tonumber(settings.SideKickDiscBarPad) or 6
     local discAnchorGap = tonumber(settings.SideKickDiscBarAnchorGap) or 2
 
-    discCell, changed = imgui.SliderInt('Cell Size', discCell, 36, 120)
+    imgui.Text('Cell Size')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    discCell, changed = imgui.SliderInt('##DiscCellSize', discCell, 36, 120)
     if changed and onChange then onChange('SideKickDiscBarCell', discCell) end
 
-    discRows, changed = imgui.SliderInt('Rows', discRows, 1, 6)
+    imgui.Text('Rows')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    discRows, changed = imgui.SliderInt('##DiscRows', discRows, 1, 6)
     if changed and onChange then onChange('SideKickDiscBarRows', discRows) end
 
-    discGap, changed = imgui.SliderInt('Gap', discGap, 0, 12)
+    imgui.Text('Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    discGap, changed = imgui.SliderInt('##DiscGap', discGap, 0, 12)
     if changed and onChange then onChange('SideKickDiscBarGap', discGap) end
 
-    discPad, changed = imgui.SliderInt('Padding', discPad, 0, 24)
+    imgui.Text('Padding')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    discPad, changed = imgui.SliderInt('##DiscPadding', discPad, 0, 24)
     if changed and onChange then onChange('SideKickDiscBarPad', discPad) end
 
-    discAlpha, changed = imgui.SliderFloat('Background Alpha', discAlpha, 0.2, 1.0)
+    imgui.Text('Background Alpha')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    discAlpha, changed = imgui.SliderFloat('##DiscBgAlpha', discAlpha, 0.2, 1.0)
     if changed and onChange then onChange('SideKickDiscBarBgAlpha', discAlpha) end
 
     local anchors = { 'none', 'left', 'right', 'above', 'below', 'left_bottom', 'right_bottom' }
-    local target = comboKeyed('Anchor To', settings.SideKickDiscBarAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
+
+    imgui.Text('Anchor To')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    local target = comboKeyed('##DiscAnchorTo', settings.SideKickDiscBarAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
     if target ~= tostring(settings.SideKickDiscBarAnchorTarget or 'grouptarget') and onChange then
         onChange('SideKickDiscBarAnchorTarget', target)
     end
+
+    imgui.Text('Anchor Mode')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
     local discAnchor = tostring(settings.SideKickDiscBarAnchor or 'none')
-    discAnchor = comboString('Anchor Mode', discAnchor, anchors)
+    discAnchor = comboString('##DiscAnchorMode', discAnchor, anchors)
     if discAnchor ~= tostring(settings.SideKickDiscBarAnchor or 'none') and onChange then
         onChange('SideKickDiscBarAnchor', discAnchor)
     end
 
-    discAnchorGap, changed = imgui.SliderInt('Anchor Gap', discAnchorGap, 0, 24)
+    imgui.Text('Anchor Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    discAnchorGap, changed = imgui.SliderInt('##DiscAnchorGap', discAnchorGap, 0, 24)
     if changed and onChange then onChange('SideKickDiscBarAnchorGap', discAnchorGap) end
 end
 
@@ -464,13 +631,7 @@ local function drawAutomation(settings, onChange)
 
     imgui.Spacing()
     imgui.TextColored(0.8, 0.8, 0.8, 1.0, 'Scan Settings')
-
-    local zRange = tonumber(settings.MAScanZRange) or 100
-    zRange, changed = imgui.SliderInt('MA Scan Z Range', zRange, 10, 500)
-    if changed and onChange then onChange('MAScanZRange', zRange) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Z-axis range for scanning MA targets (vertical distance).')
-    end
+    imgui.TextDisabled('No scan settings available.')
 
     imgui.Spacing()
     imgui.Separator()
@@ -497,12 +658,8 @@ local function drawAutomation(settings, onChange)
         safeTooltip('Enable automatic AA/Disc execution for abilities set to auto modes (On Cooldown/Burn/Named/Condition).')
     end
 
-    local autoItems = settings.AutoItemsEnabled ~= false
-    autoItems, changed = imgui.Checkbox('Auto Items', autoItems)
-    if changed and onChange then onChange('AutoItemsEnabled', autoItems) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Enable automatic item clicking for item slots set to Combat/OOC/On Condition.')
-    end
+    -- Note: AutoItemsEnabled defaults to true (hidden setting)
+    -- Auto-use behavior is controlled per-item via mode: combat, ooc, on_condition
 
     imgui.Spacing()
     imgui.Separator()
@@ -908,45 +1065,14 @@ local function drawAutomation(settings, onChange)
 
         imgui.Spacing()
         imgui.TextColored(0.8, 0.8, 0.8, 1.0, 'Emergency & Rez')
-
-        local emergencyPct = tonumber(settings.EmergencyHealPct) or 25
-        emergencyPct, changed = imgui.SliderInt('Emergency Heal Pct', emergencyPct, 1, 50)
-        if changed and onChange then onChange('EmergencyHealPct', emergencyPct) end
-        if imgui.IsItemHovered() then
-            safeTooltip('HP threshold for emergency abilities (panic heals, defensive cooldowns).')
-        end
-
-        local doCombatRez = settings.DoCombatRez == true
-        doCombatRez, changed = imgui.Checkbox('Combat Rez Enabled', doCombatRez)
-        if changed and onChange then onChange('DoCombatRez', doCombatRez) end
-        if imgui.IsItemHovered() then
-            safeTooltip('Allow rezzing during combat (if you have combat rez capability).')
-        end
-
-        local doOocRez = settings.DoOutOfCombatRez ~= false
-        doOocRez, changed = imgui.Checkbox('Out of Combat Rez Enabled', doOocRez)
-        if changed and onChange then onChange('DoOutOfCombatRez', doOocRez) end
-        if imgui.IsItemHovered() then
-            safeTooltip('Allow rezzing out of combat.')
-        end
+        imgui.TextDisabled('No emergency/rez settings available.')
 
         imgui.Unindent()
     end
 
     imgui.Spacing()
     imgui.TextColored(0.6, 0.8, 1.0, 1.0, 'Class Specific')
-
-    -- FD Classes: Auto stand from Feign Death
-    local fdClasses = { MNK = true, NEC = true, SHD = true }
-    local meClass = mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName and mq.TLO.Me.Class.ShortName() or ''
-    if fdClasses[tostring(meClass):upper()] then
-        local autoStandFD = settings.AutoStandFD == true
-        autoStandFD, changed = imgui.Checkbox('Auto Stand from FD', autoStandFD)
-        if changed and onChange then onChange('AutoStandFD', autoStandFD) end
-        if imgui.IsItemHovered() then
-            safeTooltip('Automatically stand from Feign Death when safe (no aggro on you).')
-        end
-    end
+    imgui.TextDisabled('No class-specific settings available.')
 end
 
 local function drawIntegration(settings, onChange)
@@ -1012,13 +1138,9 @@ local function drawIntegration(settings, onChange)
                     outFile:write(line .. '\n')
                 end
                 outFile:close()
-                if newAutostart then
-                    mq.cmd('/echo \\ag[SideKick]\\aw Added to autostart: ' .. autostartPath)
-                else
-                    mq.cmd('/echo \\ag[SideKick]\\aw Removed from autostart: ' .. autostartPath)
-                end
+                -- Echo disabled
             else
-                mq.cmd('/echo \\ar[SideKick]\\aw Failed to write autostart config')
+                -- Echo disabled
             end
         end
         if imgui.IsItemHovered() then
@@ -1057,13 +1179,6 @@ local function drawAnimations(settings, onChange)
         safeTooltip('Pulsing glow on abilities that are ready to use')
     end
 
-    local cooldownSweep = settings.CooldownSweepEnabled ~= false
-    cooldownSweep, changed = imgui.Checkbox('Cooldown Overlay', cooldownSweep)
-    if changed and onChange then onChange('CooldownSweepEnabled', cooldownSweep) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Color-coded cooldown overlay that fills from bottom')
-    end
-
     local hoverScale = settings.HoverScaleEnabled ~= false
     hoverScale, changed = imgui.Checkbox('Hover Scale', hoverScale)
     if changed and onChange then onChange('HoverScaleEnabled', hoverScale) end
@@ -1089,13 +1204,6 @@ local function drawAnimations(settings, onChange)
     if changed and onChange then onChange('LowResourceWarningEnabled', lowResWarning) end
     if imgui.IsItemHovered() then
         safeTooltip('Pulsing red warning when HP/Mana/End is low')
-    end
-
-    local threshold = tonumber(settings.LowResourceThreshold) or 20
-    threshold, changed = imgui.SliderInt('Warning Threshold %', threshold, 5, 50)
-    if changed and onChange then onChange('LowResourceThreshold', threshold) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Show warning when resource drops below this percentage')
     end
 
     local damageFlash = settings.DamageFlashEnabled ~= false
@@ -1128,8 +1236,10 @@ local function drawAnimations(settings, onChange)
     imgui.Unindent()
 end
 
-local function drawItems(settings, onChange)
+-- Item Bar UI settings (for consolidated UI tab)
+local function drawItemBarUI(settings, onChange)
     local changed
+    local controlWidth = 150
 
     local enabled = settings.SideKickItemBarEnabled ~= false
     enabled, changed = imgui.Checkbox('Show item bar', enabled)
@@ -1142,36 +1252,105 @@ local function drawItems(settings, onChange)
     local pad = tonumber(settings.SideKickItemBarPad) or 6
     local anchorGap = tonumber(settings.SideKickItemBarAnchorGap) or 2
 
-    cell, changed = imgui.SliderInt('Cell Size', cell, 32, 120)
+    imgui.Text('Cell Size')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    cell, changed = imgui.SliderInt('##ItemCellSize', cell, 32, 120)
     if changed and onChange then onChange('SideKickItemBarCell', cell) end
 
-    rows, changed = imgui.SliderInt('Rows', rows, 1, 6)
+    imgui.Text('Rows')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    rows, changed = imgui.SliderInt('##ItemRows', rows, 1, 6)
     if changed and onChange then onChange('SideKickItemBarRows', rows) end
 
-    gap, changed = imgui.SliderInt('Gap', gap, 0, 12)
+    imgui.Text('Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    gap, changed = imgui.SliderInt('##ItemGap', gap, 0, 12)
     if changed and onChange then onChange('SideKickItemBarGap', gap) end
 
-    pad, changed = imgui.SliderInt('Padding', pad, 0, 24)
+    imgui.Text('Padding')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    pad, changed = imgui.SliderInt('##ItemPadding', pad, 0, 24)
     if changed and onChange then onChange('SideKickItemBarPad', pad) end
 
-    alpha, changed = imgui.SliderFloat('Background Alpha', alpha, 0.2, 1.0)
+    imgui.Text('Background Alpha')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    alpha, changed = imgui.SliderFloat('##ItemBgAlpha', alpha, 0.2, 1.0)
     if changed and onChange then onChange('SideKickItemBarBgAlpha', alpha) end
 
     local anchors = { 'none', 'left', 'right', 'above', 'below', 'left_bottom', 'right_bottom' }
-    local target = comboKeyed('Anchor To', settings.SideKickItemBarAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
+
+    imgui.Text('Anchor To')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    local target = comboKeyed('##ItemAnchorTo', settings.SideKickItemBarAnchorTarget or 'grouptarget', ANCHOR_TARGETS)
     if target ~= tostring(settings.SideKickItemBarAnchorTarget or 'grouptarget') and onChange then
         onChange('SideKickItemBarAnchorTarget', target)
     end
+
+    imgui.Text('Anchor Mode')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
     local anchor = tostring(settings.SideKickItemBarAnchor or 'none')
-    anchor = comboString('Anchor Mode', anchor, anchors)
+    anchor = comboString('##ItemAnchorMode', anchor, anchors)
     if anchor ~= tostring(settings.SideKickItemBarAnchor or 'none') and onChange then
         onChange('SideKickItemBarAnchor', anchor)
     end
 
-    anchorGap, changed = imgui.SliderInt('Anchor Gap', anchorGap, 0, 24)
+    imgui.Text('Anchor Gap')
+    imgui.SameLine(200)
+    imgui.SetNextItemWidth(controlWidth)
+    anchorGap, changed = imgui.SliderInt('##ItemAnchorGap', anchorGap, 0, 24)
     if changed and onChange then onChange('SideKickItemBarAnchorGap', anchorGap) end
+end
 
-    imgui.Separator()
+-- Consolidated UI tab with collapsing headers for all bar/visual settings
+local function drawUITab(settings, themeNames, onChange)
+    local defaultOpenFlag = ImGuiTreeNodeFlags and ImGuiTreeNodeFlags.DefaultOpen or 0
+
+    -- General UI section (theme, docking)
+    if imgui.CollapsingHeader('General##ui_general', defaultOpenFlag) then
+        imgui.Indent()
+        drawUI(settings, themeNames, onChange)
+        imgui.Unindent()
+    end
+
+    -- Ability Bar section
+    if imgui.CollapsingHeader('Ability Bar##ui_bar') then
+        imgui.Indent()
+        drawBar(settings, onChange)
+        imgui.Unindent()
+    end
+
+    -- Special Bar section
+    if imgui.CollapsingHeader('Special Bar##ui_special') then
+        imgui.Indent()
+        drawSpecial(settings, onChange)
+        imgui.Unindent()
+    end
+
+    -- Disciplines Bar section
+    if imgui.CollapsingHeader('Disciplines Bar##ui_disc') then
+        imgui.Indent()
+        drawDisciplines(settings, onChange)
+        imgui.Unindent()
+    end
+
+    -- Item Bar section
+    if imgui.CollapsingHeader('Item Bar##ui_item') then
+        imgui.Indent()
+        drawItemBarUI(settings, onChange)
+        imgui.Unindent()
+    end
+end
+
+local function drawItems(settings, onChange)
+    local changed
+
     imgui.Text('Item Slots')
     imgui.TextWrapped('Drag an item onto a slot (or pick it up and click the slot icon) to assign it. Hover the bar icons for clicky details.')
 
@@ -1391,34 +1570,9 @@ local function drawBuffs(settings, onChange)
 
     -- ========== BUFF TARGETS ==========
     imgui.TextColored(0.8, 0.8, 0.8, 1.0, 'Buff Targets')
-
-    local buffSelf = settings.BuffSelfOnly == true
-    buffSelf, changed = imgui.Checkbox('Self Only', buffSelf)
-    if changed and onChange then onChange('BuffSelfOnly', buffSelf) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Only buff yourself, ignore group members.')
-    end
-
-    if not buffSelf then
-        local buffGroup = settings.BuffGroupEnabled ~= false
-        buffGroup, changed = imgui.Checkbox('Buff Group Members', buffGroup)
-        if changed and onChange then onChange('BuffGroupEnabled', buffGroup) end
-
-        local buffPets = settings.BuffPetsEnabled ~= false
-        buffPets, changed = imgui.Checkbox('Buff Pets', buffPets)
-        if changed and onChange then onChange('BuffPetsEnabled', buffPets) end
-
-        local buffRaid = settings.BuffRaidEnabled == true
-        buffRaid, changed = imgui.Checkbox('Buff Raid Members (OOG)', buffRaid)
-        if changed and onChange then onChange('BuffRaidEnabled', buffRaid) end
-        if imgui.IsItemHovered() then
-            safeTooltip('Buff raid members outside your group.')
-        end
-
-        local buffFellowship = settings.BuffFellowshipEnabled == true
-        buffFellowship, changed = imgui.Checkbox('Buff Fellowship Members', buffFellowship)
-        if changed and onChange then onChange('BuffFellowshipEnabled', buffFellowship) end
-    end
+    local buffPets = settings.BuffPetsEnabled ~= false
+    buffPets, changed = imgui.Checkbox('Buff Pets', buffPets)
+    if changed and onChange then onChange('BuffPetsEnabled', buffPets) end
 
     imgui.Spacing()
     imgui.Separator()
@@ -1426,20 +1580,7 @@ local function drawBuffs(settings, onChange)
 
     -- ========== BUFF TIMING ==========
     imgui.TextColored(0.8, 0.8, 0.8, 1.0, 'Timing')
-
-    local rebuffWindow = tonumber(settings.BuffRebuffWindow) or 60
-    rebuffWindow, changed = imgui.SliderInt('Rebuff Window (sec)', rebuffWindow, 15, 300)
-    if changed and onChange then onChange('BuffRebuffWindow', rebuffWindow) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Start rebuffing when buff has this many seconds remaining.')
-    end
-
-    local allowCombat = settings.BuffAllowInCombat == true
-    allowCombat, changed = imgui.Checkbox('Allow Buffing In Combat', allowCombat)
-    if changed and onChange then onChange('BuffAllowInCombat', allowCombat) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Allow casting buffs during combat (individual buff settings may override).')
-    end
+    imgui.TextDisabled('No timing settings available.')
 
     imgui.Spacing()
     imgui.Separator()
@@ -1447,33 +1588,14 @@ local function drawBuffs(settings, onChange)
 
     -- ========== COORDINATION ==========
     imgui.TextColored(0.8, 0.8, 0.8, 1.0, 'Coordination')
-
-    local coordActors = settings.BuffCoordinateActors ~= false
-    coordActors, changed = imgui.Checkbox('Coordinate via Actors', coordActors)
-    if changed and onChange then onChange('BuffCoordinateActors', coordActors) end
-    if imgui.IsItemHovered() then
-        safeTooltip('Use actors to coordinate with other SideKick instances to prevent duplicate buffs.')
-    end
+    imgui.TextDisabled('No coordination settings available.')
 
     imgui.Spacing()
     imgui.Separator()
     imgui.Spacing()
 
     -- ========== AURA SELECTION ==========
-    -- Only show for aura classes
-    local auraClasses = { BRD = true, ENC = true, PAL = true, RNG = true, SHD = true, NEC = true }
-    local meClass = mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName and mq.TLO.Me.Class.ShortName() or ''
-    if auraClasses[tostring(meClass):upper()] then
-        imgui.TextColored(0.8, 0.8, 0.8, 1.0, 'Aura')
-
-        imgui.SetNextItemWidth(200)
-        local auraSelection = tostring(settings.AuraSelection or '')
-        auraSelection, changed = imgui.InputText('Aura Selection', auraSelection, 128)
-        if changed and onChange then onChange('AuraSelection', auraSelection) end
-        if imgui.IsItemHovered() then
-            safeTooltip('Name of the aura to maintain. Leave blank to disable aura management.')
-        end
-    end
+    imgui.TextDisabled('No aura settings available.')
 
     imgui.Spacing()
     imgui.Separator()
@@ -1486,7 +1608,7 @@ local function drawBuffs(settings, onChange)
     imgui.Spacing()
 
     -- Get buff definitions from Buff module
-    local ok, Buff = pcall(require, 'automation.buff')
+    local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
     if ok and Buff and Buff.getBuffDefinitions then
         local defs = Buff.getBuffDefinitions()
         if defs and next(defs) then
@@ -1573,11 +1695,18 @@ local function drawRemote(settings, onChange)
     end
 end
 
-function M.draw(ctx)
-    ctx = ctx or {}
-    local settings = ctx.settings or {}
-    local themeNames = ctx.themeNames or {}
-    local onChange = ctx.onChange
+function M.draw(settingsOrCtx, themeNames, onChange)
+    local settings = nil
+    if type(settingsOrCtx) == 'table' and (settingsOrCtx.settings or settingsOrCtx.themeNames or settingsOrCtx.onChange) then
+        local ctx = settingsOrCtx
+        settings = ctx.settings or {}
+        themeNames = ctx.themeNames or themeNames or {}
+        onChange = ctx.onChange or onChange
+    else
+        settings = settingsOrCtx or {}
+        themeNames = themeNames or {}
+        onChange = onChange
+    end
 
     -- Check class for conditional UI
     local meClass = mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName and mq.TLO.Me.Class.ShortName() or ''
@@ -1596,27 +1725,10 @@ function M.draw(ctx)
     end
 
     if imgui.BeginTabBar('##sk_settings_tabs') then
+        -- Consolidated UI tab (General, Ability Bar, Special Bar, Disciplines Bar, Item Bar)
         if imgui.BeginTabItem('UI') then
             withTabScrollChild('##sk_settings_ui_scroll', function()
-                drawUI(settings, themeNames, onChange)
-            end)
-            imgui.EndTabItem()
-        end
-        if imgui.BeginTabItem('Bar') then
-            withTabScrollChild('##sk_settings_bar_scroll', function()
-                drawBar(settings, onChange)
-            end)
-            imgui.EndTabItem()
-        end
-        if imgui.BeginTabItem('Special') then
-            withTabScrollChild('##sk_settings_special_scroll', function()
-                drawSpecial(settings, onChange)
-            end)
-            imgui.EndTabItem()
-        end
-        if imgui.BeginTabItem('Disciplines') then
-            withTabScrollChild('##sk_settings_disc_scroll', function()
-                drawDisciplines(settings, onChange)
+                drawUITab(settings, themeNames, onChange)
             end)
             imgui.EndTabItem()
         end

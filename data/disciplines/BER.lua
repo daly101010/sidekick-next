@@ -33,7 +33,7 @@ local function discDef(d)
 end
 
 -- Source: `data.disciplines.BER_data` (RaidLoot Berserker Timer_01..Timer_22 pages at level 130)
-local DISCS = require('data.disciplines.BER_data')
+local DISCS = require('sidekick-next.data.disciplines.BER_data')
 
 local defs = {}
 for _, d in ipairs(DISCS) do

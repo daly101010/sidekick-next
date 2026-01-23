@@ -1,6 +1,6 @@
 local mq = require('mq')
-local Cache = require('utils.runtime_cache')
-local Actors = require('utils.actors_coordinator')
+local Cache = require('sidekick-next.utils.runtime_cache')
+local Actors = require('sidekick-next.utils.actors_coordinator')
 
 local M = {}
 
@@ -321,7 +321,7 @@ function M.selectBestTarget(myId, range, settings)
                 if (now - lastLog) >= SKIP_LOG_COOLDOWN then
                     _skippedTargetLog[spawnId] = now
                     local name = spawn.CleanName() or 'Unknown'
-                    mq.cmdf('/echo [SideKick] Skipping target %s: %s', name, reason)
+                    -- Echo disabled
                 end
             end
         end
@@ -351,7 +351,7 @@ function M.selectBestTarget(myId, range, settings)
                 if (now - lastLog) >= SKIP_LOG_COOLDOWN then
                     _skippedTargetLog[spawnId] = now
                     local name = spawn.CleanName() or 'Unknown'
-                    mq.cmdf('/echo [SideKick] Skipping mezzed target %s: %s', name, reason)
+                    -- Echo disabled
                 end
             end
         end

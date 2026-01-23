@@ -3,10 +3,15 @@
 
 local mq = require('mq')
 
-local RuntimeCache = require('utils.runtime_cache')
-local Core = require('utils.core')
+local RuntimeCache = require('sidekick-next.utils.runtime_cache')
+local Core = require('sidekick-next.utils.core')
 
 local M = {}
+
+local function buildNameQuery(name)
+    if not name or name == '' then return nil end
+    return string.format('name "%s"', name)
+end
 
 --- Build a context object for condition evaluation
 --- Caches expensive TLO calls for the duration of the tick
@@ -57,14 +62,26 @@ function M.build()
             -- Function to check buff by name
             buff = function(name)
                 if not name or name == '' then return false end
-                local b = me.Buff(name)
+                local b
+                if me.FindBuff then
+                    local query = buildNameQuery(name)
+                    b = query and me.FindBuff(query) or nil
+                else
+                    b = me.Buff(name)
+                end
                 return b and b() ~= nil and safeNum(function() return b.ID() end, 0) > 0
             end,
 
             -- Function to check song by name
             song = function(name)
                 if not name or name == '' then return false end
-                local s = me.Song(name)
+                local s
+                if me.FindSong then
+                    local query = buildNameQuery(name)
+                    s = query and me.FindSong(query) or nil
+                else
+                    s = me.Song(name)
+                end
                 return s and s() ~= nil and safeNum(function() return s.ID() end, 0) > 0
             end,
 
@@ -101,14 +118,28 @@ function M.build()
             -- Check if target has a buff
             buff = function(name)
                 if not name or name == '' then return false end
-                local b = target.Buff(name)
+                local b
+                if target.FindBuff then
+                    local query = buildNameQuery(name)
+                    b = query and target.FindBuff(query) or nil
+                else
+                    b = target.Buff(name)
+                end
                 return b and b() ~= nil and safeNum(function() return b.ID() end, 0) > 0
             end,
 
             -- Check if target has MY buff (I cast it)
             myBuff = function(name)
                 if not name or name == '' then return false end
-                local b = target.MyBuff(name)
+                local b
+                if target.MyBuff then
+                    local ok, res = pcall(function() return target.MyBuff(name) end)
+                    if ok then b = res end
+                end
+                if not b and target.FindBuff then
+                    local query = buildNameQuery(name)
+                    b = query and target.FindBuff(query) or nil
+                end
                 return b and b() ~= nil and safeNum(function() return b.ID() end, 0) > 0
             end,
 
@@ -125,7 +156,13 @@ function M.build()
                 if not name or name == '' then return false end
                 local pet = me.Pet
                 if not (pet and pet()) then return false end
-                local b = pet.Buff(name)
+                local b
+                if pet.FindBuff then
+                    local query = buildNameQuery(name)
+                    b = query and pet.FindBuff(query) or nil
+                else
+                    b = pet.Buff(name)
+                end
                 return b and b() ~= nil and safeNum(function() return b.ID() end, 0) > 0
             end,
         },

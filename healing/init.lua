@@ -1,21 +1,42 @@
 -- healing/init.lua (full implementation)
 local mq = require('mq')
 
-local Config = require('healing.config')
-local HealTracker = require('healing.heal_tracker')
-local TargetMonitor = require('healing.target_monitor')
-local IncomingHeals = require('healing.incoming_heals')
-local CombatAssessor = require('healing.combat_assessor')
-local HealSelector = require('healing.heal_selector')
-local Analytics = require('healing.analytics')
-local SpellEvents = require('healing.spell_events')
-local Logger = require('healing.logger')
+-- Debug logging to file (using centralized Paths)
+local _Paths = nil
+local function getPaths()
+    if not _Paths then
+        local ok, p = pcall(require, 'sidekick-next.utils.paths')
+        if ok then _Paths = p end
+    end
+    return _Paths
+end
+
+local function debugLog(fmt, ...)
+    local msg = string.format(fmt, ...)
+    local Paths = getPaths()
+    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_HealDebug.log')
+    local f = io.open(logPath, 'a')
+    if f then
+        f:write(string.format('[%s] [Heal] %s\n', os.date('%H:%M:%S'), msg))
+        f:close()
+    end
+end
+
+local Config = require('sidekick-next.healing.config')
+local HealTracker = require('sidekick-next.healing.heal_tracker')
+local TargetMonitor = require('sidekick-next.healing.target_monitor')
+local IncomingHeals = require('sidekick-next.healing.incoming_heals')
+local CombatAssessor = require('sidekick-next.healing.combat_assessor')
+local HealSelector = require('sidekick-next.healing.heal_selector')
+local Analytics = require('sidekick-next.healing.analytics')
+local SpellEvents = require('sidekick-next.healing.spell_events')
+local Logger = require('sidekick-next.healing.logger')
 
 -- Lazy-load UI modules
 local Monitor = nil
 local function getMonitor()
     if Monitor == nil then
-        local ok, m = pcall(require, 'healing.ui.monitor')
+        local ok, m = pcall(require, 'sidekick-next.healing.ui.monitor')
         Monitor = ok and m or false
     end
     return Monitor or nil
@@ -24,7 +45,7 @@ end
 local Settings = nil
 local function getSettings()
     if Settings == nil then
-        local ok, s = pcall(require, 'healing.ui.settings')
+        local ok, s = pcall(require, 'sidekick-next.healing.ui.settings')
         Settings = ok and s or false
     end
     return Settings or nil
@@ -34,7 +55,7 @@ end
 local Proactive = nil
 local function getProactive()
     if Proactive == nil then
-        local ok, p = pcall(require, 'healing.proactive')
+        local ok, p = pcall(require, 'sidekick-next.healing.proactive')
         Proactive = ok and p or false
     end
     return Proactive or nil
@@ -44,10 +65,25 @@ end
 local HotAnalyzer = nil
 local function getHotAnalyzer()
     if HotAnalyzer == nil then
-        local ok, ha = pcall(require, 'healing.hot_analyzer')
+        local ok, ha = pcall(require, 'sidekick-next.healing.hot_analyzer')
         HotAnalyzer = ok and ha or false
     end
     return HotAnalyzer or nil
+end
+
+-- Lazy-load MobAssessor (named mob detection and consider-based tier assessment)
+local MobAssessor = nil
+local function getMobAssessor()
+    if MobAssessor == nil then
+        local ok, ma = pcall(require, 'sidekick-next.healing.mob_assessor')
+        if ok and ma then
+            MobAssessor = ma
+            ma.init()
+        else
+            MobAssessor = false
+        end
+    end
+    return MobAssessor or nil
 end
 
 local M = {}
@@ -61,7 +97,7 @@ local ActorsCoordinator = nil
 local DamageParser = nil
 local function getDamageParser()
     if DamageParser == nil then
-        local ok, dp = pcall(require, 'healing.damage_parser')
+        local ok, dp = pcall(require, 'sidekick-next.healing.damage_parser')
         if ok and dp then
             DamageParser = dp
             dp.init(Config)
@@ -76,7 +112,7 @@ end
 local DamageAttribution = nil
 local function getDamageAttribution()
     if DamageAttribution == nil then
-        local ok, da = pcall(require, 'healing.damage_attribution')
+        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
         if ok and da then
             DamageAttribution = da
             da.init(Config)
@@ -100,23 +136,38 @@ end
 -- Check if we can heal right now
 local function canHealNow()
     local me = mq.TLO.Me
-    if not me or not me() then return false end
-
-    -- Dead or hovering
-    if me.Hovering and me.Hovering() then return false end
-
-    -- Already casting
-    if me.Casting and me.Casting() then return false end
-
-    -- Moving
-    if me.Moving and me.Moving() then return false end
-
-    -- Check spell engine busy
-    local ok, SpellEngine = pcall(require, 'utils.spell_engine')
-    if ok and SpellEngine and SpellEngine.isBusy and SpellEngine.isBusy() then
+    if not me or not me() then
+        debugLog('[CanHealNow] FAIL: no me')
         return false
     end
 
+    -- Dead or hovering
+    if me.Hovering and me.Hovering() then
+        debugLog('[CanHealNow] FAIL: hovering')
+        return false
+    end
+
+    -- Already casting (Casting() returns spell name string, empty if not casting)
+    local casting = me.Casting and me.Casting() or ''
+    if casting ~= '' then
+        debugLog('[CanHealNow] FAIL: casting spell=%s', casting)
+        return false
+    end
+
+    -- Moving
+    if me.Moving and me.Moving() then
+        debugLog('[CanHealNow] FAIL: moving')
+        return false
+    end
+
+    -- Check spell engine busy
+    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
+    if ok and SpellEngine and SpellEngine.isBusy and SpellEngine.isBusy() then
+        debugLog('[CanHealNow] FAIL: spell engine busy')
+        return false
+    end
+
+    debugLog('[CanHealNow] PASS: can heal now')
     return true
 end
 
@@ -190,7 +241,7 @@ local function executeHeal(spellName, targetId, tier, isHoT)
     })
 
     -- Use SpellEngine if available
-    local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
     local success = false
 
     if ok and SpellEngine and SpellEngine.cast then
@@ -273,7 +324,8 @@ local function monitorDuck()
     if not castInfo then return end
 
     local me = mq.TLO.Me
-    if not me or not me() or not me.Casting or not me.Casting() then
+    local currentlyCasting = me and me() and me.Casting and (me.Casting() or '') ~= ''
+    if not currentlyCasting then
         -- Cast ended naturally - DON'T clear cast info here!
         -- Let the heal event (onHealLanded) clear it so analytics can record properly.
         -- Add a short timeout (2s) to clear stale cast info if heal event doesn't fire.
@@ -301,7 +353,7 @@ local function monitorDuck()
         mq.cmd('/stopcast')
 
         -- IMPORTANT: Clear SpellEngine busy state to allow new casts
-        local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+        local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
         if ok and SpellEngine and SpellEngine.abort then
             SpellEngine.abort()
         end
@@ -357,7 +409,7 @@ function M.init()
         getDamageAttribution()
 
         -- Load ActorsCoordinator for multi-healer coordination
-        local acOk, ac = pcall(require, 'utils.actors_coordinator')
+        local acOk, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
         if acOk and ac then
             ActorsCoordinator = ac
             -- Register callbacks to receive heal coordination messages (avoids circular require)
@@ -374,10 +426,14 @@ function M.init()
             end
         end
 
+        -- Initialize MobAssessor for named mob detection
+        getMobAssessor()
+
         -- Initialize UI modules if available
         local monitor = getMonitor()
         if monitor and monitor.init then
-            monitor.init(Config, TargetMonitor, IncomingHeals, CombatAssessor, Analytics, HealTracker, HealSelector)
+            local mobAssessor = getMobAssessor()
+            monitor.init(Config, TargetMonitor, IncomingHeals, CombatAssessor, Analytics, HealTracker, HealSelector, mobAssessor)
         end
 
         local settings = getSettings()
@@ -403,39 +459,62 @@ function M.init()
 end
 
 function M.tick(settings)
+    -- DEBUG: Track which module stalls (logs to file)
+    local _tickDbg = true
+    local function tickLog(msg)
+        if _tickDbg then debugLog('[HealTick] %s', msg) end
+    end
+
     -- Update all modules
+    tickLog('1-TargetMonitor')
     TargetMonitor.tick()
+    tickLog('2-IncomingHeals')
     IncomingHeals.tick()
+    tickLog('3-CombatAssessor')
     CombatAssessor.tick()
+    tickLog('4-SpellEvents')
     SpellEvents.tick()
+    tickLog('5-HealTracker')
     HealTracker.tick()
 
+    tickLog('6-Proactive')
     local proactive = getProactive()
     if proactive and proactive.tick then
         proactive.tick()
     end
 
     -- Update DamageParser for dual-source DPS tracking
+    tickLog('7-DamageParser')
     local dp = getDamageParser()
     if dp and dp.tick then dp.tick() end
 
     -- Update DamageAttribution for mob-specific damage tracking
+    tickLog('8-DamageAttribution')
     local da = getDamageAttribution()
     if da and da.tick then da.tick() end
 
+    -- Update MobAssessor for named mob scanning (runs when safe/idle)
+    tickLog('9-MobAssessor')
+    local ma = getMobAssessor()
+    if ma and ma.tick then ma.tick() end
+    tickLog('10-MobAssessor done')
+
     -- Check if healing is enabled (Config.enabled is the single source of truth)
+    tickLog('11-CheckEnabled')
     if Config.enabled == false then
         _priorityActive = false
         return false
     end
 
     -- Check if we're a healer class
+    tickLog('12-CheckHealerClass')
     if not isHealerClass() then
         _priorityActive = false
         return false
     end
 
     -- Monitor for ducking during cast
+    tickLog('13-CheckCasting')
     if SpellEvents.isCasting() then
         monitorDuck()
         _priorityActive = true
@@ -450,9 +529,11 @@ function M.tick(settings)
     _lastHealAttempt = now
 
     -- Can we heal?
+    tickLog('14-CanHealNow')
     if not canHealNow() then
         return _priorityActive
     end
+    tickLog('15-PastCanHealNow')
 
     local function cloneTarget(t)
         local out = {}
@@ -465,6 +546,7 @@ function M.tick(settings)
     local groupTargets = {}
 
     local targets = TargetMonitor.getAllTargets() or {}
+    tickLog(string.format('16-Targets count=%d', #targets))
     for _, t in pairs(targets) do
         if Config.healPetsEnabled or t.role ~= 'pet' then
             local entry = cloneTarget(t)
@@ -515,10 +597,29 @@ function M.tick(settings)
     situation.fightPhase = combatState.fightPhase or 'none'
     situation.estimatedFightDuration = combatState.estimatedTTK or 0
 
+    -- Raid/named fight detection
+    situation.hasRaidMob = combatState.hasRaidMob == true
+    situation.hasNamedMob = combatState.hasNamedMob == true
+    situation.mobDpsMultiplier = combatState.mobDpsMultiplier or 1.0
+    situation.raidFight = situation.hasRaidMob or (situation.hasNamedMob and situation.mobDpsMultiplier >= 2.0)
+
+    -- Log situation summary
+    local hurtCount = 0
+    local lowestHp = 100
+    for _, t in ipairs(allTargets) do
+        if (t.deficit or 0) > 0 then hurtCount = hurtCount + 1 end
+        if (t.pctHP or 100) < lowestHp then lowestHp = t.pctHP or 100 end
+    end
+    tickLog(string.format('17-Situation: targets=%d hurt=%d lowestHP=%d emergency=%s',
+        #allTargets, hurtCount, lowestHp, tostring(situation.hasEmergency)))
+
     -- Priority 1: emergency
+    tickLog('18-CheckEmergency')
     for _, t in ipairs(allTargets) do
         if (t.pctHP or 100) < (Config.emergencyPct or 25) then
+            tickLog(string.format('19-EmergencyTarget: %s HP=%d', tostring(t.name), t.pctHP or 0))
             local heal, reason = HealSelector.SelectHeal(t, situation)
+            tickLog(string.format('20-EmergencyHeal: spell=%s reason=%s', tostring(heal and heal.spell), tostring(reason)))
             if heal then
                 local spellInfo = mq.TLO.Spell(heal.spell)
                 local isHoT = false
@@ -573,7 +674,9 @@ function M.tick(settings)
     local function tryHealList(list)
         for _, t in ipairs(list) do
             if (t.deficit or 0) > 0 then
+                tickLog(string.format('21-TryHeal: %s HP=%d deficit=%d', tostring(t.name), t.pctHP or 0, t.deficit or 0))
                 local heal, reason = HealSelector.SelectHeal(t, situation)
+                tickLog(string.format('22-HealSelected: spell=%s reason=%s', tostring(heal and heal.spell), tostring(reason)))
                 if heal then
                     if heal.category == 'hot' and proactive and proactive.HasActiveHot and proactive.HasActiveHot(t.name) then
                         local canRefresh = proactive.ShouldRefreshHot and proactive.ShouldRefreshHot(t.name, Config) or false
@@ -622,9 +725,12 @@ function M.tick(settings)
         return false
     end
 
+    tickLog('23-TryPriorityTargets')
     if tryHealList(priorityTargets) then return true end
+    tickLog('24-TryGroupTargets')
     if tryHealList(groupTargets) then return true end
 
+    tickLog('25-NoHealNeeded')
     _priorityActive = false
     return false
 end
@@ -708,6 +814,13 @@ function M.shutdown()
 
     HealTracker.shutdown()
     Config.save()
+
+    -- Shutdown MobAssessor (saves any dirty data)
+    local ma = getMobAssessor()
+    if ma and ma.shutdown then
+        ma.shutdown()
+    end
+
     Logger.shutdown()  -- Close log file
     _initialized = false
 end
@@ -753,5 +866,6 @@ M.Logger = Logger
 -- UI modules are exposed via getter functions to allow late binding
 function M.getMonitor() return getMonitor() end
 function M.getSettings() return getSettings() end
+function M.getMobAssessor() return getMobAssessor() end
 
 return M

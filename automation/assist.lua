@@ -1,8 +1,8 @@
 local mq = require('mq')
-local Actors = require('utils.actors_coordinator')
-local Positioning = require('utils.positioning')
-local Targeting = require('utils.targeting')
-local CasterAssist = require('automation.caster_assist')
+local Actors = require('sidekick-next.utils.actors_coordinator')
+local Positioning = require('sidekick-next.utils.positioning')
+local Targeting = require('sidekick-next.utils.targeting')
+local CasterAssist = require('sidekick-next.automation.caster_assist')
 
 local M = {}
 
@@ -97,7 +97,7 @@ function M.shouldEngage(settings)
         if (now - lastLog) >= SKIP_LOG_COOLDOWN then
             _skippedTargetLog[targetId] = now
             local name = spawn.CleanName() or 'Unknown'
-            mq.cmdf('/echo [SideKick] Assist skipping target %s: %s', name, reason or 'unsafe')
+            -- Debug echo disabled
         end
         return false
     end

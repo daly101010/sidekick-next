@@ -4,7 +4,7 @@
 local mq = require('mq')
 
 local function log(msg)
-    mq.cmdf('/echo [SK:start] %s', msg)
+    -- In-game echo disabled
 end
 
 local modules = {

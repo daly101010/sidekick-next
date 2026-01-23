@@ -991,6 +991,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        spellSetLine = 'Ward',
         settingKey = 'DoACBuff',
     },
     -- Vie Buff (melee damage absorb)
@@ -1000,6 +1001,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        spellSetLine = 'Vie',
         settingKey = 'DoVieBuff',
     },
     -- Shining Buff (tank armor)
@@ -1008,6 +1010,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        spellSetLine = 'Shining',
         settingKey = 'DoShining',
     },
     -- Divine Buff (death save)
@@ -1016,6 +1019,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        spellSetLine = 'Divine',
         settingKey = 'DoDivineBuff',
     },
     -- Symbol (HP/mana regen)
@@ -1024,6 +1028,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        spellSetLine = 'Symbol',
     },
     -- Aegolism (HP buff)
     AegoBuff = {
@@ -1031,6 +1036,7 @@ M.buffLines = {
         targets = 'group',
         rebuffWindow = 120,
         outOfCombatOnly = true,
+        spellSetLine = 'Aegolism',
     },
     -- Ward (self rune)
     WardBuff = {
@@ -1038,6 +1044,7 @@ M.buffLines = {
         targets = 'self',
         rebuffWindow = 60,
         outOfCombatOnly = true,
+        spellSetLine = 'Ward',
     },
 }
 

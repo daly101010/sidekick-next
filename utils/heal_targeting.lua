@@ -1,6 +1,6 @@
 local mq = require('mq')
 
-local RuntimeCache = require('utils.runtime_cache')
+local RuntimeCache = require('sidekick-next.utils.runtime_cache')
 
 local M = {}
 

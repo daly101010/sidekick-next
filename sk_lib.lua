@@ -163,15 +163,27 @@ function M.getMainAssistId()
     return M.safeNum(function() return ma.ID() end, 0)
 end
 
+-- Log levels: 0=none, 1=error, 2=warn, 3=info, 4=debug
+M.LogLevel = 1  -- Set to 1 to only show errors, 4 for all messages
+
+local logLevelValue = {
+    error = 1,
+    warn = 2,
+    info = 3,
+    debug = 4,
+}
+
 --- Log with prefix
 -- @param level string 'debug', 'info', 'warn', 'error'
 -- @param module string Module name
 -- @param fmt string Format string
 -- @param ... any Format args
 function M.log(level, module, fmt, ...)
-    local msg = string.format(fmt, ...)
-    local prefix = string.format('[SK:%s][%s]', module, level:upper())
-    mq.cmdf('/echo %s %s', prefix, msg)
+    local levelVal = logLevelValue[level] or 4
+    if levelVal > M.LogLevel then
+        return
+    end
+    -- In-game echo disabled
 end
 
 return M

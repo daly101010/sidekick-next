@@ -7,6 +7,14 @@ local _dropbox = nil
 local _selfName = ''
 local _selfServer = ''
 local _selfZone = ''
+local _actorsInitError = nil
+local _lastGroupTargetMsgAt = 0
+local _lastGroupTargetMsgId = ''
+local _lastBoundsReqAt = 0
+local _lastSendErr = nil
+local _lastSendResult = nil
+local _lastSendDbgAt = 0
+local _lastTickDbgAt = 0
 
 local _lastDockedSendAt = 0
 local _lastStatusSendAt = 0
@@ -16,6 +24,9 @@ local _lastStatusPayload = nil
 -- Healing coordination state (claims + HoT presence)
 local _healClaims = {} -- [targetId][from] = { spellName, tier, expiresAt }
 local _hotStates = {}  -- [targetId][from] = { spellName, expiresAt }
+
+-- Healing message callbacks (registered by healing module to avoid circular require)
+local _healingCallbacks = {}
 
 -- Tank coordination state
 local _tankState = {
@@ -63,24 +74,45 @@ local function sendToGroupTarget(payload)
     if type(payload) ~= 'table' then return end
     payload.from = payload.from or _selfName
     payload.server = payload.server or _selfServer
-    pcall(function()
-        _dropbox:send({ mailbox = 'lua:group:grouptarget', absolute_mailbox = true }, payload)
+    -- Try multiple send formats for compatibility
+    local ok1, res1 = pcall(function()
+        return _dropbox:send({ mailbox = 'lua:group:grouptarget', absolute_mailbox = true }, payload)
     end)
+    local ok2, res2 = pcall(function()
+        return _dropbox:send({ mailbox = 'lua:group:GroupTarget', absolute_mailbox = true }, payload)
+    end)
+    -- Also try script+mailbox format
+    local ok3, res3 = pcall(function()
+        return _dropbox:send({ mailbox = 'grouptarget', script = 'group' }, payload)
+    end)
+    _lastSendResult = { ok1 = ok1, res1 = res1, ok2 = ok2, res2 = res2, ok3 = ok3, res3 = res3 }
+    if not ok1 then _lastSendErr = tostring(res1) end
+    if not ok2 then _lastSendErr = tostring(res2) end
+    if not ok3 then _lastSendErr = tostring(res3) end
 end
 
 function M.sendToGroupTarget(payload)
     sendToGroupTarget(payload)
 end
 
+function M.requestGroupTargetBounds()
+    sendToGroupTarget({ id = 'window:bounds:req' })
+end
+
 function M.init(opts)
     opts = opts or {}
     local ok, lib = pcall(require, 'actors')
-    if not ok then return nil end
+    if not ok then
+        _actorsInitError = tostring(lib)
+        return nil
+    end
     _actors = lib
 
     _selfName = safeMeName()
     _selfServer = safeServer()
     _selfZone = safeZone()
+    local _selfNameLower = tostring(_selfName or ''):lower()
+    local _selfServerLower = tostring(_selfServer or ''):lower()
 
     _dropbox = _actors.register('sidekick', function(message)
         local content = message()
@@ -88,8 +120,17 @@ function M.init(opts)
         local id = tostring(content.id or ''):lower()
         local sender = normalize_sender(message.sender)
 
-        local fromMe = (sender.character ~= '' and sender.character == _selfName)
-            and (_selfServer == '' or sender.server == '' or sender.server == _selfServer)
+        local senderCharLower = tostring(sender.character or ''):lower()
+        local senderServerLower = tostring(sender.server or ''):lower()
+        local fromMe = (senderCharLower ~= '' and senderCharLower == _selfNameLower)
+            and (_selfServerLower == '' or senderServerLower == '' or senderServerLower == _selfServerLower)
+
+        local senderMailboxLower = tostring(sender.mailbox or ''):lower()
+        local fromGroupTargetMailbox = (senderMailboxLower ~= '' and senderMailboxLower:find('grouptarget', 1, true) ~= nil)
+        if fromGroupTargetMailbox then
+            _lastGroupTargetMsgAt = os.clock()
+            _lastGroupTargetMsgId = id
+        end
 
         -- Respond to GroupTarget pull-style status requests (targeted send).
         -- Note: sender may be our own character (GroupTarget runs on the same client), so do NOT gate on fromMe.
@@ -106,7 +147,7 @@ function M.init(opts)
 
         -- GroupTarget broadcasting its settings panel state (used to hide Exit Both button, etc.)
         if id == 'gt:settings_open' then
-            if not fromMe then return end
+            if not fromMe and not fromGroupTargetMailbox then return end
             _G.GroupTargetBounds = _G.GroupTargetBounds or {}
             _G.GroupTargetBounds.settingsOpen = content.open == true
             _G.GroupTargetBounds.settingsOpenAt = os.clock()
@@ -150,7 +191,7 @@ function M.init(opts)
 
             -- Check if we should accept assists from this source based on settings
             -- Load settings via Core module
-            local okCore, Core = pcall(require, 'utils.core')
+            local okCore, Core = pcall(require, 'sidekick-next.utils.core')
             local settings = okCore and Core and Core.Settings or {}
 
             -- Determine if sender is in group, raid, or is a known peer
@@ -203,7 +244,7 @@ function M.init(opts)
             end
 
             -- Import assist module and set the target
-            local ok, Assist = pcall(require, 'automation.assist')
+            local ok, Assist = pcall(require, 'sidekick-next.automation.assist')
             if ok and Assist then
                 Assist.primaryTargetId = targetId
                 Assist.currentTargetId = targetId
@@ -211,14 +252,16 @@ function M.init(opts)
                 Assist.lastTankBroadcast = os.clock()
             end
 
-            -- Echo that we received the command
-            mq.cmdf('/echo [SideKick] Assisting %s on %s', fromName, targetName)
+            -- Echo disabled
             return
         end
 
-        -- Accept GroupTarget bounds for anchoring (only from self).
+        -- Accept GroupTarget bounds for anchoring (only from self or from GroupTarget mailbox).
         if id == 'window:bounds' then
-            if not fromMe then return end
+            local accept = fromMe or fromGroupTargetMailbox
+            if not accept then
+                return
+            end
             _G.GroupTargetBounds = {
                 x = content.x or 0,
                 y = content.y or 0,
@@ -266,7 +309,7 @@ function M.init(opts)
         -- Tank coordination: repositioning notification
         if id == 'tank:repositioning' then
             if fromMe then return end
-            local Positioning = require('utils.positioning')
+            local Positioning = require('sidekick-next.utils.positioning')
             Positioning.enterSoftPause()
             return
         end
@@ -274,7 +317,7 @@ function M.init(opts)
         -- Tank coordination: settled after repositioning
         if id == 'tank:settled' then
             if fromMe then return end
-            local Positioning = require('utils.positioning')
+            local Positioning = require('sidekick-next.utils.positioning')
             Positioning.exitSoftPause()
             return
         end
@@ -282,7 +325,7 @@ function M.init(opts)
         -- Tank coordination: taunt run started
         if id == 'tank:taunt_run' then
             if fromMe then return end
-            local Positioning = require('utils.positioning')
+            local Positioning = require('sidekick-next.utils.positioning')
             Positioning.enterSoftPause()
             return
         end
@@ -290,7 +333,7 @@ function M.init(opts)
         -- Tank coordination: taunt run completed
         if id == 'tank:taunt_done' then
             if fromMe then return end
-            local Positioning = require('utils.positioning')
+            local Positioning = require('sidekick-next.utils.positioning')
             Positioning.exitSoftPause()
             return
         end
@@ -305,7 +348,7 @@ function M.init(opts)
         -- CC coordination: receive mez list from mezzer
         if id == 'cc:mezlist' then
             if fromMe then return end
-            local ok, CC = pcall(require, 'automation.cc')
+            local ok, CC = pcall(require, 'sidekick-next.automation.cc')
             if ok and CC and CC.receiveMezList then
                 CC.receiveMezList(content)
             end
@@ -315,7 +358,7 @@ function M.init(opts)
         -- CC coordination: receive mez claim from another mezzer
         if id == 'cc:claim' then
             if fromMe then return end
-            local ok, CC = pcall(require, 'automation.cc')
+            local ok, CC = pcall(require, 'sidekick-next.automation.cc')
             if ok and CC and CC.receiveClaim then
                 CC.receiveClaim(content)
             end
@@ -325,7 +368,7 @@ function M.init(opts)
         -- Debuff coordination: receive debuff claim from another debuffer
         if id == 'debuff:claim' then
             if fromMe then return end
-            local ok, Debuff = pcall(require, 'automation.debuff')
+            local ok, Debuff = pcall(require, 'sidekick-next.automation.debuff')
             if ok and Debuff and Debuff.receiveClaim then
                 Debuff.receiveClaim(content)
             end
@@ -335,9 +378,40 @@ function M.init(opts)
         -- Debuff coordination: receive debuff landed notification
         if id == 'debuff:landed' then
             if fromMe then return end
-            local ok, Debuff = pcall(require, 'automation.debuff')
+            local ok, Debuff = pcall(require, 'sidekick-next.automation.debuff')
             if ok and Debuff and Debuff.receiveDebuffLanded then
                 Debuff.receiveDebuffLanded(content)
+            end
+            return
+        end
+
+        -- Healing coordination: incoming heal broadcasts (uses callback to avoid circular require)
+        if id == 'heal:incoming' then
+            if fromMe then return end
+            local cb = _healingCallbacks['heal:incoming']
+            if cb then
+                local senderName = tostring(sender.character or sender.name or 'unknown')
+                pcall(cb, content, senderName)
+            end
+            return
+        end
+
+        if id == 'heal:landed' then
+            if fromMe then return end
+            local cb = _healingCallbacks['heal:landed']
+            if cb then
+                local senderName = tostring(sender.character or sender.name or 'unknown')
+                pcall(cb, content, senderName)
+            end
+            return
+        end
+
+        if id == 'heal:cancelled' then
+            if fromMe then return end
+            local cb = _healingCallbacks['heal:cancelled']
+            if cb then
+                local senderName = tostring(sender.character or sender.name or 'unknown')
+                pcall(cb, content, senderName)
             end
             return
         end
@@ -380,7 +454,7 @@ function M.init(opts)
         -- Buff coordination: receive buff list from another buffer
         if id == 'buff:list' then
             if fromMe then return end
-            local ok, Buff = pcall(require, 'automation.buff')
+            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveBuffList then
                 Buff.receiveBuffList(content)
             end
@@ -390,7 +464,7 @@ function M.init(opts)
         -- Buff coordination: receive buff claim from another buffer
         if id == 'buff:claim' then
             if fromMe then return end
-            local ok, Buff = pcall(require, 'automation.buff')
+            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveClaim then
                 Buff.receiveClaim(content)
             end
@@ -400,7 +474,7 @@ function M.init(opts)
         -- Buff coordination: receive buff landed notification
         if id == 'buff:landed' then
             if fromMe then return end
-            local ok, Buff = pcall(require, 'automation.buff')
+            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveBuffLanded then
                 Buff.receiveBuffLanded(content)
             end
@@ -410,7 +484,7 @@ function M.init(opts)
         -- Buff coordination: receive buff blocks from peer
         if id == 'buff:blocks' then
             if fromMe then return end
-            local ok, Buff = pcall(require, 'automation.buff')
+            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveBlocks then
                 Buff.receiveBlocks(content)
             end
@@ -420,7 +494,7 @@ function M.init(opts)
         -- Cure coordination: receive cure claim from another curer
         if id == 'cure:claim' then
             if fromMe then return end
-            local ok, Cures = pcall(require, 'automation.cures')
+            local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
             if ok and Cures and Cures.receiveClaim then
                 Cures.receiveClaim(content)
             end
@@ -430,7 +504,7 @@ function M.init(opts)
         -- Cure coordination: receive cure landed notification
         if id == 'cure:landed' then
             if fromMe then return end
-            local ok, Cures = pcall(require, 'automation.cures')
+            local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
             if ok and Cures and Cures.receiveCureLanded then
                 Cures.receiveCureLanded(content)
             end
@@ -439,6 +513,21 @@ function M.init(opts)
     end)
 
     return _dropbox
+end
+
+function M.getDebugState()
+    return {
+        actors_loaded = _actors ~= nil,
+        dropbox_ready = _dropbox ~= nil,
+        init_error = _actorsInitError,
+        docked = M._docked == true,
+        last_send_err = _lastSendErr,
+        last_send_result = _lastSendResult,
+        self = { name = _selfName, server = _selfServer, zone = _selfZone },
+        last_gt_msg_at = _lastGroupTargetMsgAt or 0,
+        last_gt_msg_id = _lastGroupTargetMsgId or '',
+        last_bounds_req_at = _lastBoundsReqAt or 0,
+    }
 end
 
 function M.setDocked(docked)
@@ -454,6 +543,11 @@ function M.tick(opts)
         if (now - _lastDockedSendAt) >= 0.25 then
             _lastDockedSendAt = now
             sendToGroupTarget({ id = 'sidekick:docked', docked = true })
+        end
+        -- If we're configured to dock but don't yet have GT bounds, request them.
+        if (not _G.GroupTargetBounds or not _G.GroupTargetBounds.loaded) and (now - _lastBoundsReqAt) >= 1.0 then
+            _lastBoundsReqAt = now
+            sendToGroupTarget({ id = 'window:bounds:req' })
         end
     end
 
@@ -522,6 +616,13 @@ end
 function M.getHoTStates()
     pruneHealTables()
     return _hotStates
+end
+
+--- Register a callback for healing-related Actor messages
+-- @param msgType string One of: 'heal:incoming', 'heal:landed', 'heal:cancelled'
+-- @param callback function Called with (content, senderName) when message arrives
+function M.registerHealingCallback(msgType, callback)
+    _healingCallbacks[msgType] = callback
 end
 
 --- Generic broadcast to all SideKick instances
@@ -635,14 +736,14 @@ function M.broadcastAssistMe()
 
     local target = mq.TLO.Target
     if not target or not target() then
-        mq.cmd('/echo [SideKick] AssistMe: No target selected')
+        -- Echo disabled
         return false
     end
 
     local targetId = target.ID and target.ID() or 0
     local targetName = target.CleanName and target.CleanName() or 'Unknown'
     if targetId <= 0 then
-        mq.cmd('/echo [SideKick] AssistMe: Invalid target')
+        -- Echo disabled
         return false
     end
 
@@ -667,7 +768,7 @@ function M.broadcastAssistMe()
         end
     end
 
-    mq.cmdf('/echo [SideKick] AssistMe: Broadcasting target %s to %d peers in zone', targetName, peerCount)
+    -- Echo disabled
     return true
 end
 
@@ -698,9 +799,19 @@ function M.getHealClaimsRaw()
     return _healClaims
 end
 
+--- Get heal claims (alias)
+function M.getHealClaims()
+    return _healClaims
+end
+
 --- Get HoT states for debug display
 -- @return table HoT states table
 function M.getHoTStatesRaw()
+    return _hotStates
+end
+
+--- Get HoT states (alias)
+function M.getHoTStates()
     return _hotStates
 end
 

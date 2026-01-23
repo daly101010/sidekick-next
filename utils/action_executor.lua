@@ -11,7 +11,7 @@ local M = {}
 local _BuffLogger = nil
 local function getBuffLogger()
     if not _BuffLogger then
-        local ok, logger = pcall(require, 'automation.buff_logger')
+        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
         if ok then
             _BuffLogger = logger
             if _BuffLogger and _BuffLogger.init then
@@ -167,7 +167,7 @@ function M.executeSpell(spellName, targetId, opts)
     if not M.isChannelReady('spell') then return false end
 
     -- Delegate to spell engine for full state machine handling
-    local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
     if not ok or not SpellEngine then return false end
 
     -- Check if spell engine is already casting
@@ -194,7 +194,7 @@ end
 --- Check if spell engine is busy
 -- @return boolean True if currently casting a spell
 function M.isSpellBusy()
-    local ok, SpellEngine = pcall(require, 'utils.spell_engine')
+    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
     if ok and SpellEngine then
         return SpellEngine.isBusy()
     end

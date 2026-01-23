@@ -5,7 +5,7 @@
 local mq = require('mq')
 local lib = require('sidekick.sk_lib')
 local ModuleBase = require('sidekick.sk_module_base')
-local Spells = require('sk_spells_clr')
+local Spells = require('sidekick-next.sk_spells_clr')
 
 -------------------------------------------------------------------------------
 -- Lazy-load Dependencies
@@ -14,7 +14,7 @@ local Spells = require('sk_spells_clr')
 local _SpellsetManager = nil
 local function getSpellsetManager()
     if not _SpellsetManager then
-        local ok, sm = pcall(require, 'utils.spellset_manager')
+        local ok, sm = pcall(require, 'sidekick-next.utils.spellset_manager')
         if ok then _SpellsetManager = sm end
     end
     return _SpellsetManager
@@ -23,7 +23,7 @@ end
 local _ConditionBuilder = nil
 local function getConditionBuilder()
     if not _ConditionBuilder then
-        local ok, cb = pcall(require, 'ui.condition_builder')
+        local ok, cb = pcall(require, 'sidekick-next.ui.condition_builder')
         if ok then _ConditionBuilder = cb end
     end
     return _ConditionBuilder
