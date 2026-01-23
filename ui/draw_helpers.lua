@@ -20,7 +20,7 @@ local M = {}
 
 -- Detect DrawList API signature once at startup, not per-call
 local _apiDetected = false
-local _useImVec2 = false
+local _useImVec2 = true  -- Default to ImVec2 (MQ standard)
 local _imVec2Func = nil
 
 local function detectApiSignature(dl)
@@ -36,21 +36,24 @@ local function detectApiSignature(dl)
     -- Only run when a valid draw list is provided
     if not dl then return end
     _apiDetected = true
-    _useImVec2 = false
 
-    -- Test raw coordinates first (most common)
-    local ok = pcall(function()
-        dl:AddRect(0, 0, 1, 1, 0x00000000, 0, 0, 0)
-    end)
-
-    if not ok and _imVec2Func then
-        -- Try ImVec2 signature
-        ok = pcall(function()
-            dl:AddRect(_imVec2Func(0, 0), _imVec2Func(1, 1), 0x00000000, 0, 0, 0)
+    -- Try ImVec2 FIRST (MQ standard requires it)
+    if _imVec2Func then
+        local ok = pcall(function()
+            dl:AddRectFilled(_imVec2Func(0, 0), _imVec2Func(1, 1), 0x00000000)
         end)
         if ok then
             _useImVec2 = true
+            return
         end
+    end
+
+    -- Fallback: try raw coordinates
+    local ok = pcall(function()
+        dl:AddRectFilled(0, 0, 1, 1, 0x00000000)
+    end)
+    if ok then
+        _useImVec2 = false
     end
 end
 
@@ -108,17 +111,27 @@ local function callDl(dl, method, x1, y1, x2, y2, ...)
         detectApiSignature(dl)
     end
 
+    local args = {...}
+
+    -- Try ImVec2 first (MQ standard)
     if _useImVec2 and _imVec2Func then
-        local ok = pcall(dl[method], dl, _imVec2Func(x1, y1), _imVec2Func(x2, y2), ...)
+        local ok = pcall(dl[method], dl, _imVec2Func(x1, y1), _imVec2Func(x2, y2), unpack(args))
         if ok then return true end
+
+        -- Try with fewer args
+        while #args > 0 do
+            table.remove(args)
+            ok = pcall(dl[method], dl, _imVec2Func(x1, y1), _imVec2Func(x2, y2), unpack(args))
+            if ok then return true end
+        end
     end
 
-    -- Try raw coordinates
-    local ok = pcall(dl[method], dl, x1, y1, x2, y2, ...)
+    -- Fallback: try raw coordinates
+    args = {...}
+    local ok = pcall(dl[method], dl, x1, y1, x2, y2, unpack(args))
     if ok then return true end
 
-    -- Fallback: try with fewer arguments
-    local args = {...}
+    -- Try with fewer arguments
     while #args > 0 do
         table.remove(args)
         ok = pcall(dl[method], dl, x1, y1, x2, y2, unpack(args))
@@ -154,13 +167,20 @@ function M.addLine(dl, x1, y1, x2, y2, col, thickness)
         detectApiSignature(dl)
     end
 
+    -- Try ImVec2 first (MQ standard)
     if _useImVec2 and _imVec2Func then
         local ok = pcall(function()
             dl:AddLine(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col, thickness)
         end)
         if ok then return true end
+
+        ok = pcall(function()
+            dl:AddLine(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col)
+        end)
+        if ok then return true end
     end
 
+    -- Fallback to raw coords
     local ok = pcall(function() dl:AddLine(x1, y1, x2, y2, col, thickness) end)
     if ok then return true end
 
@@ -171,9 +191,26 @@ end
 -- AddCircle wrapper
 function M.addCircle(dl, cx, cy, radius, col, segments, thickness)
     if not dl then return false end
-    segments = tonumber(segments) or 0
+    segments = tonumber(segments) or 12
     thickness = tonumber(thickness) or 1
 
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
+
+    -- Try ImVec2 first (MQ standard)
+    if _useImVec2 and _imVec2Func then
+        local ok = pcall(function() dl:AddCircle(_imVec2Func(cx, cy), radius, col, segments, thickness) end)
+        if ok then return true end
+
+        ok = pcall(function() dl:AddCircle(_imVec2Func(cx, cy), radius, col, segments) end)
+        if ok then return true end
+
+        ok = pcall(function() dl:AddCircle(_imVec2Func(cx, cy), radius, col) end)
+        if ok then return true end
+    end
+
+    -- Fallback to raw coords
     local ok = pcall(function() dl:AddCircle(cx, cy, radius, col, segments, thickness) end)
     if ok then return true end
 
@@ -187,8 +224,22 @@ end
 -- AddCircleFilled wrapper
 function M.addCircleFilled(dl, cx, cy, radius, col, segments)
     if not dl then return false end
-    segments = tonumber(segments) or 0
+    segments = tonumber(segments) or 12
 
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
+
+    -- Try ImVec2 first (MQ standard)
+    if _useImVec2 and _imVec2Func then
+        local ok = pcall(function() dl:AddCircleFilled(_imVec2Func(cx, cy), radius, col, segments) end)
+        if ok then return true end
+
+        ok = pcall(function() dl:AddCircleFilled(_imVec2Func(cx, cy), radius, col) end)
+        if ok then return true end
+    end
+
+    -- Fallback to raw coords
     local ok = pcall(function() dl:AddCircleFilled(cx, cy, radius, col, segments) end)
     if ok then return true end
 
@@ -205,11 +256,13 @@ function M.addText(dl, x, y, col, text)
         detectApiSignature(dl)
     end
 
+    -- Try ImVec2 first (MQ standard)
     if _useImVec2 and _imVec2Func then
         local ok = pcall(function() dl:AddText(_imVec2Func(x, y), col, text) end)
         if ok then return true end
     end
 
+    -- Fallback to raw coords
     local ok = pcall(function() dl:AddText(x, y, col, text) end)
     return ok == true
 end
