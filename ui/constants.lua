@@ -16,39 +16,39 @@ local M = {}
 -- ============================================================
 
 M.ANIMATION = {
-    -- Spring physics parameters
-    SPRING_STIFFNESS = 400,
-    SPRING_DAMPING = 25,
-    SPRING_STIFFNESS_FAST = 500,
-    SPRING_DAMPING_FAST = 20,
+    -- Spring physics parameters (tuned for snappier feel)
+    SPRING_STIFFNESS = 450,       -- Tighter springs (was 400)
+    SPRING_DAMPING = 28,          -- Slightly more damped (was 25)
+    SPRING_STIFFNESS_FAST = 600,  -- Faster response (was 500)
+    SPRING_DAMPING_FAST = 22,     -- (was 20)
     SPRING_STIFFNESS_SLOW = 300,
     SPRING_DAMPING_SLOW = 30,
 
     -- Tween durations (seconds)
-    TWEEN_FAST = 0.15,
-    TWEEN_NORMAL = 0.25,
-    TWEEN_SLOW = 0.4,
+    TWEEN_FAST = 0.12,            -- Snappier (was 0.15)
+    TWEEN_NORMAL = 0.22,          -- Slightly faster (was 0.25)
+    TWEEN_SLOW = 0.35,            -- (was 0.4)
 
-    -- Button scaling
-    HOVER_SCALE = 1.05,
-    PRESS_SCALE = 0.95,
-    TOGGLE_POP_SCALE = 1.15,
+    -- Button scaling (more noticeable feedback)
+    HOVER_SCALE = 1.08,           -- More visible (was 1.05)
+    PRESS_SCALE = 0.92,           -- More visible (was 0.95)
+    TOGGLE_POP_SCALE = 1.18,      -- Punchier (was 1.15)
 
     -- Pulse/glow frequencies (Hz)
-    READY_PULSE_FREQ = 2.0,
+    READY_PULSE_FREQ = 2.5,       -- Faster pulse (was 2.0)
     LOW_RESOURCE_PULSE_FREQ_MIN = 1.5,
-    LOW_RESOURCE_PULSE_FREQ_MAX = 3.5,
+    LOW_RESOURCE_PULSE_FREQ_MAX = 4.0,  -- More urgent at low (was 3.5)
 
     -- Shake parameters
-    SHAKE_MAGNITUDE = 3,
-    SHAKE_DECAY = 0.25,
+    SHAKE_MAGNITUDE = 4,          -- Slightly more visible (was 3)
+    SHAKE_DECAY = 0.22,           -- Faster decay (was 0.25)
 
     -- Damage flash duration (seconds)
-    DAMAGE_FLASH_DURATION = 0.3,
+    DAMAGE_FLASH_DURATION = 0.25, -- Quicker flash (was 0.3)
 
     -- Stagger animation delay per item (seconds)
-    STAGGER_DELAY = 0.05,
-    STAGGER_DURATION = 0.5,
+    STAGGER_DELAY = 0.04,         -- Slightly faster cascade (was 0.05)
+    STAGGER_DURATION = 0.45,      -- (was 0.5)
 }
 
 -- ============================================================
@@ -100,8 +100,8 @@ M.COOLDOWN = {
 
     -- Ready state glow parameters
     READY_GLOW_MIN = 0.4,
-    READY_GLOW_MAX = 0.8,
-    READY_GLOW_FREQ = 2.0,
+    READY_GLOW_MAX = 0.85,         -- Slightly brighter peak (was 0.8)
+    READY_GLOW_FREQ = 2.5,         -- Synced with READY_PULSE_FREQ (was 2.0)
 }
 
 -- ============================================================
