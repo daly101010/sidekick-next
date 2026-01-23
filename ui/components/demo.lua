@@ -97,7 +97,7 @@ local TABS = {
 local function renderButtonsTab()
     local theme = State.themeName
 
-    -- Themed Toggle Buttons
+    -- Themed Toggle Buttons (these work - use standard imgui)
     Components.SettingGroup.section('Toggle Buttons', theme)
 
     imgui.Text('Standard toggles:')
@@ -110,95 +110,60 @@ local function renderButtonsTab()
 
     imgui.Spacing()
 
-    -- Icon Buttons
+    -- Test basic ImGui buttons first
+    Components.SettingGroup.section('Basic ImGui Buttons (Test)', theme)
+
+    imgui.Text('Standard ImGui:')
+    imgui.SameLine(120)
+    if imgui.Button('Test 1') then
+        print('Test 1 clicked')
+    end
+    imgui.SameLine()
+    if imgui.Button('Test 2') then
+        print('Test 2 clicked')
+    end
+
+    imgui.Spacing()
+
+    -- Icon Buttons - wrap in pcall to see errors
     Components.SettingGroup.section('Icon Buttons', theme)
 
     imgui.Text('Square buttons:')
     imgui.SameLine(120)
-    if Components.IconButton.draw('⚙', 'Settings', theme) then
-        Components.Toast.info('Settings clicked!')
-    end
-    imgui.SameLine()
-    if Components.IconButton.draw('↻', 'Refresh', theme) then
-        Components.Toast.success('Refreshed!')
-    end
-    imgui.SameLine()
-    if Components.IconButton.draw('+', 'Add', theme) then
-        Components.Toast.info('Add clicked')
-    end
-    imgui.SameLine()
-    Components.IconButton.draw('×', 'Close (disabled)', theme, { disabled = true })
-
-    imgui.Spacing()
-
-    imgui.Text('Toggle icons:')
-    imgui.SameLine(120)
-    State.playPaused = Components.IconButton.toggle(
-        State.playPaused and '⏸' or '▶',
-        State.playPaused and 'Pause' or 'Play',
-        State.playPaused, theme
-    )
-    imgui.SameLine()
-    State.lockState = Components.IconButton.toggle(
-        State.lockState and '🔒' or '🔓',
-        State.lockState and 'Locked' or 'Unlocked',
-        State.lockState, theme
-    )
-
-    imgui.Spacing()
-
-    imgui.Text('Circular:')
-    imgui.SameLine(120)
-    Components.IconButton.circular('♥', 'Health', theme)
-    imgui.SameLine()
-    Components.IconButton.circular('◆', 'Mana', theme)
-    imgui.SameLine()
-    Components.IconButton.circular('⚔', 'Combat', theme)
-
-    imgui.Spacing()
-
-    imgui.Text('With label:')
-    imgui.SameLine(120)
-    if Components.IconButton.withLabel('💾', 'Save Settings', theme) then
-        Components.Toast.success('Settings saved!')
+    local ok, err = pcall(function()
+        if Components.IconButton.draw('S', 'Settings', theme) then
+            print('Settings clicked')
+        end
+    end)
+    if not ok then
+        imgui.SameLine()
+        imgui.TextColored(1, 0.3, 0.3, 1, 'Error: ' .. tostring(err))
     end
 
     imgui.Spacing()
 
-    -- Radio group
-    Components.SettingGroup.section('Radio Button Group', theme)
-
-    local radioButtons = {
-        { icon = '▤', tooltip = 'List view' },
-        { icon = '▦', tooltip = 'Grid view' },
-        { icon = '▧', tooltip = 'Compact view' },
-    }
-    imgui.Text('View mode:')
-    imgui.SameLine(120)
-    State.radioSelection = Components.IconButton.radio(radioButtons, State.radioSelection, theme)
-    imgui.SameLine()
-    imgui.Text('  Selected: ' .. State.radioSelection)
-
-    imgui.Spacing()
-
-    -- Keybind badges
+    -- Keybind badges - simplified
     Components.SettingGroup.section('Keybind Badges', theme)
 
     imgui.Text('Single key:')
     imgui.SameLine(120)
-    Components.KeybindBadge.draw('F1', theme)
-    imgui.SameLine()
-    Components.KeybindBadge.draw('Esc', theme)
-    imgui.SameLine()
-    Components.KeybindBadge.draw('Space', theme)
+    local ok2, err2 = pcall(function()
+        Components.KeybindBadge.draw('F1', theme)
+    end)
+    if not ok2 then
+        imgui.TextColored(1, 0.3, 0.3, 1, 'Keybind Error: ' .. tostring(err2))
+    end
 
     imgui.Spacing()
 
     imgui.Text('Key combos:')
     imgui.SameLine(120)
-    Components.KeybindBadge.combo('Ctrl+S', theme)
-    imgui.SameLine()
-    Components.KeybindBadge.combo({'Alt', 'F4'}, theme)
+    local ok3, err3 = pcall(function()
+        Components.KeybindBadge.combo('Ctrl+S', theme)
+    end)
+    if not ok3 then
+        imgui.TextColored(1, 0.3, 0.3, 1, 'Combo Error: ' .. tostring(err3))
+    end
 
     imgui.Spacing()
 
@@ -435,7 +400,8 @@ local function renderInputsTab()
     -- Checkbox Row
     Components.SettingGroup.section('Checkbox Row', theme)
 
-    local cbChanged, newCbVal = Components.CheckboxRow.draw('Show spinners', 'demoSpinner', State.spinnerDemo)
+    -- CheckboxRow now returns: newValue, changed
+    local newCbVal, cbChanged = Components.CheckboxRow.draw('Show spinners', 'demoSpinner', State.spinnerDemo)
     if cbChanged then State.spinnerDemo = newCbVal end
 end
 

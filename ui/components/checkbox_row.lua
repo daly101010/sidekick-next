@@ -20,7 +20,24 @@ function M.draw(label, settingKey, current, onChange, opts)
     local tooltip = opts.tooltip
 
     -- Checkbox with label
-    local changed, newValue = imgui.Checkbox(label .. '##' .. settingKey, current)
+    -- MQ ImGui returns: newValue, changed (not changed, newValue)
+    local result1, result2 = imgui.Checkbox(label .. '##' .. settingKey, current)
+
+    -- Handle both return order conventions
+    local newValue, changed
+    if type(result1) == 'boolean' and type(result2) == 'boolean' then
+        -- MQ style: newValue, changed
+        newValue = result1
+        changed = result2
+    elseif type(result1) == 'boolean' then
+        -- Single return - just the new value, infer changed
+        newValue = result1
+        changed = (newValue ~= current)
+    else
+        -- Fallback
+        newValue = current
+        changed = false
+    end
 
     -- Tooltip
     if tooltip and imgui.IsItemHovered() then
@@ -32,7 +49,7 @@ function M.draw(label, settingKey, current, onChange, opts)
         onChange(newValue)
     end
 
-    return changed, newValue
+    return newValue, changed
 end
 
 -- ============================================================
