@@ -409,22 +409,25 @@ local function renderInputsTab()
     -- Slider Row
     Components.SettingGroup.section('Slider Row', theme)
 
-    State.sliderValue = Components.SliderRow.int('Volume', State.sliderValue, 0, 100, theme, {
+    local sliderChanged, newSliderVal = Components.SliderRow.int('Volume', 'demoVolume', State.sliderValue, 0, 100, nil, {
         width = 150,
         format = '%d%%',
     })
+    if sliderChanged then State.sliderValue = newSliderVal end
 
     imgui.Spacing()
 
     -- Combo Row
     Components.SettingGroup.section('Theme Selector (Combo)', theme)
 
-    local themeChanged
-    State.selectedTheme, themeChanged = Components.ComboRow.draw('Theme', State.selectedTheme, THEME_NAMES, theme, {
+    local comboChanged, newThemeIdx = Components.ComboRow.draw('Theme', 'demoTheme', State.selectedTheme - 1, THEME_NAMES, nil, {
         width = 150,
     })
-    if themeChanged and THEME_NAMES[State.selectedTheme] then
-        State.themeName = THEME_NAMES[State.selectedTheme]
+    if comboChanged then
+        State.selectedTheme = newThemeIdx + 1  -- Convert back to 1-indexed
+        if THEME_NAMES[State.selectedTheme] then
+            State.themeName = THEME_NAMES[State.selectedTheme]
+        end
     end
 
     imgui.Spacing()
@@ -432,7 +435,8 @@ local function renderInputsTab()
     -- Checkbox Row
     Components.SettingGroup.section('Checkbox Row', theme)
 
-    State.spinnerDemo = Components.CheckboxRow.draw('Show spinners', State.spinnerDemo, theme)
+    local cbChanged, newCbVal = Components.CheckboxRow.draw('Show spinners', 'demoSpinner', State.spinnerDemo)
+    if cbChanged then State.spinnerDemo = newCbVal end
 end
 
 local function renderTablesTab()
