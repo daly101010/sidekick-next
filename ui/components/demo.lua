@@ -12,9 +12,25 @@
 
 local mq = require('mq')
 local imgui = require('ImGui')
-local Components = require('sidekick-next.ui.components')
-local Themes = require('sidekick-next.themes')
-local Colors = require('sidekick-next.ui.colors')
+
+-- Protected requires with error reporting
+local function safeRequire(modname)
+    local ok, result = pcall(require, modname)
+    if not ok then
+        print('\ar[Demo] Failed to load ' .. modname .. ':\ax ' .. tostring(result))
+        return nil
+    end
+    return result
+end
+
+local Components = safeRequire('sidekick-next.ui.components')
+local Themes = safeRequire('sidekick-next.themes')
+local Colors = safeRequire('sidekick-next.ui.colors')
+
+if not Components or not Themes or not Colors then
+    print('\ar[Demo] Required modules missing, cannot continue.\ax')
+    return {}
+end
 
 local M = {}
 
