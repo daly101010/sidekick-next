@@ -709,6 +709,31 @@ function M.withStyleAlpha(alpha, fn)
 end
 
 -- ============================================================
+-- WINDOW FOCUS GLOW
+-- ============================================================
+
+-- Draw a subtle outer glow when window is focused
+function M.drawWindowFocusGlow(dl, x, y, w, h, themeName, isFocused)
+    if not isFocused then return end
+    if not featureEnabled('ReadyPulseEnabled') then return end
+    if not dl then return end
+
+    local readyRGB = Colors.ready(themeName)
+
+    -- Subtle pulsing glow
+    local t = os.clock() * 1.5  -- Slower pulse than ready
+    local pulse = 0.5 + 0.5 * math.sin(t * math.pi)
+
+    -- Draw 3 layers of outer glow
+    for i = 3, 1, -1 do
+        local baseAlpha = 12 + (3 - i) * 6  -- 12, 18, 24
+        local alpha = math.floor(baseAlpha * (0.6 + 0.4 * pulse))
+        local col = Draw.IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], alpha)
+        Draw.addRect(dl, x - i, y - i, x + w + i, y + h + i, col, 6 + i, 0, 1)
+    end
+end
+
+-- ============================================================
 -- GEOMETRY HELPERS
 -- ============================================================
 
