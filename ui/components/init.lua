@@ -43,6 +43,7 @@ M.SliderRow = lazyLoad('slider_row')
 M.ComboRow = lazyLoad('combo_row')
 M.CheckboxRow = lazyLoad('checkbox_row')
 M.AnchorVisualizer = lazyLoad('anchor_visualizer')
+M.Tooltip = lazyLoad('tooltip')
 
 -- Direct access for common patterns
 function M.toggle(...)
@@ -79,6 +80,14 @@ end
 
 function M.section(...)
     return M.SettingGroup.section(...)
+end
+
+function M.tooltip(...)
+    return M.Tooltip.simple(...)
+end
+
+function M.abilityTooltip(...)
+    return M.Tooltip.ability(...)
 end
 
 return M
