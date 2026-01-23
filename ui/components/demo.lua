@@ -725,26 +725,20 @@ end
 -- STANDALONE EXECUTION
 -- ============================================================
 
-local function main()
+M.render = renderDemoWindow
+
+-- For standalone execution, call M.run()
+function M.run()
     mq.imgui.init('SideKickComponentsDemo', renderDemoWindow)
 
-    print('\ay[SideKick]\ax UI Components Demo loaded. Window should be visible.')
+    print('\ay[SideKick]\ax UI Components Demo loaded.')
+    print('\ay[SideKick]\ax Close the window or /lua stop to exit.')
 
     while State.open do
         mq.delay(100)
     end
 
     print('\ay[SideKick]\ax UI Components Demo closed.')
-end
-
--- Check if running standalone
-if ... == nil or ... == 'sidekick-next.ui.components.demo' then
-    -- Being required as module, just return M
-    M.render = renderDemoWindow
-    return M
-else
-    -- Running standalone
-    main()
 end
 
 return M
