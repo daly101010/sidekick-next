@@ -115,26 +115,42 @@ local function renderButtonsTab()
         end
 
         -- Reserve space and try to draw
-        imgui.Dummy(100, 30)
+        imgui.Dummy(100, 50)
 
-        -- Try direct DrawList call
+        -- Check for ImVec2
+        local ImVec2 = ImVec2 or imgui.ImVec2
+        imgui.Text('ImVec2 available: ' .. tostring(ImVec2 ~= nil))
+
         local col = 0xFF00FF00  -- Green, ABGR format
-        local ok, err = pcall(function()
-            dl:AddRectFilled(cx, cy, cx + 80, cy + 20, col, 4)
-        end)
-        if ok then
-            imgui.Text('AddRectFilled (raw): OK')
+
+        -- Try with ImVec2
+        if ImVec2 then
+            local ok, err = pcall(function()
+                dl:AddRectFilled(ImVec2(cx, cy), ImVec2(cx + 80, cy + 20), col, 4)
+            end)
+            if ok then
+                imgui.Text('AddRectFilled (ImVec2): OK - should see green box above')
+            else
+                imgui.TextColored(1, 0.3, 0.3, 1, 'AddRectFilled (ImVec2): ' .. tostring(err))
+
+                -- Try without rounding param
+                local ok2, err2 = pcall(function()
+                    dl:AddRectFilled(ImVec2(cx, cy + 25), ImVec2(cx + 80, cy + 45), col)
+                end)
+                if ok2 then
+                    imgui.Text('AddRectFilled (no rounding): OK')
+                else
+                    imgui.TextColored(1, 0.3, 0.3, 1, 'AddRectFilled (no rounding): ' .. tostring(err2))
+                end
+            end
         else
-            imgui.TextColored(1, 0.3, 0.3, 1, 'AddRectFilled (raw): ' .. tostring(err))
+            imgui.TextColored(1, 0.5, 0, 1, 'ImVec2 not found - trying raw coords')
+
+            local ok, err = pcall(function()
+                dl:AddRectFilled(cx, cy, cx + 80, cy + 20, col, 4)
+            end)
+            imgui.Text('AddRectFilled (raw): ' .. (ok and 'OK' or tostring(err)))
         end
-
-        -- Try with Draw helper
-        local Draw = require('sidekick-next.ui.draw_helpers')
-        local col2 = Draw.IM_COL32(0, 255, 0, 255)
-        imgui.Text('IM_COL32 result: ' .. tostring(col2))
-
-        local ok2 = Draw.addRectFilled(dl, cx, cy + 25, cx + 80, cy + 45, col2, 4)
-        imgui.Text('Draw.addRectFilled: ' .. tostring(ok2))
     else
         imgui.TextColored(1, 0.3, 0.3, 1, 'DrawList: NIL!')
     end
