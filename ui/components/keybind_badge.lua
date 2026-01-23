@@ -238,8 +238,9 @@ function M.combo(keys, themeName, opts)
 
     if type(keys) == 'string' then
         -- Parse string like "Ctrl+S"
+        local keyStr = keys
         keys = {}
-        for part in string.gmatch(keys, '[^+]+') do
+        for part in string.gmatch(keyStr, '[^+]+') do
             table.insert(keys, part:match('^%s*(.-)%s*$'))  -- Trim whitespace
         end
     end
