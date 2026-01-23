@@ -280,6 +280,143 @@ function M.drawOutlinedText(x, y, text, r, g, b, outlineColor)
 end
 
 -- ============================================================
+-- GRADIENT FILLS
+-- ============================================================
+
+-- Vertical gradient fill (top color to bottom color)
+-- Uses AddRectFilledMultiColor if available, falls back to solid
+function M.addRectFilledGradientV(dl, x1, y1, x2, y2, colTop, colBottom, rounding)
+    if not dl then return false end
+    rounding = tonumber(rounding) or 0
+
+    -- Try multi-color gradient first (no rounding support)
+    if rounding == 0 and dl.AddRectFilledMultiColor then
+        local ok = pcall(function()
+            dl:AddRectFilledMultiColor(x1, y1, x2, y2, colTop, colTop, colBottom, colBottom)
+        end)
+        if ok then return true end
+    end
+
+    -- Fallback: solid fill with top color
+    return M.addRectFilled(dl, x1, y1, x2, y2, colTop, rounding)
+end
+
+-- Horizontal gradient fill (left color to right color)
+function M.addRectFilledGradientH(dl, x1, y1, x2, y2, colLeft, colRight, rounding)
+    if not dl then return false end
+    rounding = tonumber(rounding) or 0
+
+    -- Try multi-color gradient first (no rounding support)
+    if rounding == 0 and dl.AddRectFilledMultiColor then
+        local ok = pcall(function()
+            dl:AddRectFilledMultiColor(x1, y1, x2, y2, colLeft, colRight, colRight, colLeft)
+        end)
+        if ok then return true end
+    end
+
+    -- Fallback: solid fill with left color
+    return M.addRectFilled(dl, x1, y1, x2, y2, colLeft, rounding)
+end
+
+-- Four-corner gradient (each corner can be different)
+function M.addRectFilledGradient4(dl, x1, y1, x2, y2, colTL, colTR, colBR, colBL)
+    if not dl then return false end
+
+    if dl.AddRectFilledMultiColor then
+        local ok = pcall(function()
+            dl:AddRectFilledMultiColor(x1, y1, x2, y2, colTL, colTR, colBR, colBL)
+        end)
+        if ok then return true end
+    end
+
+    -- Fallback: solid fill with top-left color
+    return M.addRectFilled(dl, x1, y1, x2, y2, colTL, 0)
+end
+
+-- ============================================================
+-- DECORATIVE BORDERS
+-- ============================================================
+
+-- Draw corner accents (EQ-style bracket corners)
+function M.addCornerAccents(dl, x1, y1, x2, y2, col, size, thickness)
+    if not dl then return false end
+    size = tonumber(size) or 8
+    thickness = tonumber(thickness) or 2
+
+    -- Top-left corner
+    M.addLine(dl, x1, y1 + size, x1, y1, col, thickness)
+    M.addLine(dl, x1, y1, x1 + size, y1, col, thickness)
+
+    -- Top-right corner
+    M.addLine(dl, x2 - size, y1, x2, y1, col, thickness)
+    M.addLine(dl, x2, y1, x2, y1 + size, col, thickness)
+
+    -- Bottom-left corner
+    M.addLine(dl, x1, y2 - size, x1, y2, col, thickness)
+    M.addLine(dl, x1, y2, x1 + size, y2, col, thickness)
+
+    -- Bottom-right corner
+    M.addLine(dl, x2 - size, y2, x2, y2, col, thickness)
+    M.addLine(dl, x2, y2, x2, y2 - size, col, thickness)
+
+    return true
+end
+
+-- Draw beveled border (classic 3D look: light top-left, dark bottom-right)
+function M.addBeveledBorder(dl, x1, y1, x2, y2, lightCol, darkCol, thickness)
+    if not dl then return false end
+    thickness = tonumber(thickness) or 1
+
+    -- Light edges (top, left) - raised look
+    M.addLine(dl, x1, y1, x2, y1, lightCol, thickness)
+    M.addLine(dl, x1, y1, x1, y2, lightCol, thickness)
+
+    -- Dark edges (bottom, right) - shadow
+    M.addLine(dl, x1, y2, x2, y2, darkCol, thickness)
+    M.addLine(dl, x2, y1, x2, y2, darkCol, thickness)
+
+    return true
+end
+
+-- Draw inner glow effect (layered lighter borders inside)
+function M.addInnerGlow(dl, x1, y1, x2, y2, glowCol, glowWidth)
+    if not dl then return false end
+    glowWidth = tonumber(glowWidth) or 2
+
+    -- Extract RGBA from packed color
+    local r = bit32 and bit32.band(glowCol, 0xFF) or (glowCol % 256)
+    local g = bit32 and bit32.band(bit32.rshift(glowCol, 8), 0xFF) or (math.floor(glowCol / 256) % 256)
+    local b = bit32 and bit32.band(bit32.rshift(glowCol, 16), 0xFF) or (math.floor(glowCol / 65536) % 256)
+
+    for i = glowWidth, 1, -1 do
+        local alpha = math.floor(60 * (i / glowWidth))
+        local col = M.IM_COL32(r, g, b, alpha)
+        M.addRect(dl, x1 + i, y1 + i, x2 - i, y2 - i, col, 0, 0, 1)
+    end
+
+    return true
+end
+
+-- Draw outer glow effect (layered borders outside)
+function M.addOuterGlow(dl, x1, y1, x2, y2, glowCol, glowWidth)
+    if not dl then return false end
+    glowWidth = tonumber(glowWidth) or 3
+
+    -- Extract RGBA from packed color
+    local r = bit32 and bit32.band(glowCol, 0xFF) or (glowCol % 256)
+    local g = bit32 and bit32.band(bit32.rshift(glowCol, 8), 0xFF) or (math.floor(glowCol / 256) % 256)
+    local b = bit32 and bit32.band(bit32.rshift(glowCol, 16), 0xFF) or (math.floor(glowCol / 65536) % 256)
+
+    for i = glowWidth, 1, -1 do
+        local alpha = math.floor(40 * (1 - (i - 1) / glowWidth))
+        local col = M.IM_COL32(r, g, b, alpha)
+        M.addRect(dl, x1 - i, y1 - i, x2 + i, y2 + i, col, 0, 0, 1)
+    end
+
+    return true
+end
+
+-- ============================================================
 -- RE-DETECTION (for runtime debugging)
 -- ============================================================
 
