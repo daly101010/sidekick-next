@@ -5,8 +5,15 @@
 ]]
 
 local mq = require('mq')
+local iam = require('ImAnim')
+local imgui = require('ImGui')
 
 local M = {}
+
+-- Style animation state
+local _stylesRegistered = false
+local _currentThemeTarget = nil
+local _ezOutCubic = iam.EasePreset(IamEaseType.OutCubic)
 
 local function normalizeThemeKey(name)
     name = tostring(name or '')
@@ -64,6 +71,28 @@ M.presets = {
         name = 'ClassicEQ',
         description = 'Classic EverQuest (gold/stone) UI look',
         -- Window styling: dark stone panels + warm gold trim, with EQ-like steel/blue buttons.
+        WindowBg = { 0.06, 0.055, 0.05 },
+        ChildBg = { 0.06, 0.055, 0.05 },
+        FrameBg = { 0.10, 0.095, 0.09 },
+        FrameBgHovered = { 0.15, 0.14, 0.13 },
+        FrameBgActive = { 0.19, 0.18, 0.17 },
+        Button = { 0.12, 0.20, 0.30 },
+        ButtonHovered = { 0.16, 0.28, 0.42 },
+        ButtonActive = { 0.10, 0.24, 0.38 },
+        Header = { 0.10, 0.17, 0.26 },
+        HeaderHovered = { 0.14, 0.24, 0.36 },
+        HeaderActive = { 0.08, 0.20, 0.32 },
+        Border = { 0.78, 0.68, 0.38 },
+        Separator = { 0.60, 0.52, 0.30 },
+        ScrollbarBg = { 0.06, 0.055, 0.05 },
+        ScrollbarGrab = { 0.50, 0.44, 0.26 },
+    },
+
+    ['ClassicEQ Textured'] = {
+        name = 'ClassicEQ Textured',
+        description = 'Classic EverQuest with actual EQ textures',
+        useTextures = true,  -- Enable textured rendering
+        -- Fallback colors for text/overlays (same as ClassicEQ)
         WindowBg = { 0.06, 0.055, 0.05 },
         ChildBg = { 0.06, 0.055, 0.05 },
         FrameBg = { 0.10, 0.095, 0.09 },
@@ -305,6 +334,8 @@ M._presetKeyByNormalized[normalizeThemeKey('Light_Blue')] = 'Light Blue'
 M._presetKeyByNormalized[normalizeThemeKey('GreenTheme')] = 'Green'
 M._presetKeyByNormalized[normalizeThemeKey('BlueTheme')] = 'Blue'
 M._presetKeyByNormalized[normalizeThemeKey('LightTheme')] = 'Light'
+M._presetKeyByNormalized[normalizeThemeKey('ClassicEQTextured')] = 'ClassicEQ Textured'
+M._presetKeyByNormalized[normalizeThemeKey('ClassicEQ_Textured')] = 'ClassicEQ Textured'
 
 local function resolvePresetKey(themeName)
     if M.presets[themeName] then
@@ -436,6 +467,74 @@ function M.pushWindowTheme(imgui, themeName, opts)
     end
 
     return pushed
+end
+
+-- Check if theme uses textures
+function M.isTexturedTheme(themeName)
+    local key = resolvePresetKey(themeName)
+    local preset = key and M.presets[key]
+    return preset and preset.useTextures == true
+end
+
+-- Get texture renderer if theme is textured
+function M.getTextureRenderer(themeName)
+    if not M.isTexturedTheme(themeName) then return nil end
+
+    local ok, renderer = pcall(require, 'sidekick-next.ui.texture_renderer')
+    if not ok or not renderer then return nil end
+
+    if renderer.isAvailable and not renderer.isAvailable() then
+        return nil
+    end
+
+    return renderer
+end
+
+-- ============================================================
+-- ANIMATED THEME TRANSITIONS (StyleTween)
+-- ============================================================
+
+-- Register all themes as ImAnim style snapshots (call once)
+function M.registerAllStyles()
+    if _stylesRegistered then return end
+    if not imgui or not imgui.PushStyleColor then return end
+
+    local ImGuiCol = rawget(_G, 'ImGuiCol') or rawget(imgui, 'ImGuiCol')
+    if not ImGuiCol then return end
+
+    _stylesRegistered = true
+    for _, name in ipairs(M.getThemeNames()) do
+        local pushed = M.pushWindowTheme(imgui, name)
+        if pushed > 0 then
+            pcall(function()
+                iam.StyleRegisterCurrent(imgui.GetID(name))
+            end)
+            imgui.PopStyleColor(pushed)
+        end
+    end
+end
+
+-- Tween to a target theme over 0.4s with OKLAB blending
+function M.tweenToTheme(themeName, dt)
+    if not _stylesRegistered then M.registerAllStyles() end
+    if not _stylesRegistered then return end  -- registration failed
+
+    _currentThemeTarget = themeName
+    pcall(function()
+        iam.StyleTween(
+            imgui.GetID('sk_theme'),
+            imgui.GetID(themeName),
+            0.4,
+            _ezOutCubic,
+            IamColorSpace.OKLAB,
+            dt
+        )
+    end)
+end
+
+-- Get the current tween target
+function M.getCurrentThemeTarget()
+    return _currentThemeTarget
 end
 
 return M

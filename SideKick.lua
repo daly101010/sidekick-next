@@ -25,6 +25,7 @@ end
 local Core = require('sidekick-next.utils.core')
 local Themes = require('sidekick-next.themes')
 local Helpers = require('sidekick-next.lib.helpers')
+local Draw = require('sidekick-next.ui.draw_helpers')
 local Cooldowns = require('sidekick-next.abilities.cooldowns')
 local AbilityLoader = require('sidekick-next.abilities.loader')
 local Abilities = require('sidekick-next.utils.abilities')
@@ -72,7 +73,7 @@ local Bar = require('sidekick-next.ui.bar_animated')
 local SpecialBar = require('sidekick-next.ui.special_bar_animated')
 local DiscBar = require('sidekick-next.ui.disc_bar_animated')
 local ItemBar = require('sidekick-next.ui.item_bar_animated')
-local ImAnim = require('sidekick-next.lib.imanim')
+local iam = require('ImAnim')
 local Anchor = require('sidekick-next.ui.anchor')
 local Items = require('sidekick-next.utils.items')
 
@@ -80,6 +81,7 @@ local Items = require('sidekick-next.utils.items')
 local RemoteAbilities = require('sidekick-next.ui.remote_abilities')
 local AggroWarning = require('sidekick-next.ui.aggro_warning')
 local ActorsDebug = require('sidekick-next.ui.actors_debug')
+local CoordinatorDebug = require('sidekick-next.ui.coordinator_debug')
 
 -- Runtime cache, action executor, rotation engine, CC, and spell engine
 local RuntimeCache = require('sidekick-next.utils.runtime_cache')
@@ -449,21 +451,22 @@ end
 local _buttonHoverState = {}
 
 -- Animated button with spring hover effect
-local function animatedButton(label)
+local function animatedButton(label, btnScale)
+    btnScale = btnScale or 1.0
     local animEnabled = Core.Settings.AnimationsEnabled ~= false and Core.Settings.HoverScaleEnabled ~= false
     local hoverScale = 1.0
 
-    if animEnabled and ImAnim and ImAnim.spring then
+    if animEnabled and iam and iam.TweenFloat then
         local springId = 'btn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = ImAnim.spring(springId, targetScale, 300, 22, 1.0)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, iam.EaseSpring(1.0, 300, 22, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
-    local padX, padY = 4, 2
+    local padX, padY = math.floor(4 * btnScale), math.floor(2 * btnScale)
     local pushedStyle = false
-    if hoverScale > 1.001 then
+    if hoverScale > 1.001 or btnScale ~= 1.0 then
         local extraPad = (hoverScale - 1.0) * 8
         padX = padX + extraPad
         padY = padY + extraPad * 0.5
@@ -471,29 +474,76 @@ local function animatedButton(label)
         pushedStyle = true
     end
 
+    -- Check if we should use textured rendering
+    local themeName = Core.Settings.SideKickTheme or 'Classic'
+    local useTextures = false
+    pcall(function()
+        if not Themes.isTexturedTheme or not Themes.isTexturedTheme(themeName) then return end
+        local TextureRenderer = Draw.getTextureRenderer and Draw.getTextureRenderer()
+        if not TextureRenderer then return end
+        if TextureRenderer.isAvailable and not TextureRenderer.isAvailable() then return end
+
+        local dl = imgui.GetWindowDrawList()
+        if not dl then return end
+
+        local screenX, screenY = imgui.GetCursorScreenPos()
+        if type(screenX) == 'table' then
+            screenY = screenX.y or screenX[2]
+            screenX = screenX.x or screenX[1]
+        end
+
+        -- Calculate button size to match ImGui button exactly
+        local textW = imgui.CalcTextSize(label:gsub('##.*', ''))
+        local tw = type(textW) == 'number' and textW or (textW.x or textW[1] or 50)
+        -- Get the actual FramePadding ImGui will use
+        local framePadX = padX
+        pcall(function()
+            local style = imgui.GetStyle()
+            if style and style.FramePadding then
+                local fp = style.FramePadding
+                framePadX = type(fp) == 'number' and fp or (fp.x or fp[1] or padX)
+            end
+        end)
+        local btnW = tw + framePadX * 2
+        local btnH = imgui.GetTextLineHeight() + padY * 2
+
+        local state = (_buttonHoverState[label] or false) and 'hover' or 'normal'
+        local btnSize = TextureRenderer.getBestButtonSize and TextureRenderer.getBestButtonSize(btnW, btnH) or 'std'
+        TextureRenderer.drawClassicButton(dl, screenX, screenY, btnW, btnH, state, btnSize)
+
+        -- Make ImGui button transparent with black text
+        imgui.PushStyleColor(ImGuiCol.Button, 0, 0, 0, 0)
+        imgui.PushStyleColor(ImGuiCol.ButtonHovered, 1, 1, 1, 0.15)
+        imgui.PushStyleColor(ImGuiCol.ButtonActive, 0, 0, 0, 0.2)
+        imgui.PushStyleColor(ImGuiCol.Text, 0, 0, 0, 1)
+        useTextures = true
+    end)
+
     local pressed = imgui.Button(label)
     _buttonHoverState[label] = imgui.IsItemHovered()
 
+    if useTextures then imgui.PopStyleColor(4) end
     if pushedStyle then imgui.PopStyleVar() end
-    return pressed
+    return pressed, useTextures
 end
 
 -- Animated small button with spring hover effect (for icon buttons)
-local function animatedSmallButton(label)
+local function animatedSmallButton(label, btnScale)
+    btnScale = btnScale or 1.0
     local animEnabled = Core.Settings.AnimationsEnabled ~= false and Core.Settings.HoverScaleEnabled ~= false
     local hoverScale = 1.0
 
-    if animEnabled and ImAnim and ImAnim.spring then
+    if animEnabled and iam and iam.TweenFloat then
         local springId = 'sbtn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.12 or 1.0
-        hoverScale = ImAnim.spring(springId, targetScale, 300, 22, 1.0)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, iam.EaseSpring(1.0, 300, 22, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment (smaller base padding for SmallButton)
-    local padX, padY = 2, 1
+    local padX, padY = math.floor(2 * btnScale), math.floor(1 * btnScale)
     local pushedStyle = false
-    if hoverScale > 1.001 then
+    if hoverScale > 1.001 or btnScale ~= 1.0 then
         local extraPad = (hoverScale - 1.0) * 6
         padX = padX + extraPad
         padY = padY + extraPad * 0.5
@@ -501,21 +551,68 @@ local function animatedSmallButton(label)
         pushedStyle = true
     end
 
+    -- Check if we should use textured rendering
+    local themeName = Core.Settings.SideKickTheme or 'Classic'
+    local useTextures = false
+    pcall(function()
+        if not Themes.isTexturedTheme or not Themes.isTexturedTheme(themeName) then return end
+        local TextureRenderer = Draw.getTextureRenderer and Draw.getTextureRenderer()
+        if not TextureRenderer then return end
+        if TextureRenderer.isAvailable and not TextureRenderer.isAvailable() then return end
+
+        local dl = imgui.GetWindowDrawList()
+        if not dl then return end
+
+        local screenX, screenY = imgui.GetCursorScreenPos()
+        if type(screenX) == 'table' then
+            screenY = screenX.y or screenX[2]
+            screenX = screenX.x or screenX[1]
+        end
+
+        -- Calculate button size to match ImGui button exactly
+        local textW = imgui.CalcTextSize(label:gsub('##.*', ''))
+        local tw = type(textW) == 'number' and textW or (textW.x or textW[1] or 20)
+        -- Get the actual FramePadding ImGui will use
+        local framePadX = padX
+        pcall(function()
+            local style = imgui.GetStyle()
+            if style and style.FramePadding then
+                local fp = style.FramePadding
+                framePadX = type(fp) == 'number' and fp or (fp.x or fp[1] or padX)
+            end
+        end)
+        local btnW = tw + framePadX * 2
+        local btnH = imgui.GetTextLineHeight() + padY * 2
+
+        local state = (_buttonHoverState[label] or false) and 'hover' or 'normal'
+        -- Use small button size for icon buttons
+        TextureRenderer.drawClassicButton(dl, screenX, screenY, btnW, btnH, state, 'small')
+
+        -- Make ImGui button transparent with black text
+        imgui.PushStyleColor(ImGuiCol.Button, 0, 0, 0, 0)
+        imgui.PushStyleColor(ImGuiCol.ButtonHovered, 1, 1, 1, 0.15)
+        imgui.PushStyleColor(ImGuiCol.ButtonActive, 0, 0, 0, 0.2)
+        imgui.PushStyleColor(ImGuiCol.Text, 0, 0, 0, 1)
+        useTextures = true
+    end)
+
     local pressed = imgui.SmallButton(label)
     _buttonHoverState[label] = imgui.IsItemHovered()
 
+    if useTextures then imgui.PopStyleColor(4) end
     if pushedStyle then imgui.PopStyleVar() end
-    return pressed
+    return pressed, useTextures
 end
 
-local function toggleButton(label, enabled, onClick)
+local function toggleButton(label, enabled, onClick, btnScale)
+    btnScale = btnScale or 1.0
     enabled = enabled == true
 
     -- Spring hover animation
     local animEnabled = Core.Settings.AnimationsEnabled ~= false and Core.Settings.HoverScaleEnabled ~= false
     local hoverScale = 1.0
 
-    if animEnabled and ImAnim and ImAnim.spring then
+    if animEnabled and iam and iam.TweenFloat then
         -- Use invisible button to detect hover before rendering
         local btnId = label:gsub('##.*', '') -- Strip ImGui ID suffix for display
         local springId = 'btn_hover_' .. label
@@ -523,19 +620,75 @@ local function toggleButton(label, enabled, onClick)
         -- Check if this button will be hovered (use last frame's state)
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = ImAnim.spring(springId, targetScale, 300, 22, 1.0)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, iam.EaseSpring(1.0, 300, 22, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
-    local padX, padY = 4, 2
-    if hoverScale > 1.001 then
+    local padX, padY = math.floor(4 * btnScale), math.floor(2 * btnScale)
+    local pushedScale = false
+    if hoverScale > 1.001 or btnScale ~= 1.0 then
         local extraPad = (hoverScale - 1.0) * 8
         padX = padX + extraPad
         padY = padY + extraPad * 0.5
         imgui.PushStyleVar(ImGuiStyleVar.FramePadding, padX, padY)
+        pushedScale = true
     end
 
-    if enabled then
+    -- Check if we should use textured rendering
+    local themeName = Core.Settings.SideKickTheme or 'Classic'
+    local useTextures = false
+    pcall(function()
+        if not Themes.isTexturedTheme or not Themes.isTexturedTheme(themeName) then return end
+        local TextureRenderer = Draw.getTextureRenderer and Draw.getTextureRenderer()
+        if not TextureRenderer then return end
+        if TextureRenderer.isAvailable and not TextureRenderer.isAvailable() then return end
+
+        local dl = imgui.GetWindowDrawList()
+        if not dl then return end
+
+        local screenX, screenY = imgui.GetCursorScreenPos()
+        if type(screenX) == 'table' then
+            screenY = screenX.y or screenX[2]
+            screenX = screenX.x or screenX[1]
+        end
+
+        -- Calculate button size to match ImGui button exactly
+        local textW = imgui.CalcTextSize(label:gsub('##.*', ''))
+        local tw = type(textW) == 'number' and textW or (textW.x or textW[1] or 50)
+        -- Get the actual FramePadding ImGui will use
+        local framePadX = padX
+        pcall(function()
+            local style = imgui.GetStyle()
+            if style and style.FramePadding then
+                local fp = style.FramePadding
+                framePadX = type(fp) == 'number' and fp or (fp.x or fp[1] or padX)
+            end
+        end)
+        local btnW = tw + framePadX * 2
+        local btnH = imgui.GetTextLineHeight() + padY * 2
+
+        -- Use 'pressed' state for enabled toggle buttons
+        local state = enabled and 'pressed' or ((_buttonHoverState[label] or false) and 'hover' or 'normal')
+        local btnSize = TextureRenderer.getBestButtonSize and TextureRenderer.getBestButtonSize(btnW, btnH) or 'std'
+        TextureRenderer.drawClassicButton(dl, screenX, screenY, btnW, btnH, state, btnSize)
+
+        -- Make ImGui button mostly transparent but with slight tint for enabled state
+        -- Use black text for readability on textured buttons
+        if enabled then
+            imgui.PushStyleColor(ImGuiCol.Button, 0.1, 0.3, 0.1, 0.3)
+            imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.15, 0.4, 0.15, 0.4)
+            imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.1, 0.25, 0.1, 0.4)
+        else
+            imgui.PushStyleColor(ImGuiCol.Button, 0, 0, 0, 0)
+            imgui.PushStyleColor(ImGuiCol.ButtonHovered, 1, 1, 1, 0.15)
+            imgui.PushStyleColor(ImGuiCol.ButtonActive, 0, 0, 0, 0.2)
+        end
+        imgui.PushStyleColor(ImGuiCol.Text, 0, 0, 0, 1)
+        useTextures = true
+    end)
+
+    -- Only apply default enabled colors if not using textures
+    if not useTextures and enabled then
         imgui.PushStyleColor(ImGuiCol.Button, 0.20, 0.70, 0.30, 0.90)
         imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.25, 0.80, 0.35, 1.00)
         imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.15, 0.60, 0.25, 1.00)
@@ -546,90 +699,183 @@ local function toggleButton(label, enabled, onClick)
     -- Update hover state for next frame
     _buttonHoverState[label] = imgui.IsItemHovered()
 
-    if enabled then imgui.PopStyleColor(3) end
-    if hoverScale > 1.001 then imgui.PopStyleVar() end
+    if useTextures then
+        imgui.PopStyleColor(4)  -- 3 button colors + 1 text color
+    elseif enabled then
+        imgui.PopStyleColor(3)
+    end
+    if pushedScale then imgui.PopStyleVar() end
 
     if pressed and onClick then onClick() end
-    return pressed
+    return pressed, useTextures
 end
 
 local function draw()
-    if not State.open then return end
+    local settings = Core.Settings or {}
+    local mainEnabled = settings.SideKickMainEnabled ~= false
+    if not mainEnabled or not State.open then
+        _G.SideKickDockedToGT = false
+    end
+    if (not State.open or not mainEnabled) and not State.settingsOpen then return end
 
-    local themeName = Core.Settings.SideKickTheme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
     local style = Themes.getWindowStyle(themeName)
 
-    local mainAnchor = tostring(Core.Settings.SideKickMainAnchor or 'none'):lower()
+    if mainEnabled and State.open then
+        local mainAnchor = tostring(Core.Settings.SideKickMainAnchor or 'none'):lower()
     local mainAnchorTarget = Anchor and Anchor.normalizeTargetKey and Anchor.normalizeTargetKey(Core.Settings.SideKickMainAnchorTarget or 'grouptarget')
         or tostring(Core.Settings.SideKickMainAnchorTarget or 'grouptarget'):lower()
-    local anchorGap = tonumber(Core.Settings.SideKickMainAnchorGap) or 2
-    local matchGTW = Core.Settings.SideKickMainMatchGTWidth == true
-    local rounding = 6
-    local gt = getStableGroupTargetBounds()
-    if Core.Settings.SideKickSyncThemeWithGT == true and gt and tonumber(gt.windowRounding) then
-        rounding = tonumber(gt.windowRounding)
-    end
-
-    local estW = tonumber(State._mainBarLast.w) or 200
-    local estH = tonumber(State._mainBarLast.h) or 30
-
-    if matchGTW and tostring(mainAnchorTarget or '') == 'grouptarget' then
+        local anchorGap = tonumber(Core.Settings.SideKickMainAnchorGap) or 2
+        local rounding = tonumber(Core.Settings.SideKickMainRounding) or 6
         local gt = getStableGroupTargetBounds()
-        local gtW = gt and tonumber(gt.width) or nil
-        if gtW and gtW > 50 then
-            if imgui.SetNextWindowSizeConstraints then
-                imgui.SetNextWindowSizeConstraints(gtW, 10, gtW, 10000)
-            end
-            if imgui.SetNextWindowSize then
-                imgui.SetNextWindowSize(gtW, estH, (ImGuiCond and ImGuiCond.Always) or 0)
-            end
-            estW = gtW
+        if Core.Settings.SideKickSyncThemeWithGT == true and gt and tonumber(gt.windowRounding) then
+            rounding = tonumber(gt.windowRounding)
         end
-    end
 
-    local anchorX, anchorY = Anchor.getAnchorPos(mainAnchorTarget, mainAnchor, estW, estH, anchorGap)
-    local dockedToGT = (tostring(mainAnchorTarget or '') == 'grouptarget') and (anchorX ~= nil and anchorY ~= nil)
-    _G.SideKickDockedToGT = dockedToGT
+        local estW = tonumber(State._mainBarLast.w) or 200
+        local estH = tonumber(State._mainBarLast.h) or 30
 
-    -- Center horizontally above/below GT when not matching width
-    if dockedToGT and not matchGTW and anchorX and gt then
-        local gtW = tonumber(gt.width) or 0
-        if gtW > 0 and (mainAnchor == 'above' or mainAnchor == 'below') then
-            anchorX = anchorX + (gtW - estW) / 2
+        local anchorX, anchorY = Anchor.getAnchorPos(mainAnchorTarget, mainAnchor, estW, estH, anchorGap)
+        -- Consider docked if anchored to any GroupTarget window (group, target, or xtarget)
+    local isGTWindow = (mainAnchorTarget == 'grouptarget' or mainAnchorTarget == 'target' or mainAnchorTarget == 'xtarget' or mainAnchorTarget == 'gt_commandbar')
+        local dockedToGT = isGTWindow and (anchorX ~= nil and anchorY ~= nil)
+        _G.SideKickDockedToGT = dockedToGT
+
+        if anchorX and anchorY and imgui.SetNextWindowPos then
+            local smoothX, smoothY = getSmoothWindowPos('SideKickMain', anchorX, anchorY, 0.25)
+            imgui.SetNextWindowPos(smoothX, smoothY, (ImGuiCond and ImGuiCond.Always) or 0)
+        elseif imgui.SetNextWindowPos then
+            imgui.SetNextWindowPos(50, 160, (ImGuiCond and ImGuiCond.FirstUseEver) or 4)
         end
-    end
 
-    if dockedToGT and imgui.SetNextWindowPos then
-        local smoothX, smoothY = getSmoothWindowPos('SideKickMain', anchorX, anchorY, 0.25)
-        imgui.SetNextWindowPos(smoothX, smoothY, (ImGuiCond and ImGuiCond.Always) or 0)
-    elseif imgui.SetNextWindowPos then
-        imgui.SetNextWindowPos(50, 160, (ImGuiCond and ImGuiCond.FirstUseEver) or 4)
-    end
+        -- Width override (0 = auto)
+        local widthOverride = tonumber(Core.Settings.SideKickMainWidth) or 0
+        if widthOverride > 0 and imgui.SetNextWindowSizeConstraints then
+            imgui.SetNextWindowSizeConstraints(widthOverride, 0, widthOverride, 2000)
+        end
 
-    local flags = (ImGuiWindowFlags and ImGuiWindowFlags.AlwaysAutoResize) or 0
-    if matchGTW then
-        flags = 0
-    end
-    if ImGuiWindowFlags and bit32 and bit32.bor then
-        flags = bit32.bor(
-            flags,
-            ImGuiWindowFlags.NoTitleBar or 0,
-            ImGuiWindowFlags.NoScrollbar or 0,
-            ImGuiWindowFlags.NoCollapse or 0
-        )
-    end
+        local flags = (ImGuiWindowFlags and ImGuiWindowFlags.AlwaysAutoResize) or 0
+        if ImGuiWindowFlags and bit32 and bit32.bor then
+            flags = bit32.bor(
+                flags,
+                ImGuiWindowFlags.NoTitleBar or 0,
+                ImGuiWindowFlags.NoScrollbar or 0,
+                ImGuiWindowFlags.NoCollapse or 0
+            )
+        end
 
-    local pushedTheme = Themes.pushWindowTheme(imgui, themeName, {
-        windowAlpha = 0.92,
-        childAlpha = 0.92 * 0.6,
-        popupAlpha = 0.96,
-        ImGuiCol = ImGuiCol,
-    })
-    imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, rounding)
-    imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, 8, 6)
+        -- Check if using textured theme for transparent background
+        local isTexturedTheme = Themes.isTexturedTheme and Themes.isTexturedTheme(themeName)
+        local pushedTexturedBg = false
+        if isTexturedTheme then
+            imgui.PushStyleColor(ImGuiCol.WindowBg, 0, 0, 0, 0)
+            pushedTexturedBg = true
+        end
 
-    State.open, shown = imgui.Begin('SideKick##MainBar', State.open, flags)
-    if shown then
+        -- Animated theme crossfade (smooth OKLAB blend on theme change)
+        Themes.tweenToTheme(themeName, imgui.GetIO().DeltaTime)
+
+        local pushedTheme = Themes.pushWindowTheme(imgui, themeName, {
+            windowAlpha = 0.92,
+            childAlpha = 0.92 * 0.6,
+            popupAlpha = 0.96,
+            ImGuiCol = ImGuiCol,
+        })
+        imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, rounding)
+        imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, 8, 6)
+
+        State.open, shown = imgui.Begin('SideKick##MainBar', State.open, flags)
+        if shown then
+        -- Draw textured background for ClassicEQ Textured theme
+        -- ShowBorder: true = gold frame for 'classic' style, false = background only (no gold border)
+        local showBorder = settings.SideKickMainShowBorder ~= false
+        if isTexturedTheme then
+            pcall(function()
+                local TextureRenderer = Draw.getTextureRenderer and Draw.getTextureRenderer()
+                if not TextureRenderer then return end
+
+                local dl = imgui.GetWindowDrawList()
+                if not dl then return end
+
+                local winPosX, winPosY = imgui.GetWindowPos()
+                if type(winPosX) == 'table' then
+                    winPosY = winPosX.y or winPosX[2]
+                    winPosX = winPosX.x or winPosX[1]
+                end
+                local winSizeX, winSizeY = imgui.GetWindowSize()
+                if type(winSizeX) == 'table' then
+                    winSizeY = winSizeX.y or winSizeX[2]
+                    winSizeX = winSizeX.x or winSizeX[1]
+                end
+
+                local tintCol = TextureRenderer.parseTintSetting and TextureRenderer.parseTintSetting(settings.SideKickMainTextureTint) or nil
+                local bgStyle = tostring(settings.SideKickMainBgStyle or 'lightrock')
+                local customAnim = tostring(settings.SideKickMainBgTexture or '')
+                local tileCustom = (bgStyle == 'custom') and (settings.SideKickMainBgTile ~= false) or true
+
+                if bgStyle == 'none' then
+                    return
+                elseif bgStyle == 'lightrock' and TextureRenderer.drawLightRockBg then
+                    TextureRenderer.drawLightRockBg(dl, winPosX, winPosY, winSizeX, winSizeY, { rounding = rounding, tintCol = tintCol })
+                    return
+                elseif bgStyle == 'classic' then
+                    -- 'classic' style has gold frame - use it only when showBorder is true
+                    if showBorder and TextureRenderer.drawHotbuttonBg then
+                        TextureRenderer.drawHotbuttonBg(dl, winPosX, winPosY, winSizeX, winSizeY, { rounding = rounding, tintCol = tintCol })
+                    elseif TextureRenderer.drawActionWindowBg then
+                        -- Draw background only (no gold border)
+                        TextureRenderer.drawActionWindowBg(dl, winPosX, winPosY, winSizeX, winSizeY, {
+                            tile = true,
+                            shadows = false,
+                            tintCol = tintCol,
+                        })
+                    end
+                    return
+                end
+
+                -- Fallback to generic tiled background for other styles/custom.
+                local anim = customAnim
+                if bgStyle == 'darkrock' then
+                    anim = 'A_Listbox_Background1'
+                elseif bgStyle == 'action' then
+                    anim = 'ACTW_bg_TX'
+                elseif anim == '' or anim == 'nil' then
+                    anim = 'A_Listbox_Background1'
+                end
+
+                if TextureRenderer.drawTiledAnimBg then
+                    TextureRenderer.drawTiledAnimBg(dl, winPosX, winPosY, winSizeX, winSizeY, anim, {
+                        rounding = rounding,
+                        tintCol = tintCol,
+                        tile = tileCustom,
+                    })
+                elseif TextureRenderer.drawActionWindowBg and anim == 'A_Listbox_Background1' then
+                    TextureRenderer.drawActionWindowBg(dl, winPosX, winPosY, winSizeX, winSizeY, {
+                        tile = tileCustom,
+                        tintCol = tintCol,
+                        shadows = false,
+                    })
+                end
+            end)
+        end
+
+        -- Add extra button spacing for textured themes
+        local pushedItemSpacing = false
+        local isTextured = Themes.isTexturedTheme and Themes.isTexturedTheme(themeName)
+        if isTextured then
+            imgui.PushStyleVar(ImGuiStyleVar.ItemSpacing, 8, 4)
+            pushedItemSpacing = 1
+        end
+
+        -- Read button scale setting
+        local btnScale = tonumber(Core.Settings.SideKickMainButtonScale) or 1.0
+        -- Push scaled FramePadding so buttonW() reads correct padding for centering
+        local pushedBtnScale = false
+        if btnScale ~= 1.0 then
+            imgui.PushStyleVar(ImGuiStyleVar.FramePadding, math.floor(4 * btnScale), math.floor(2 * btnScale))
+            pushedBtnScale = true
+        end
+
         local assistOn = Core.Settings.AssistEnabled == true
         local chaseOn = Core.Settings.ChaseEnabled == true
         local burnOn = Core.Settings.BurnActive == true
@@ -684,29 +930,25 @@ local function draw()
             table.insert(parts, { kind = 'btn', label = 'Chase##sk' })
             table.insert(parts, { kind = 'btn', label = 'Burn##sk' })
 
-            if dockedToGT then
-                table.insert(parts, { kind = 'txt', text = '|' })
-                table.insert(parts, { kind = 'btn', label = inviteLabel })
-                table.insert(parts, { kind = 'btn', label = 'Disband##grp' })
-                table.insert(parts, { kind = 'txt', text = '|' }) -- divider between Disband and AFollow
-                table.insert(parts, { kind = 'btn', label = 'AFollow##grp' })
-                table.insert(parts, { kind = 'btn', label = 'GChase##grp' })
-                table.insert(parts, { kind = 'btn', label = 'Come##grp' })
-                table.insert(parts, { kind = 'btn', label = 'Travel##grp' })
-                table.insert(parts, { kind = 'btn', label = 'Mimic##grp' })
-                table.insert(parts, { kind = 'btn', label = 'Doors##grp' })
-            end
+            -- Always show group control buttons (no longer requires docking)
+            table.insert(parts, { kind = 'txt', text = '|' })
+            table.insert(parts, { kind = 'btn', label = inviteLabel })
+            table.insert(parts, { kind = 'btn', label = 'Disband##grp' })
+            table.insert(parts, { kind = 'txt', text = '|' }) -- divider between Disband and AFollow
+            table.insert(parts, { kind = 'btn', label = 'AFollow##grp' })
+            table.insert(parts, { kind = 'btn', label = 'GChase##grp' })
+            table.insert(parts, { kind = 'btn', label = 'Come##grp' })
+            table.insert(parts, { kind = 'btn', label = 'Travel##grp' })
+            table.insert(parts, { kind = 'btn', label = 'Mimic##grp' })
+            table.insert(parts, { kind = 'btn', label = 'Doors##grp' })
 
             table.insert(parts, { kind = 'txt', text = '|' })
             table.insert(parts, { kind = 'btn', label = tostring(cogIcon) .. '##SideKickSettings' })
-            if dockedToGT then
-                local lockIcon = (Icons and Icons.FA_LOCK or 'L')
-                table.insert(parts, { kind = 'btn', label = tostring(lockIcon) .. '##GTLock' })
-                table.insert(parts, { kind = 'btn', label = tostring(gtSettingsIcon) .. '##GTSettings' })
-                table.insert(parts, { kind = 'btn', label = tostring(closeIcon) .. '##ExitBoth' })
-            else
-                table.insert(parts, { kind = 'btn', label = tostring(closeIcon) .. '##SideKickClose' })
-            end
+            -- Always show GT control buttons (no longer requires docking)
+            local lockIcon = (Icons and Icons.FA_LOCK or 'L')
+            table.insert(parts, { kind = 'btn', label = tostring(lockIcon) .. '##GTLock' })
+            table.insert(parts, { kind = 'btn', label = tostring(gtSettingsIcon) .. '##GTSettings' })
+            table.insert(parts, { kind = 'btn', label = tostring(closeIcon) .. '##ExitBoth' })
 
             local totalW = 0
             local spacingX = 0
@@ -732,42 +974,45 @@ local function draw()
             imgui.SetCursorPosX(curX + offset)
         end
 
+        -- Pop the centering FramePadding; each button function pushes its own
+        if pushedBtnScale then imgui.PopStyleVar() end
+
         local pausedOn = Core.Settings.AutomationPaused == true
         toggleButton('Pause##sk', pausedOn, function()
             enqueue(function() Core.set('AutomationPaused', not pausedOn) end)
-        end)
+        end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Pause all automation') end
 
         imgui.SameLine()
         toggleButton('Assist##sk', assistOn, function()
             enqueue(function() Core.set('AssistEnabled', not assistOn) end)
-        end)
+        end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Toggle Assist') end
 
         imgui.SameLine()
         toggleButton('Chase##sk', chaseOn, function()
             enqueue(function() Core.set('ChaseEnabled', not chaseOn) end)
-        end)
+        end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Toggle Chase') end
 
         imgui.SameLine()
         toggleButton('Burn##sk', burnOn, function()
             enqueue(function() Core.set('BurnActive', not burnOn) end)
-        end)
+        end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Toggle Burn phase') end
 
-        if dockedToGT then
-            imgui.SameLine()
-            imgui.Text('|')
-            imgui.SameLine()
+        -- Always show group control buttons (no longer requires docking)
+        imgui.SameLine()
+        imgui.Text('|')
+        imgui.SameLine()
 
-            if animatedButton(inviteLabel) then
-                mq.cmd('/keypress ctrl+i')
-            end
-            if imgui.IsItemHovered() then imgui.SetTooltip(isInvited and 'Accept group invite' or 'Invite target to group') end
+        if animatedButton(inviteLabel, btnScale) then
+            mq.cmd('/keypress ctrl+i')
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(isInvited and 'Accept group invite' or 'Invite target to group') end
 
             imgui.SameLine()
-            if animatedButton('Disband##grp') then
+            if animatedButton('Disband##grp', btnScale) then
                 mq.cmdf('/disband')
             end
             if imgui.IsItemHovered() then imgui.SetTooltip('Disband group') end
@@ -787,7 +1032,7 @@ local function draw()
                     mq.cmdf('/squelch %s /afollow spawn ${Me.ID}', dgCmd)
                     _G.GroupTargetFollowing = true
                 end
-            end)
+            end, btnScale)
             if imgui.IsItemHovered() then imgui.SetTooltip('Toggle /afollow for group (broadcast)') end
 
             imgui.SameLine()
@@ -801,11 +1046,11 @@ local function draw()
                 else
                     mq.cmdf('/squelch %s /skchaseoff', dgCmd)
                 end
-            end)
+            end, btnScale)
             if imgui.IsItemHovered() then imgui.SetTooltip('Toggle group chase (broadcast)') end
 
             imgui.SameLine()
-            if animatedButton('Come##grp') then
+            if animatedButton('Come##grp', btnScale) then
                 local inRaid = (tonumber(mq.TLO.Raid and mq.TLO.Raid.Members and mq.TLO.Raid.Members() or 0) or 0) > 0
                 local dgCmd = inRaid and '/dgre' or '/dgge'
                 mq.cmdf('/squelch %s /nav id %d', dgCmd, mq.TLO.Me.ID() or 0)
@@ -813,7 +1058,7 @@ local function draw()
             if imgui.IsItemHovered() then imgui.SetTooltip('Tell group to nav to you (broadcast)') end
 
             imgui.SameLine()
-            if animatedButton('Travel##grp') then
+            if animatedButton('Travel##grp', btnScale) then
                 local inRaid = (tonumber(mq.TLO.Raid and mq.TLO.Raid.Members and mq.TLO.Raid.Members() or 0) or 0) > 0
                 local dgCmd = inRaid and '/dgex' or '/dgge'
                 mq.cmdf('/squelch %s /travelto %s', dgCmd, mq.TLO.Zone.ShortName() or '')
@@ -824,16 +1069,15 @@ local function draw()
             local mimicActive = _G.GroupTargetMimicToggle or false
             toggleButton('Mimic##grp', mimicActive, function()
                 _G.GroupTargetMimicToggle = not mimicActive
-            end)
+            end, btnScale)
             if imgui.IsItemHovered() then imgui.SetTooltip('Toggle group mimic mode (local)') end
 
             imgui.SameLine()
-            if animatedButton('Doors##grp') then
+            if animatedButton('Doors##grp', btnScale) then
                 mq.cmd('/dga /doortarget')
                 mq.cmd('/dga /click left door')
             end
             if imgui.IsItemHovered() then imgui.SetTooltip('Target nearest door and click it (broadcast)') end
-        end
 
         imgui.SameLine()
         imgui.Text('|')
@@ -845,60 +1089,48 @@ local function draw()
             imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.3, 0.7, 0.9, 1.0)
             imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.1, 0.5, 0.7, 1.0)
         end
-        if animatedSmallButton(tostring(cogIcon) .. '##SideKickSettings') then
+        if animatedSmallButton(tostring(cogIcon) .. '##SideKickSettings', btnScale) then
             State.settingsOpen = not State.settingsOpen
         end
         if wasOpen then imgui.PopStyleColor(3) end
         if imgui.IsItemHovered() then imgui.SetTooltip(State.settingsOpen and 'Close Options' or 'Open Options') end
 
-        if dockedToGT then
-            imgui.SameLine()
-            -- Lock button for GroupTarget
-            local gt = getStableGroupTargetBounds()
-            local gtLocked = gt and gt.locked == true
-            local lockIcon = gtLocked and (Icons and Icons.FA_LOCK or 'L') or (Icons and Icons.FA_UNLOCK or 'U')
-            if gtLocked then
-                imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.5, 0.1, 0.9)
-                imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.7, 0.6, 0.2, 1.0)
-                imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.4, 0.1, 1.0)
-            end
-            if animatedSmallButton(tostring(lockIcon) .. '##GTLock') then
-                ActorsCoordinator.sendToGroupTarget({ id = 'sidekick:toggle_lock' })
-            end
-            if gtLocked then imgui.PopStyleColor(3) end
-            if imgui.IsItemHovered() then imgui.SetTooltip(gtLocked and 'Unlock GroupTarget Position' or 'Lock GroupTarget Position') end
-
-            imgui.SameLine()
-            if animatedSmallButton(tostring(gtSettingsIcon) .. '##GTSettings') then
-                ActorsCoordinator.sendToGroupTarget({ id = 'sidekick:toggle_settings' })
-            end
-            if imgui.IsItemHovered() then imgui.SetTooltip('GroupTarget Settings') end
-
-            -- Exit Both button
-            imgui.SameLine()
-            imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.2, 0.2, 0.8)
-            imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 1.0)
-            imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.1, 0.1, 1.0)
-            if animatedSmallButton(tostring(closeIcon) .. '##ExitBoth') then
-                ActorsCoordinator.sendToGroupTarget({ id = 'sidekick:exit' })
-                State.settingsOpen = false
-                State.open = false
-                State.isRunning = false  -- Terminate the script
-            end
-            imgui.PopStyleColor(3)
-            if imgui.IsItemHovered() then imgui.SetTooltip('Exit Both (SideKick + GroupTarget on this character)') end
-        else
-            imgui.SameLine()
-            imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.2, 0.2, 0.8)
-            imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 1.0)
-            imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.1, 0.1, 1.0)
-            if animatedSmallButton(tostring(closeIcon) .. '##SideKickClose') then
-                State.settingsOpen = false
-                State.open = false
-            end
-            imgui.PopStyleColor(3)
-            if imgui.IsItemHovered() then imgui.SetTooltip('Close SideKick UI') end
+        -- Always show GT control buttons (no longer requires docking)
+        imgui.SameLine()
+        -- Lock button for GroupTarget
+        local gt = getStableGroupTargetBounds()
+        local gtLocked = gt and gt.locked == true
+        local lockIcon = gtLocked and (Icons and Icons.FA_LOCK or 'L') or (Icons and Icons.FA_UNLOCK or 'U')
+        if gtLocked then
+            imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.5, 0.1, 0.9)
+            imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.7, 0.6, 0.2, 1.0)
+            imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.4, 0.1, 1.0)
         end
+        if animatedSmallButton(tostring(lockIcon) .. '##GTLock', btnScale) then
+            ActorsCoordinator.sendToGroupTarget({ id = 'sidekick:toggle_lock' })
+        end
+        if gtLocked then imgui.PopStyleColor(3) end
+        if imgui.IsItemHovered() then imgui.SetTooltip(gtLocked and 'Unlock GroupTarget Position' or 'Lock GroupTarget Position') end
+
+        imgui.SameLine()
+        if animatedSmallButton(tostring(gtSettingsIcon) .. '##GTSettings', btnScale) then
+            ActorsCoordinator.sendToGroupTarget({ id = 'sidekick:toggle_settings' })
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip('GroupTarget Settings') end
+
+        -- Exit Both button
+        imgui.SameLine()
+        imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.2, 0.2, 0.8)
+        imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 1.0)
+        imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.5, 0.1, 0.1, 1.0)
+        if animatedSmallButton(tostring(closeIcon) .. '##ExitBoth', btnScale) then
+            ActorsCoordinator.sendToGroupTarget({ id = 'sidekick:exit' })
+            State.settingsOpen = false
+            State.open = false
+            State.isRunning = false  -- Terminate the script
+        end
+        imgui.PopStyleColor(3)
+        if imgui.IsItemHovered() then imgui.SetTooltip('Exit Both (SideKick + GroupTarget on this character)') end
 
         local px, py = vec2xy(imgui.GetWindowPos())
         local pw, ph = vec2xy(imgui.GetWindowSize())
@@ -912,49 +1144,84 @@ local function draw()
             anchorTarget = mainAnchorTarget,
             syncThemeWithGT = Core.Settings.SideKickSyncThemeWithGT == true,
             activeTheme = tostring(Core.Settings.SideKickTheme or 'Classic'),
+            settingsOpen = State.settingsOpen == true,
             x = px,
             y = py,
             width = pw,
             height = ph,
         }
+        -- Export settings for external scripts (GroupTarget command bar)
+        _G.SideKickSettings = Core.Settings
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_main', imgui)
         end
+
+        -- Pop item spacing if we pushed it for textured theme
+        if pushedItemSpacing then imgui.PopStyleVar(pushedItemSpacing) end
     end
 
-    imgui.End()
-    imgui.PopStyleVar(2)
-    if pushedTheme > 0 then imgui.PopStyleColor(pushedTheme) end
+        imgui.End()
+        imgui.PopStyleVar(2)
+        if pushedTheme > 0 then imgui.PopStyleColor(pushedTheme) end
+        if pushedTexturedBg then imgui.PopStyleColor() end
+    end
 
     local openTarget = State.settingsOpen and 1.0 or 0.0
+    local manualOptions = Core.Settings.SideKickOptionsManual ~= false
     local heightFactor = openTarget
-    if ImAnim and ImAnim.spring then
-        heightFactor = ImAnim.spring('sk_settings_height', openTarget, 200, 20)
+    if not manualOptions and iam and iam.TweenFloat then
+        heightFactor = iam.TweenFloat('sk_settings_height', imgui.GetID('hfactor'), openTarget, 0.5, iam.EaseSpring(1.0, 200, 20, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
-    if heightFactor > 0.01 then
+    if (manualOptions and State.settingsOpen) or (not manualOptions and heightFactor > 0.01) then
         local mainX = tonumber(State._mainBarLast.x) or 50
         local mainY = tonumber(State._mainBarLast.y) or 160
         local mainW = math.max(350, tonumber(State._mainBarLast.w) or 350)
         local settingsH = math.max(90, math.floor(480 * heightFactor + 0.5))
         local settingsY = mainY - settingsH - 2
 
+        local optW = tonumber(Core.Settings.SideKickOptionsWidth) or 0
+        if optW <= 0 then optW = mainW end
+        local optH = tonumber(Core.Settings.SideKickOptionsHeight) or 0
+        if optH <= 0 then optH = 480 end
+        local optX = tonumber(Core.Settings.SideKickOptionsPosX)
+        local optY = tonumber(Core.Settings.SideKickOptionsPosY)
+
         if imgui.SetNextWindowPos then
-            imgui.SetNextWindowPos(mainX, settingsY, (ImGuiCond and ImGuiCond.Always) or 0)
+            if manualOptions then
+                local px = optX
+                local py = optY
+                if px == nil or py == nil or px < 0 or py < 0 then
+                    px = mainX
+                    py = mainY - optH - 2
+                end
+                imgui.SetNextWindowPos(px, py, (ImGuiCond and ImGuiCond.FirstUseEver) or 4)
+            else
+                imgui.SetNextWindowPos(mainX, settingsY, (ImGuiCond and ImGuiCond.Always) or 0)
+            end
         end
         if imgui.SetNextWindowSize then
-            imgui.SetNextWindowSize(mainW, settingsH, (ImGuiCond and ImGuiCond.Always) or 0)
+            if manualOptions then
+                imgui.SetNextWindowSize(optW, optH, (ImGuiCond and ImGuiCond.FirstUseEver) or 4)
+            else
+                imgui.SetNextWindowSize(mainW, settingsH, (ImGuiCond and ImGuiCond.Always) or 0)
+            end
         end
 
         local sFlags = 0
         if ImGuiWindowFlags and bit32 and bit32.bor then
             sFlags = bit32.bor(
                 ImGuiWindowFlags.NoTitleBar or 0,
-                ImGuiWindowFlags.NoResize or 0,
-                ImGuiWindowFlags.NoMove or 0,
                 ImGuiWindowFlags.NoCollapse or 0,
                 ImGuiWindowFlags.NoScrollbar or 0
             )
+            if not manualOptions then
+                sFlags = bit32.bor(
+                    sFlags,
+                    ImGuiWindowFlags.NoResize or 0,
+                    ImGuiWindowFlags.NoMove or 0
+                )
+            end
         end
 
         local pushedTheme2 = Themes.pushWindowTheme(imgui, themeName, {
@@ -998,6 +1265,14 @@ local function draw()
                 if imgui.BeginTabItem('Options') then
                     local debugSettings = Core.Settings.SideKickDebugSettings == true
                     local themeNames = Themes.getThemeNames()
+
+                    -- DEBUG: Log theme info once per second
+                    State._lastThemeDebugLog = State._lastThemeDebugLog or 0
+                    if os.clock() - State._lastThemeDebugLog > 1.0 then
+                        State._lastThemeDebugLog = os.clock()
+                        print(string.format('\aw[SideKick] Options tab: %d themes, current=%s\ax', #themeNames, tostring(Core.Settings.SideKickTheme or 'nil')))
+                    end
+
                     if debugSettings then
                         local TL = getThrottledLog()
                         if TL and TL.log then
@@ -1028,10 +1303,13 @@ local function draw()
                         Core.Settings,
                         themeNames,
                         function(key, value)
+                            print(string.format('\ay[SideKick] onChange called: key=%s value=%s\ax', tostring(key), tostring(value)))
                             if tostring(key) == 'SideKickTheme' then
                                 State._themeLocalSetAt = os.clock()
+                                print(string.format('\ag[SideKick] Theme change detected, holdUntil set to %.2f\ax', State._themeLocalSetAt + 5.0))
                             end
                             Core.set(key, value)
+                            print(string.format('\ag[SideKick] Core.set completed, new value=%s\ax', tostring(Core.Settings[tostring(key)])))
                         end
                     )
 
@@ -1188,6 +1466,24 @@ local function draw()
                     end
                 end
             end
+
+            if manualOptions then
+                local winX, winY = vec2xy(imgui.GetWindowPos())
+                local winW, winH = vec2xy(imgui.GetWindowSize())
+                if imgui.IsMouseReleased then
+                    local okRel, released = pcall(imgui.IsMouseReleased, 0)
+                    if okRel and released then
+                        local rx = math.floor((winX or 0) + 0.5)
+                        local ry = math.floor((winY or 0) + 0.5)
+                        local rw = math.floor((winW or 0) + 0.5)
+                        local rh = math.floor((winH or 0) + 0.5)
+                        if Core.Settings.SideKickOptionsPosX ~= rx then Core.set('SideKickOptionsPosX', rx) end
+                        if Core.Settings.SideKickOptionsPosY ~= ry then Core.set('SideKickOptionsPosY', ry) end
+                        if Core.Settings.SideKickOptionsWidth ~= rw then Core.set('SideKickOptionsWidth', rw) end
+                        if Core.Settings.SideKickOptionsHeight ~= rh then Core.set('SideKickOptionsHeight', rh) end
+                    end
+                end
+            end
         end
         imgui.End()
         imgui.PopStyleVar(2)
@@ -1272,15 +1568,16 @@ local function tickAutomation()
         end
     end
 
-    -- Buff casting - only when not in priority healing mode and ability automation allowed
-    if allowAbilityAutomation and not priorityHealingActive then
-        Buff.buffTick()
-    else
-        if debugAutomationLogging and TL then
-            TL.log('buff_tick_skip', 15, 'Buff.buffTick SKIP: allowAbilityAutomation=%s, priorityHealingActive=%s',
-                tostring(allowAbilityAutomation), tostring(priorityHealingActive))
-        end
-    end
+    -- Buff casting - DISABLED: Now handled by sk_buffs.lua coordinator module
+    -- if allowAbilityAutomation and not priorityHealingActive then
+    --     Buff.buffTick()
+    -- else
+    --     if debugAutomationLogging and TL then
+    --         TL.log('buff_tick_skip', 15, 'Buff.buffTick SKIP: allowAbilityAutomation=%s, priorityHealingActive=%s',
+    --             tostring(allowAbilityAutomation), tostring(priorityHealingActive))
+    --     end
+    -- end
+    -- NOTE: Buff.tick() is still called above (line ~1223) for broadcast/cleanup tasks (non-casting logic)
 
     Burn.tick()
 
@@ -1305,11 +1602,11 @@ local function tickAutomation()
         Items.tick()
     end
 
-    -- Meditation (sit/stand) should run last to avoid fighting with casting/movement actions.
-    if playStyle ~= 'manual' and Meditation and Meditation.tick then
-        debugLog('[MedTick] calling meditation.tick playStyle=%s mode=%s', tostring(playStyle), tostring(Core.Settings.MeditationMode or 'unknown'))
-        Meditation.tick(Core.Settings)
-    end
+    -- Meditation (sit/stand) - DISABLED: Now handled by sk_meditation.lua coordinator module
+    -- if playStyle ~= 'manual' and Meditation and Meditation.tick then
+    --     debugLog('[MedTick] calling meditation.tick playStyle=%s mode=%s', tostring(playStyle), tostring(Core.Settings.MeditationMode or 'unknown'))
+    --     Meditation.tick(Core.Settings)
+    -- end
 end
 
 local function syncModulesFromSettings()
@@ -1321,7 +1618,7 @@ local function syncModulesFromSettings()
     if Core.Settings.SideKickSyncThemeWithGT == true then
         local gt = _G.GroupTargetBounds
         local gtTheme = gt and tostring(gt.activeTheme or '') or ''
-        local localHoldUntil = (State._themeLocalSetAt or 0) + 1.0
+        local localHoldUntil = (State._themeLocalSetAt or 0) + 5.0  -- Hold for 5 seconds after manual change
         if now >= localHoldUntil and gtTheme ~= '' and gtTheme ~= tostring(Core.Settings.SideKickTheme or '') then
             if (now - (State.lastThemeSyncAt or 0)) >= 1.0 then
                 State.lastThemeSyncAt = now
@@ -1520,6 +1817,7 @@ local function main()
     -- Initialize new enhancement modules
     RemoteAbilities.init()
     AggroWarning.init()
+    CoordinatorDebug.init()
 
     -- Initialize runtime cache, action executor, CC, cures, and spell engine
     RuntimeCache.init()
@@ -1592,6 +1890,8 @@ local function main()
         elseif a1 == 'actorsdebug' then
             -- Opens actors debug window instead of echoing
             ActorsDebug.toggle()
+        elseif a1 == 'coord' or a1 == 'coordinator' then
+            CoordinatorDebug.toggle()
         elseif a1 == 'cache' then
             -- Debug command disabled (no in-game output)
         elseif a1 == 'cc' then
@@ -1658,6 +1958,10 @@ local function main()
             if OocExec and OocExec.debugPrint then
                 OocExec.debugPrint()
             end
+        elseif a1 == 'settings' or a1 == 'options' or a1 == 'config' then
+            -- Toggle settings panel (also ensures main window is open)
+            State.open = true
+            State.settingsOpen = not State.settingsOpen
         else
             State.open = not State.open
         end
@@ -1694,6 +1998,12 @@ local function main()
     end)
 
     mq.imgui.init('SideKick', function()
+        -- Apply font scale for high-resolution monitors
+        local fontScale = tonumber(Core.Settings.SideKickFontScale) or 1.0
+        if fontScale ~= 1.0 then
+            imgui.PushFont(imgui.GetFont(), imgui.GetFontSize() * fontScale)
+        end
+
         if Core.Settings.SideKickBarEnabled ~= false then
             Bar.draw({
                 abilities = State.barAbilities,
@@ -1712,6 +2022,7 @@ local function main()
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
                 onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                onSettingChange = function(key, value) Core.set(key, value) end,
             })
         end
 
@@ -1739,6 +2050,7 @@ local function main()
         RemoteAbilities.draw()
         AggroWarning.draw()
         ActorsDebug.render()
+        CoordinatorDebug.render()
         SpellSetEditor.render()
 
         -- Healing monitor (new healing intelligence module)
@@ -1752,6 +2064,11 @@ local function main()
 
         -- First-run autostart prompt (modal popup)
         drawAutostartPrompt()
+
+        -- Restore original font scale
+        if fontScale ~= 1.0 then
+            imgui.PopFont()
+        end
     end)
 
     while State.isRunning and mq.TLO.MacroQuest.GameState() == 'INGAME' do
@@ -1772,11 +2089,11 @@ local function main()
             CombatSpellExecutor.process()
         end
 
-        -- Process OOC buffs (must be in main loop for mq.delay)
-        local OocBuffExecutor = getOocBuffExecutor()
-        if OocBuffExecutor and OocBuffExecutor.process then
-            OocBuffExecutor.process()
-        end
+        -- Process OOC buffs - DISABLED: Now handled by sk_buffs.lua coordinator module
+        -- local OocBuffExecutor = getOocBuffExecutor()
+        -- if OocBuffExecutor and OocBuffExecutor.process then
+        --     OocBuffExecutor.process()
+        -- end
 
         -- Check for zone change (immune database)
         ImmuneDB.loadZone()
@@ -1793,7 +2110,7 @@ local function main()
                 mode = tostring(mode or 'none'):lower()
                 if mode == 'none' then return false end
                 target = Anchor and Anchor.normalizeTargetKey and Anchor.normalizeTargetKey(target or 'grouptarget') or tostring(target or 'grouptarget'):lower()
-                return target == 'grouptarget'
+                return target == 'grouptarget' or target == 'gt_commandbar'
             end
             local docked = (
                 anchoredToGT(Core.Settings.SideKickBarAnchor, Core.Settings.SideKickBarAnchorTarget)
@@ -1808,6 +2125,9 @@ local function main()
                 abilities = State.abilities,
                 cooldownProbe = cooldownRemaining,
                 chase = Core.Settings.ChaseEnabled == true,
+                assistEnabled = Core.Settings.AssistEnabled == true,
+                burnActive = Core.Settings.BurnActive == true,
+                settingsOpen = State.settingsOpen == true,
             })
             ActorsCoordinator.tick({ status = status })
 
