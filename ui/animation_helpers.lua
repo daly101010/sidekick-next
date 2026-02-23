@@ -493,8 +493,11 @@ end
 -- ENHANCED COOLDOWN OVERLAY
 -- ============================================================
 
-function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, IM_COL32, dlAddRectFilled, dlAddRect, themeName)
+function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, IM_COL32_fn, dlAddRectFilled_fn, dlAddRect_fn, themeName)
     if not dl then return end
+    IM_COL32_fn = IM_COL32_fn or Draw.IM_COL32
+    dlAddRectFilled_fn = dlAddRectFilled_fn or Draw.addRectFilled
+    dlAddRect_fn = dlAddRect_fn or Draw.addRect
 
     rem = tonumber(rem) or 0
     total = tonumber(total) or 0
@@ -503,38 +506,69 @@ function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId,
     -- Check for cooldown completion (triggers pulse)
     M.checkCooldownCompletion(uniqueId, onCooldown)
 
+    local rounding = math.floor((maxX - minX) * C.LAYOUT.BUTTON_ROUNDING_PCT)
+
     -- Ready state: enhanced pulsing glow
     if not onCooldown then
         local pulse = M.getReadyGlow()
         local glowAlpha = math.floor(pulse * C.COLORS.READY_GLOW_ALPHA_MAX)
         local readyRGB = Colors.ready(themeName)
-        local glowColor = IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], glowAlpha)
-        dlAddRect(dl, minX - 1, minY - 1, maxX + 1, maxY + 1, glowColor, 0, 0, 2)
+        local glowColor = IM_COL32_fn(readyRGB[1], readyRGB[2], readyRGB[3], glowAlpha)
+        dlAddRect_fn(dl, minX - 1, minY - 1, maxX + 1, maxY + 1, glowColor, rounding, 0, 2)
         return
     end
 
     local pct = (total > 0) and (rem / total) or 1
     pct = math.max(0, math.min(1, pct))
 
-    local fillH = math.max(2, math.floor((maxY - minY) * pct + 0.5))
-    local fillY = maxY - fillH
-
     -- Get smoothly interpolated color via OKLAB
     local r, g, b = M.getCooldownColor(uniqueId, pct)
-
-    -- Convert 0-1 to 0-255
     local r255 = math.floor(r * 255)
     local g255 = math.floor(g * 255)
     local b255 = math.floor(b * 255)
 
-    -- Draw overlay
-    dlAddRectFilled(dl, minX, minY, maxX, maxY, IM_COL32(0, 0, 0, C.COLORS.COOLDOWN_OVERLAY_ALPHA), 0, 0)
-    dlAddRectFilled(dl, minX, fillY, maxX, maxY, IM_COL32(r255, g255, b255, C.COLORS.COOLDOWN_FILL_ALPHA), 0, 0)
-    dlAddRect(dl, minX, minY, maxX, maxY, IM_COL32(r255, g255, b255, C.COLORS.COOLDOWN_BORDER_ALPHA), 0, 0, 2)
+    -- Radial sweep cooldown: dark overlay + colored pie reveal
+    local cx = (minX + maxX) / 2
+    local cy = (minY + maxY) / 2
+    local radius = math.max(maxX - minX, maxY - minY) * 0.71  -- diagonal to cover corners
+    local completePct = 1.0 - pct  -- 0 = just started, 1 = done
+    local overlayAlpha = C.COLORS.COOLDOWN_OVERLAY_ALPHA
+    local tintAlpha = math.floor(C.COLORS.COOLDOWN_FILL_ALPHA * 0.5)
 
-    -- Cooldown text with matching color
-    if helpers and helpers.fmtCooldown then
-        local txt = helpers.fmtCooldown(rem)
+    -- Draw the REVEALED portion as clear (no overlay) via clipping:
+    -- Strategy: draw dark pie for the REMAINING cooldown portion only
+    if completePct < 0.999 then
+        local startAngle = -math.pi / 2  -- 12 o'clock
+        local remainStart = startAngle + completePct * math.pi * 2
+        local remainEnd = startAngle + math.pi * 2
+
+        -- Dark overlay pie (remaining portion)
+        Draw.pathClear(dl)
+        Draw.pathLineTo(dl, cx, cy)
+        Draw.pathArcTo(dl, cx, cy, radius, remainStart, remainEnd, 32)
+        Draw.pathFillConvex(dl, IM_COL32_fn(0, 0, 0, overlayAlpha))
+
+        -- Colored tint pie (remaining portion)
+        Draw.pathClear(dl)
+        Draw.pathLineTo(dl, cx, cy)
+        Draw.pathArcTo(dl, cx, cy, radius, remainStart, remainEnd, 32)
+        Draw.pathFillConvex(dl, IM_COL32_fn(r255, g255, b255, tintAlpha))
+    else
+        -- Fully on cooldown: dark overlay on entire cell
+        dlAddRectFilled_fn(dl, minX, minY, maxX, maxY, IM_COL32_fn(0, 0, 0, overlayAlpha), rounding)
+        dlAddRectFilled_fn(dl, minX, minY, maxX, maxY, IM_COL32_fn(r255, g255, b255, tintAlpha), rounding)
+    end
+
+    -- Cooldown border
+    dlAddRect_fn(dl, minX, minY, maxX, maxY,
+        IM_COL32_fn(r255, g255, b255, C.COLORS.COOLDOWN_BORDER_ALPHA), rounding, 0, 1)
+
+    -- Countdown text centered
+    if rem > 0 then
+        local txt = rem >= 10 and string.format('%d', math.ceil(rem)) or string.format('%.1f', rem)
+        if helpers and helpers.fmtCooldown then
+            txt = helpers.fmtCooldown(rem)
+        end
         M.drawOutlinedText(minX + 3, maxY - imgui.GetTextLineHeight() - 2, txt, r, g, b)
     end
 end
