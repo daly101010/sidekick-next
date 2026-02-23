@@ -52,6 +52,13 @@ local _lastHpValues = {}
 local _damageFlashState = {}
 local _toggleStates = {}
 
+-- Clip-based stagger entry animation state
+local _gridEntryClipDefined = false
+local _ALPHA_CH = nil
+local _SCALE_CH = nil
+local _OFFSET_CH = nil
+local _gridEntryClipId = nil
+
 -- Animation ID cache to avoid string concatenation per frame
 local _idCache = {}
 local _idCacheHits = 0
@@ -582,6 +589,25 @@ end
 -- STAGGER ANIMATION SUPPORT
 -- ============================================================
 
+-- Lazy-init the grid entry clip (defines keyframes for alpha, scale, offsetY)
+local function ensureGridEntryClip()
+    if _gridEntryClipDefined then return end
+    _gridEntryClipDefined = true
+    _ALPHA_CH  = imgui.GetID('ge_alpha')
+    _SCALE_CH  = imgui.GetID('ge_scale')
+    _OFFSET_CH = imgui.GetID('ge_offset')
+    _gridEntryClipId = imgui.GetID('gridEntry')
+
+    IamClip.Begin(_gridEntryClipId)
+        :KeyFloat(_ALPHA_CH, 0.0, 0.0, IamEaseType.Linear)
+        :KeyFloat(_ALPHA_CH, C.ANIMATION.STAGGER_DURATION, 1.0, IamEaseType.OutCubic)
+        :KeyFloat(_SCALE_CH, 0.0, 0.85, IamEaseType.Linear)
+        :KeyFloat(_SCALE_CH, C.ANIMATION.STAGGER_DURATION, 1.0, IamEaseType.OutBack)
+        :KeyFloat(_OFFSET_CH, 0.0, 15.0, IamEaseType.Linear)
+        :KeyFloat(_OFFSET_CH, C.ANIMATION.STAGGER_DURATION, 0.0, IamEaseType.OutCubic)
+        :End()
+end
+
 function M.updateStaggerFrame()
     -- No-op: native ImAnim handles frame updates automatically
 end
@@ -629,81 +655,41 @@ function M.getGridEntryElapsed(gridKey)
     return os.clock() - entryTime
 end
 
--- Staggered scale-in for grid items (elastic ease-out)
+-- Staggered scale-in for grid items (delegates to clip-based transform)
 function M.getStaggeredEntryScale(gridKey, idx, total)
-    if not featureEnabled('StaggerAnimationEnabled') then return 1.0 end
-
-    local alpha = M.getStaggerAlpha(gridKey, idx, total, C.ANIMATION.STAGGER_DELAY)
-
-    if alpha >= 1.0 then return 1.0 end
-    if alpha <= 0 then return 0.5 end
-
-    -- Elastic ease-out for bouncy scale-in
-    local t = alpha
-    local elasticT
-    if t == 0 or t == 1 then
-        elasticT = t
-    else
-        -- Attempt elastic with reduced overshoot for subtlety
-        local p = 0.4
-        elasticT = math.pow(2, -10 * t) * math.sin((t - p / 4) * (2 * math.pi) / p) + 1
-    end
-
-    -- Scale from 0.7 to 1.0
-    return 0.7 + 0.3 * math.min(1, math.max(0, elasticT))
+    local scale, _, _, _ = M.getStaggeredEntryTransform(gridKey, idx, total)
+    return scale
 end
 
--- Staggered Y offset for slide-up effect
+-- Staggered Y offset for slide-up effect (delegates to clip-based transform)
 function M.getStaggeredEntryOffsetY(gridKey, idx, total, maxOffset)
-    if not featureEnabled('StaggerAnimationEnabled') then return 0 end
-
-    maxOffset = maxOffset or 12
-    local alpha = M.getStaggerAlpha(gridKey, idx, total, C.ANIMATION.STAGGER_DELAY)
-
-    if alpha >= 1.0 then return 0 end
-    if alpha <= 0 then return maxOffset end
-
-    -- Ease-out cubic for smooth deceleration
-    local t = alpha
-    local eased = 1 - math.pow(1 - t, 3)
-
-    return maxOffset * (1 - eased)
+    local _, _, offsetY, _ = M.getStaggeredEntryTransform(gridKey, idx, total)
+    return offsetY
 end
 
 -- Combined entry transform: returns scale, offsetX, offsetY, alpha
+-- Uses IamClip keyframe playback with per-item stagger delay
 function M.getStaggeredEntryTransform(gridKey, idx, total, opts)
-    opts = opts or {}
-    local maxOffsetY = opts.maxOffsetY or 12
-    local maxOffsetX = opts.maxOffsetX or 0
-
     if not featureEnabled('StaggerAnimationEnabled') then
         return 1.0, 0, 0, 1.0
     end
 
-    local alpha = M.getStaggerAlpha(gridKey, idx, total, C.ANIMATION.STAGGER_DELAY)
+    ensureGridEntryClip()
+    local instId = imgui.GetID(gridKey .. '_' .. idx)
+    local ok, inst = pcall(iam.PlayStagger, _gridEntryClipId, instId, idx, total, C.ANIMATION.STAGGER_DELAY)
 
-    if alpha >= 1.0 then return 1.0, 0, 0, 1.0 end
-    if alpha <= 0 then return 0.7, maxOffsetX, maxOffsetY, 0 end
-
-    -- Ease-out for position
-    local t = alpha
-    local posEased = 1 - math.pow(1 - t, 3)
-
-    -- Elastic for scale (subtle)
-    local scaleT = alpha
-    local scale
-    if scaleT >= 0.99 then
-        scale = 1.0
-    else
-        local p = 0.5
-        local elastic = math.pow(2, -8 * scaleT) * math.sin((scaleT - p / 4) * (2 * math.pi) / p) + 1
-        scale = 0.7 + 0.3 * math.min(1.05, math.max(0, elastic))
+    if not ok or not inst or (inst.Valid and not inst:Valid()) then
+        return 1.0, 0, 0, 1.0
     end
 
-    local offsetX = maxOffsetX * (1 - posEased)
-    local offsetY = maxOffsetY * (1 - posEased)
+    local ok_a, alpha   = pcall(function() return inst:GetFloat(_ALPHA_CH) end)
+    local ok_s, scale   = pcall(function() return inst:GetFloat(_SCALE_CH) end)
+    local ok_o, offsetY = pcall(function() return inst:GetFloat(_OFFSET_CH) end)
 
-    return scale, offsetX, offsetY, alpha
+    return ok_s and scale or 1.0,
+           0,
+           ok_o and offsetY or 0,
+           ok_a and alpha or 1.0
 end
 
 -- ============================================================
