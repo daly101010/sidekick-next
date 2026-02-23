@@ -15,10 +15,15 @@
 --   Toast.render('Classic')
 
 local imgui = require('ImGui')
+local iam = require('ImAnim')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Colors = require('sidekick-next.ui.colors')
 
 local M = {}
+
+-- Cached ease descriptors
+local _ezOutCubic = iam.EasePreset(IamEaseType.OutCubic)
+local _ezOutBack = iam.EasePreset(IamEaseType.OutBack)
 
 -- ============================================================
 -- CONFIGURATION
@@ -152,43 +157,8 @@ local function getPosition()
     return x, y, anchorBottom
 end
 
-local function calculateAlpha(toast)
-    local now = os.clock()
-    local elapsed = now - toast.startTime
-    local remaining = toast.endTime - now
-
-    -- Fade in
-    if elapsed < CONFIG.fadeInTime then
-        return elapsed / CONFIG.fadeInTime
-    end
-
-    -- Fade out
-    if remaining < CONFIG.fadeOutTime then
-        return math.max(0, remaining / CONFIG.fadeOutTime)
-    end
-
-    return 1.0
-end
-
-local function calculateSlideOffset(toast)
-    local now = os.clock()
-    local elapsed = now - toast.startTime
-    local remaining = toast.endTime - now
-
-    -- Slide in
-    if elapsed < CONFIG.fadeInTime then
-        local t = elapsed / CONFIG.fadeInTime
-        return CONFIG.slideDistance * (1 - t * t)  -- Ease out
-    end
-
-    -- Slide out
-    if remaining < CONFIG.fadeOutTime then
-        local t = 1 - (remaining / CONFIG.fadeOutTime)
-        return CONFIG.slideDistance * t * t  -- Ease in
-    end
-
-    return 0
-end
+-- Alpha and slide are now computed via native ImAnim tweens in render()
+-- (removed manual calculateAlpha/calculateSlideOffset)
 
 -- ============================================================
 -- TOAST CREATION
@@ -304,23 +274,38 @@ function M.render(themeName)
     local dl = imgui.GetForegroundDrawList and imgui.GetForegroundDrawList()
     if not dl then return end
 
-    -- Draw each toast
+    -- Draw each toast with native ImAnim tweens
     local yOffset = 0
+    local dt = imgui.GetIO().DeltaTime
 
     for i, toast in ipairs(_toasts) do
         local style = getStyle(toast.styleType)
-        local alpha = calculateAlpha(toast)
-        local slideX = calculateSlideOffset(toast)
+        local tid = 'toast_' .. toast.id
+        local remaining = toast.endTime - now
 
-        -- Calculate position
-        local x = baseX + slideX
-        local y
+        -- Native tweened alpha (fade in/out)
+        local isFadingOut = remaining < CONFIG.fadeOutTime
+        local targetAlpha = isFadingOut and 0.0 or 1.0
+        local fadeDur = isFadingOut and CONFIG.fadeOutTime or CONFIG.fadeInTime
+        local alpha = iam.TweenFloat(tid, imgui.GetID('alpha'), targetAlpha, fadeDur,
+            _ezOutCubic, IamPolicy.Crossfade, dt, 0.0)
+
+        -- Native tweened slide X (OutBack for slight overshoot on entry)
+        local slideTarget = 0
+        local slideX = iam.TweenFloat(tid, imgui.GetID('slideX'), slideTarget, 0.3,
+            _ezOutBack, IamPolicy.Crossfade, dt, CONFIG.slideDistance)
+
+        -- Native tweened Y position (smooth stack reflow)
+        local targetY
         if anchorBottom then
-            y = baseY - CONFIG.toastHeight - yOffset
+            targetY = baseY - CONFIG.toastHeight - yOffset
         else
-            y = baseY + yOffset
+            targetY = baseY + yOffset
         end
+        local y = iam.TweenFloat(tid, imgui.GetID('posY'), targetY, 0.25,
+            _ezOutCubic, IamPolicy.Crossfade, dt)
 
+        local x = baseX + slideX
         local w = CONFIG.toastWidth
         local h = CONFIG.toastHeight
 
@@ -362,17 +347,41 @@ function M.render(themeName)
         local iconY = y + (h - imgui.GetTextLineHeight()) / 2
         Draw.addText(dl, iconX, iconY, iconCol, style.icon)
 
-        -- Message text
+        -- Message text with stagger effect
         local textCol = Colors.text(themeName)
-        local msgCol = Draw.IM_COL32(
-            math.floor(textCol[1] * 255),
-            math.floor(textCol[2] * 255),
-            math.floor(textCol[3] * 255),
-            math.floor(alpha * 255)
-        )
         local textX = x + h + CONFIG.padding
         local textY = y + (h - imgui.GetTextLineHeight()) / 2
-        Draw.addText(dl, textX, textY, msgCol, toast.message)
+        local textElapsed = now - toast.startTime
+
+        -- Use TextStagger for per-character fade-in during first 0.8s
+        local staggerDone = textElapsed > 0.8
+        if not staggerDone then
+            local staggerOpts = IamTextStaggerOpts()
+            staggerOpts.pos = ImVec2(textX, textY)
+            staggerOpts.effect = IamTextStaggerEffect.Fade
+            staggerOpts.char_delay = 0.02
+            staggerOpts.char_duration = 0.15
+            staggerOpts.ease = _ezOutCubic
+            staggerOpts.color = Draw.IM_COL32(
+                math.floor(textCol[1] * 255),
+                math.floor(textCol[2] * 255),
+                math.floor(textCol[3] * 255),
+                math.floor(alpha * 255)
+            )
+            local progress = math.min(1.0, textElapsed / 0.6)
+            pcall(function()
+                iam.TextStagger(imgui.GetID(tid .. '_text'), toast.message, progress, staggerOpts)
+            end)
+        else
+            -- After stagger complete, draw normally
+            local msgCol = Draw.IM_COL32(
+                math.floor(textCol[1] * 255),
+                math.floor(textCol[2] * 255),
+                math.floor(textCol[3] * 255),
+                math.floor(alpha * 255)
+            )
+            Draw.addText(dl, textX, textY, msgCol, toast.message)
+        end
 
         -- Progress bar (time remaining)
         local progress = (toast.endTime - now) / (toast.endTime - toast.startTime)
