@@ -38,7 +38,6 @@ local _ezSpringSlow   = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C
 -- MODULE STATE
 -- ============================================================
 
-local _ImAnim = nil
 local _settings = nil  -- Reference to settings for early-exit checks
 local _lastCooldownState = {}
 local _lastFrameTime = os.clock()
@@ -102,8 +101,8 @@ end
 -- INITIALIZATION
 -- ============================================================
 
-function M.init(ImAnim, settings)
-    _ImAnim = ImAnim
+-- Backward-compat: ImAnim arg ignored (now required natively at module scope)
+function M.init(_, settings)
     _settings = settings
 end
 
