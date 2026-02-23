@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local ImAnim = require('sidekick-next.lib.imanim')
+local iam = require('ImAnim')
 local Core = require('sidekick-next.utils.core')
 
 local M = {}
@@ -110,11 +110,9 @@ function M.update()
                 State.showStartTime = now
                 State.lastWarningTime = now
 
-                -- Trigger shake animation
-                if ImAnim and ImAnim.trigger_shake then
-                    ImAnim.trigger_shake('aggro_warning')
-                    ImAnim.trigger_shake('aggro_warning_y')
-                end
+                -- Trigger shake animation (native ImAnim)
+                iam.TriggerShake('aggro_warning')
+                iam.TriggerShake('aggro_warning_y')
             end
         end
     else
@@ -142,25 +140,19 @@ function M.draw()
     local centerX = displaySize.x / 2
     local centerY = displaySize.y / 2
 
-    -- Calculate scale (spring in, then settle)
-    local scale = 1.0
-    if ImAnim and ImAnim.spring then
-        local targetScale = progress < 0.1 and 1.2 or 1.0
-        scale = ImAnim.spring('aggro_scale', targetScale, 400, 20)
-    end
+    -- Calculate scale (spring in, then settle) via native TweenFloat
+    local dt = imgui.GetIO().DeltaTime
+    local targetScale = progress < 0.1 and 1.2 or 1.0
+    local ezSpring = iam.EaseSpring(1.0, 400, 20, 0.0)
+    local scale = iam.TweenFloat('aggro_scale', imgui.GetID('aScale'), targetScale, 0.5, ezSpring, IamPolicy.Crossfade, dt)
 
-    -- Calculate shake offset
-    local shakeX, shakeY = 0, 0
-    if ImAnim and ImAnim.shake then
-        shakeX = ImAnim.shake('aggro_warning', 15, 0.5) or 0
-        shakeY = ImAnim.shake('aggro_warning_y', 10, 0.5) or 0
-    end
+    -- Calculate shake offset via native Shake
+    local shakeX = iam.Shake('aggro_warning', imgui.GetID('awX'), 15, 0.5, dt)
+    local shakeY = iam.Shake('aggro_warning_y', imgui.GetID('awY'), 10, 0.5, dt)
 
-    -- Calculate pulse for glow
-    local pulse = 1.0
-    if ImAnim and ImAnim.oscillate then
-        pulse = ImAnim.oscillate('aggro_pulse', 'sine', 0.7, 1.0, 4.0) or 1.0
-    end
+    -- Calculate pulse for glow via native Oscillate
+    local pulse = iam.Oscillate('aggro_pulse', imgui.GetID('aPulse'), 0.15, 4.0, 0.0, IamWaveType.Sine, dt)
+    pulse = 0.85 + pulse  -- 0.7 to 1.0 range
 
     -- Calculate fade out near end
     local alpha = 1.0

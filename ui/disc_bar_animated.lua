@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local ImAnim = require('sidekick-next.lib.imanim')
+local iam = require('ImAnim')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Core = require('sidekick-next.utils.core')
 local Themes = require('sidekick-next.themes')
@@ -9,6 +9,19 @@ local Draw = require('sidekick-next.ui.draw_helpers')
 local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
+
+-- Lazy-loaded texture renderer
+local _TextureRenderer = nil
+local _TextureRendererLoaded = false
+local function getTextureRenderer()
+    if _TextureRendererLoaded then return _TextureRenderer end
+    _TextureRendererLoaded = true
+    local ok, renderer = pcall(require, 'sidekick-next.ui.texture_renderer')
+    if ok and renderer then
+        _TextureRenderer = renderer
+    end
+    return _TextureRenderer
+end
 
 local _dragKey = nil
 local _pressKey = nil
@@ -280,8 +293,12 @@ function M.draw(opts)
     end
 
     local cols = math.max(1, math.ceil(#enabled / rows))
-    local winW = cols * cell + (cols - 1) * gap + pad * 2
+    local autoW = cols * cell + (cols - 1) * gap + pad * 2
     local winH = rows * cell + (rows - 1) * gap + pad * 2
+
+    -- Width override (0 = auto)
+    local widthOverride = tonumber(settings.SideKickDiscBarWidth) or 0
+    local winW = (widthOverride > 0) and widthOverride or autoW
 
     if imgui.SetNextWindowSizeConstraints then
         imgui.SetNextWindowSizeConstraints(winW, winH, winW, winH)
@@ -307,7 +324,19 @@ function M.draw(opts)
 
     local themeName = settings.SideKickTheme or 'Classic'
     local style = Themes.getWindowStyle(themeName)
-    imgui.PushStyleColor(ImGuiCol.WindowBg, style.WindowBg[1], style.WindowBg[2], style.WindowBg[3], bgAlpha)
+
+    -- Check if we're using textured theme
+    local useTexturedBg = false
+    pcall(function()
+        useTexturedBg = Themes.isTexturedTheme and Themes.isTexturedTheme(themeName)
+    end)
+
+    -- For textured themes, make window background transparent so texture shows
+    if useTexturedBg then
+        imgui.PushStyleColor(ImGuiCol.WindowBg, 0, 0, 0, 0)
+    else
+        imgui.PushStyleColor(ImGuiCol.WindowBg, style.WindowBg[1], style.WindowBg[2], style.WindowBg[3], bgAlpha)
+    end
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 6)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
@@ -318,6 +347,46 @@ function M.draw(opts)
         end
         local animSpellIcons = opts.animSpellIcons
         local dl = imgui.GetWindowDrawList()
+
+        -- Draw textured background for ClassicEQ Textured theme
+        -- Flip horizontally when anchored to the right so borders mirror the left-side bar
+        -- ShowBorder: true = gold frame + background, false = background only (no gold border)
+        local showBorder = settings.SideKickDiscBarShowBorder ~= false
+        if useTexturedBg and dl then
+            pcall(function()
+                local tr = getTextureRenderer()
+                if tr then
+                    local winPosX, winPosY = imgui.GetWindowPos()
+                    if type(winPosX) == 'table' then
+                        winPosY = winPosX.y or winPosX[2]
+                        winPosX = winPosX.x or winPosX[1]
+                    end
+                    local winSizeX, winSizeY = imgui.GetWindowSize()
+                    if type(winSizeX) == 'table' then
+                        winSizeY = winSizeX.y or winSizeX[2]
+                        winSizeX = winSizeX.x or winSizeX[1]
+                    end
+                    local anchor = tostring(settings.SideKickDiscBarAnchor or 'none'):lower()
+                    local tintCol = tr.parseTintSetting and tr.parseTintSetting(settings.SideKickDiscBarTextureTint) or nil
+                    if showBorder and tr.drawHotbuttonBg then
+                        -- Draw with gold frame border
+                        tr.drawHotbuttonBg(dl, winPosX, winPosY, winSizeX, winSizeY, {
+                            rounding = 6,
+                            flipH = (anchor == 'right'),
+                            tintCol = tintCol,
+                        })
+                    elseif tr.drawActionWindowBg then
+                        -- Draw background only (no gold border)
+                        tr.drawActionWindowBg(dl, winPosX, winPosY, winSizeX, winSizeY, {
+                            tile = true,
+                            shadows = false,
+                            tintCol = tintCol,
+                        })
+                    end
+                end
+            end)
+        end
+
         local startX, startY = imgui.GetCursorPos()
 
         for idx, def in ipairs(enabled) do
@@ -434,11 +503,29 @@ function M.draw(opts)
             sw = sw + pulse * 2
             sh = sh + pulse * 2
 
-            -- Draw icon at scaled position
+            -- Draw textured icon holder background
+            local _textureRenderer = nil
+            pcall(function()
+                if not useTexturedBg then return end
+                local tr = getTextureRenderer()
+                if not tr or not tr.drawIconHolder then return end
+                local holderState = hovered and 'hover' or (active and 'active' or 'normal')
+                if tr.drawIconHolder(dl, minX, minY, sw, holderState) then
+                    _textureRenderer = tr
+                end
+            end)
+
+            -- Draw icon at scaled position (inset when using textured frame)
+            local iconInset = _textureRenderer and 4 or 0
+            local iconX = minX + iconInset
+            local iconY = minY + iconInset
+            local iconW = sw - (iconInset * 2)
+            local iconH = sh - (iconInset * 2)
+
             if animSpellIcons and imgui.DrawTextureAnimation then
                 animSpellIcons:SetTextureCell(tonumber(def.icon) or 0)
-                imgui.SetCursorScreenPos(minX, minY)
-                imgui.DrawTextureAnimation(animSpellIcons, sw, sh)
+                imgui.SetCursorScreenPos(iconX, iconY)
+                imgui.DrawTextureAnimation(animSpellIcons, iconW, iconH)
                 imgui.SetCursorPos(x, y)
             end
 
@@ -449,13 +536,13 @@ function M.draw(opts)
                 rem, total = opts.cooldownProbe({ label = nm, key = nm })
             end
 
-            -- Draw enhanced cooldown overlay with OKLAB colors
+            -- Draw enhanced cooldown overlay with OKLAB colors (over icon area)
             local restoreX, restoreY = imgui.GetCursorPos()
-            AnimHelpers.drawCooldownOverlay(dl, minX, minY, minX + sw, minY + sh, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
+            AnimHelpers.drawCooldownOverlay(dl, iconX, iconY, iconX + iconW, iconY + iconH, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
             imgui.SetCursorPos(restoreX, restoreY)
 
-            -- Name overlay
-            drawNameWrapped(minX, minY, minX + sw, def.discName or def.altName, opts.helpers)
+            -- Name overlay (over icon area)
+            drawNameWrapped(iconX, iconY, iconX + iconW, def.discName or def.altName, opts.helpers)
 
             if hovered then
                 local fmtCooldown = getFmtCooldown(opts.helpers)
