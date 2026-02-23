@@ -66,6 +66,19 @@ M.LAYOUT = {
     MAX_ANCHOR_GAP = 48,  -- Increased from 24
     DEFAULT_ANCHOR_GAP = 2,
 
+    -- Button rounding (% of cell size, 0.0 = square, 0.5 = pill)
+    BUTTON_ROUNDING_PCT = 0.4,
+
+    -- Shadow
+    SHADOW_OFFSET_X = 2,
+    SHADOW_OFFSET_Y = 3,
+    SHADOW_ALPHA_NORMAL = 75,    -- 0-255
+    SHADOW_ALPHA_HOVER = 120,
+
+    -- Glow
+    GLOW_EXPAND = 2,             -- pixels larger than cell
+    GLOW_ALPHA_MAX = 150,        -- 0-255
+
     -- Bar defaults
     DEFAULT_CELL_SIZE = 48,
     DEFAULT_ROWS = 2,
@@ -167,7 +180,10 @@ M.ANCHOR_MODES = {
 -- ============================================================
 
 M.ANCHOR_TARGETS = {
-    { key = 'grouptarget', label = 'GroupTarget' },
+    { key = 'grouptarget', label = 'Group Window' },
+    { key = 'gt_commandbar', label = 'GT Command Bar' },
+    { key = 'target', label = 'Target Window' },
+    { key = 'xtarget', label = 'XTarget Window' },
     { key = 'sidekick_main', label = 'SideKick Main' },
     { key = 'sidekick_bar', label = 'SideKick Ability Bar' },
     { key = 'sidekick_special', label = 'SideKick Special Bar' },

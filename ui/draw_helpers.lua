@@ -21,15 +21,17 @@ local M = {}
 -- Detect DrawList API signature once at startup, not per-call
 local _apiDetected = false
 local _useImVec2 = true  -- Default to ImVec2 (MQ standard)
-local _imVec2Func = nil
+
+-- Find ImVec2 at module load time
+-- MQ exposes ImVec2 as a global - capture it now while we're at module scope
+local _imVec2Func = ImVec2 or (imgui and imgui.ImVec2) or nil
 
 local function detectApiSignature(dl)
     if _apiDetected then return end
 
-    -- Check for ImVec2 constructor
-    local ImVec2 = _G.ImVec2 or (imgui and imgui.ImVec2)
-    if ImVec2 and type(ImVec2) == 'function' then
-        _imVec2Func = ImVec2
+    -- If we didn't find ImVec2 at load time, try again
+    if not _imVec2Func then
+        _imVec2Func = ImVec2 or (imgui and imgui.ImVec2) or nil
     end
 
     -- Try to detect which signature works by probing with safe dummy values
@@ -103,59 +105,112 @@ end
 -- DRAWLIST WRAPPERS
 -- ============================================================
 
--- Internal helper to call DrawList methods with correct signature
-local function callDl(dl, method, x1, y1, x2, y2, ...)
-    if not dl or not dl[method] then return false end
+-- AddRectFilled wrapper
+-- Uses closure-style pcall for reliable MQ userdata binding compatibility
+function M.addRectFilled(dl, x1, y1, x2, y2, col, rounding, flags)
+    if not dl then return false end
+    rounding = tonumber(rounding) or 0
+    flags = tonumber(flags) or 0
 
     if not _apiDetected then
         detectApiSignature(dl)
     end
 
-    local args = {...}
-
     -- Try ImVec2 first (MQ standard)
     if _useImVec2 and _imVec2Func then
-        local ok = pcall(dl[method], dl, _imVec2Func(x1, y1), _imVec2Func(x2, y2), unpack(args))
+        local ok = pcall(function()
+            dl:AddRectFilled(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col, rounding, flags)
+        end)
         if ok then return true end
 
-        -- Try with fewer args
-        while #args > 0 do
-            table.remove(args)
-            ok = pcall(dl[method], dl, _imVec2Func(x1, y1), _imVec2Func(x2, y2), unpack(args))
-            if ok then return true end
-        end
+        -- Try without flags
+        ok = pcall(function()
+            dl:AddRectFilled(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col, rounding)
+        end)
+        if ok then return true end
+
+        -- Try without rounding
+        ok = pcall(function()
+            dl:AddRectFilled(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col)
+        end)
+        if ok then return true end
     end
 
     -- Fallback: try raw coordinates
-    args = {...}
-    local ok = pcall(dl[method], dl, x1, y1, x2, y2, unpack(args))
+    local ok = pcall(function()
+        dl:AddRectFilled(x1, y1, x2, y2, col, rounding, flags)
+    end)
     if ok then return true end
 
-    -- Try with fewer arguments
-    while #args > 0 do
-        table.remove(args)
-        ok = pcall(dl[method], dl, x1, y1, x2, y2, unpack(args))
-        if ok then return true end
-    end
+    ok = pcall(function()
+        dl:AddRectFilled(x1, y1, x2, y2, col, rounding)
+    end)
+    if ok then return true end
 
-    return false
-end
-
--- AddRectFilled wrapper
-function M.addRectFilled(dl, x1, y1, x2, y2, col, rounding, flags)
-    if not dl then return false end
-    rounding = tonumber(rounding) or 0
-    flags = tonumber(flags) or 0
-    return callDl(dl, 'AddRectFilled', x1, y1, x2, y2, col, rounding, flags)
+    ok = pcall(function()
+        dl:AddRectFilled(x1, y1, x2, y2, col)
+    end)
+    return ok == true
 end
 
 -- AddRect wrapper (outline)
+-- Uses closure-style pcall for reliable MQ userdata binding compatibility
 function M.addRect(dl, x1, y1, x2, y2, col, rounding, flags, thickness)
     if not dl then return false end
     rounding = tonumber(rounding) or 0
     flags = tonumber(flags) or 0
     thickness = tonumber(thickness) or 1
-    return callDl(dl, 'AddRect', x1, y1, x2, y2, col, rounding, flags, thickness)
+
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
+
+    -- Try ImVec2 first (MQ standard)
+    if _useImVec2 and _imVec2Func then
+        local ok = pcall(function()
+            dl:AddRect(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col, rounding, flags, thickness)
+        end)
+        if ok then return true end
+
+        -- Try without thickness
+        ok = pcall(function()
+            dl:AddRect(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col, rounding, flags)
+        end)
+        if ok then return true end
+
+        -- Try without flags
+        ok = pcall(function()
+            dl:AddRect(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col, rounding)
+        end)
+        if ok then return true end
+
+        -- Try minimal
+        ok = pcall(function()
+            dl:AddRect(_imVec2Func(x1, y1), _imVec2Func(x2, y2), col)
+        end)
+        if ok then return true end
+    end
+
+    -- Fallback: try raw coordinates
+    local ok = pcall(function()
+        dl:AddRect(x1, y1, x2, y2, col, rounding, flags, thickness)
+    end)
+    if ok then return true end
+
+    ok = pcall(function()
+        dl:AddRect(x1, y1, x2, y2, col, rounding, flags)
+    end)
+    if ok then return true end
+
+    ok = pcall(function()
+        dl:AddRect(x1, y1, x2, y2, col, rounding)
+    end)
+    if ok then return true end
+
+    ok = pcall(function()
+        dl:AddRect(x1, y1, x2, y2, col)
+    end)
+    return ok == true
 end
 
 -- AddLine wrapper
@@ -264,6 +319,64 @@ function M.addText(dl, x, y, col, text)
 
     -- Fallback to raw coords
     local ok = pcall(function() dl:AddText(x, y, col, text) end)
+    return ok == true
+end
+
+-- AddImage wrapper (for texture rendering)
+function M.addImage(dl, texId, x1, y1, x2, y2, u0, v0, u1, v1, tintCol)
+    if not dl or not texId then return false end
+
+    -- Default UV coordinates
+    u0 = u0 or 0
+    v0 = v0 or 0
+    u1 = u1 or 1
+    v1 = v1 or 1
+
+    if not _apiDetected then
+        detectApiSignature(dl)
+    end
+
+    -- Try ImVec2 first (MQ standard)
+    if _useImVec2 and _imVec2Func then
+        -- With tint color
+        if tintCol then
+            local ok = pcall(function()
+                dl:AddImage(texId, _imVec2Func(x1, y1), _imVec2Func(x2, y2),
+                           _imVec2Func(u0, v0), _imVec2Func(u1, v1), tintCol)
+            end)
+            if ok then return true end
+        end
+
+        -- Without tint
+        local ok = pcall(function()
+            dl:AddImage(texId, _imVec2Func(x1, y1), _imVec2Func(x2, y2),
+                       _imVec2Func(u0, v0), _imVec2Func(u1, v1))
+        end)
+        if ok then return true end
+
+        -- Minimal (no UV)
+        ok = pcall(function()
+            dl:AddImage(texId, _imVec2Func(x1, y1), _imVec2Func(x2, y2))
+        end)
+        if ok then return true end
+    end
+
+    -- Fallback: raw coordinates
+    if tintCol then
+        local ok = pcall(function()
+            dl:AddImage(texId, x1, y1, x2, y2, u0, v0, u1, v1, tintCol)
+        end)
+        if ok then return true end
+    end
+
+    local ok = pcall(function()
+        dl:AddImage(texId, x1, y1, x2, y2, u0, v0, u1, v1)
+    end)
+    if ok then return true end
+
+    ok = pcall(function()
+        dl:AddImage(texId, x1, y1, x2, y2)
+    end)
     return ok == true
 end
 
@@ -485,6 +598,92 @@ function M.getApiInfo()
         useImVec2 = _useImVec2,
         hasImVec2 = _imVec2Func ~= nil,
     }
+end
+
+-- ============================================================
+-- TEXTURE RENDERER ACCESS
+-- ============================================================
+
+local _textureRenderer = nil
+local _textureRendererLoaded = false
+
+function M.getTextureRenderer()
+    if _textureRendererLoaded then return _textureRenderer end
+    _textureRendererLoaded = true
+
+    local ok, renderer = pcall(require, 'sidekick-next.ui.texture_renderer')
+    if ok and renderer then
+        _textureRenderer = renderer
+    end
+    return _textureRenderer
+end
+
+function M.useTexturesForTheme(themeName)
+    local ok, Themes = pcall(require, 'sidekick-next.themes')
+    if not ok or not Themes then return false end
+
+    local isTextured = false
+    pcall(function() isTextured = Themes.isTexturedTheme(themeName) end)
+    if not isTextured then return false end
+
+    local renderer = M.getTextureRenderer()
+    if not renderer then return false end
+
+    local available = false
+    pcall(function()
+        if renderer.isAvailable then
+            available = renderer.isAvailable()
+        end
+    end)
+
+    return available
+end
+
+-- ============================================================
+-- PATH DRAWING WRAPPERS (for radial cooldown sweep, etc.)
+-- ============================================================
+
+-- PathArcTo wrapper
+function M.pathArcTo(dl, cx, cy, radius, a_min, a_max, segments)
+    if not dl then return false end
+    segments = segments or 32
+
+    if not _apiDetected then detectApiSignature(dl) end
+
+    if _useImVec2 and _imVec2Func then
+        local ok = pcall(function() dl:PathArcTo(_imVec2Func(cx, cy), radius, a_min, a_max, segments) end)
+        if ok then return true end
+    end
+    local ok = pcall(function() dl:PathArcTo(cx, cy, radius, a_min, a_max, segments) end)
+    return ok == true
+end
+
+-- PathLineTo wrapper
+function M.pathLineTo(dl, x, y)
+    if not dl then return false end
+
+    if not _apiDetected then detectApiSignature(dl) end
+
+    if _useImVec2 and _imVec2Func then
+        local ok = pcall(function() dl:PathLineTo(_imVec2Func(x, y)) end)
+        if ok then return true end
+    end
+    local ok = pcall(function() dl:PathLineTo(x, y) end)
+    return ok == true
+end
+
+-- PathFillConvex wrapper
+function M.pathFillConvex(dl, col)
+    if not dl then return false end
+    local ok = pcall(function() dl:PathFillConvex(col) end)
+    return ok == true
+end
+
+-- PathClear wrapper
+function M.pathClear(dl)
+    if not dl then return false end
+    local ok = pcall(function() dl:PathClear() end)
+    return ok == true
 end
 
 return M
