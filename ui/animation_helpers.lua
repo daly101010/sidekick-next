@@ -16,8 +16,23 @@ local imgui = require('ImGui')
 local C = require('sidekick-next.ui.constants')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Colors = require('sidekick-next.ui.colors')
+local iam = require('ImAnim')
 
 local M = {}
+
+-- ============================================================
+-- CACHED EASE DESCRIPTORS (expensive to create per-frame)
+-- ============================================================
+
+local _ezOutCubic   = iam.EasePreset(IamEaseType.OutCubic)
+local _ezOutBack    = iam.EasePreset(IamEaseType.OutBack)
+local _ezOutElastic = iam.EasePreset(IamEaseType.OutElastic)
+local _ezOutSine    = iam.EasePreset(IamEaseType.OutSine)
+local _ezLinear     = iam.EasePreset(IamEaseType.Linear)
+
+local _ezSpringNormal = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS, C.ANIMATION.SPRING_DAMPING, 0.0)
+local _ezSpringFast   = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS_FAST, C.ANIMATION.SPRING_DAMPING_FAST, 0.0)
+local _ezSpringSlow   = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C.ANIMATION.SPRING_DAMPING_SLOW, 0.0)
 
 -- ============================================================
 -- MODULE STATE
@@ -145,18 +160,12 @@ function M.getButtonScale(uniqueId, isHovered, isActive)
         return 1.0
     end
 
-    local targetScale = 1.0
-    if isActive then
-        targetScale = C.ANIMATION.PRESS_SCALE
-    elseif isHovered then
-        targetScale = C.ANIMATION.HOVER_SCALE
-    end
-
-    if _ImAnim and _ImAnim.spring then
-        local id = getCachedId(uniqueId, '_scale')
-        return _ImAnim.spring(id, targetScale, C.ANIMATION.SPRING_STIFFNESS, C.ANIMATION.SPRING_DAMPING)
-    end
-    return targetScale
+    local dt = M.get_dt()
+    local target = isActive and C.ANIMATION.PRESS_SCALE
+                or isHovered and C.ANIMATION.HOVER_SCALE
+                or 1.0
+    local ez = isActive and _ezSpringFast or _ezSpringNormal
+    return iam.TweenFloat(uniqueId, imgui.GetID('scale'), target, 0.5, ez, IamPolicy.Crossfade, dt)
 end
 
 -- ============================================================
@@ -172,19 +181,15 @@ function M.checkCooldownCompletion(uniqueId, onCooldown)
 
     local wasOnCooldown = _lastCooldownState[uniqueId]
     if wasOnCooldown and not onCooldown then
-        if _ImAnim and _ImAnim.trigger_shake then
-            local id = getCachedId(uniqueId, '_pulse')
-            _ImAnim.trigger_shake(id)
-        end
+        iam.TriggerShake(uniqueId)
     end
     _lastCooldownState[uniqueId] = onCooldown
 end
 
 function M.getCompletionPulse(uniqueId)
     if not featureEnabled('ClickBounceEnabled') then return 0 end
-    if not _ImAnim or not _ImAnim.shake then return 0 end
-    local id = getCachedId(uniqueId, '_pulse')
-    return _ImAnim.shake(id, C.ANIMATION.SHAKE_MAGNITUDE, C.ANIMATION.SHAKE_DECAY, M.get_dt())
+    local dt = M.get_dt()
+    return iam.Shake(uniqueId, imgui.GetID('pulse'), C.ANIMATION.SHAKE_MAGNITUDE, C.ANIMATION.SHAKE_DECAY, dt)
 end
 
 -- ============================================================
@@ -210,13 +215,10 @@ function M.getReadyPulseAlpha(uniqueId, isReady)
     if not isReady then return 1.0 end
     if not featureEnabled('ReadyPulseEnabled') then return 1.0 end
 
-    if _ImAnim and _ImAnim.oscillate then
-        local id = getCachedId(uniqueId, '_ready_pulse')
-        return _ImAnim.oscillate(id, 'sine', 0.7, 1.0, C.ANIMATION.READY_PULSE_FREQ) or 1.0
-    end
-    -- Fallback without ImAnim
-    local t = os.clock() * 2 * math.pi * C.ANIMATION.READY_PULSE_FREQ
-    return 0.7 + 0.15 * (1 + math.sin(t))
+    local dt = M.get_dt()
+    local wave = iam.Oscillate(uniqueId, imgui.GetID('rpulse'),
+        0.15, C.ANIMATION.READY_PULSE_FREQ, 0.0, IamWaveType.Sine, dt)
+    return 0.85 + wave
 end
 
 function M.getReadyGlowColor(uniqueId, isReady, baseColor)
@@ -326,20 +328,18 @@ function M.getLowResourcePulse(uniqueId, currentPct, threshold)
         return 1.0, Colors.lowResource(1.0)
     end
 
+    local dt = M.get_dt()
+
     -- Pulse faster as resource gets lower
-    local urgency = 1.0 - (currentPct / threshold)
-    local freq = C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MIN + urgency * (C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MAX - C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MIN)
+    local severity = 1.0 - (currentPct / threshold)
+    local freq = C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MIN +
+                 severity * (C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MAX - C.ANIMATION.LOW_RESOURCE_PULSE_FREQ_MIN)
 
-    if _ImAnim and _ImAnim.oscillate then
-        local id = getCachedId(uniqueId, '_low_res')
-        local pulse = _ImAnim.oscillate(id, 'sine', 0.5, 1.0, freq) or 1.0
-        return pulse, Colors.lowResource(pulse)
-    end
-
-    -- Fallback without ImAnim
-    local t = os.clock() * 2 * math.pi * freq
-    local pulse = 0.5 + 0.25 * (1 + math.sin(t))
-    return pulse, Colors.lowResource(pulse)
+    local pulse = iam.Oscillate(uniqueId, imgui.GetID('lrpulse'),
+        0.5, freq, 0.0, IamWaveType.Sine, dt)
+    pulse = (pulse + 0.5) * severity
+    local color = Colors.lowResource(severity)
+    return pulse, color
 end
 
 function M.setLowResourceThreshold(threshold)
@@ -403,7 +403,6 @@ end
 
 function M.getToggleScale(uniqueId, isActive)
     local prevState = _toggleStates[uniqueId]
-    local justActivated = isActive and not prevState
     _toggleStates[uniqueId] = isActive
 
     -- Early exit if toggle pop is disabled
@@ -411,22 +410,15 @@ function M.getToggleScale(uniqueId, isActive)
         return 1.0
     end
 
-    -- Trigger pop animation when toggled on
-    if justActivated and _ImAnim and _ImAnim.trigger_shake then
-        local id = getCachedId(uniqueId, '_toggle_pop')
-        _ImAnim.trigger_shake(id)
+    local dt = M.get_dt()
+
+    -- Trigger shake when toggled on
+    if prevState ~= nil and prevState ~= isActive and isActive then
+        iam.TriggerShake(uniqueId .. '_toggle')
     end
 
-    -- Spring-based pop effect
-    if _ImAnim and _ImAnim.spring then
-        local scaleId = getCachedId(uniqueId, '_toggle_scale')
-        if justActivated then
-            -- Temporarily target larger scale for pop
-            return _ImAnim.spring(scaleId, C.ANIMATION.TOGGLE_POP_SCALE, C.ANIMATION.SPRING_STIFFNESS_FAST, C.ANIMATION.SPRING_DAMPING_FAST)
-        end
-        return _ImAnim.spring(scaleId, 1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C.ANIMATION.SPRING_DAMPING)
-    end
-    return 1.0
+    local ez = isActive and _ezSpringFast or _ezSpringSlow
+    return iam.TweenFloat(uniqueId, imgui.GetID('tscale'), 1.0, 0.5, ez, IamPolicy.Crossfade, dt)
 end
 
 function M.getToggleColor(uniqueId, isActive, onColor, offColor)
@@ -435,21 +427,21 @@ function M.getToggleColor(uniqueId, isActive, onColor, offColor)
         return isActive and onColor or offColor
     end
 
-    if not _ImAnim or not _ImAnim.tween_vec4 then
-        return isActive and onColor or offColor
-    end
-
+    local dt = M.get_dt()
     local target = isActive and onColor or offColor
-    local id = getCachedId(uniqueId, '_toggle_color')
-    local result = _ImAnim.tween_vec4(id, target, C.ANIMATION.TWEEN_FAST, _ImAnim.EASE and _ImAnim.EASE.out_cubic or 5)
-    return result or target
+    local col = iam.TweenColor(
+        uniqueId, imgui.GetID('tcol'),
+        ImVec4(target[1], target[2], target[3], target[4] or 1.0),
+        C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade,
+        IamColorSpace.OKLAB, dt
+    )
+    return { col.x, col.y, col.z, col.w }
 end
 
 function M.getTogglePop(uniqueId)
     if not featureEnabled('TogglePopEnabled') then return 0 end
-    if not _ImAnim or not _ImAnim.shake then return 0 end
-    local id = getCachedId(uniqueId, '_toggle_pop')
-    return _ImAnim.shake(id, 2, C.ANIMATION.TWEEN_FAST, M.get_dt()) or 0
+    local dt = M.get_dt()
+    return iam.Shake(uniqueId .. '_toggle', imgui.GetID('tpop'), C.ANIMATION.SHAKE_MAGNITUDE * 0.5, C.ANIMATION.SHAKE_DECAY, dt)
 end
 
 -- Theme-aware toggle color helper
@@ -479,21 +471,14 @@ function M.getCooldownColor(uniqueId, pct)
         return targetR, targetG, targetB
     end
 
-    if _ImAnim and _ImAnim.tween_color then
-        local dt = M.get_dt()
-        local id = getCachedId(uniqueId, '_cd')
-        local r, g, b = _ImAnim.tween_color(
-            id, 'col',
-            targetR, targetG, targetB, 1.0,
-            C.ANIMATION.TWEEN_FAST,
-            _ImAnim.EASE and _ImAnim.EASE.out_cubic or 5,
-            _ImAnim.COLOR_SPACE and _ImAnim.COLOR_SPACE.oklab or 3,
-            _ImAnim.POLICY and _ImAnim.POLICY.crossfade or 0,
-            dt
-        )
-        return r, g, b
-    end
-    return targetR, targetG, targetB
+    local dt = M.get_dt()
+    local col = iam.TweenColor(
+        uniqueId, imgui.GetID('cdcol'),
+        ImVec4(targetR, targetG, targetB, 1.0),
+        C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade,
+        IamColorSpace.OKLAB, dt
+    )
+    return col.x, col.y, col.z, col.w
 end
 
 -- ============================================================
@@ -564,24 +549,21 @@ end
 -- ============================================================
 
 function M.updateStaggerFrame()
-    if not featureEnabled('StaggerAnimationEnabled') then return end
-    if _ImAnim and _ImAnim.update_stagger_frame then
-        _ImAnim.update_stagger_frame(M.get_dt())
-    end
+    -- No-op: native ImAnim handles frame updates automatically
 end
 
 function M.resetStagger(gridKey)
     _staggerGrids[gridKey] = nil
-    if _ImAnim and _ImAnim.reset_stagger then
-        _ImAnim.reset_stagger(gridKey)
-    end
 end
 
 function M.getStaggerAlpha(gridKey, idx, total, delay)
     if not featureEnabled('StaggerAnimationEnabled') then return 1.0 end
-    if not _ImAnim or not _ImAnim.stagger then return 1.0 end
     delay = delay or C.ANIMATION.STAGGER_DELAY
-    return _ImAnim.stagger(gridKey, idx, total, C.ANIMATION.STAGGER_DURATION, delay)
+    local staggerOffset = iam.StaggerDelay(idx, total, delay)
+    local elapsed = M.getGridEntryElapsed(gridKey)
+    if elapsed > C.ANIMATION.STAGGER_DURATION + (total * delay) then return 1.0 end
+    local t = math.max(0, math.min(1, (elapsed - staggerOffset) / C.ANIMATION.STAGGER_DURATION))
+    return iam.EvalPreset(IamEaseType.OutCubic, t)
 end
 
 -- ============================================================
@@ -768,14 +750,7 @@ function M.maybeRunGc()
         -- In practice, abilities cycle and this keeps the table bounded
     end
 
-    -- Run ImAnim GC if available
-    if _ImAnim and _ImAnim.gc then
-        _ImAnim.gc(300)  -- max frame age
-    end
-
-    if _ImAnim and _ImAnim.clip_gc then
-        _ImAnim.clip_gc(300)
-    end
+    -- Native C++ ImAnim manages its own memory — no gc() or clip_gc() needed
 
     -- Clear old ID cache entries (optional, usually stable)
     -- Only clear if cache gets very large
