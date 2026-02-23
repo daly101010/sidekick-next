@@ -12,6 +12,7 @@
 --   Spinner.pulse('Waiting', 'Classic')
 
 local imgui = require('ImGui')
+local iam = require('ImAnim')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Colors = require('sidekick-next.ui.colors')
 
@@ -65,12 +66,15 @@ function M.circular(label, themeName, opts)
     local centerX = cx + radius
     local centerY = cy + radius
 
-    -- Animation time
-    local t = os.clock() * speed
+    -- Animation: native sawtooth oscillator for continuous rotation
+    local dt = imgui.GetIO().DeltaTime
+    local sid = 'circ_' .. (label or 'spinner')
+    local angle = iam.Oscillate(sid, imgui.GetID('cAngle'),
+        math.pi, speed, 0.0, IamWaveType.Sawtooth, dt)
 
     -- Draw spinning arc segments
     local arcLength = 0.7  -- Portion of circle that's visible
-    local startAngle = t * math.pi * 2
+    local startAngle = angle * 2
 
     for i = 0, segments - 1 do
         local segStart = startAngle + (i / segments) * arcLength * math.pi * 2
@@ -148,14 +152,17 @@ function M.dots(label, themeName, opts)
         return
     end
 
-    -- Animation time
-    local t = os.clock() * speed
+    -- Animation: native sine oscillators with per-dot phase offsets
+    local dt = imgui.GetIO().DeltaTime
+    local sid = 'dots_' .. (label or 'spinner')
 
     -- Draw dots with bounce animation
     local totalWidth = 0
     for i = 0, dotCount - 1 do
-        local phase = t - i * 0.3
-        local bounce = math.max(0, math.sin(phase * math.pi))
+        local phaseOffset = i * 0.3 * math.pi
+        local wave = iam.Oscillate(sid, imgui.GetID('dot' .. i),
+            1.0, speed * 0.5, phaseOffset, IamWaveType.Sine, dt)
+        local bounce = math.max(0, wave)  -- half-wave rectified for bounce
         local scale = 1.0 + bounce * 0.5
         local alpha = 0.4 + bounce * 0.6
 
@@ -238,10 +245,12 @@ function M.bar(current, total, themeName, opts)
         )
         Draw.addRectFilled(dl, cx, cy, cx + fillWidth, cy + height, fillCol, 2)
 
-        -- Animated shine effect
+        -- Animated shine effect using native sawtooth oscillator
         if animated and pct < 1 then
-            local t = os.clock() * 2
-            local shinePos = (t % 1) * (fillWidth + 40) - 20
+            local barDt = imgui.GetIO().DeltaTime
+            local shineWave = iam.Oscillate('bar_shine', imgui.GetID('bshine'),
+                0.5, 2.0, 0.0, IamWaveType.Sawtooth, barDt)
+            local shinePos = (shineWave + 0.5) * (fillWidth + 40) - 20
 
             if shinePos > 0 and shinePos < fillWidth then
                 local shineCol = Draw.IM_COL32(255, 255, 255, 60)
@@ -291,9 +300,12 @@ function M.pulse(label, themeName, opts)
         return
     end
 
-    -- Animation
-    local t = os.clock() * speed
-    local pulse = 0.5 + 0.5 * math.sin(t * math.pi)
+    -- Animation: native sine oscillator for pulse
+    local dt = imgui.GetIO().DeltaTime
+    local sid = 'pulse_' .. (label or 'spinner')
+    local wave = iam.Oscillate(sid, imgui.GetID('pulse'),
+        0.5, speed * 0.5, 0.0, IamWaveType.Sine, dt)
+    local pulse = 0.5 + wave  -- 0 to 1 range
     local scale = 1.0 + pulse * 0.3
 
     -- Center
@@ -368,9 +380,12 @@ function M.indeterminate(label, themeName, opts)
     local bgCol = Draw.IM_COL32(40, 40, 40, 200)
     Draw.addRectFilled(dl, cx, cy, cx + width, cy + height, bgCol, 2)
 
-    -- Animated segment
-    local t = os.clock() * speed
-    local pos = 0.5 + 0.5 * math.sin(t * math.pi)
+    -- Animated segment using native sine oscillator
+    local dt = imgui.GetIO().DeltaTime
+    local sid = 'indet_' .. (label or 'spinner')
+    local wave = iam.Oscillate(sid, imgui.GetID('ipos'),
+        0.5, speed * 0.5, 0.0, IamWaveType.Sine, dt)
+    local pos = 0.5 + wave  -- 0 to 1 range
     local segWidth = width * 0.3
 
     local segLeft = cx + pos * (width - segWidth)
