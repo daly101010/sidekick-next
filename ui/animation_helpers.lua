@@ -208,10 +208,13 @@ function M.getReadyGlow()
         return C.COOLDOWN.READY_GLOW_MIN
     end
 
-    local t = os.clock() * C.COOLDOWN.READY_GLOW_FREQ
-    local wave = math.sin(t * math.pi)
-    local elastic = 1.0 + 0.15 * math.pow(2, -10 * (t % 1)) * math.sin((t % 1) * 10 * math.pi / 3)
-    return C.COOLDOWN.READY_GLOW_MIN + (C.COOLDOWN.READY_GLOW_MAX - C.COOLDOWN.READY_GLOW_MIN) * math.abs(wave) * elastic
+    local dt = M.get_dt()
+    -- Native oscillator for ready glow pulse
+    local wave = iam.Oscillate('readyGlow', imgui.GetID('rgWave'),
+        0.5, C.COOLDOWN.READY_GLOW_FREQ, 0.0, IamWaveType.Sine, dt)
+    local absWave = math.abs(wave * 2)  -- 0 to 1 range
+
+    return C.COOLDOWN.READY_GLOW_MIN + (C.COOLDOWN.READY_GLOW_MAX - C.COOLDOWN.READY_GLOW_MIN) * absWave
 end
 
 -- ============================================================
@@ -246,27 +249,55 @@ end
 -- READY SHINE EFFECT (sweeping highlight)
 -- ============================================================
 
+-- Cached shine paths per cell width
+local _shinePaths = {}
+
+local function getOrCreateShinePath(cellWidth)
+    local key = tostring(cellWidth)
+    if _shinePaths[key] then return _shinePaths[key] end
+
+    local pathId = imgui.GetID('shine_' .. key)
+    local ok = pcall(function()
+        local cx = cellWidth / 2
+        IamPath:Begin(ImVec2(-10, 0))
+            :QuadraticTo(ImVec2(cx, -3), ImVec2(cellWidth + 10, 0))
+            :End()
+        iam.PathBuildArcLut(pathId)
+    end)
+    if ok then
+        _shinePaths[key] = pathId
+        return pathId
+    end
+    return nil
+end
+
 -- Get the X offset for a shine sweep across a cell
--- Returns nil if ability is not ready or shine is disabled
+-- Returns shineX, shineY (or nil if not ready/disabled)
+-- Uses native motion path with gentle arc for curved sweep
 function M.getReadyShineOffset(uniqueId, cellWidth, isReady)
     if not isReady then return nil end
     if not featureEnabled('ReadyPulseEnabled') then return nil end
 
-    -- Slow sweep: 2.5 second cycle
-    local cycleDuration = 2.5
-    local t = (os.clock() % cycleDuration) / cycleDuration
+    local dt = M.get_dt()
 
-    -- Ease in-out for smoother motion at edges
-    local eased
-    if t < 0.5 then
-        eased = 2 * t * t
-    else
-        eased = 1 - math.pow(-2 * t + 2, 2) / 2
+    -- Try native path-based sweep first
+    local pathId = getOrCreateShinePath(cellWidth)
+    if pathId then
+        local ok, pos = pcall(function()
+            return iam.TweenPath(uniqueId, imgui.GetID('shine'), pathId, 2.5,
+                _ezOutSine, IamPolicy.Crossfade, dt)
+        end)
+        if ok and pos then
+            return pos.x, pos.y
+        end
     end
 
-    -- Sweep from left edge past right edge
+    -- Fallback: linear sweep using native oscillator (sawtooth)
+    local wave = iam.Oscillate(uniqueId, imgui.GetID('shineX'),
+        0.5, 0.4, 0.0, IamWaveType.Sawtooth, dt)
     local shineWidth = cellWidth * 0.25
-    return -shineWidth + (cellWidth + shineWidth * 2) * eased
+    local t = wave + 0.5  -- 0 to 1
+    return -shineWidth + (cellWidth + shineWidth * 2) * t
 end
 
 -- Draw the shine highlight effect on a ready ability
@@ -277,11 +308,13 @@ function M.drawReadyShine(dl, minX, minY, maxX, maxY, isReady, themeName)
     if not dl then return end
 
     local cellWidth = maxX - minX
-    local shineOffset = M.getReadyShineOffset('shine', cellWidth, true)
-    if not shineOffset then return end
+    local shineX, shineY = M.getReadyShineOffset('shine', cellWidth, true)
+    if not shineX then return end
 
     local shineWidth = cellWidth * 0.25
-    local sx = minX + shineOffset
+    local sx = minX + shineX
+    -- shineY is the arc offset (from motion path), shift minY/maxY if present
+    local sy = shineY or 0
 
     -- Skip if shine is completely outside cell
     if sx > maxX or sx + shineWidth < minX then return end
@@ -738,24 +771,35 @@ end
 -- WINDOW FOCUS GLOW
 -- ============================================================
 
--- Draw a subtle outer glow when window is focused
+-- Draw a subtle outer glow when window is focused (with organic noise drift)
 function M.drawWindowFocusGlow(dl, x, y, w, h, themeName, isFocused)
     if not isFocused then return end
     if not featureEnabled('ReadyPulseEnabled') then return end
     if not dl then return end
 
+    local dt = M.get_dt()
     local readyRGB = Colors.ready(themeName)
 
-    -- Subtle pulsing glow
-    local t = os.clock() * 1.5  -- Slower pulse than ready
-    local pulse = 0.5 + 0.5 * math.sin(t * math.pi)
+    -- Native oscillator for base pulse + noise for organic drift
+    local basePulse = iam.Oscillate('focusGlow', imgui.GetID('fgPulse'),
+        0.15, 1.2, 0.0, IamWaveType.Sine, dt)
 
-    -- Draw 3 layers of outer glow
+    -- Perlin noise for organic glow intensity variation
+    local drift = 0
+    pcall(function()
+        local noiseOpts = IamNoiseOpts()
+        noiseOpts.type = IamNoiseType.Perlin
+        noiseOpts.octaves = 2
+        drift = iam.SmoothNoiseFloat('focusGlow', 0.3, 0.08, noiseOpts, dt)
+    end)
+
+    local intensity = 0.5 + basePulse + drift
+
+    -- Draw 3 layers of outer glow with varying intensity
     for i = 3, 1, -1 do
-        local baseAlpha = 12 + (3 - i) * 6  -- 12, 18, 24
-        local alpha = math.floor(baseAlpha * (0.6 + 0.4 * pulse))
+        local alpha = math.floor(math.max(0, intensity * 20 * (i / 3)))
         local col = Draw.IM_COL32(readyRGB[1], readyRGB[2], readyRGB[3], alpha)
-        Draw.addRect(dl, x - i, y - i, x + w + i, y + h + i, col, 6 + i, 0, 1)
+        Draw.addRect(dl, x - i, y - i, x + w + i, y + h + i, col, C.LAYOUT.DEFAULT_ROUNDING + i, 0, 1)
     end
 end
 
