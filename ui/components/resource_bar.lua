@@ -13,8 +13,19 @@
 local imgui = require('ImGui')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Colors = require('sidekick-next.ui.colors')
+local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 
 local M = {}
+
+-- Lazy-loaded themes module for textured rendering
+local _Themes = nil
+local function getThemes()
+    if not _Themes then
+        local ok, t = pcall(require, 'sidekick-next.themes')
+        if ok then _Themes = t end
+    end
+    return _Themes
+end
 
 -- ============================================================
 -- COLOR DEFINITIONS
@@ -115,6 +126,8 @@ function M.draw(current, max, opts)
     local gradient = opts.gradient ~= false
     local vertical = opts.vertical == true
     local reversed = opts.reversed == true  -- Fill from right/top
+    local themeName = opts.theme
+    local barType = opts.barType or 'health'
 
     -- Calculate percentage
     current = tonumber(current) or 0
@@ -134,9 +147,65 @@ function M.draw(current, max, opts)
         cx = cx.x or cx[1]
     end
 
+    -- Apply shake offset if provided (for damage shake on HP bars)
+    local shakeX = opts.shakeX or 0
+    local shakeY = opts.shakeY or 0
+    cx = cx + shakeX
+    cy = cy + shakeY
+
     local dl = imgui.GetWindowDrawList()
     if not dl then
         imgui.Dummy(width, height)
+        return
+    end
+
+    -- Try textured rendering if theme supports it (completely isolated in pcall)
+    local texturedSuccess = false
+    pcall(function()
+        if not themeName or vertical then return end
+        local Themes = getThemes()
+        if not Themes or not Themes.isTexturedTheme then return end
+        if not Themes.isTexturedTheme(themeName) then return end
+
+        local TextureRenderer = Draw.getTextureRenderer and Draw.getTextureRenderer()
+        if not TextureRenderer then return end
+        if TextureRenderer.isAvailable and not TextureRenderer.isAvailable() then return end
+
+        local drawResult = TextureRenderer.drawClassicGauge(dl, cx, cy, width, height, pct, barType)
+        if not drawResult then return end
+
+        -- Reserve space
+        imgui.Dummy(width, height)
+
+        -- Draw text overlay if needed
+        if showText or showPercent then
+            local text
+            if showPercent then
+                text = string.format('%d%%', math.floor(pct * 100))
+            elseif showText == true then
+                text = string.format('%d/%d', math.floor(current), math.floor(max))
+            else
+                text = tostring(showText)
+            end
+
+            local textW = imgui.CalcTextSize(text)
+            if type(textW) == 'table' then textW = textW.x or textW[1] or 0 end
+            local textX = cx + (width - textW) / 2
+            local textY = cy + (height - imgui.GetTextLineHeight()) / 2
+
+            Draw.addText(dl, textX + 1, textY + 1, Draw.IM_COL32(0, 0, 0, 200), text)
+            Draw.addText(dl, textX, textY, Draw.IM_COL32(
+                math.floor(textColor[1] * 255),
+                math.floor(textColor[2] * 255),
+                math.floor(textColor[3] * 255),
+                255
+            ), text)
+        end
+
+        texturedSuccess = true
+    end)
+
+    if texturedSuccess then
         return
     end
 
@@ -242,15 +311,28 @@ end
 -- SPECIALIZED BARS
 -- ============================================================
 
--- Health bar with automatic color based on percentage
+-- Health bar with gradient color and damage shake
 function M.health(current, max, opts)
     opts = opts or {}
     current = tonumber(current) or 0
     max = tonumber(max) or 1
     local pct = max > 0 and (current / max) or 0
 
-    opts.color = opts.color or getHealthColor(pct)
+    -- Use OKLAB gradient sampling for smooth color (with fallback to stepped)
+    if not opts.color then
+        local ok, gradColor = pcall(Colors.healthBarGradient, pct)
+        opts.color = (ok and gradColor) or getHealthColor(pct)
+    end
     opts.borderColor = opts.borderColor or { 0.3, 0.1, 0.1 }
+    opts.barType = opts.barType or 'health'
+
+    -- HP damage shake (offset bar on significant HP drop)
+    if not opts.noShake then
+        local hpPct = pct * 100
+        local shakeX, shakeY = AnimHelpers.getHpBarShake('hpbar_' .. (opts.id or 'default'), hpPct)
+        opts.shakeX = shakeX
+        opts.shakeY = shakeY
+    end
 
     M.draw(current, max, opts)
 end
@@ -260,6 +342,7 @@ function M.mana(current, max, opts)
     opts = opts or {}
     opts.color = opts.color or RESOURCE_COLORS.mana
     opts.borderColor = opts.borderColor or { 0.1, 0.15, 0.3 }
+    opts.barType = opts.barType or 'mana'
 
     M.draw(current, max, opts)
 end
@@ -269,6 +352,7 @@ function M.endurance(current, max, opts)
     opts = opts or {}
     opts.color = opts.color or RESOURCE_COLORS.endurance
     opts.borderColor = opts.borderColor or { 0.3, 0.25, 0.1 }
+    opts.barType = opts.barType or 'endurance'
 
     M.draw(current, max, opts)
 end
@@ -279,6 +363,7 @@ function M.experience(current, max, opts)
     opts.color = opts.color or RESOURCE_COLORS.experience
     opts.borderColor = opts.borderColor or { 0.2, 0.1, 0.3 }
     opts.height = opts.height or 8  -- Thinner by default
+    opts.barType = opts.barType or 'experience'
 
     M.draw(current, max, opts)
 end
@@ -292,6 +377,7 @@ function M.aggro(current, max, opts)
 
     opts.color = opts.color or getAggroColor(pct)
     opts.borderColor = opts.borderColor or { 0.25, 0.25, 0.25 }
+    opts.barType = opts.barType or 'aggro'
 
     M.draw(current, max, opts)
 end
@@ -319,6 +405,7 @@ function M.cooldown(remaining, total, opts)
     end
 
     opts.borderColor = opts.borderColor or { 0.25, 0.25, 0.25 }
+    opts.barType = opts.barType or 'cooldown'
 
     M.draw(elapsed, total, opts)
 end

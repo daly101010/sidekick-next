@@ -12,8 +12,86 @@
 
 local C = require('sidekick-next.ui.constants')
 local Draw = require('sidekick-next.ui.draw_helpers')
+local iam = require('ImAnim')
 
 local M = {}
+
+-- ============================================================
+-- NATIVE GRADIENT OBJECTS (created once, sampled per frame)
+-- ============================================================
+
+local _hpGradient = nil
+local _manaGradient = nil
+local _endGradient = nil
+
+function M.getHpGradient()
+    if not _hpGradient then
+        _hpGradient = IamGradient()
+            :Add(0.0, ImVec4(0.8, 0.1, 0.1, 1.0))    -- red at 0%
+            :Add(0.25, ImVec4(0.9, 0.4, 0.1, 1.0))   -- orange at 25%
+            :Add(0.50, ImVec4(0.9, 0.8, 0.2, 1.0))   -- yellow at 50%
+            :Add(0.75, ImVec4(0.5, 0.85, 0.3, 1.0))  -- yellow-green at 75%
+            :Add(1.0, ImVec4(0.2, 0.8, 0.2, 1.0))    -- green at 100%
+    end
+    return _hpGradient
+end
+
+function M.getManaGradient()
+    if not _manaGradient then
+        _manaGradient = IamGradient()
+            :Add(0.0, ImVec4(0.1, 0.1, 0.3, 1.0))
+            :Add(0.5, ImVec4(0.2, 0.4, 0.8, 1.0))
+            :Add(1.0, ImVec4(0.4, 0.6, 1.0, 1.0))
+    end
+    return _manaGradient
+end
+
+function M.getEndGradient()
+    if not _endGradient then
+        _endGradient = IamGradient()
+            :Add(0.0, ImVec4(0.4, 0.3, 0.1, 1.0))
+            :Add(0.5, ImVec4(0.7, 0.6, 0.2, 1.0))
+            :Add(1.0, ImVec4(0.9, 0.8, 0.3, 1.0))
+    end
+    return _endGradient
+end
+
+-- Sample HP color from gradient (returns {r, g, b} 0-1 table)
+function M.healthBarGradient(pct)
+    local grad = M.getHpGradient()
+    local ok, col = pcall(function()
+        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.OKLAB)
+    end)
+    if ok and col then
+        return { col.x, col.y, col.z }
+    end
+    -- Fallback to stepped colors
+    return M.healthBar(pct * 100)
+end
+
+-- Sample mana color from gradient (returns {r, g, b} 0-1 table)
+function M.manaBarGradient(pct)
+    local grad = M.getManaGradient()
+    local ok, col = pcall(function()
+        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.OKLAB)
+    end)
+    if ok and col then
+        return { col.x, col.y, col.z }
+    end
+    return { 0.2, 0.4, 0.9 }
+end
+
+-- Sample endurance color from gradient (returns {r, g, b} 0-1 table)
+function M.enduranceBarGradient(pct)
+    local grad = M.getEndGradient()
+    local ok, col = pcall(function()
+        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.OKLAB)
+    end)
+    if ok and col then
+        return { col.x, col.y, col.z }
+    end
+    return { 0.9, 0.7, 0.2 }
+end
 
 -- ============================================================
 -- THEME COLOR PALETTES

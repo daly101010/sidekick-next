@@ -405,6 +405,30 @@ function M.resetDamageFlash(uniqueId)
 end
 
 -- ============================================================
+-- HP BAR DAMAGE SHAKE (native ShakeVec2)
+-- ============================================================
+
+function M.getHpBarShake(uniqueId, currentHp)
+    if not featureEnabled('DamageFlashEnabled') then return 0, 0 end
+    local dt = M.get_dt()
+
+    -- Detect significant HP drop and trigger shake
+    local prev = _lastHpValues[uniqueId .. '_shake']
+    _lastHpValues[uniqueId .. '_shake'] = currentHp
+    if prev and prev > 0 and currentHp < prev then
+        local dropPct = (prev - currentHp) / prev * 100
+        if dropPct >= C.RESOURCE.DAMAGE_FLASH_THRESHOLD then
+            iam.TriggerShake(uniqueId .. '_hpshake')
+        end
+    end
+
+    -- Return shake offset (decays naturally)
+    local offsetX = iam.Shake(uniqueId .. '_hpshake', imgui.GetID('sx'), 6, 0.2, dt)
+    local offsetY = iam.Shake(uniqueId .. '_hpshake', imgui.GetID('sy'), 3, 0.2, dt)
+    return offsetX, offsetY
+end
+
+-- ============================================================
 -- TOGGLE BUTTON ANIMATIONS
 -- ============================================================
 
