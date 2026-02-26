@@ -962,19 +962,9 @@ function M.draw()
     local mainAnchorTarget = Anchor and Anchor.normalizeTargetKey and Anchor.normalizeTargetKey(settings.SideKickMainAnchorTarget or 'grouptarget')
         or tostring(settings.SideKickMainAnchorTarget or 'grouptarget'):lower()
     local anchorGap = tonumber(settings.SideKickMainAnchorGap) or 2
-    local matchGTW = settings.SideKickMainMatchGTWidth == true
 
     local estW = tonumber(_lastSize.w) or 450
     local estH = tonumber(_lastSize.h) or 400
-
-    if matchGTW and tostring(mainAnchorTarget or '') == 'grouptarget' then
-        local gt = Anchor and Anchor.getTargetBounds and Anchor.getTargetBounds('grouptarget') or _G.GroupTargetBounds
-        local gtW = gt and tonumber(gt.width) or nil
-        if gtW and gtW > 50 and imgui.SetNextWindowSizeConstraints then
-            imgui.SetNextWindowSizeConstraints(gtW, 10, gtW, 10000)
-            estW = gtW
-        end
-    end
 
     local anchorX, anchorY = nil, nil
     if Anchor and Anchor.getAnchorPos then

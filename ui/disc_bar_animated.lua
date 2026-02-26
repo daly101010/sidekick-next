@@ -1,6 +1,7 @@
 local mq = require('mq')
 local imgui = require('ImGui')
 local iam = require('ImAnim')
+local C = require('sidekick-next.ui.constants')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Core = require('sidekick-next.utils.core')
 local Themes = require('sidekick-next.themes')
@@ -25,6 +26,8 @@ end
 
 local _dragKey = nil
 local _pressKey = nil
+local _hoverStart = {}
+local TOOLTIP_DELAY = 1.0 -- seconds before showing tooltip
 
 -- Use centralized draw helpers
 local IM_COL32 = Draw.IM_COL32
@@ -341,7 +344,7 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
     local shown = imgui.Begin('SideKick Discs##SideKickDiscBar', true, flags)
-    if shown then
+    if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_disc', imgui)
         end
@@ -515,8 +518,9 @@ function M.draw(opts)
                 end
             end)
 
-            -- Draw icon at scaled position (inset when using textured frame)
-            local iconInset = _textureRenderer and 4 or 0
+            -- Inscribe icon within circular button to prevent corner overflow
+            local circleInset = math.floor(sw * C.LAYOUT.ICON_CIRCLE_INSET_PCT)
+            local iconInset = math.max(circleInset, _textureRenderer and 4 or 0)
             local iconX = minX + iconInset
             local iconY = minY + iconInset
             local iconW = sw - (iconInset * 2)
@@ -536,7 +540,7 @@ function M.draw(opts)
                 rem, total = opts.cooldownProbe({ label = nm, key = nm })
             end
 
-            -- Draw enhanced cooldown overlay with OKLAB colors (over icon area)
+            -- Draw enhanced cooldown overlay with smooth color tween (over icon area)
             local restoreX, restoreY = imgui.GetCursorPos()
             AnimHelpers.drawCooldownOverlay(dl, iconX, iconY, iconX + iconW, iconY + iconH, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
             imgui.SetCursorPos(restoreX, restoreY)
@@ -544,35 +548,48 @@ function M.draw(opts)
             -- Name overlay (over icon area)
             drawNameWrapped(iconX, iconY, iconX + iconW, def.discName or def.altName, opts.helpers)
 
+            -- Tooltip with hover delay
             if hovered then
-                local fmtCooldown = getFmtCooldown(opts.helpers)
-                local nm = tostring(def.discName or def.altName or '')
-                local duration = (nm ~= '') and spellDurationSeconds(mq.TLO.Spell(nm)) or 0
-                imgui.BeginTooltip()
-                imgui.Text(nm)
-                if def.timer ~= nil then imgui.Text(string.format('Timer: T%s', tostring(def.timer))) end
-                if def.level ~= nil then imgui.Text(string.format('Level: %s', tostring(def.level))) end
-                if duration and duration > 0 then
-                    imgui.Text(string.format('Duration: %s', fmtCooldown(duration)))
+                if not _hoverStart[uniqueId] then
+                    _hoverStart[uniqueId] = os.clock()
                 end
-                if total and total > 0 then
-                    imgui.Text(string.format('Reuse: %s', fmtCooldown(total)))
-                    if rem and rem > 0 then
-                        imgui.Text(string.format('Cooldown: %s', fmtCooldown(rem)))
-                    else
-                        imgui.Text('Ready')
-                    end
+                if (os.clock() - _hoverStart[uniqueId]) >= TOOLTIP_DELAY then
+                    local fmtCooldown = getFmtCooldown(opts.helpers)
+                    local nm = tostring(def.discName or def.altName or '')
+                    local duration = (nm ~= '') and spellDurationSeconds(mq.TLO.Spell(nm)) or 0
+                    -- Defensive tooltip: Begin/End always paired, content in pcall
+                    imgui.BeginTooltip()
+                    pcall(function()
+                        imgui.Text(nm)
+                        if def.timer ~= nil then imgui.Text(string.format('Timer: T%s', tostring(def.timer))) end
+                        if def.level ~= nil then imgui.Text(string.format('Level: %s', tostring(def.level))) end
+                        if duration and duration > 0 then
+                            imgui.Text(string.format('Duration: %s', fmtCooldown(duration)))
+                        end
+                        if total and total > 0 then
+                            imgui.Text(string.format('Reuse: %s', fmtCooldown(total)))
+                            if rem and rem > 0 then
+                                imgui.Text(string.format('Cooldown: %s', fmtCooldown(rem)))
+                            else
+                                imgui.Text('Ready')
+                            end
+                        end
+                        if def.description and tostring(def.description) ~= '' then
+                            imgui.Separator()
+                            imgui.PushTextWrapPos(imgui.GetFontSize() * 20)
+                            drawDescription(def.description)
+                            imgui.PopTextWrapPos()
+                        end
+                    end)
+                    imgui.EndTooltip()
                 end
-                if def.description and tostring(def.description) ~= '' then
-                    imgui.Separator()
-                    drawDescription(def.description)
-                end
-                imgui.EndTooltip()
+            else
+                _hoverStart[uniqueId] = nil
             end
 
             imgui.PopID()
         end
-    end
+    end) if not _drawOk and mq and mq.cmd then mq.cmd('/echo \\ar[SideKick DiscBar] Render error: ' .. tostring(_drawErr) .. '\\ax') end end
     imgui.End()
     imgui.PopStyleVar(2)
     imgui.PopStyleColor(1)

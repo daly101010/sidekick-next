@@ -9,6 +9,17 @@ local Core = require('sidekick-next.utils.core')
 local M = {}
 
 M._smooth = M._smooth or {}
+M._observedTotal = M._observedTotal or {}
+M._debug = false  -- Set to true via /lua run sidekick-next to enable CD debug logging
+M._debugFilter = nil  -- Set to ability name to filter, e.g. "Fists of Wu"
+
+local function dbg(...)
+  if not M._debug then return end
+  local msg = string.format(...)
+  if mq and mq.cmd then
+    mq.cmd('/echo \ag[CD DBG]\ax ' .. msg)
+  end
+end
 
 local function nowMs()
   if mq and mq.gettime then return mq.gettime() end
@@ -27,6 +38,25 @@ local function smooth(name, rem, total)
 
   if name == '' then
     return rem, total
+  end
+
+  -- Remember initial total for the duration of a cooldown.
+  -- Needed when RecastTime=0 (shared timer) and total = rem each frame,
+  -- which would otherwise make pct = rem/rem = 1.0 (stuck).
+  if rem > 0 then
+    local prev = M._observedTotal[name]
+    if not prev then
+      M._observedTotal[name] = total  -- Lock in total from first frame
+    end
+    local origTotal = total
+    -- Use whichever is larger: current total or remembered total
+    total = math.max(total, M._observedTotal[name])
+    if M._debug and (not M._debugFilter or name == M._debugFilter) then
+      dbg('[smooth] %s: rem=%.3f inTotal=%.3f observedTotal=%s outTotal=%.3f',
+        name, rem, origTotal, tostring(prev), total)
+    end
+  else
+    M._observedTotal[name] = nil
   end
 
   if rem <= 0 then
@@ -57,23 +87,35 @@ function M.probe(row)
   local key = row and row.key
   if not label and not key then return 0, 0 end
   local name = label or key
+  local shouldLog = M._debug and (not M._debugFilter or name == M._debugFilter)
 
   -- Try AA first
   local aa = mq.TLO.Me.AltAbility(name)
   if aa and aa() then
-    local total = (aa.MyReuseTime and aa.MyReuseTime()) or (aa.ReuseTime and aa.ReuseTime()) or 0
-    total = tonumber(total) or 0
+    local myReuse = (aa.MyReuseTime and aa.MyReuseTime()) or 0
+    local reuse = (aa.ReuseTime and aa.ReuseTime()) or 0
+    local total = tonumber(myReuse) or 0
+    if total <= 0 then total = tonumber(reuse) or 0 end
 
     local ready = mq.TLO.Me.AltAbilityReady(name)()
+    local remRaw = (mq.TLO.Me.AltAbilityTimer and mq.TLO.Me.AltAbilityTimer(name)()) or 0
+    local rem = (tonumber(remRaw) or 0) / 1000
+
+    if shouldLog and (rem > 0 or not ready) then
+      dbg('[AA] %s: MyReuse=%s Reuse=%s total=%.2f ready=%s remRaw=%s rem=%.3f',
+        name, tostring(myReuse), tostring(reuse), total, tostring(ready), tostring(remRaw), rem)
+    end
+
     if ready and total > 0 then
       return smooth(name, 0, total)
     end
 
-    local remRaw = (mq.TLO.Me.AltAbilityTimer and mq.TLO.Me.AltAbilityTimer(name)()) or 0
-    local rem = (tonumber(remRaw) or 0) / 1000
     if rem > 0 and total > 0 then
       return smooth(name, rem, total)
     end
+    -- NOTE: If total=0 here, DON'T use rem as fallback.
+    -- AltAbilityTimer can report global AA lockout, not this ability's recast.
+    -- Let disc/spell/item sections try instead.
     if total > 0 then
       return smooth(name, 0, total)
     end
@@ -84,13 +126,29 @@ function M.probe(row)
     for _, candidate in ipairs(Helpers.discNameCandidates(name)) do
       local discTimer = mq.TLO.Me.CombatAbilityTimer(candidate)
       if discTimer and discTimer() then
-        local rem = discTimer.TotalSeconds and discTimer.TotalSeconds() or 0
-        rem = tonumber(rem) or 0
+        local tickRem = discTimer.TotalSeconds and discTimer.TotalSeconds() or 0
+        tickRem = tonumber(tickRem) or 0
         local spell = mq.TLO.Spell(candidate)
-        local total = spell and spell.RecastTime and (spell.RecastTime() or 0) / 1000 or 0
-        total = tonumber(total) or 0
+        local recastRaw = spell and spell.RecastTime and spell.RecastTime() or 0
+        local total = (tonumber(recastRaw) or 0) / 1000
 
-        if rem > 0 and total > 0 then
+        -- Tick timers have 6-second granularity and may overshoot short recasts.
+        -- Cap rem at total so short-CD abilities (e.g. 1.5s) don't show 6s.
+        local rem = tickRem
+        if total > 0 and rem > total then
+          rem = total
+        end
+
+        if shouldLog and tickRem > 0 then
+          dbg('[DISC] %s (candidate=%s): tickRem=%.3f recastRaw=%s total=%.3f rem=%.3f',
+            name, candidate, tickRem, tostring(recastRaw), total, rem)
+        end
+
+        if rem > 0 then
+          if total <= 0 then total = rem end  -- shared timer: RecastTime=0 but timer is real
+          if shouldLog then
+            dbg('[DISC] RETURNING: rem=%.3f total=%.3f', rem, total)
+          end
           return smooth(candidate, rem, total)
         end
         if total > 0 then
@@ -109,6 +167,9 @@ function M.probe(row)
         local rem = (tonumber(gemTimer()) or 0) / 1000
         local total = gemTimer.TotalSeconds and gemTimer.TotalSeconds() or 0
         total = tonumber(total) or 0
+        if shouldLog and rem > 0 then
+          dbg('[GEM] %s: gem=%d rem=%.3f total=%.3f', name, gem, rem, total)
+        end
         if rem > 0 and total > 0 then return smooth(name, rem, total) end
         if total > 0 then return smooth(name, 0, total) end
       end
@@ -143,6 +204,10 @@ function M.probe(row)
         total = recastMs / 1000
       end
 
+      if shouldLog and remain > 0 then
+        dbg('[ITEM] %s: remain=%.3f total=%.3f', name, remain, total)
+      end
+
       if remain > 0 then
         if total <= 0 then total = remain end
         return smooth(name, remain, total)
@@ -154,6 +219,9 @@ function M.probe(row)
     end
   end
 
+  if shouldLog then
+    dbg('[MISS] %s: no section matched with active timer', name)
+  end
   return 0, 0
 end
 

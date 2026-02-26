@@ -515,21 +515,13 @@ function M.registerAllStyles()
 end
 
 -- Tween to a target theme over 0.4s with OKLAB blending
+-- NOTE: StyleTween disabled — it modifies the global ImGui style and was
+-- producing purple/pink tint artifacts (OKLAB interpolation side-effects).
+-- Per-window theming via pushWindowTheme is sufficient.
 function M.tweenToTheme(themeName, dt)
-    if not _stylesRegistered then M.registerAllStyles() end
-    if not _stylesRegistered then return end  -- registration failed
-
     _currentThemeTarget = themeName
-    pcall(function()
-        iam.StyleTween(
-            imgui.GetID('sk_theme'),
-            imgui.GetID(themeName),
-            0.4,
-            _ezOutCubic,
-            IamColorSpace.OKLAB,
-            dt
-        )
-    end)
+    -- StyleTween disabled: pushWindowTheme handles per-window colors.
+    -- Re-enable if native StyleTween OKLAB artifacts are resolved.
 end
 
 -- Get the current tween target

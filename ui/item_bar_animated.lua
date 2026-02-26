@@ -1,6 +1,7 @@
 local mq = require('mq')
 local imgui = require('ImGui')
 local iam = require('ImAnim')
+local C = require('sidekick-next.ui.constants')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Items = require('sidekick-next.utils.items')
 local Themes = require('sidekick-next.themes')
@@ -27,26 +28,32 @@ local IM_COL32 = Draw.IM_COL32
 local dlAddRectFilled = Draw.addRectFilled
 local dlAddRect = Draw.addRect
 
+local _hoverStart = {}
+local TOOLTIP_DELAY = 1.0 -- seconds before showing tooltip
+
 local function tooltipFor(entry, helpers, rem, total)
     local info = entry.info
+    -- Defensive tooltip: Begin/End always paired, content in pcall
     imgui.BeginTooltip()
-    imgui.TextColored(0.0, 1.0, 0.0, 1.0, tostring(entry.itemName))
-    if info then
-        if info.spell and info.spell ~= '' then imgui.Text('Spell: ' .. tostring(info.spell)) end
-        if info.durationFmt and info.durationFmt ~= '' then imgui.Text('Duration: ' .. tostring(info.durationFmt)) end
-        if info.category and info.category ~= '' then imgui.Text('Category: ' .. tostring(info.category)) end
-        if info.castTimeFmt and info.castTimeFmt ~= '' then imgui.Text('Cast Time: ' .. tostring(info.castTimeFmt)) end
-        if info.recastFmt and info.recastFmt ~= '' then imgui.Text('Reuse: ' .. tostring(info.recastFmt)) end
-    elseif total and total > 0 and helpers and helpers.fmtCooldown then
-        imgui.Text('Reuse: ' .. helpers.fmtCooldown(total))
-    end
-    if total and total > 0 and helpers and helpers.fmtCooldown then
-        if rem and rem > 0 then
-            imgui.Text('Cooldown: ' .. helpers.fmtCooldown(rem))
-        else
-            imgui.Text('Ready')
+    pcall(function()
+        imgui.TextColored(0.0, 1.0, 0.0, 1.0, tostring(entry.itemName))
+        if info then
+            if info.spell and info.spell ~= '' then imgui.Text('Spell: ' .. tostring(info.spell)) end
+            if info.durationFmt and info.durationFmt ~= '' then imgui.Text('Duration: ' .. tostring(info.durationFmt)) end
+            if info.category and info.category ~= '' then imgui.Text('Category: ' .. tostring(info.category)) end
+            if info.castTimeFmt and info.castTimeFmt ~= '' then imgui.Text('Cast Time: ' .. tostring(info.castTimeFmt)) end
+            if info.recastFmt and info.recastFmt ~= '' then imgui.Text('Reuse: ' .. tostring(info.recastFmt)) end
+        elseif total and total > 0 and helpers and helpers.fmtCooldown then
+            imgui.Text('Reuse: ' .. helpers.fmtCooldown(total))
         end
-    end
+        if total and total > 0 and helpers and helpers.fmtCooldown then
+            if rem and rem > 0 then
+                imgui.Text('Cooldown: ' .. helpers.fmtCooldown(rem))
+            else
+                imgui.Text('Ready')
+            end
+        end
+    end)
     imgui.EndTooltip()
 end
 
@@ -122,7 +129,7 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
     local shown = imgui.Begin('SideKick Items##SideKickItemBar', true, flags)
-    if shown then
+    if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_items', imgui)
         end
@@ -227,8 +234,9 @@ function M.draw(opts)
                 end
             end)
 
-            -- Icon (inset when using textured frame)
-            local iconInset = _textureRenderer and 4 or 0
+            -- Inscribe icon within circular button to prevent corner overflow
+            local circleInset = math.floor(sw * C.LAYOUT.ICON_CIRCLE_INSET_PCT)
+            local iconInset = math.max(circleInset, _textureRenderer and 4 or 0)
             local iconX = minX + iconInset
             local iconY = minY + iconInset
             local iconW = sw - (iconInset * 2)
@@ -253,13 +261,21 @@ function M.draw(opts)
             AnimHelpers.drawCooldownOverlay(dl, iconX, iconY, iconX + iconW, iconY + iconH, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
             imgui.SetCursorPos(restoreX, restoreY)
 
+            -- Tooltip with hover delay
             if hovered then
-                tooltipFor(entry, opts.helpers, rem, total)
+                if not _hoverStart[uniqueId] then
+                    _hoverStart[uniqueId] = os.clock()
+                end
+                if (os.clock() - _hoverStart[uniqueId]) >= TOOLTIP_DELAY then
+                    tooltipFor(entry, opts.helpers, rem, total)
+                end
+            else
+                _hoverStart[uniqueId] = nil
             end
 
             imgui.PopID()
         end
-    end
+    end) if not _drawOk and mq and mq.cmd then mq.cmd('/echo \\ar[SideKick ItemBar] Render error: ' .. tostring(_drawErr) .. '\\ax') end end
 
     imgui.End()
     imgui.PopStyleVar(2)

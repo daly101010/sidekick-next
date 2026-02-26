@@ -1,5 +1,8 @@
+local mq = require('mq')
 local imgui = require('ImGui')
 local iam = require('ImAnim')
+local C = require('sidekick-next.ui.constants')
+local Colors = require('sidekick-next.ui.colors')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Themes = require('sidekick-next.themes')
 local Anchor = require('sidekick-next.ui.anchor')
@@ -27,7 +30,12 @@ local IM_COL32 = Draw.IM_COL32
 local dlAddRectFilled = Draw.addRectFilled
 local dlAddRect = Draw.addRect
 
+-- Cached ease descriptor for shadow/glow animations
+local _ezOutCubic = iam.EasePreset(IamEaseType.OutCubic)
+
 local _dragKey = nil
+local _hoverStart = {}
+local TOOLTIP_DELAY = 1.0 -- seconds before showing tooltip
 
 local function getButtonKey(def, idx)
     if def and def.altID ~= nil then return tostring(def.altID) end
@@ -90,6 +98,66 @@ local function drawNameWrapped(minX, minY, maxX, name, helpers)
     for i = 1, math.min(#lines, 2) do
         drawOutlinedText(minX + 3, minY + 3 + (i - 1) * lineH, lines[i], 1, 1, 1)
     end
+end
+
+local function getFmtCooldown(helpers)
+    if helpers and helpers.fmtCooldown then return helpers.fmtCooldown end
+    return function(rem)
+        rem = tonumber(rem) or 0
+        rem = math.max(0, math.floor(rem + 0.5))
+        if rem >= 3600 then
+            local h = math.floor(rem / 3600)
+            local m = math.floor(math.fmod(rem, 3600) / 60)
+            local s = math.floor(math.fmod(rem, 60))
+            return string.format("%d:%02d:%02d", h, m, s)
+        elseif rem >= 60 then
+            local m = math.floor(rem / 60)
+            local s = math.floor(math.fmod(rem, 60))
+            return string.format("%d:%02d", m, s)
+        else
+            return string.format("%ds", rem)
+        end
+    end
+end
+
+local function spellDurationSeconds(spell)
+    if not spell then return 0 end
+    local ok, exists = pcall(function() return spell() end)
+    if not ok or not exists then return 0 end
+    local dur = 0
+    local okDur, v = pcall(function()
+        return spell.Duration and spell.Duration.TotalSeconds and spell.Duration.TotalSeconds()
+    end)
+    if okDur then dur = tonumber(v) or 0 end
+    if dur > 0 then return dur end
+    okDur, v = pcall(function()
+        return spell.Duration and spell.Duration()
+    end)
+    if okDur then dur = tonumber(v) or 0 end
+    if dur > 0 and dur < 5000 and math.floor(dur) == dur then
+        dur = dur * 6
+    end
+    return dur
+end
+
+local function abilityDurationSeconds(def)
+    if not def then return 0 end
+    local idOrName = def.altID or def.altName
+    local aa = idOrName and mq.TLO.Me.AltAbility(idOrName) or nil
+    if aa and aa() then
+        local okName, spellName = pcall(function()
+            if aa.Spell and aa.Spell.Name then return aa.Spell.Name() end
+            return nil
+        end)
+        if okName and type(spellName) == 'string' and spellName ~= '' then
+            return spellDurationSeconds(mq.TLO.Spell(spellName))
+        end
+    end
+    local nm = tostring(def.altName or '')
+    if nm ~= '' then
+        return spellDurationSeconds(mq.TLO.Spell(nm))
+    end
+    return 0
 end
 
 function M.draw(opts)
@@ -173,7 +241,7 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
     local shown = imgui.Begin('SideKick Specials##SideKickSpecial', true, flags)
-    if shown then
+    if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_special', imgui)
         end
@@ -322,20 +390,65 @@ function M.draw(opts)
             sw = sw + pulse * 2
             sh = sh + pulse * 2
 
+            -- Rounded button rendering: shadow, background, glow
+            local btnRounding = math.floor(cell * C.LAYOUT.BUTTON_ROUNDING_PCT)
+            local dt = AnimHelpers.get_dt()
+
+            -- Drop shadow (behind everything)
+            local shadowAlpha = iam.TweenFloat(
+                uniqueId, imgui.GetID('shadow'),
+                hovered and C.LAYOUT.SHADOW_ALPHA_HOVER or C.LAYOUT.SHADOW_ALPHA_NORMAL,
+                0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
+            local shadowCol = IM_COL32(0, 0, 0, math.floor(shadowAlpha))
+            dlAddRectFilled(dl,
+                minX + C.LAYOUT.SHADOW_OFFSET_X,
+                minY + C.LAYOUT.SHADOW_OFFSET_Y,
+                minX + sw + C.LAYOUT.SHADOW_OFFSET_X,
+                minY + sh + C.LAYOUT.SHADOW_OFFSET_Y,
+                shadowCol, btnRounding)
+
+            -- Button background
+            dlAddRectFilled(dl, minX, minY, minX + sw, minY + sh,
+                IM_COL32(30, 30, 30, 220), btnRounding)
+
+            -- Glow on hover
+            local glowAlpha = iam.TweenFloat(
+                uniqueId, imgui.GetID('glow'),
+                hovered and C.LAYOUT.GLOW_ALPHA_MAX or 0,
+                0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
+            if glowAlpha > 1 then
+                local accentColor = Colors.ready(themeName)
+                local glowCol = IM_COL32(accentColor[1], accentColor[2], accentColor[3], math.floor(glowAlpha))
+                local expand = C.LAYOUT.GLOW_EXPAND
+                dlAddRect(dl,
+                    minX - expand, minY - expand,
+                    minX + sw + expand, minY + sh + expand,
+                    glowCol, btnRounding + expand, 0, 2)
+            end
+
+            -- Clip to rounded rect for icon and overlays
+            imgui.PushClipRect(minX, minY, minX + sw, minY + sh, true)
+
             -- Draw textured icon holder background
             local _textureRenderer = nil
-            pcall(function()
-                if not useTexturedBg then return end
+            local _texOk, _texErr = pcall(function()
+                if not Themes.isTexturedTheme then return end
+                local isTextured = Themes.isTexturedTheme(themeName)
+                if not isTextured then return end
                 local tr = getTextureRenderer()
-                if not tr or not tr.drawIconHolder then return end
+                if not tr then return end
+                if tr.isAvailable and not tr.isAvailable() then return end
+                if not dl then return end
                 local holderState = hovered and 'hover' or (active and 'active' or 'normal')
-                if tr.drawIconHolder(dl, minX, minY, sw, holderState) then
+                local drawResult = tr.drawIconHolder(dl, minX, minY, sw, holderState)
+                if drawResult then
                     _textureRenderer = tr
                 end
             end)
 
-            -- Draw icon at scaled position (inset when using textured frame)
-            local iconInset = _textureRenderer and 4 or 0
+            -- Inscribe icon within circular button to prevent corner overflow
+            local circleInset = math.floor(sw * C.LAYOUT.ICON_CIRCLE_INSET_PCT)
+            local iconInset = math.max(circleInset, _textureRenderer and 4 or 0)
             local iconX = minX + iconInset
             local iconY = minY + iconInset
             local iconW = sw - (iconInset * 2)
@@ -354,25 +467,62 @@ function M.draw(opts)
                 rem, total = opts.cooldownProbe({ label = def.altName, key = def.altName })
             end
 
-            -- Draw enhanced cooldown overlay with OKLAB colors (over icon area)
+            -- Draw enhanced cooldown overlay with smooth color tween (over icon area)
             local restoreX, restoreY = imgui.GetCursorPos()
             AnimHelpers.drawCooldownOverlay(dl, iconX, iconY, iconX + iconW, iconY + iconH, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
             imgui.SetCursorPos(restoreX, restoreY)
+
+            -- Draw textured cooldown bar at bottom of icon
+            if _textureRenderer and dl and rem and rem > 0 and total and total > 0 then
+                pcall(function()
+                    local cdBarH = 6
+                    local cdPct = (total - rem) / total
+                    local cdY = iconY + iconH - cdBarH
+                    _textureRenderer.drawSimpleGauge(dl, iconX, cdY, iconW, cdBarH, cdPct, 'cooldown')
+                end)
+            end
 
             -- Name overlay (over icon area)
             if opts.drawName ~= false then
                 drawNameWrapped(iconX, iconY, iconX + iconW, def.altName, opts.helpers)
             end
 
+            -- Pop rounded clip rect
+            imgui.PopClipRect()
+
+            -- Tooltip with hover delay
             if hovered then
-                imgui.BeginTooltip()
-                imgui.Text(tostring(def.altName))
-                imgui.EndTooltip()
+                if not _hoverStart[uniqueId] then
+                    _hoverStart[uniqueId] = os.clock()
+                end
+                if (os.clock() - _hoverStart[uniqueId]) >= TOOLTIP_DELAY then
+                    local fmtCooldown = getFmtCooldown(opts.helpers)
+                    local duration = abilityDurationSeconds(def)
+                    -- Defensive tooltip: Begin/End always paired, content in pcall
+                    imgui.BeginTooltip()
+                    pcall(function()
+                        imgui.Text(tostring(def.altName))
+                        if duration and duration > 0 then
+                            imgui.Text(string.format('Duration: %s', fmtCooldown(duration)))
+                        end
+                        if total and total > 0 then
+                            imgui.Text(string.format('Reuse: %s', fmtCooldown(total)))
+                            if rem and rem > 0 then
+                                imgui.Text(string.format('Cooldown: %s', fmtCooldown(rem)))
+                            else
+                                imgui.Text('Ready')
+                            end
+                        end
+                    end)
+                    imgui.EndTooltip()
+                end
+            else
+                _hoverStart[uniqueId] = nil
             end
 
             imgui.PopID()
         end
-    end
+    end) if not _drawOk and mq and mq.cmd then mq.cmd('/echo \\ar[SideKick SpecialBar] Render error: ' .. tostring(_drawErr) .. '\\ax') end end
     imgui.End()
     imgui.PopStyleVar(2)
     imgui.PopStyleColor(1)

@@ -66,8 +66,12 @@ M.LAYOUT = {
     MAX_ANCHOR_GAP = 48,  -- Increased from 24
     DEFAULT_ANCHOR_GAP = 2,
 
-    -- Button rounding (% of cell size, 0.0 = square, 0.5 = pill)
-    BUTTON_ROUNDING_PCT = 0.4,
+    -- Button rounding (% of cell size, 0.0 = square, 0.5 = circle)
+    BUTTON_ROUNDING_PCT = 0.5,
+
+    -- Icon circle inset (% of cell, inscribes square icon within circular button)
+    -- Derived from (1 - sqrt(2)/2) / 2 ≈ 0.146 — corners touch circle boundary
+    ICON_CIRCLE_INSET_PCT = 0.146,
 
     -- Shadow
     SHADOW_OFFSET_X = 2,

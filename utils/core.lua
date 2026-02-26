@@ -142,12 +142,25 @@ end
 function Core.set(key, value)
     if key == nil then return end
     local k = tostring(key)
+
+    -- DEBUG: Always log theme changes
+    if k == 'SideKickTheme' then
+        local prev = Core.Settings and Core.Settings[k]
+        print(string.format('\ay[Core.set] Theme: %s -> %s\ax', tostring(prev), tostring(value)))
+    end
+
     local debug = Core.Settings and Core.Settings.SideKickDebugSettings == true
     if debug then
         local prev = Core.Settings[k]
         debugEcho('Core.set(%s): %s -> %s', k, tostring(prev), tostring(value))
     end
     Core.Settings[k] = value
+
+    -- DEBUG: Verify assignment
+    if k == 'SideKickTheme' then
+        print(string.format('\ag[Core.set] Theme now: %s\ax', tostring(Core.Settings[k])))
+    end
+
     -- Ability toggles/modes/conditions always begin with "do" (e.g. doFoo, doFooMode, doFooCondition).
     -- Global settings like AssistMode/CombatMode must stay in the SideKick section.
     if k:match('^do') then
@@ -161,6 +174,11 @@ function Core.set(key, value)
         debugEcho('INI[%s].%s=%s', sec, k, tostring(stored))
     end
     Core.save()
+
+    -- DEBUG: Final verification
+    if k == 'SideKickTheme' then
+        print(string.format('\ag[Core.set] Save complete, Settings.SideKickTheme=%s\ax', tostring(Core.Settings.SideKickTheme)))
+    end
 end
 
 function Core.ensureSeeded(abilities, MODE)

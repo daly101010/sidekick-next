@@ -8,6 +8,7 @@
 --   local changed, newValue = CheckboxRow.draw('Enable Animations', 'AnimationsEnabled', current)
 
 local imgui = require('ImGui')
+require('sidekick-next.ui.imgui_compat')
 
 local M = {}
 
@@ -60,7 +61,7 @@ function M.withDesc(label, description, settingKey, current, onChange, opts)
     opts = opts or {}
 
     -- Checkbox
-    local changed, newValue = imgui.Checkbox('##' .. settingKey, current)
+    local newValue, changed = imgui.Checkbox('##' .. settingKey, current)
 
     imgui.SameLine()
 
@@ -81,7 +82,7 @@ function M.withDesc(label, description, settingKey, current, onChange, opts)
         onChange(newValue)
     end
 
-    return changed, newValue
+    return newValue, changed
 end
 
 -- ============================================================
@@ -93,10 +94,10 @@ function M.indented(label, settingKey, current, onChange, opts)
     local indent = opts.indent or 20
 
     imgui.Indent(indent)
-    local changed, newValue = M.draw(label, settingKey, current, onChange, opts)
+    local newValue, changed = M.draw(label, settingKey, current, onChange, opts)
     imgui.Unindent(indent)
 
-    return changed, newValue
+    return newValue, changed
 end
 
 -- ============================================================
@@ -116,7 +117,7 @@ function M.group(items, opts)
     end
 
     for i, item in ipairs(items) do
-        local changed, newValue = M.draw(
+        local newValue, changed = M.draw(
             item.label,
             item.key,
             item.value,
@@ -161,7 +162,7 @@ function M.toggle(label, settingKey, current, onChange, opts)
     imgui.PushStyleColor(ImGuiCol.FrameBgHovered, offColor[1] * 1.1, offColor[2] * 1.1, offColor[3] * 1.1, offColor[4])
     imgui.PushStyleColor(ImGuiCol.CheckMark, onColor[1], onColor[2], onColor[3], onColor[4])
 
-    local changed, newValue = imgui.Checkbox(label .. '##' .. settingKey, current)
+    local newValue, changed = imgui.Checkbox(label .. '##' .. settingKey, current)
 
     imgui.PopStyleColor(3)
 
@@ -175,7 +176,7 @@ function M.toggle(label, settingKey, current, onChange, opts)
         onChange(newValue)
     end
 
-    return changed, newValue
+    return newValue, changed
 end
 
 -- ============================================================

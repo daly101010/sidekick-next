@@ -394,4 +394,104 @@ function M.statusDot(isReady, themeName, opts)
     end
 end
 
+-- ============================================================
+-- TOGGLE BADGE (clickable on/off toggle)
+-- ============================================================
+
+--- Draw a toggle badge that switches between enabled/disabled states
+---@param label string The label to show (used for both states by default)
+---@param isEnabled boolean Current enabled state
+---@param themeName string Theme name
+---@param opts table|nil Options: enabledText, disabledText, enabledStyle, disabledStyle, tooltip
+---@return boolean newValue The new value after toggle
+---@return boolean changed Whether the value changed
+function M.toggle(label, isEnabled, themeName, opts)
+    opts = opts or {}
+
+    local enabledText = opts.enabledText or label or 'Enabled'
+    local disabledText = opts.disabledText or label or 'Disabled'
+    local enabledStyle = opts.enabledStyle or 'success'
+    local disabledStyle = opts.disabledStyle or 'neutral'
+
+    local text = isEnabled and enabledText or disabledText
+    local style = isEnabled and enabledStyle or disabledStyle
+
+    local badgeOpts = {
+        showIcon = opts.showIcon,
+        pulsing = isEnabled and (opts.pulsing ~= false),
+        minWidth = opts.minWidth,
+        paddingH = opts.paddingH or 8,
+        paddingV = opts.paddingV or 3,
+        rounding = opts.rounding or 4,
+    }
+
+    local clicked, hovered = M.draw(text, style, themeName, badgeOpts)
+
+    -- Show tooltip on hover
+    if hovered then
+        local tooltip = opts.tooltip
+        if not tooltip then
+            tooltip = isEnabled and 'Click to disable' or 'Click to enable'
+        end
+        if tooltip and imgui.BeginTooltip then
+            imgui.BeginTooltip()
+            imgui.Text(tooltip)
+            imgui.EndTooltip()
+        elseif tooltip and imgui.SetTooltip then
+            imgui.SetTooltip(tooltip)
+        end
+    end
+
+    local newValue = isEnabled
+    local changed = false
+    if clicked then
+        newValue = not isEnabled
+        changed = true
+    end
+
+    return newValue, changed
+end
+
+--- Toggle badge for feature enable/disable
+---@param label string Feature name
+---@param isEnabled boolean Current enabled state
+---@param themeName string Theme name
+---@param opts table|nil Options
+---@return boolean newValue
+---@return boolean changed
+function M.toggleFeature(label, isEnabled, themeName, opts)
+    opts = opts or {}
+    opts.enabledText = opts.enabledText or 'Active'
+    opts.disabledText = opts.disabledText or 'Off'
+    opts.enabledStyle = opts.enabledStyle or 'success'
+    opts.disabledStyle = opts.disabledStyle or 'neutral'
+    return M.toggle(label, isEnabled, themeName, opts)
+end
+
+--- Toggle badge showing connected peers count
+---@param peerCount number Number of connected peers
+---@param isEnabled boolean Whether actors are enabled
+---@param themeName string Theme name
+---@param opts table|nil Options
+---@return boolean newValue
+---@return boolean changed
+function M.togglePeers(peerCount, isEnabled, themeName, opts)
+    opts = opts or {}
+    local count = tonumber(peerCount) or 0
+
+    if isEnabled then
+        if count > 0 then
+            opts.enabledText = count .. ' Peers'
+            opts.enabledStyle = 'success'
+        else
+            opts.enabledText = 'No Peers'
+            opts.enabledStyle = 'info'
+        end
+    end
+    opts.disabledText = opts.disabledText or 'Off'
+    opts.disabledStyle = opts.disabledStyle or 'neutral'
+
+    return M.toggle(nil, isEnabled, themeName, opts)
+end
+
 return M

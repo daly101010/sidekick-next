@@ -4,10 +4,21 @@ M.defaults = {
     SideKickTheme = { type = 'text', Default = 'Classic', Category = 'UI', DisplayName = 'Theme' },
     SideKickSyncThemeWithGT = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Sync Theme With GroupTarget' },
     SideKickDebugSettings = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Debug Settings Logging' },
+    SideKickMainEnabled = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Show Main Bar' },
+    SideKickOptionsManual = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Options Window Manual Move/Resize' },
+    SideKickOptionsPosX = { type = 'number', Default = -1, Category = 'UI', DisplayName = 'Options Window X' },
+    SideKickOptionsPosY = { type = 'number', Default = -1, Category = 'UI', DisplayName = 'Options Window Y' },
+    SideKickOptionsWidth = { type = 'number', Default = 0, Category = 'UI', DisplayName = 'Options Window Width' },
+    SideKickOptionsHeight = { type = 'number', Default = 0, Category = 'UI', DisplayName = 'Options Window Height' },
     SideKickMainAnchor = { type = 'text', Default = 'none', Category = 'UI', DisplayName = 'Main Anchor (GroupTarget)' },
     SideKickMainAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'UI', DisplayName = 'Main Anchor Target' },
     SideKickMainAnchorGap = { type = 'number', Default = 2, Category = 'UI', DisplayName = 'Main Anchor Gap' },
-    SideKickMainMatchGTWidth = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Main Match GroupTarget Width' },
+    SideKickMainButtonScale = { type = 'number', Default = 1.0, Category = 'UI', DisplayName = 'Main Button Scale' },
+    SideKickFontScale = { type = 'number', Default = 1.0, Category = 'UI', DisplayName = 'Font Scale' },
+    SideKickMainTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'UI', DisplayName = 'Main Bar Texture Tint' },
+    SideKickMainBgStyle = { type = 'text', Default = 'lightrock', Category = 'UI', DisplayName = 'Main Bar Background Style' },
+    SideKickMainBgTexture = { type = 'text', Default = 'A_Listbox_Background1', Category = 'UI', DisplayName = 'Main Bar Background Texture' },
+    SideKickMainBgTile = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Main Bar Background Tile' },
 
     SideKickBarEnabled = { type = 'bool', Default = true, Category = 'Bar', DisplayName = 'Show Ability Bar' },
     SideKickBarCell = { type = 'number', Default = 48, Category = 'Bar', DisplayName = 'Cell Size' },
@@ -18,8 +29,12 @@ M.defaults = {
     SideKickBarAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Bar', DisplayName = 'Anchor Target' },
     SideKickBarAnchor = { type = 'text', Default = 'none', Category = 'Bar', DisplayName = 'Anchor Mode' },
     SideKickBarAnchorGap = { type = 'number', Default = 2, Category = 'Bar', DisplayName = 'Anchor Gap' },
+    SideKickBarTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Bar', DisplayName = 'Bar Texture Tint' },
 
     SideKickSpecialEnabled = { type = 'bool', Default = true, Category = 'Special', DisplayName = 'Show Special Abilities' },
+    SideKickSpecialForceSingleRow = { type = 'bool', Default = false, Category = 'Special', DisplayName = 'Specials: Force Single Row' },
+    SideKickSpecialForceSingleColumn = { type = 'bool', Default = false, Category = 'Special', DisplayName = 'Specials: Force Single Column' },
+    SideKickSpecialPerButtonMove = { type = 'bool', Default = false, Category = 'Special', DisplayName = 'Specials: Per-Button Move' },
     SideKickSpecialCell = { type = 'number', Default = 65, Category = 'Special', DisplayName = 'Cell Size' },
     SideKickSpecialRows = { type = 'number', Default = 1, Category = 'Special', DisplayName = 'Rows' },
     SideKickSpecialGap = { type = 'number', Default = 4, Category = 'Special', DisplayName = 'Gap' },
@@ -28,6 +43,7 @@ M.defaults = {
     SideKickSpecialAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Special', DisplayName = 'Anchor Target' },
     SideKickSpecialAnchor = { type = 'text', Default = 'none', Category = 'Special', DisplayName = 'Anchor Mode' },
     SideKickSpecialAnchorGap = { type = 'number', Default = 2, Category = 'Special', DisplayName = 'Anchor Gap' },
+    SideKickSpecialTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Special', DisplayName = 'Special Bar Texture Tint' },
 
     SideKickDiscBarEnabled = { type = 'bool', Default = true, Category = 'Disciplines', DisplayName = 'Show Disciplines Bar' },
     SideKickDiscBarCell = { type = 'number', Default = 48, Category = 'Disciplines', DisplayName = 'Bar Cell Size' },
@@ -38,6 +54,7 @@ M.defaults = {
     SideKickDiscBarAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Disciplines', DisplayName = 'Bar Anchor Target' },
     SideKickDiscBarAnchor = { type = 'text', Default = 'none', Category = 'Disciplines', DisplayName = 'Bar Anchor Mode' },
     SideKickDiscBarAnchorGap = { type = 'number', Default = 2, Category = 'Disciplines', DisplayName = 'Bar Anchor Gap' },
+    SideKickDiscBarTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Disciplines', DisplayName = 'Disc Bar Texture Tint' },
 
     SideKickItemBarEnabled = { type = 'bool', Default = true, Category = 'Items', DisplayName = 'Show Item Bar' },
     SideKickItemBarCell = { type = 'number', Default = 40, Category = 'Items', DisplayName = 'Cell Size' },
@@ -48,6 +65,7 @@ M.defaults = {
     SideKickItemBarAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Items', DisplayName = 'Anchor Target' },
     SideKickItemBarAnchor = { type = 'text', Default = 'none', Category = 'Items', DisplayName = 'Anchor Mode' },
     SideKickItemBarAnchorGap = { type = 'number', Default = 2, Category = 'Items', DisplayName = 'Anchor Gap' },
+    SideKickItemBarTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Items', DisplayName = 'Item Bar Texture Tint' },
 
     ChaseEnabled = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Chase Enabled' },
     ChaseRole = { type = 'text', Default = 'ma', Category = 'Automation', DisplayName = 'Chase Role (none/ma/mt/leader/raid1/raid2/raid3)' },
@@ -255,6 +273,12 @@ local VALIDATORS = {
     SideKickSpecialAnchorGap = { min = 0, max = 48 },
     SideKickDiscBarAnchorGap = { min = 0, max = 48 },
     SideKickItemBarAnchorGap = { min = 0, max = 48 },
+
+    -- Button scale: 0.5-3.0
+    SideKickMainButtonScale = { min = 0.5, max = 3.0 },
+
+    -- Font scale: 0.5-3.0
+    SideKickFontScale = { min = 0.5, max = 3.0 },
 
     -- Cell sizes: 32-120
     SideKickBarCell = { min = 32, max = 120 },

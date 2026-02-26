@@ -10,6 +10,7 @@ local Anchor = require('sidekick-next.ui.anchor')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Helpers = require('sidekick-next.lib.helpers')
 local SpecialAbilities = require('sidekick-next.utils.special_abilities')
+local ContextMenu = require('sidekick-next.ui.components.animated_context_menu')
 
 local M = {}
 
@@ -28,6 +29,8 @@ end
 
 local _dragKey = nil
 local _pressKey = nil
+local _hoverStart = {}
+local TOOLTIP_DELAY = 1.0 -- seconds before showing tooltip
 
 -- Use centralized draw helpers
 local IM_COL32 = Draw.IM_COL32
@@ -310,6 +313,37 @@ local function abilityDurationSeconds(def)
     return 0
 end
 
+local function buildModeMenu(def, settings, opts)
+    if not def.modeKey then return nil end
+    local currentMode = tonumber(settings[def.modeKey]) or 1
+    local items = {}
+
+    -- Header (disabled, just for context)
+    table.insert(items, { label = tostring(def.altName or 'Ability'), disabled = true })
+    table.insert(items, { separator = true })
+
+    -- Mode options: 1=On Demand, 2=On Condition, 3=On Cooldown
+    local modes = { { value = 1, label = 'On Demand' }, { value = 2, label = 'On Condition' }, { value = 3, label = 'On Cooldown' } }
+    if opts.modeLabels then
+        for _, m in ipairs(modes) do
+            m.label = opts.modeLabels[m.value] or m.label
+        end
+    end
+
+    for _, m in ipairs(modes) do
+        local check = (currentMode == m.value) and '> ' or '   '
+        table.insert(items, {
+            label = check .. m.label,
+            action = function()
+                if opts.onMode then opts.onMode(def.modeKey, m.value) end
+                if m.value == 2 and opts.onOpenSettings then opts.onOpenSettings() end
+            end,
+        })
+    end
+
+    return items
+end
+
 function M.draw(opts)
     opts = opts or {}
     local settings = opts.settings or {}
@@ -390,8 +424,9 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, rounding)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
-    local shown = imgui.Begin('SideKick Abilities##SideKickBar', true, flags)
-    if shown then
+    local open, shown = imgui.Begin('SideKick Abilities##SideKickBar', true, flags)
+    if shown == nil then shown = open end
+    if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_bar', imgui)
         end
@@ -446,256 +481,301 @@ function M.draw(opts)
 
             imgui.SetCursorPos(x, y)
             imgui.PushID(def.settingKey)
-
-            local sp = imgui.GetCursorScreenPos()
-            local bx, by
-            if type(sp) == 'table' then
-                bx = sp.x or sp[1]
-                by = sp.y or sp[2]
-            else
-                bx = sp
-                by = select(2, imgui.GetCursorScreenPos())
-            end
-
-            imgui.InvisibleButton('btn', cell, cell)
-            local hovered = imgui.IsItemHovered()
-            local active = imgui.IsItemActive()
-
-            local justPressed = false
-            if imgui.IsItemActivated then
-                local ok, v = pcall(imgui.IsItemActivated)
-                justPressed = ok and v == true
-            elseif imgui.IsMouseClicked then
-                local ok, v = pcall(imgui.IsMouseClicked, 0)
-                justPressed = ok and v == true and hovered
-            end
-
-            if justPressed then
-                _pressKey = tostring(def.settingKey or '')
-            end
-
-            local isDragging = false
-            if imgui.IsMouseDragging then
-                local okDrag, dragging = pcall(imgui.IsMouseDragging, 0, 4)
-                if okDrag and dragging and active then
-                    isDragging = true
+            local clipPushed = false
+            local cellOk, cellErr = pcall(function()
+                local sp = imgui.GetCursorScreenPos()
+                local bx, by
+                if type(sp) == 'table' then
+                    bx = sp.x or sp[1]
+                    by = sp.y or sp[2]
+                else
+                    bx = sp
+                    by = select(2, imgui.GetCursorScreenPos())
                 end
-            end
 
-            if imgui.BeginDragDropSource and imgui.EndDragDropSource then
-                local ok, started = pcall(imgui.BeginDragDropSource)
-                if ok and started then
-                    _dragKey = tostring(def.settingKey or '')
-                    isDragging = true
-                    _pressKey = nil
-                    if imgui.SetDragDropPayload then
-                        pcall(imgui.SetDragDropPayload, 'SideKickBarSwap', _dragKey)
+                imgui.InvisibleButton('btn', cell, cell)
+                local hovered = imgui.IsItemHovered()
+                local active = imgui.IsItemActive()
+
+                local justPressed = false
+                if imgui.IsItemActivated then
+                    local ok, v = pcall(imgui.IsItemActivated)
+                    justPressed = ok and v == true
+                elseif imgui.IsMouseClicked then
+                    local ok, v = pcall(imgui.IsMouseClicked, 0)
+                    justPressed = ok and v == true and hovered
+                end
+
+                if justPressed then
+                    _pressKey = tostring(def.settingKey or '')
+                end
+
+                local isDragging = false
+                if imgui.IsMouseDragging then
+                    local okDrag, dragging = pcall(imgui.IsMouseDragging, 0, 4)
+                    if okDrag and dragging and active then
+                        isDragging = true
                     end
-                    imgui.Text(string.format('Move: %s', tostring(def.altName or '')))
-                    imgui.EndDragDropSource()
                 end
-            end
 
-            local swapped = false
-            if imgui.BeginDragDropTarget and imgui.EndDragDropTarget then
-                local ok, isTarget = pcall(imgui.BeginDragDropTarget)
-                if ok and isTarget then
-                    local droppedKey = nil
-                    if imgui.AcceptDragDropPayload then
-                        local ok2, payload = pcall(imgui.AcceptDragDropPayload, 'SideKickBarSwap')
-                        if ok2 and payload ~= nil then
-                            if type(payload) == 'string' then
-                                droppedKey = payload
-                            elseif type(payload) == 'table' then
-                                droppedKey = payload.Data or payload.data or payload.Payload or payload.payload
+                if imgui.BeginDragDropSource and imgui.EndDragDropSource then
+                    local ok, started = pcall(imgui.BeginDragDropSource)
+                    if ok and started then
+                        _dragKey = tostring(def.settingKey or '')
+                        isDragging = true
+                        _pressKey = nil
+                        if imgui.SetDragDropPayload then
+                            pcall(imgui.SetDragDropPayload, 'SideKickBarSwap', _dragKey)
+                        end
+                        imgui.Text(string.format('Move: %s', tostring(def.altName or '')))
+                        imgui.EndDragDropSource()
+                    end
+                end
+
+                local swapped = false
+                if imgui.BeginDragDropTarget and imgui.EndDragDropTarget then
+                    local ok, isTarget = pcall(imgui.BeginDragDropTarget)
+                    if ok and isTarget then
+                        local droppedKey = nil
+                        if imgui.AcceptDragDropPayload then
+                            local ok2, payload = pcall(imgui.AcceptDragDropPayload, 'SideKickBarSwap')
+                            if ok2 and payload ~= nil then
+                                if type(payload) == 'string' then
+                                    droppedKey = payload
+                                elseif type(payload) == 'table' then
+                                    droppedKey = payload.Data or payload.data or payload.Payload or payload.payload
+                                end
                             end
                         end
+                        if not droppedKey and _dragKey and imgui.IsMouseReleased and imgui.IsMouseReleased(0) then
+                            droppedKey = _dragKey
+                        end
+                        if droppedKey and droppedKey ~= '' then
+                            swapped = swapOrder(orderKey, orderList, droppedKey, def.settingKey) or false
+                            _dragKey = nil
+                            _pressKey = nil
+                        end
+                        imgui.EndDragDropTarget()
                     end
-                    if not droppedKey and _dragKey and imgui.IsMouseReleased and imgui.IsMouseReleased(0) then
-                        droppedKey = _dragKey
+                end
+
+                -- Activate only on mouse release (prevents activation on click-and-hold for drag).
+                local released = false
+                if imgui.IsMouseReleased then
+                    local okRel, v = pcall(imgui.IsMouseReleased, 0)
+                    released = okRel and v == true
+                end
+                if released and _pressKey == tostring(def.settingKey or '') then
+                    if hovered and not isDragging and not swapped and opts.onActivate then
+                        opts.onActivate(def)
                     end
-                    if droppedKey and droppedKey ~= '' then
-                        swapped = swapOrder(orderKey, orderList, droppedKey, def.settingKey) or false
-                        _dragKey = nil
-                        _pressKey = nil
+                    _pressKey = nil
+                end
+
+                -- Right-click opens mode context menu
+                local rightReleased = false
+                pcall(function() rightReleased = imgui.IsMouseReleased(1) end)
+                if hovered and rightReleased and not isDragging and def.modeKey then
+                    local uniqueCtx = def.settingKey or def.altName or tostring(idx)
+                    local menuDef = buildModeMenu(def, settings, opts)
+                    if menuDef then
+                        ContextMenu.open(menuDef, bx, by, 'sk_mode_' .. uniqueCtx)
                     end
-                    imgui.EndDragDropTarget()
-                end
-            end
-
-            -- Activate only on mouse release (prevents activation on click-and-hold for drag).
-            local released = false
-            if imgui.IsMouseReleased then
-                local okRel, v = pcall(imgui.IsMouseReleased, 0)
-                released = okRel and v == true
-            end
-            if released and _pressKey == tostring(def.settingKey or '') then
-                if hovered and not isDragging and not swapped and opts.onActivate then
-                    opts.onActivate(def)
-                end
-                _pressKey = nil
-            end
-
-            -- Get unique ID for animations
-            local uniqueId = def.settingKey or def.altName or tostring(idx)
-
-            -- Spring-based button scaling
-            local scale = AnimHelpers.getButtonScale(uniqueId, hovered, active)
-
-            -- Calculate scaled geometry from center
-            local minX, minY, sw, sh = AnimHelpers.scaleFromCenter(bx, by, cell, cell, scale)
-
-            -- Get completion pulse offset
-            local pulse = AnimHelpers.getCompletionPulse(uniqueId)
-            minX = minX - pulse
-            minY = minY - pulse
-            sw = sw + pulse * 2
-            sh = sh + pulse * 2
-
-            -- Rounded button rendering: shadow, background, glow
-            local rounding = math.floor(cell * C.LAYOUT.BUTTON_ROUNDING_PCT)
-            local dt = AnimHelpers.get_dt()
-
-            -- Drop shadow (behind everything)
-            local shadowAlpha = iam.TweenFloat(
-                uniqueId, imgui.GetID('shadow'),
-                hovered and C.LAYOUT.SHADOW_ALPHA_HOVER or C.LAYOUT.SHADOW_ALPHA_NORMAL,
-                0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
-            local shadowCol = IM_COL32(0, 0, 0, math.floor(shadowAlpha))
-            dlAddRectFilled(dl,
-                minX + C.LAYOUT.SHADOW_OFFSET_X,
-                minY + C.LAYOUT.SHADOW_OFFSET_Y,
-                minX + sw + C.LAYOUT.SHADOW_OFFSET_X,
-                minY + sh + C.LAYOUT.SHADOW_OFFSET_Y,
-                shadowCol, rounding)
-
-            -- Button background
-            dlAddRectFilled(dl, minX, minY, minX + sw, minY + sh,
-                IM_COL32(30, 30, 30, 220), rounding)
-
-            -- Glow on hover
-            local glowAlpha = iam.TweenFloat(
-                uniqueId, imgui.GetID('glow'),
-                hovered and C.LAYOUT.GLOW_ALPHA_MAX or 0,
-                0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
-            if glowAlpha > 1 then
-                local accentColor = Colors.ready(themeName)
-                local glowCol = IM_COL32(accentColor[1], accentColor[2], accentColor[3], math.floor(glowAlpha))
-                local expand = C.LAYOUT.GLOW_EXPAND
-                dlAddRect(dl,
-                    minX - expand, minY - expand,
-                    minX + sw + expand, minY + sh + expand,
-                    glowCol, rounding + expand, 0, 2)
-            end
-
-            -- Clip to rounded rect for icon and overlays
-            imgui.PushClipRect(minX, minY, minX + sw, minY + sh, true)
-
-            -- Draw textured icon holder background (completely isolated)
-            local _textureRenderer = nil
-            local _texOk, _texErr = pcall(function()
-                if not Themes.isTexturedTheme then
-                    -- Missing function
-                    return
-                end
-                local isTextured = Themes.isTexturedTheme(themeName)
-                if not isTextured then
-                    -- Not a textured theme
-                    return
-                end
-                local tr = getTextureRenderer()
-                if not tr then
-                    return
-                end
-                if tr.isAvailable and not tr.isAvailable() then
-                    return
-                end
-                if not dl then
-                    return
                 end
 
-                local holderState = hovered and 'hover' or (active and 'active' or 'normal')
-                local drawResult = tr.drawIconHolder(dl, minX, minY, sw, holderState)
-                if drawResult then
-                    _textureRenderer = tr  -- Save for cooldown bar below
+                -- Get unique ID for animations
+                local uniqueId = def.settingKey or def.altName or tostring(idx)
+
+                -- Spring-based button scaling
+                local scale = AnimHelpers.getButtonScale(uniqueId, hovered, active)
+
+                -- Calculate scaled geometry from center
+                local minX, minY, sw, sh = AnimHelpers.scaleFromCenter(bx, by, cell, cell, scale)
+
+                -- Get completion pulse offset
+                local pulse = AnimHelpers.getCompletionPulse(uniqueId)
+                minX = minX - pulse
+                minY = minY - pulse
+                sw = sw + pulse * 2
+                sh = sh + pulse * 2
+
+                -- Rounded button rendering: shadow, background, glow
+                local rounding = math.floor(cell * C.LAYOUT.BUTTON_ROUNDING_PCT)
+                local dt = AnimHelpers.get_dt()
+
+                -- Drop shadow (behind everything)
+                local shadowAlpha = iam.TweenFloat(
+                    uniqueId, imgui.GetID('shadow'),
+                    hovered and C.LAYOUT.SHADOW_ALPHA_HOVER or C.LAYOUT.SHADOW_ALPHA_NORMAL,
+                    0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
+                local shadowCol = IM_COL32(0, 0, 0, math.floor(shadowAlpha))
+                dlAddRectFilled(dl,
+                    minX + C.LAYOUT.SHADOW_OFFSET_X,
+                    minY + C.LAYOUT.SHADOW_OFFSET_Y,
+                    minX + sw + C.LAYOUT.SHADOW_OFFSET_X,
+                    minY + sh + C.LAYOUT.SHADOW_OFFSET_Y,
+                    shadowCol, rounding)
+
+                -- Button background
+                dlAddRectFilled(dl, minX, minY, minX + sw, minY + sh,
+                    IM_COL32(30, 30, 30, 220), rounding)
+
+                -- Glow on hover
+                local glowAlpha = iam.TweenFloat(
+                    uniqueId, imgui.GetID('glow'),
+                    hovered and C.LAYOUT.GLOW_ALPHA_MAX or 0,
+                    0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
+                if glowAlpha > 1 then
+                    local accentColor = Colors.ready(themeName)
+                    local glowCol = IM_COL32(accentColor[1], accentColor[2], accentColor[3], math.floor(glowAlpha))
+                    local expand = C.LAYOUT.GLOW_EXPAND
+                    dlAddRect(dl,
+                        minX - expand, minY - expand,
+                        minX + sw + expand, minY + sh + expand,
+                        glowCol, rounding + expand, 0, 2)
+                end
+
+                -- Clip to rounded rect for icon and overlays
+                imgui.PushClipRect(minX, minY, minX + sw, minY + sh, true)
+                clipPushed = true
+
+                -- Draw textured icon holder background (completely isolated)
+                local _textureRenderer = nil
+                pcall(function()
+                    if not Themes.isTexturedTheme then
+                        -- Missing function
+                        return
+                    end
+                    local isTextured = Themes.isTexturedTheme(themeName)
+                    if not isTextured then
+                        -- Not a textured theme
+                        return
+                    end
+                    local tr = getTextureRenderer()
+                    if not tr then
+                        return
+                    end
+                    if tr.isAvailable and not tr.isAvailable() then
+                        return
+                    end
+                    if not dl then
+                        return
+                    end
+
+                    local holderState = hovered and 'hover' or (active and 'active' or 'normal')
+                    local drawResult = tr.drawIconHolder(dl, minX, minY, sw, holderState)
+                    if drawResult then
+                        _textureRenderer = tr  -- Save for cooldown bar below
+                    end
+                end)
+
+                -- Draw icon at scaled position
+                -- Inscribe icon within circular button to prevent corner overflow
+                local circleInset = math.floor(sw * C.LAYOUT.ICON_CIRCLE_INSET_PCT)
+                local iconInset = math.max(circleInset, _textureRenderer and 4 or 0)
+                local iconX = minX + iconInset
+                local iconY = minY + iconInset
+                local iconW = sw - (iconInset * 2)
+                local iconH = sh - (iconInset * 2)
+
+                if animSpellIcons and imgui.DrawTextureAnimation then
+                    animSpellIcons:SetTextureCell(tonumber(def.icon) or 0)
+                    imgui.SetCursorScreenPos(iconX, iconY)
+                    imgui.DrawTextureAnimation(animSpellIcons, iconW, iconH)
+                    imgui.SetCursorPos(x, y)
+                else
+                    imgui.SetCursorScreenPos(iconX + 4, iconY + 4)
+                    imgui.Text('AA')
+                    imgui.SetCursorPos(x, y)
+                end
+
+                -- Probe cooldown
+                local rem, total = 0, 0
+                if opts.cooldownProbe then
+                    rem, total = opts.cooldownProbe({ label = def.altName, key = def.altName })
+                end
+
+                -- Draw enhanced cooldown overlay with smooth color tween (over icon area, not frame)
+                local restoreX, restoreY = imgui.GetCursorPos()
+                AnimHelpers.drawCooldownOverlay(dl, iconX, iconY, iconX + iconW, iconY + iconH, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
+                imgui.SetCursorPos(restoreX, restoreY)
+
+                -- Draw textured cooldown bar at bottom of icon (optional)
+                if _textureRenderer and dl and rem and rem > 0 and total and total > 0 then
+                    pcall(function()
+                        local cdBarH = 6
+                        local cdPct = (total - rem) / total  -- Fill as cooldown completes
+                        local cdY = iconY + iconH - cdBarH
+                        _textureRenderer.drawSimpleGauge(dl, iconX, cdY, iconW, cdBarH, cdPct, 'cooldown')
+                    end)
+                end
+
+                -- Name overlay (over icon area)
+                drawNameWrapped(iconX, iconY, iconX + iconW, def.altName, opts.helpers)
+
+                -- Pop rounded clip rect
+                imgui.PopClipRect()
+                clipPushed = false
+
+                -- Tooltip with hover delay
+                if hovered then
+                    if not _hoverStart[uniqueId] then
+                        _hoverStart[uniqueId] = os.clock()
+                    end
+                    if (os.clock() - _hoverStart[uniqueId]) >= TOOLTIP_DELAY then
+                        local fmtCooldown = getFmtCooldown(opts.helpers)
+                        local duration = abilityDurationSeconds(def)
+                        -- Defensive tooltip: Begin/End always paired, content in pcall
+                        imgui.BeginTooltip()
+                        pcall(function()
+                            imgui.Text(tostring(def.altName))
+                            -- Show current automation mode
+                            if def.modeKey then
+                                local mode = tonumber(settings[def.modeKey]) or 1
+                                local modeLabel = opts.modeLabels and opts.modeLabels[mode] or 'On Demand'
+                                imgui.TextColored(0.6, 0.8, 1.0, 1.0, 'Mode: ' .. modeLabel)
+                            end
+                            if duration and duration > 0 then
+                                imgui.Text(string.format('Duration: %s', fmtCooldown(duration)))
+                            end
+                            if total and total > 0 then
+                                imgui.Text(string.format('Reuse: %s', fmtCooldown(total)))
+                                if rem and rem > 0 then
+                                    imgui.Text(string.format('Cooldown: %s', fmtCooldown(rem)))
+                                else
+                                    imgui.Text('Ready')
+                                end
+                            end
+                            if def.description and tostring(def.description) ~= '' then
+                                imgui.Separator()
+                                imgui.PushTextWrapPos(imgui.GetFontSize() * 20)
+                                drawDescription(def.description)
+                                imgui.PopTextWrapPos()
+                            end
+                        end)
+                        imgui.EndTooltip()
+                    end
+                else
+                    _hoverStart[uniqueId] = nil
                 end
             end)
-
-            -- Draw icon at scaled position
-            -- When using textured theme, inset the icon to show the frame border (4px each side)
-            local iconInset = _textureRenderer and 4 or 0
-            local iconX = minX + iconInset
-            local iconY = minY + iconInset
-            local iconW = sw - (iconInset * 2)
-            local iconH = sh - (iconInset * 2)
-
-            if animSpellIcons and imgui.DrawTextureAnimation then
-                animSpellIcons:SetTextureCell(tonumber(def.icon) or 0)
-                imgui.SetCursorScreenPos(iconX, iconY)
-                imgui.DrawTextureAnimation(animSpellIcons, iconW, iconH)
-                imgui.SetCursorPos(x, y)
-            else
-                imgui.SetCursorScreenPos(iconX + 4, iconY + 4)
-                imgui.Text('AA')
-                imgui.SetCursorPos(x, y)
+            if clipPushed then
+                pcall(imgui.PopClipRect)
             end
-
-            -- Probe cooldown
-            local rem, total = 0, 0
-            if opts.cooldownProbe then
-                rem, total = opts.cooldownProbe({ label = def.altName, key = def.altName })
-            end
-
-            -- Draw enhanced cooldown overlay with OKLAB colors (over icon area, not frame)
-            local restoreX, restoreY = imgui.GetCursorPos()
-            AnimHelpers.drawCooldownOverlay(dl, iconX, iconY, iconX + iconW, iconY + iconH, rem, total, uniqueId, opts.helpers, IM_COL32, dlAddRectFilled, dlAddRect)
-            imgui.SetCursorPos(restoreX, restoreY)
-
-            -- Draw textured cooldown bar at bottom of icon (optional)
-            if _textureRenderer and dl and rem and rem > 0 and total and total > 0 then
-                pcall(function()
-                    local cdBarH = 6
-                    local cdPct = (total - rem) / total  -- Fill as cooldown completes
-                    local cdY = iconY + iconH - cdBarH
-                    _textureRenderer.drawSimpleGauge(dl, iconX, cdY, iconW, cdBarH, cdPct, 'cooldown')
-                end)
-            end
-
-            -- Name overlay (over icon area)
-            drawNameWrapped(iconX, iconY, iconX + iconW, def.altName, opts.helpers)
-
-            -- Pop rounded clip rect
-            imgui.PopClipRect()
-
-            if hovered then
-                local fmtCooldown = getFmtCooldown(opts.helpers)
-                local duration = abilityDurationSeconds(def)
-                imgui.BeginTooltip()
-                imgui.Text(tostring(def.altName))
-                if duration and duration > 0 then
-                    imgui.Text(string.format('Duration: %s', fmtCooldown(duration)))
-                end
-                if total and total > 0 then
-                    imgui.Text(string.format('Reuse: %s', fmtCooldown(total)))
-                    if rem and rem > 0 then
-                        imgui.Text(string.format('Cooldown: %s', fmtCooldown(rem)))
-                    else
-                        imgui.Text('Ready')
-                    end
-                end
-                if def.description and tostring(def.description) ~= '' then
-                    imgui.Separator()
-                    drawDescription(def.description)
-                end
-                imgui.EndTooltip()
-            end
-
             imgui.PopID()
+            if not cellOk and mq and mq.cmd then
+                mq.cmd('/echo \\ar[SideKick Bar] Cell error [' .. tostring(def.altName or def.settingKey or idx) .. ']: ' .. tostring(cellErr) .. '\\ax')
+            end
         end
-    end
+    end) if not _drawOk and mq and mq.cmd then mq.cmd('/echo \\ar[SideKick Bar] Render error: ' .. tostring(_drawErr) .. '\\ax') end end
     imgui.End()
     imgui.PopStyleVar(2)
     imgui.PopStyleColor(1)
+
+    -- Draw context menu above all windows (uses foreground draw list)
+    if ContextMenu.isOpen() then
+        ContextMenu.draw()
+    end
 
     if _dragKey and imgui.IsMouseDown and not imgui.IsMouseDown(0) then
         _dragKey = nil

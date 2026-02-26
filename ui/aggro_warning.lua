@@ -5,6 +5,17 @@ local Core = require('sidekick-next.utils.core')
 
 local M = {}
 
+-- Cached spring ease descriptor (iam.EaseSpring may be nil in some builds)
+local _ezSpringAggro = (function()
+    local ez = IamEaseDesc()
+    ez.type = IamEaseType.Spring
+    ez.p0 = 1.0
+    ez.p1 = 400
+    ez.p2 = 20
+    ez.p3 = 0.0
+    return ez
+end)()
+
 local TANK_CLASSES = { WAR = true, PAL = true, SHD = true }
 
 local State = {
@@ -130,58 +141,82 @@ end
 function M.draw()
     if not State.showing then return end
 
-    local now = os.clock()
-    local elapsed = now - State.showStartTime
-    local progress = elapsed / State.duration
+    local stylePushed = false
+    local begun = false
+    local ok, err = pcall(function()
+        local now = os.clock()
+        local duration = tonumber(State.duration) or 3.0
+        if duration <= 0 then duration = 3.0 end
+        local elapsed = now - State.showStartTime
+        local progress = elapsed / duration
 
-    -- Get screen center
-    local io = imgui.GetIO()
-    local displaySize = io.DisplaySize
-    local centerX = displaySize.x / 2
-    local centerY = displaySize.y / 2
+        -- Get screen center
+        local io = imgui.GetIO()
+        local displaySize = io and io.DisplaySize or nil
+        local centerX = 960
+        local centerY = 540
+        if type(displaySize) == 'table' then
+            centerX = (tonumber(displaySize.x or displaySize[1]) or 1920) / 2
+            centerY = (tonumber(displaySize.y or displaySize[2]) or 1080) / 2
+        end
 
-    -- Calculate scale (spring in, then settle) via native TweenFloat
-    local dt = imgui.GetIO().DeltaTime
-    local targetScale = progress < 0.1 and 1.2 or 1.0
-    local ezSpring = iam.EaseSpring(1.0, 400, 20, 0.0)
-    local scale = iam.TweenFloat('aggro_scale', imgui.GetID('aScale'), targetScale, 0.5, ezSpring, IamPolicy.Crossfade, dt)
+        -- Calculate scale (spring in, then settle) via native TweenFloat
+        local dt = (io and tonumber(io.DeltaTime)) or 0.016
+        local targetScale = progress < 0.1 and 1.2 or 1.0
+        local scale = tonumber(iam.TweenFloat('aggro_scale', imgui.GetID('aScale'), targetScale, 0.5, _ezSpringAggro, IamPolicy.Crossfade, dt)) or 1.0
 
-    -- Calculate shake offset via native Shake
-    local shakeX = iam.Shake('aggro_warning', imgui.GetID('awX'), 15, 0.5, dt)
-    local shakeY = iam.Shake('aggro_warning_y', imgui.GetID('awY'), 10, 0.5, dt)
+        -- Calculate shake offset via native Shake
+        local shakeX = tonumber(iam.Shake('aggro_warning', imgui.GetID('awX'), 15, 0.5, dt)) or 0
+        local shakeY = tonumber(iam.Shake('aggro_warning_y', imgui.GetID('awY'), 10, 0.5, dt)) or 0
 
-    -- Calculate pulse for glow via native Oscillate
-    local pulse = iam.Oscillate('aggro_pulse', imgui.GetID('aPulse'), 0.15, 4.0, 0.0, IamWaveType.Sine, dt)
-    pulse = 0.85 + pulse  -- 0.7 to 1.0 range
+        -- Calculate pulse for glow via native Oscillate
+        local pulse = tonumber(iam.Oscillate('aggro_pulse', imgui.GetID('aPulse'), 0.15, 4.0, 0.0, IamWaveType.Sine, dt)) or 0
+        pulse = 0.85 + pulse  -- 0.7 to 1.0 range
 
-    -- Calculate fade out near end
-    local alpha = 1.0
-    if progress > 0.7 then
-        alpha = 1.0 - ((progress - 0.7) / 0.3)
+        -- Calculate fade out near end
+        local alpha = 1.0
+        if progress > 0.7 then
+            alpha = 1.0 - ((progress - 0.7) / 0.3)
+        end
+        if alpha < 0 then alpha = 0 end
+        if alpha > 1 then alpha = 1 end
+
+        imgui.SetNextWindowPos(centerX + shakeX, centerY + shakeY, ImGuiCond.Always, 0.5, 0.5)
+        imgui.SetNextWindowBgAlpha(0)
+        imgui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0)
+        stylePushed = true
+
+        local flags = ImGuiWindowFlags.NoTitleBar + ImGuiWindowFlags.NoResize +
+                      ImGuiWindowFlags.NoMove + ImGuiWindowFlags.NoScrollbar +
+                      ImGuiWindowFlags.NoInputs + ImGuiWindowFlags.AlwaysAutoResize
+
+        local open, draw = imgui.Begin('##AggroWarning', true, flags)
+        begun = true
+        if draw == nil then draw = open end
+        if draw then
+            -- Red pulsing text
+            local r, g, b = 1.0, 0.1 * pulse, 0.1 * pulse
+            imgui.PushStyleColor(ImGuiCol.Text, r, g, b, alpha)
+            imgui.SetWindowFontScale(scale * 3)
+            imgui.Text('AGGRO!')
+            imgui.SetWindowFontScale(1.0)
+            imgui.PopStyleColor()
+        end
+    end)
+
+    if begun then
+        pcall(imgui.End)
+    end
+    if stylePushed then
+        pcall(imgui.PopStyleVar)
     end
 
-    -- Draw the warning
-    local text = 'AGGRO!'
-
-    imgui.SetNextWindowPos(centerX + shakeX, centerY + shakeY, ImGuiCond.Always, 0.5, 0.5)
-    imgui.SetNextWindowBgAlpha(0)
-    imgui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0)
-
-    local flags = ImGuiWindowFlags.NoTitleBar + ImGuiWindowFlags.NoResize +
-                  ImGuiWindowFlags.NoMove + ImGuiWindowFlags.NoScrollbar +
-                  ImGuiWindowFlags.NoInputs + ImGuiWindowFlags.AlwaysAutoResize
-
-    if imgui.Begin('##AggroWarning', true, flags) then
-        -- Red pulsing text
-        local r, g, b = 1.0, 0.1 * pulse, 0.1 * pulse
-        imgui.PushStyleColor(ImGuiCol.Text, r, g, b, alpha)
-        imgui.SetWindowFontScale(scale * 3)
-        imgui.Text(text)
-        imgui.SetWindowFontScale(1.0)
-        imgui.PopStyleColor()
+    if not ok then
+        State.showing = false
+        if mq and mq.cmd then
+            mq.cmd('/echo \\ar[SideKick AggroWarning] Draw error: ' .. tostring(err) .. '\\ax')
+        end
     end
-    imgui.End()
-    imgui.PopStyleVar()
 end
 
 function M.drawSettings()

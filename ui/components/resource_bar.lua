@@ -318,7 +318,7 @@ function M.health(current, max, opts)
     max = tonumber(max) or 1
     local pct = max > 0 and (current / max) or 0
 
-    -- Use OKLAB gradient sampling for smooth color (with fallback to stepped)
+    -- Use gradient sampling for smooth color (with fallback to stepped)
     if not opts.color then
         local ok, gradColor = pcall(Colors.healthBarGradient, pct)
         opts.color = (ok and gradColor) or getHealthColor(pct)

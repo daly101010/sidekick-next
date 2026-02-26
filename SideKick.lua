@@ -74,6 +74,21 @@ local SpecialBar = require('sidekick-next.ui.special_bar_animated')
 local DiscBar = require('sidekick-next.ui.disc_bar_animated')
 local ItemBar = require('sidekick-next.ui.item_bar_animated')
 local iam = require('ImAnim')
+
+-- Cached spring ease descriptors (iam.EaseSpring may be nil in some builds)
+local _ezSpringHover = (function()
+    local ez = IamEaseDesc()
+    ez.type = IamEaseType.Spring
+    ez.p0 = 1.0; ez.p1 = 300; ez.p2 = 22; ez.p3 = 0.0
+    return ez
+end)()
+local _ezSpringSettings = (function()
+    local ez = IamEaseDesc()
+    ez.type = IamEaseType.Spring
+    ez.p0 = 1.0; ez.p1 = 200; ez.p2 = 20; ez.p3 = 0.0
+    return ez
+end)()
+
 local Anchor = require('sidekick-next.ui.anchor')
 local Items = require('sidekick-next.utils.items')
 
@@ -460,7 +475,7 @@ local function animatedButton(label, btnScale)
         local springId = 'btn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, iam.EaseSpring(1.0, 300, 22, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
@@ -537,7 +552,7 @@ local function animatedSmallButton(label, btnScale)
         local springId = 'sbtn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.12 or 1.0
-        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, iam.EaseSpring(1.0, 300, 22, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment (smaller base padding for SmallButton)
@@ -620,7 +635,7 @@ local function toggleButton(label, enabled, onClick, btnScale)
         -- Check if this button will be hovered (use last frame's state)
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, iam.EaseSpring(1.0, 300, 22, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
@@ -1170,7 +1185,7 @@ local function draw()
     local manualOptions = Core.Settings.SideKickOptionsManual ~= false
     local heightFactor = openTarget
     if not manualOptions and iam and iam.TweenFloat then
-        heightFactor = iam.TweenFloat('sk_settings_height', imgui.GetID('hfactor'), openTarget, 0.5, iam.EaseSpring(1.0, 200, 20, 0), IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        heightFactor = iam.TweenFloat('sk_settings_height', imgui.GetID('hfactor'), openTarget, 0.5, _ezSpringSettings, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     if (manualOptions and State.settingsOpen) or (not manualOptions and heightFactor > 0.01) then
@@ -1996,6 +2011,33 @@ local function main()
             end
         end)
     end)
+    _bindCmd('/skcd', function(...)
+        local args = { ... }
+        local sub = tostring(args[1] or ''):lower()
+        if sub == 'on' or sub == 'debug' then
+            local filter = args[2]
+            -- Join remaining args for multi-word names like "Fists of Wu"
+            if filter then
+                local parts = {}
+                for i = 2, #args do parts[#parts+1] = tostring(args[i]) end
+                filter = table.concat(parts, ' ')
+            end
+            Cooldowns._debug = true
+            Cooldowns._debugFilter = filter
+            mq.cmd('/echo \\ag[SideKick]\\ax CD debug ON' ..
+                (filter and (' filter="' .. filter .. '"') or ' (all abilities)'))
+        elseif sub == 'off' then
+            Cooldowns._debug = false
+            Cooldowns._debugFilter = nil
+            mq.cmd('/echo \\ag[SideKick]\\ax CD debug OFF')
+        elseif sub == 'clear' then
+            Cooldowns._observedTotal = {}
+            Cooldowns._smooth = {}
+            mq.cmd('/echo \\ag[SideKick]\\ax CD caches cleared')
+        else
+            mq.cmd('/echo \\ay[SideKick]\\ax /skcd on [name] | /skcd off | /skcd clear')
+        end
+    end)
 
     mq.imgui.init('SideKick', function()
         -- Apply font scale for high-resolution monitors
@@ -2012,6 +2054,9 @@ local function main()
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
                 onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                modeLabels = Abilities.MODE_LABELS,
+                onMode = function(key, value) Core.set(key, value) end,
+                onOpenSettings = function() State.settingsOpen = true end,
             })
         end
 

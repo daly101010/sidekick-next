@@ -1,6 +1,6 @@
--- F:/lua/sidekick-next/sk_healing.lua
--- Healing Intelligence module for SideKick multi-script system
--- Priority 1: Non-emergency heals
+-- F:/lua/sidekick-next/sk_healing_emergency.lua
+-- Emergency Healing Intelligence module for SideKick multi-script system
+-- Priority 0: Emergency heals (preempts all lower-priority casts)
 
 local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
@@ -9,7 +9,7 @@ local Core = require('sidekick-next.utils.core')
 local Healing = require('sidekick-next.healing')
 
 -- Create module instance
-local module = ModuleBase.create('healing', lib.Priority.HEALING)
+local module = ModuleBase.create('healing_emergency', lib.Priority.EMERGENCY)
 
 local _coreLoaded = false
 local _pendingAction = nil
@@ -104,7 +104,7 @@ module.onTick = function(self)
     end
 
     local action, reason = Healing.buildHealAction({
-        excludeEmergency = true,
+        onlyEmergency = true,
         ignoreSpellEngine = true,
         skipIfCasting = false,
     })
@@ -127,8 +127,8 @@ module.onTick = function(self)
     if needs and self.state and self.state.castBusy and not self:ownsCast() then
         local owner = self.state.castOwner
         local ownerPriority = owner and owner.priority or lib.Priority.IDLE
-        if ownerPriority > lib.Priority.HEALING then
-            self:requestInterrupt('heal_preempt')
+        if ownerPriority > lib.Priority.EMERGENCY then
+            self:requestInterrupt('emergency_heal')
         end
     end
 end
@@ -155,13 +155,13 @@ module.getAction = function(self)
         spellName = spellName,
         targetId = targetIdVal,
         targetName = action.targetName,
-        tier = action.tier or 'heal',
+        tier = action.tier or 'emergency',
         isHoT = action.isHoT == true,
         expected = action.expected,
         details = action.details,
         groupHotTargets = action.groupHotTargets,
-        idempotencyKey = string.format('heal:%s:%d', action.tier or 'heal', targetIdVal),
-        reason = action.reason or _pendingReason or 'heal',
+        idempotencyKey = string.format('heal_emergency:%s:%d', action.tier or 'emergency', targetIdVal),
+        reason = action.reason or _pendingReason or 'emergency_heal',
     }
 end
 
@@ -254,7 +254,7 @@ end
 -- Command Binding
 -------------------------------------------------------------------------------
 
-mq.bind('/sk_healing', function(cmd)
+mq.bind('/sk_healing_emergency', function(cmd)
     if cmd == 'stop' then
         module:stop()
         lib.log('info', module.name, 'Stop requested')

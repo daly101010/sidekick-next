@@ -29,6 +29,15 @@ local GCD_MS = 2250                 -- Global cooldown in milliseconds
 -- Lazy-loaded Dependencies
 --------------------------------------------------------------------------------
 
+local _Core = nil
+local function getCore()
+    if not _Core then
+        local ok, mod = pcall(require, 'sidekick-next.core')
+        if ok then _Core = mod end
+    end
+    return _Core
+end
+
 local _SpellsetPersistence = nil
 local function getPersistence()
     if not _SpellsetPersistence then
@@ -168,15 +177,17 @@ local function hasBuffByName(spawn, spellName)
     if not spawn or not spawn() or not spellName then return false end
 
     -- Check via Buff
-    local buff = spawn.Buff(spellName)
+    local buff = spawn.Buff and spawn.Buff(spellName)
     if buff and buff() then
         return true
     end
 
-    -- Check via Song (for bard songs)
-    local song = spawn.Song(spellName)
-    if song and song() then
-        return true
+    -- Check via Song (for bard songs) - only available on Me
+    if spawn.Song then
+        local song = spawn.Song(spellName)
+        if song and song() then
+            return true
+        end
     end
 
     return false
@@ -661,6 +672,12 @@ end
 --- Process OOC buffs - main routine called from automation loop
 ---@return boolean True if a buff was cast, false otherwise
 function M.process()
+    -- Check if automation is paused
+    local Core = getCore()
+    if Core and Core.Settings and Core.Settings.AutomationPaused == true then
+        return false
+    end
+
     -- Check if in combat
     if inCombat() then
         return false

@@ -5,6 +5,16 @@
 local mq = require('mq')
 local imgui = require('ImGui')
 
+-- Lazy-load Toast to avoid circular dependencies
+local _Toast = nil
+local function getToast()
+    if not _Toast then
+        local ok, mod = pcall(require, 'sidekick-next.ui.components.toast')
+        if ok then _Toast = mod end
+    end
+    return _Toast
+end
+
 local M = {}
 
 --------------------------------------------------------------------------------
@@ -183,62 +193,30 @@ local function renderHeader()
         imgui.SetTooltip("Cannot delete the last spell set")
     end
 
-    imgui.Separator()
-
-    -- Save button
-    if imgui.Button("Save") then
-        Persistence.save()
-        print("\ag[SpellSetEditor]\ax Spell sets saved")
-    end
-
-    -- Save & Apply button
+    -- Save (and apply) button
     imgui.SameLine()
     if isBusy then
         imgui.BeginDisabled()
     end
-    if imgui.Button("Save & Apply") then
+    if imgui.Button("Save") then
         if state.selectedSet and Memorize then
             Memorize.queueApply(state.selectedSet, true)  -- true = save first
-        end
-    end
-    if isBusy then
-        imgui.EndDisabled()
-        if imgui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) then
-            imgui.SetTooltip("Memorization in progress...")
-        end
-    end
-
-    -- Apply button
-    imgui.SameLine()
-    if isBusy then
-        imgui.BeginDisabled()
-    end
-    if imgui.Button("Apply") then
-        if state.selectedSet and Memorize then
-            Memorize.queueApply(state.selectedSet, false)  -- false = no save
-        end
-    end
-    if isBusy then
-        imgui.EndDisabled()
-        if imgui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) then
-            imgui.SetTooltip("Memorization in progress...")
-        end
-    end
-
-    -- Check Upgrades button
-    imgui.SameLine()
-    if imgui.Button("Check Upgrades") then
-        local Scanner = getScanner()
-        local spellSet = getCurrentSpellSet()
-        if Scanner and spellSet then
-            Scanner.scan()
-            state.upgrades = Scanner.findAllUpgrades(spellSet)
-            if next(state.upgrades) then
-                state.showUpgradePopup = true
-                imgui.OpenPopup("Spell Upgrades Available##UpgradePopup")
-            else
-                print("\ag[SpellSetEditor]\ax No upgrades available")
+        else
+            local saveOk = Persistence.save()
+            local Toast = getToast()
+            if Toast then
+                if saveOk ~= false then
+                    Toast.success('Spell sets saved')
+                else
+                    Toast.error('Failed to save spell sets')
+                end
             end
+        end
+    end
+    if isBusy then
+        imgui.EndDisabled()
+        if imgui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled) then
+            imgui.SetTooltip("Memorization in progress...")
         end
     end
 
@@ -248,9 +226,11 @@ local function renderHeader()
         imgui.TextColored(1.0, 0.8, 0.2, 1.0, "Memorizing...")
     elseif Memorize and Memorize.getPendingSet() then
         imgui.SameLine()
-        imgui.TextColored(0.7, 0.7, 0.7, 1.0,
-            string.format("(Pending: %s)", Memorize.getPendingSet()))
+            imgui.TextColored(0.7, 0.7, 0.7, 1.0,
+                string.format("(Pending: %s)", Memorize.getPendingSet()))
     end
+
+    imgui.Separator()
 end
 
 --- Render the new set popup modal
@@ -289,7 +269,10 @@ local function renderNewSetPopup()
                     newSet.name = state.newSetName
                     -- Add directly to persistence spellSets
                     Persistence.spellSets[state.newSetName] = newSet
-                    print(string.format('\\ag[SpellSetEditor]\\ax Created "%s" as copy of "%s"', state.newSetName, currentSet.name))
+                    local Toast = getToast()
+                    if Toast then
+                        Toast.success(string.format('Created "%s"', state.newSetName))
+                    end
                 end
             else
                 -- Fallback: create empty set if no current set

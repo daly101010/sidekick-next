@@ -5,29 +5,38 @@
 
 local imgui = require('ImGui')
 local Settings = require('sidekick-next.ui.settings')
+local Components = require('sidekick-next.ui.components')
 
 local M = {}
 
 function M.draw(settings, themeNames, onChange)
-    local changed
+    local themeName = settings.Theme or 'Classic'
 
-    -- Main toggle
+    -- Main toggle (clickable badge)
     local buffingEnabled = settings.BuffingEnabled ~= false
-    buffingEnabled, changed = Settings.labeledCheckbox('Enable Buffing', buffingEnabled)
-    if changed and onChange then onChange('BuffingEnabled', buffingEnabled) end
+
+    -- Toggle badge for buffing (clickable to toggle)
+    local buffVal, buffChanged = Components.StatusBadge.toggle('Buffing', buffingEnabled, themeName, {
+        enabledText = 'Active',
+        disabledText = 'Off',
+        tooltip = 'Click to toggle automatic buffing',
+    })
+    if buffChanged and onChange then onChange('BuffingEnabled', buffVal) end
+    buffingEnabled = buffVal
 
     if buffingEnabled then
-        imgui.Separator()
-        imgui.Text('Buff Targets')
+        Components.SettingGroup.draw('Buff Targets', function()
+            -- Pets
+            local buffPets = settings.BuffPetsEnabled ~= false
+            local petVal, petChanged = Components.CheckboxRow.draw('Buff Pets', 'BuffPetsEnabled', buffPets, nil, {
+                tooltip = 'Include group pets in buff rotation',
+            })
+            if petChanged and onChange then onChange('BuffPetsEnabled', petVal) end
+        end, { id = 'buff_targets', defaultOpen = true })
 
-        -- Pets
-        local buffPets = settings.BuffPetsEnabled ~= false
-        buffPets, changed = Settings.labeledCheckbox('Buff Pets', buffPets)
-        if changed and onChange then onChange('BuffPetsEnabled', buffPets) end
-
-        imgui.Separator()
-        imgui.Text('Buff Behavior')
-        imgui.TextDisabled('No buff behavior settings available.')
+        Components.SettingGroup.draw('Buff Behavior', function()
+            imgui.TextDisabled('No buff behavior settings available.')
+        end, { id = 'buff_behavior', defaultOpen = false })
     end
 end
 

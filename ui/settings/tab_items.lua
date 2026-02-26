@@ -7,10 +7,25 @@ local imgui = require('ImGui')
 local mq = require('mq')
 local C = require('sidekick-next.ui.constants')
 local Settings = require('sidekick-next.ui.settings')
+local Components = require('sidekick-next.ui.components')
 local Core = require('sidekick-next.utils.core')
 local ConditionBuilder = require('sidekick-next.ui.condition_builder')
 
 local M = {}
+
+-- Texture tint parse/format helpers
+local function parseTintColor(str)
+    if not str or str == '' then return { 1.0, 1.0, 1.0 } end
+    local r, g, b = str:match('^%s*([%d%.]+)%s*,%s*([%d%.]+)%s*,%s*([%d%.]+)%s*$')
+    r, g, b = tonumber(r), tonumber(g), tonumber(b)
+    if not (r and g and b) then return { 1.0, 1.0, 1.0 } end
+    return { math.max(0, math.min(1, r)), math.max(0, math.min(1, g)), math.max(0, math.min(1, b)) }
+end
+
+local function formatTintColor(col)
+    if not col or #col < 3 then return '1.0,1.0,1.0' end
+    return string.format('%.2f,%.2f,%.2f', col[1] or 1, col[2] or 1, col[3] or 1)
+end
 
 -- Lazy-load Items module
 local _Items = nil
@@ -82,65 +97,90 @@ end
 
 -- Draw only the bar UI settings (for consolidated UI tab)
 function M.drawBarUI(settings, themeNames, onChange)
-    local changed
+    local themeName = settings.Theme or 'Classic'
 
     -- Enable item bar
     local itemBar = settings.SideKickItemBarEnabled ~= false
-    itemBar, changed = Settings.labeledCheckbox('Show item bar', itemBar)
-    if changed and onChange then onChange('SideKickItemBarEnabled', itemBar) end
+    local barVal, barChanged = Components.CheckboxRow.draw('Show item bar', 'SideKickItemBarEnabled', itemBar, nil, {
+        tooltip = 'Show the item quick-use bar',
+    })
+    if barChanged and onChange then onChange('SideKickItemBarEnabled', barVal) end
 
     -- Note: AutoItemsEnabled defaults to true (hidden setting)
     -- Auto-use behavior is controlled per-item via mode: combat, ooc, on_condition
     -- Items set to 'on_demand' mode are manual-only
 
-    imgui.Separator()
-    imgui.Text('Layout')
+    -- Layout Section
+    Components.SettingGroup.draw('Layout', function()
+        -- Cell size
+        local itemCell = tonumber(settings.SideKickItemBarCell) or C.LAYOUT.ITEM_CELL_SIZE
+        local cellChanged, newCell = Components.SliderRow.int('Cell Size', 'SideKickItemBarCell', itemCell, C.LAYOUT.MIN_CELL_SIZE, C.LAYOUT.MAX_CELL_SIZE)
+        if cellChanged and onChange then onChange('SideKickItemBarCell', newCell) end
 
-    -- Cell size
-    local itemCell = tonumber(settings.SideKickItemBarCell) or C.LAYOUT.ITEM_CELL_SIZE
-    itemCell, changed = Settings.labeledSliderInt('Cell Size##itembar', itemCell, C.LAYOUT.MIN_CELL_SIZE, C.LAYOUT.MAX_CELL_SIZE)
-    if changed and onChange then onChange('SideKickItemBarCell', itemCell) end
+        -- Rows
+        local itemRows = tonumber(settings.SideKickItemBarRows) or C.LAYOUT.ITEM_ROWS
+        local rowsChanged, newRows = Components.SliderRow.int('Rows', 'SideKickItemBarRows', itemRows, 1, C.LAYOUT.MAX_ROWS)
+        if rowsChanged and onChange then onChange('SideKickItemBarRows', newRows) end
 
-    -- Rows
-    local itemRows = tonumber(settings.SideKickItemBarRows) or C.LAYOUT.ITEM_ROWS
-    itemRows, changed = Settings.labeledSliderInt('Rows##itembar', itemRows, 1, C.LAYOUT.MAX_ROWS)
-    if changed and onChange then onChange('SideKickItemBarRows', itemRows) end
+        -- Gap
+        local itemGap = tonumber(settings.SideKickItemBarGap) or 4
+        local gapChanged, newGap = Components.SliderRow.int('Gap', 'SideKickItemBarGap', itemGap, 0, 12)
+        if gapChanged and onChange then onChange('SideKickItemBarGap', newGap) end
 
-    -- Gap
-    local itemGap = tonumber(settings.SideKickItemBarGap) or 4
-    itemGap, changed = Settings.labeledSliderInt('Gap##itembar', itemGap, 0, 12)
-    if changed and onChange then onChange('SideKickItemBarGap', itemGap) end
+        -- Padding
+        local itemPad = tonumber(settings.SideKickItemBarPad) or 6
+        local padChanged, newPad = Components.SliderRow.int('Padding', 'SideKickItemBarPad', itemPad, 0, 24)
+        if padChanged and onChange then onChange('SideKickItemBarPad', newPad) end
 
-    -- Padding
-    local itemPad = tonumber(settings.SideKickItemBarPad) or 6
-    itemPad, changed = Settings.labeledSliderInt('Padding##itembar', itemPad, 0, 24)
-    if changed and onChange then onChange('SideKickItemBarPad', itemPad) end
+        -- Background alpha
+        local itemAlpha = tonumber(settings.SideKickItemBarBgAlpha) or 0.85
+        local alphaChanged, newAlpha = Components.SliderRow.float('Background Alpha', 'SideKickItemBarBgAlpha', itemAlpha, 0.2, 1.0)
+        if alphaChanged and onChange then onChange('SideKickItemBarBgAlpha', newAlpha) end
 
-    -- Background alpha
-    local itemAlpha = tonumber(settings.SideKickItemBarBgAlpha) or 0.85
-    itemAlpha, changed = Settings.labeledSliderFloat('Background Alpha##itembar', itemAlpha, 0.2, 1.0)
-    if changed and onChange then onChange('SideKickItemBarBgAlpha', itemAlpha) end
+        -- Width override (0 = auto)
+        local widthOverride = tonumber(settings.SideKickItemBarWidth) or 0
+        local widthChanged, newWidth = Components.SliderRow.int('Width Override', 'SideKickItemBarWidth', widthOverride, 0, 1200)
+        if widthChanged and onChange then onChange('SideKickItemBarWidth', newWidth) end
+        imgui.SameLine()
+        imgui.TextDisabled('(0 = auto)')
 
-    imgui.Separator()
-    imgui.Text('Anchoring')
+        -- Note: Item bar doesn't have gold frame, this setting kept for potential future use
+        -- local showBorder = settings.SideKickItemBarShowBorder ~= false
 
-    -- Anchor target
-    local target = Settings.labeledComboKeyed('Anchor To##itembar', settings.SideKickItemBarAnchorTarget or 'grouptarget', C.ANCHOR_TARGETS)
-    if target ~= tostring(settings.SideKickItemBarAnchorTarget or 'grouptarget') and onChange then
-        onChange('SideKickItemBarAnchorTarget', target)
-    end
+        -- Texture tint
+        local tintStr = settings.SideKickItemBarTextureTint or '1.0,1.0,1.0'
+        local tintColor = parseTintColor(tintStr)
+        local newTint, tintChanged = imgui.ColorEdit3('Texture Tint##items', tintColor)
+        if tintChanged and onChange then onChange('SideKickItemBarTextureTint', formatTintColor(newTint)) end
+        imgui.SameLine()
+        if imgui.SmallButton('Reset##items_tint') then
+            if onChange then onChange('SideKickItemBarTextureTint', '1.0,1.0,1.0') end
+        end
+    end, { id = 'item_bar_layout', defaultOpen = true })
 
-    -- Anchor mode
-    local itemAnchor = tostring(settings.SideKickItemBarAnchor or 'none')
-    itemAnchor = Settings.labeledCombo('Anchor Mode##itembar', itemAnchor, C.ANCHOR_MODES)
-    if itemAnchor ~= tostring(settings.SideKickItemBarAnchor or 'none') and onChange then
-        onChange('SideKickItemBarAnchor', itemAnchor)
-    end
+    -- Anchoring Section
+    Components.SettingGroup.draw('Anchoring', function()
+        -- Anchor target
+        local target = settings.SideKickItemBarAnchorTarget or 'grouptarget'
+        local targetChanged, newTarget = Components.ComboRow.keyValue('Anchor To', 'SideKickItemBarAnchorTarget', target, C.ANCHOR_TARGETS, nil, {
+            tooltip = 'Which window to anchor the item bar to',
+            width = 150,
+        })
+        if targetChanged and onChange then onChange('SideKickItemBarAnchorTarget', newTarget) end
 
-    -- Anchor gap
-    local itemAnchorGap = tonumber(settings.SideKickItemBarAnchorGap) or 2
-    itemAnchorGap, changed = Settings.labeledSliderInt('Anchor Gap##itembar', itemAnchorGap, 0, C.LAYOUT.MAX_ANCHOR_GAP)
-    if changed and onChange then onChange('SideKickItemBarAnchorGap', itemAnchorGap) end
+        -- Anchor mode
+        local itemAnchor = tostring(settings.SideKickItemBarAnchor or 'none')
+        local anchorChanged, newAnchor = Components.ComboRow.byValue('Anchor Mode', 'SideKickItemBarAnchor', itemAnchor, C.ANCHOR_MODES, nil, {
+            tooltip = 'How the item bar positions relative to anchor target',
+            width = 150,
+        })
+        if anchorChanged and onChange then onChange('SideKickItemBarAnchor', newAnchor) end
+
+        -- Anchor gap
+        local itemAnchorGap = tonumber(settings.SideKickItemBarAnchorGap) or 2
+        local gapChanged, newGap = Components.SliderRow.anchorGap('Anchor Gap', 'SideKickItemBarAnchorGap', itemAnchorGap)
+        if gapChanged and onChange then onChange('SideKickItemBarAnchorGap', newGap) end
+    end, { id = 'item_bar_anchor', defaultOpen = true })
 end
 
 -- Draw the full Items tab (slots configuration)

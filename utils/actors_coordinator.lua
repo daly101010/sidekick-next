@@ -276,6 +276,13 @@ function M.init(opts)
                 transparency = content.transparency,
                 windowRounding = content.windowRounding,
                 activeTheme = content.activeTheme,
+                -- Command bar bounds for anchoring
+                commandBarX = content.commandBarX,
+                commandBarY = content.commandBarY,
+                commandBarWidth = content.commandBarWidth,
+                commandBarHeight = content.commandBarHeight,
+                commandBarRight = content.commandBarRight,
+                commandBarBottom = content.commandBarBottom,
                 loaded = true,
                 timestamp = content.timestamp or os.clock(),
             }

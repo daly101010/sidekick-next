@@ -1,15 +1,40 @@
--- F:/lua/SideKick/sk_coordinator.lua
+-- F:/lua/sidekick-next/sk_coordinator.lua
 -- Central arbiter for SideKick multi-script system
 -- Only this script issues /stopcast and broadcasts authoritative state
 
 local mq = require('mq')
 local actors = require('actors')
-local lib = require('sidekick.sk_lib')
+local lib = require('sidekick-next.sk_lib')
 
 local M = {}
 
 -- Module identity
 M.MODULE_NAME = 'coordinator'
+
+-- Debug logging (set to true to enable)
+local DEBUG_COORDINATOR = true
+local DEBUG_LOG_FILE = mq.configDir .. '/sk_coordinator_debug.log'
+
+local function debugLog(fmt, ...)
+    if not DEBUG_COORDINATOR then return end
+    local msg = string.format(fmt, ...)
+    local timestamp = os.date('%H:%M:%S')
+    local f = io.open(DEBUG_LOG_FILE, 'a')
+    if f then
+        f:write(string.format('[%s] %s\n', timestamp, msg))
+        f:close()
+    end
+end
+
+-- Clear log file on startup
+local function clearLogFile()
+    local f = io.open(DEBUG_LOG_FILE, 'w')
+    if f then
+        f:write(string.format('=== SK_COORDINATOR DEBUG LOG STARTED %s ===\n', os.date('%Y-%m-%d %H:%M:%S')))
+        f:close()
+    end
+end
+clearLogFile()
 
 -- Internal state
 local State = {
@@ -39,7 +64,7 @@ local State = {
     },
 
     -- Module heartbeats
-    moduleHeartbeats = {}, -- [module] = { sentAtMs, ready }
+    moduleHeartbeats = {}, -- [module] = { sentAtMs, ready, script, mailbox }
 
     -- Need hints from modules
     moduleNeeds = {}, -- [module] = { priority, needsAction, ttlMs, receivedAtMs }
@@ -55,6 +80,19 @@ local State = {
 
 -- Actor dropbox
 local dropbox = nil
+local mailboxDropboxes = {}
+
+local function parseSenderScript(senderMailbox)
+    if type(senderMailbox) ~= 'string' then return nil end
+    -- Mailbox format is: lua:sidekick-next/sk_buffs:buffs
+    -- We want to extract: sidekick-next/sk_buffs (the script path between first and second colon)
+    local scriptPath = senderMailbox:match('^[^:]+:([^:]+):')
+    if scriptPath then
+        return scriptPath
+    end
+    -- Fallback to old behavior
+    return senderMailbox:match('^(.-):')
+end
 
 -------------------------------------------------------------------------------
 -- World State Evaluation
@@ -119,10 +157,38 @@ end
 
 local function computeActivePriority()
     local ws = State.worldState
+    local now = lib.getTimeMs()
 
     -- Emergency takes precedence
     if ws.emergencyActive then
         return lib.Priority.EMERGENCY
+    end
+
+    -- Check module need hints (authoritative for HI thresholds)
+    local bestNeed = nil
+    local validNeeds = {}
+    for moduleName, need in pairs(State.moduleNeeds) do
+        if need and need.needsAction == true then
+            local ttl = need.ttlMs or 250
+            local receivedAt = need.receivedAtMs or 0
+            local age = now - receivedAt
+            local isValid = age <= ttl
+            table.insert(validNeeds, string.format('%s:p%d:%s(age=%dms,ttl=%dms)',
+                moduleName, need.priority or -1, isValid and 'VALID' or 'EXPIRED',
+                age, ttl))
+            if isValid then
+                if bestNeed == nil or need.priority < bestNeed then
+                    bestNeed = need.priority
+                end
+            end
+        end
+    end
+    if #validNeeds > 0 then
+        debugLog('computePriority: needs=[%s] bestNeed=%s',
+            table.concat(validNeeds, ', '), tostring(bestNeed))
+    end
+    if bestNeed ~= nil then
+        return bestNeed
     end
 
     -- Check for healing needs
@@ -164,13 +230,21 @@ end
 
 local function expireOwners()
     local changed = false
-    if State.castOwner and isOwnerExpired(State.castOwner) then
-        lib.log('debug', M.MODULE_NAME, 'Cast owner expired: %s', State.castOwner.module)
-        State.castOwner = nil
-        changed = true
+    -- Don't expire cast owner while actively casting - let the cast complete
+    if State.castOwner then
+        local expired = isOwnerExpired(State.castOwner)
+        if expired and not State.castBusy then
+            lib.log('debug', M.MODULE_NAME, 'Cast owner expired: %s', State.castOwner.module)
+            debugLog('EXPIRE: Cast owner %s expired (castBusy=%s)', State.castOwner.module, tostring(State.castBusy))
+            State.castOwner = nil
+            changed = true
+        elseif expired and State.castBusy then
+            debugLog('EXPIRE: Cast owner %s expired but castBusy=true, keeping', State.castOwner.module)
+        end
     end
     if State.targetOwner and isOwnerExpired(State.targetOwner) then
         lib.log('debug', M.MODULE_NAME, 'Target owner expired: %s', State.targetOwner.module)
+        debugLog('EXPIRE: Target owner %s expired', State.targetOwner.module)
         State.targetOwner = nil
         changed = true
     end
@@ -184,14 +258,21 @@ local function revokeOnPriorityChange(newPriority)
     if not State.castBusy then
         if State.castOwner and State.castOwner.priority ~= newPriority and State.castOwner.priority ~= lib.Priority.EMERGENCY then
             lib.log('debug', M.MODULE_NAME, 'Revoking cast owner on priority change: %s', State.castOwner.module)
+            debugLog('REVOKE: Cast owner %s revoked on priority change (old=%d, new=%d, castBusy=%s)',
+                State.castOwner.module, State.castOwner.priority, newPriority, tostring(State.castBusy))
             State.castOwner = nil
             changed = true
+        end
+    else
+        if State.castOwner and State.castOwner.priority ~= newPriority then
+            debugLog('REVOKE: Cast owner %s kept despite priority change (castBusy=true)', State.castOwner.module)
         end
     end
 
     -- Always clear target owner on priority change (except emergency)
     if State.targetOwner and State.targetOwner.priority ~= newPriority and State.targetOwner.priority ~= lib.Priority.EMERGENCY then
         lib.log('debug', M.MODULE_NAME, 'Revoking target owner on priority change: %s', State.targetOwner.module)
+        debugLog('REVOKE: Target owner %s revoked on priority change', State.targetOwner.module)
         State.targetOwner = nil
         changed = true
     end
@@ -216,11 +297,14 @@ end
 
 local function processClaim(content, sender)
     local now = lib.getTimeMs()
+    debugLog('processClaim: module=%s type=%s priority=%d epochSeen=%d currentEpoch=%d activePriority=%d',
+        content.module, content.type or 'nil', content.priority, content.epochSeen, State.epoch, State.activePriority)
 
     -- Validate epochSeen
     if content.epochSeen ~= State.epoch then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (stale epoch): %s saw %d, current %d',
             content.module, content.epochSeen, State.epoch)
+        debugLog('CLAIM REJECTED: stale epoch (saw=%d, current=%d)', content.epochSeen, State.epoch)
         return false
     end
 
@@ -228,6 +312,7 @@ local function processClaim(content, sender)
     if content.priority ~= State.activePriority and content.priority ~= lib.Priority.EMERGENCY then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (wrong priority): %s has %d, active %d',
             content.module, content.priority, State.activePriority)
+        debugLog('CLAIM REJECTED: wrong priority (has=%d, active=%d)', content.priority, State.activePriority)
         return false
     end
 
@@ -251,12 +336,15 @@ local function processClaim(content, sender)
     -- Check if resources are grantable
     if wantsTarget and not canGrantResource(State.targetOwner, content.priority) then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (target not available): %s', content.module)
+        debugLog('CLAIM REJECTED: target not available (owner=%s)', State.targetOwner and State.targetOwner.module or 'nil')
         return false
     end
     if wantsCast and not canGrantResource(State.castOwner, content.priority) then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (cast not available): %s', content.module)
+        debugLog('CLAIM REJECTED: cast not available (owner=%s)', State.castOwner and State.castOwner.module or 'nil')
         return false
     end
+    debugLog('processClaim: Resources available, granting claim')
 
     -- Grant the claim
     State.epoch = State.epoch + 1
@@ -289,6 +377,8 @@ local function processClaim(content, sender)
 
     lib.log('info', M.MODULE_NAME, 'Claim granted: %s (type=%s, claimId=%s, epoch=%d)',
         content.module, content.type or 'action', content.claimId, State.epoch)
+    debugLog('CLAIM GRANTED: module=%s type=%s claimId=%s epoch=%d ttlMs=%d',
+        content.module, content.type or 'action', content.claimId, State.epoch, content.ttlMs or 0)
 
     State.pendingBroadcast = true
     return true
@@ -338,11 +428,23 @@ local function processInterrupt(content)
     local remainingSec = lib.getCastTimeRemaining()
     local threshold = lib.InterruptThreshold[content.requestingPriority] or 999
 
+    -- Allow cast owner to request self-cancel (ducking or abort)
+    if content.requestingModule == State.castOwner.module then
+        lib.log('info', M.MODULE_NAME, 'Owner interrupt: %s (%s)', content.requestingModule, tostring(content.reason or 'owner_cancel'))
+        debugLog('STOPCAST: Owner self-cancel by %s reason=%s', content.requestingModule, tostring(content.reason or 'owner_cancel'))
+        mq.cmd('/stopcast')
+        State.castOwner = nil
+        State.epoch = State.epoch + 1
+        State.pendingBroadcast = true
+        return true
+    end
+
     -- Higher priority requesting interrupt
     if content.requestingPriority < State.castOwner.priority then
         -- Emergency always interrupts
         if content.requestingPriority == lib.Priority.EMERGENCY then
             lib.log('info', M.MODULE_NAME, 'Emergency interrupt requested by %s', content.requestingModule)
+            debugLog('STOPCAST: Emergency interrupt by %s', content.requestingModule)
             mq.cmd('/stopcast')
             State.castOwner = nil
             State.epoch = State.epoch + 1
@@ -354,6 +456,8 @@ local function processInterrupt(content)
         if remainingSec > threshold then
             lib.log('info', M.MODULE_NAME, 'Interrupt: %s interrupting %s (remaining=%.1fs, threshold=%.1fs)',
                 content.requestingModule, State.castOwner.module, remainingSec, threshold)
+            debugLog('STOPCAST: Priority interrupt by %s of %s (remaining=%.1fs, threshold=%.1fs)',
+                content.requestingModule, State.castOwner.module, remainingSec, threshold)
             mq.cmd('/stopcast')
             State.castOwner = nil
             State.epoch = State.epoch + 1
@@ -362,6 +466,7 @@ local function processInterrupt(content)
         else
             lib.log('debug', M.MODULE_NAME, 'Interrupt delayed: letting cast finish (remaining=%.1fs <= threshold=%.1fs)',
                 remainingSec, threshold)
+            debugLog('STOPCAST delayed: remaining=%.1fs <= threshold=%.1fs', remainingSec, threshold)
         end
     end
 
@@ -395,9 +500,50 @@ local function broadcastState()
     State.tickId = State.tickId + 1
     local payload = buildStatePayload()
 
-    pcall(function()
-        dropbox:send({ mailbox = lib.Mailbox.STATE, absolute_mailbox = true }, payload)
-    end)
+    local sent = {}
+    local heartbeatCount = 0
+    for _ in pairs(State.moduleHeartbeats) do heartbeatCount = heartbeatCount + 1 end
+    debugLog('broadcastState: tickId=%d epoch=%d priority=%d heartbeatCount=%d',
+        State.tickId, State.epoch, State.activePriority, heartbeatCount)
+
+    local function sendToScript(scriptName)
+        if not scriptName or scriptName == '' then return end
+        if sent[scriptName] then return end
+        sent[scriptName] = true
+        debugLog('broadcastState: Sending to script=%s', scriptName)
+        pcall(function()
+            dropbox:send({ mailbox = lib.Mailbox.STATE, script = scriptName }, payload)
+        end)
+    end
+
+    local function sendToMailbox(mailbox)
+        if not mailbox or mailbox == '' then return end
+        if sent[mailbox] then return end
+        sent[mailbox] = true
+        pcall(function()
+            dropbox:send({ mailbox = mailbox, absolute_mailbox = true }, payload)
+        end)
+    end
+
+    for _, hb in pairs(State.moduleHeartbeats) do
+        if hb then
+            if hb.script then
+                sendToScript(hb.script)
+            elseif hb.mailbox then
+                sendToMailbox(hb.mailbox)
+            end
+        end
+    end
+
+    if lib.Scripts and lib.Scripts.UI then
+        if type(lib.Scripts.UI) == 'table' then
+            for _, scriptName in ipairs(lib.Scripts.UI) do
+                sendToScript(scriptName)
+            end
+        else
+            sendToScript(lib.Scripts.UI)
+        end
+    end
 
     State.lastBroadcastAt = lib.getTimeMs()
     State.pendingBroadcast = false
@@ -413,23 +559,43 @@ local function onMessage(message)
 
     local sender = message.sender or {}
     local mailbox = sender.mailbox or ''
+    local senderScript = parseSenderScript(mailbox)
+    local msgType = content.msgType
+
+    if not msgType then
+        if mailbox == lib.Mailbox.CLAIM then
+            msgType = 'claim'
+        elseif mailbox == lib.Mailbox.RELEASE then
+            msgType = 'release'
+        elseif mailbox == lib.Mailbox.INTERRUPT then
+            msgType = 'interrupt'
+        elseif mailbox == lib.Mailbox.HEARTBEAT then
+            msgType = 'heartbeat'
+        elseif mailbox == lib.Mailbox.NEED then
+            msgType = 'need'
+        end
+    end
 
     -- Route by mailbox
-    if mailbox == lib.Mailbox.CLAIM or content.type == 'claim' then
+    if msgType == 'claim' then
         processClaim(content, sender)
-    elseif mailbox == lib.Mailbox.RELEASE or content.type == 'release' then
+    elseif msgType == 'release' then
         processRelease(content)
-    elseif mailbox == lib.Mailbox.INTERRUPT or content.type == 'interrupt' then
+    elseif msgType == 'interrupt' then
         processInterrupt(content)
-    elseif mailbox == lib.Mailbox.HEARTBEAT then
+    elseif msgType == 'heartbeat' then
         -- Track module heartbeat
         if content.module then
+            debugLog('HEARTBEAT received: module=%s script=%s mailbox=%s',
+                tostring(content.module), tostring(senderScript), tostring(mailbox))
             State.moduleHeartbeats[content.module] = {
                 sentAtMs = content.sentAtMs or lib.getTimeMs(),
                 ready = content.ready ~= false,
+                script = senderScript,
+                mailbox = mailbox,
             }
         end
-    elseif mailbox == lib.Mailbox.NEED then
+    elseif msgType == 'need' then
         -- Track module need hints
         if content.module then
             State.moduleNeeds[content.module] = {
@@ -438,6 +604,9 @@ local function onMessage(message)
                 ttlMs = content.ttlMs or 250,
                 receivedAtMs = lib.getTimeMs(),
             }
+            debugLog('NEED received: module=%s priority=%d needsAction=%s ttlMs=%d',
+                tostring(content.module), tonumber(content.priority) or -1,
+                tostring(content.needsAction), tonumber(content.ttlMs) or 250)
         end
     end
 end
@@ -453,17 +622,33 @@ local function initialize()
     dropbox = actors.register(M.MODULE_NAME, onMessage)
 
     -- Also listen on specific mailboxes
-    actors.register(lib.Mailbox.CLAIM, onMessage)
-    actors.register(lib.Mailbox.RELEASE, onMessage)
-    actors.register(lib.Mailbox.INTERRUPT, onMessage)
-    actors.register(lib.Mailbox.HEARTBEAT, onMessage)
-    actors.register(lib.Mailbox.NEED, onMessage)
+    mailboxDropboxes.claim = actors.register(lib.Mailbox.CLAIM, onMessage)
+    mailboxDropboxes.release = actors.register(lib.Mailbox.RELEASE, onMessage)
+    mailboxDropboxes.interrupt = actors.register(lib.Mailbox.INTERRUPT, onMessage)
+    mailboxDropboxes.heartbeat = actors.register(lib.Mailbox.HEARTBEAT, onMessage)
+    mailboxDropboxes.need = actors.register(lib.Mailbox.NEED, onMessage)
 
     lib.log('info', M.MODULE_NAME, 'Coordinator ready')
 end
 
+local _lastStatusLog = 0
+
 local function tick()
     local now = lib.getTimeMs()
+
+    -- Periodic status log every 5 seconds
+    if (now - _lastStatusLog) >= 5000 then
+        _lastStatusLog = now
+        debugLog('STATUS: epoch=%d priority=%d castOwner=%s castBusy=%s needCount=%d',
+            State.epoch, State.activePriority,
+            State.castOwner and State.castOwner.module or 'nil',
+            tostring(State.castBusy),
+            (function()
+                local count = 0
+                for _ in pairs(State.moduleNeeds) do count = count + 1 end
+                return count
+            end)())
+    end
 
     -- Update world state
     updateWorldState()
@@ -471,6 +656,10 @@ local function tick()
     -- Compute active priority
     local newPriority = computeActivePriority()
     if newPriority ~= State.activePriority then
+        debugLog('Priority CHANGE: %d -> %d (castBusy=%s, castOwner=%s)',
+            State.activePriority, newPriority,
+            tostring(State.castBusy),
+            State.castOwner and State.castOwner.module or 'nil')
         lib.log('info', M.MODULE_NAME, 'Priority change: %d -> %d', State.activePriority, newPriority)
         local revoked = revokeOnPriorityChange(newPriority)
         State.activePriority = newPriority

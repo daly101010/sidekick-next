@@ -1,10 +1,10 @@
--- F:/lua/SideKick/sk_dps.lua
+-- F:/lua/sidekick-next/sk_dps.lua
 -- DPS module for SideKick multi-script system
 -- Priority 4: Nukes, stuns, meditation when idle
 
 local mq = require('mq')
-local lib = require('sidekick.sk_lib')
-local ModuleBase = require('sidekick.sk_module_base')
+local lib = require('sidekick-next.sk_lib')
+local ModuleBase = require('sidekick-next.sk_module_base')
 local Spells = require('sidekick-next.sk_spells_clr')
 
 -- Create module instance

@@ -27,6 +27,15 @@ local TYPE_PRIORITY_MULTIPLIER = 10
 -- Lazy-loaded Dependencies
 --------------------------------------------------------------------------------
 
+local _Core = nil
+local function getCore()
+    if not _Core then
+        local ok, mod = pcall(require, 'sidekick-next.core')
+        if ok then _Core = mod end
+    end
+    return _Core
+end
+
 local _SpellsetPersistence = nil
 local function getSpellsetPersistence()
     if not _SpellsetPersistence then
@@ -651,6 +660,12 @@ end
 --- Returns true if a spell cast was initiated
 ---@return boolean True if a spell was cast
 function M.process()
+    -- Check if automation is paused
+    local Core = getCore()
+    if Core and Core.Settings and Core.Settings.AutomationPaused == true then
+        return false
+    end
+
     -- Only cast in combat
     if not inCombat() then
         return false

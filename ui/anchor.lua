@@ -11,7 +11,12 @@ local function normalizeTargetKey(target)
     target = target:gsub('%s+', '')
     target = target:gsub('[^%w_]', '')
     if target == '' then target = 'grouptarget' end
-    if target == 'gt' then target = 'grouptarget' end
+    if target == 'gt' or target == 'group' or target == 'groupwindow' then target = 'grouptarget' end
+    if target == 'commandbar' or target == 'command_bar' or target == 'gtcommandbar' or target == 'gt_commandbar' or target == 'grouptargetcommandbar' or target == 'grouptarget_commandbar' then
+        target = 'gt_commandbar'
+    end
+    if target == 'targetwindow' then target = 'target' end
+    if target == 'xtargetwindow' then target = 'xtarget' end
     if target == 'sidekickmain' then target = 'sidekick_main' end
     if target == 'sidekickbar' then target = 'sidekick_bar' end
     if target == 'sidekickspecial' then target = 'sidekick_special' end
@@ -20,15 +25,27 @@ local function normalizeTargetKey(target)
     return target
 end
 
-local function getStableGroupTargetBounds()
-    local gt = _G.GroupTargetBounds
-    if not gt then return nil end
+local function getStableBounds(globalName)
+    local b = _G[globalName]
+    if not b then return nil end
     -- Accept bounds even if 'loaded' is missing/false as long as required fields exist.
-    local hasCore = (gt.x ~= nil and gt.y ~= nil and gt.width ~= nil and gt.height ~= nil)
-    if not gt.loaded and not hasCore then return nil end
-    -- Avoid hard-expiring bounds; GroupTarget may only broadcast on changes.
+    local hasCore = (b.x ~= nil and b.y ~= nil and b.width ~= nil and b.height ~= nil)
+    if not b.loaded and not hasCore then return nil end
+    -- Avoid hard-expiring bounds; windows may only broadcast on changes.
     -- If stale, keep last known bounds rather than breaking docking entirely.
-    return gt
+    return b
+end
+
+local function getStableGroupTargetBounds()
+    return getStableBounds('GroupTargetBounds')
+end
+
+local function getStableTargetWindowBounds()
+    return getStableBounds('TargetWindowBounds')
+end
+
+local function getStableXTargetWindowBounds()
+    return getStableBounds('XTargetWindowBounds')
 end
 
 local function getStableSideKickBounds(key)
@@ -45,6 +62,31 @@ function M.getTargetBounds(targetKey)
     targetKey = normalizeTargetKey(targetKey)
     if targetKey == 'grouptarget' then
         return getStableGroupTargetBounds()
+    end
+    if targetKey == 'gt_commandbar' then
+        local b = getStableGroupTargetBounds()
+        if not b then return nil end
+        local x = b.commandBarX or b.x
+        local y = b.commandBarY
+        local w = b.commandBarWidth or b.width
+        local h = b.commandBarHeight
+        if not (x and y and w and h) then return nil end
+        return {
+            x = x,
+            y = y,
+            width = w,
+            height = h,
+            right = (b.commandBarRight or (x + w)),
+            bottom = (b.commandBarBottom or (y + h)),
+            loaded = true,
+            timestamp = b.timestamp or os.clock(),
+        }
+    end
+    if targetKey == 'target' then
+        return getStableTargetWindowBounds()
+    end
+    if targetKey == 'xtarget' then
+        return getStableXTargetWindowBounds()
     end
     if targetKey == 'none' then
         return nil

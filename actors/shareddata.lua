@@ -192,6 +192,9 @@ function M.buildStatusPayload(opts)
         sitting = me.Sitting and me.Sitting() == true or false,
         follow = following,
         chase = opts.chase == true,
+        assistEnabled = opts.assistEnabled == true,
+        burnActive = opts.burnActive == true,
+        settingsOpen = opts.settingsOpen == true,
         abilities = buildAbilityStatus(opts.abilities, opts.cooldownProbe),
         buffs = buildSelfBuffStatus(),  -- What buffs this character currently has
         script = 'sidekick',

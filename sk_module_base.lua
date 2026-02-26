@@ -1,12 +1,40 @@
--- F:/lua/SideKick/sk_module_base.lua
+-- F:/lua/sidekick-next/sk_module_base.lua
 -- Base class for SideKick priority modules
 -- Handles state reception, claim requests, and execution guards
 
 local mq = require('mq')
 local actors = require('actors')
-local lib = require('sidekick.sk_lib')
+local lib = require('sidekick-next.sk_lib')
 
 local M = {}
+
+-- Debug file logging
+local DEBUG_LOG_FILE = mq.configDir .. '/sk_module_base_debug.log'
+local DEBUG_ENABLED = true
+
+local function debugLogToFile(moduleName, fmt, ...)
+    if not DEBUG_ENABLED then return end
+    local msg = string.format(fmt, ...)
+    local timestamp = os.date('%H:%M:%S')
+    local f = io.open(DEBUG_LOG_FILE, 'a')
+    if f then
+        f:write(string.format('[%s] [%s] %s\n', timestamp, moduleName, msg))
+        f:close()
+    end
+end
+
+-- Clear on first load
+local _logCleared = false
+local function ensureLogCleared()
+    if _logCleared then return end
+    _logCleared = true
+    local f = io.open(DEBUG_LOG_FILE, 'w')
+    if f then
+        f:write(string.format('=== SK_MODULE_BASE DEBUG LOG STARTED %s ===\n', os.date('%Y-%m-%d %H:%M:%S')))
+        f:close()
+    end
+end
+ensureLogCleared()
 
 --- Create a new module instance
 -- @param moduleName string Unique module name
@@ -26,6 +54,8 @@ function M.create(moduleName, priority)
         currentClaimId = nil,
         claimPending = false,
         claimRequestedAt = 0,
+        lastNeedSentAt = 0,
+        lastNeedValue = nil,
 
         -- Running flag
         running = true,
@@ -34,6 +64,7 @@ function M.create(moduleName, priority)
 
         -- Actor dropbox
         dropbox = nil,
+        stateDropbox = nil,
 
         -- Callbacks (override these)
         onTick = nil,          -- Called each tick when active
@@ -68,18 +99,35 @@ function M.create(moduleName, priority)
         if not self:hasValidState() then return false end
         local owner = self.state.castOwner
         if not owner then return false end
-        return owner.module == self.name
-            and owner.claimId == self.currentClaimId
-            and owner.epoch == self.state.epoch
+        if owner.module ~= self.name then return false end
+
+        -- If we own by module name but claimId doesn't match, adopt the coordinator's claimId
+        -- This handles the case where we sent multiple claims and an earlier one was granted
+        if owner.claimId ~= self.currentClaimId then
+            debugLogToFile(self.name, 'ownsCast: Adopting coordinator claimId (owner=%s, was=%s)',
+                tostring(owner.claimId), tostring(self.currentClaimId))
+            self.currentClaimId = owner.claimId
+            self.claimPending = false
+        end
+
+        return owner.epoch == self.state.epoch
     end
 
     function self:ownsTarget()
         if not self:hasValidState() then return false end
         local owner = self.state.targetOwner
         if not owner then return false end
-        return owner.module == self.name
-            and owner.claimId == self.currentClaimId
-            and owner.epoch == self.state.epoch
+        if owner.module ~= self.name then return false end
+
+        -- If we own by module name but claimId doesn't match, adopt the coordinator's claimId
+        if owner.claimId ~= self.currentClaimId then
+            debugLogToFile(self.name, 'ownsTarget: Adopting coordinator claimId (owner=%s, was=%s)',
+                tostring(owner.claimId), tostring(self.currentClaimId))
+            self.currentClaimId = owner.claimId
+            self.claimPending = false
+        end
+
+        return owner.epoch == self.state.epoch
     end
 
     function self:ownsAction()
@@ -110,6 +158,7 @@ function M.create(moduleName, priority)
         self.currentClaimId = lib.generateClaimId(self.name, self.claimCounter)
 
         local claim = {
+            msgType = 'claim',
             type = lib.ClaimType.ACTION,
             wants = { 'target', 'cast' },
             module = self.name,
@@ -125,7 +174,7 @@ function M.create(moduleName, priority)
         self.claimRequestedAt = lib.getTimeMs()
 
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.CLAIM, absolute_mailbox = true }, claim)
+            self.dropbox:send({ mailbox = lib.Mailbox.CLAIM, script = lib.Scripts.COORDINATOR }, claim)
         end)
 
         lib.log('debug', self.name, 'Claim requested: %s (epoch=%d)', self.currentClaimId, self.state.epoch)
@@ -136,6 +185,7 @@ function M.create(moduleName, priority)
         if not self.currentClaimId then return end
 
         local release = {
+            msgType = 'release',
             type = 'action',
             module = self.name,
             claimId = self.currentClaimId,
@@ -144,7 +194,7 @@ function M.create(moduleName, priority)
         }
 
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.RELEASE, absolute_mailbox = true }, release)
+            self.dropbox:send({ mailbox = lib.Mailbox.RELEASE, script = lib.Scripts.COORDINATOR }, release)
         end)
 
         lib.log('debug', self.name, 'Release sent: %s (%s)', self.currentClaimId, reason)
@@ -156,24 +206,47 @@ function M.create(moduleName, priority)
         if not self:hasValidState() then return end
 
         local interrupt = {
+            msgType = 'interrupt',
             requestingModule = self.name,
             requestingPriority = self.priority,
             reason = reason or 'preempt',
         }
 
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.INTERRUPT, absolute_mailbox = true }, interrupt)
+            self.dropbox:send({ mailbox = lib.Mailbox.INTERRUPT, script = lib.Scripts.COORDINATOR }, interrupt)
         end)
 
         lib.log('debug', self.name, 'Interrupt requested: %s', reason)
     end
 
     function self:sendHeartbeat()
+        debugLogToFile(self.name, 'Sending heartbeat to %s', lib.Scripts.COORDINATOR)
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, absolute_mailbox = true }, {
+            self.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
+                msgType = 'heartbeat',
                 module = self.name,
                 sentAtMs = lib.getTimeMs(),
                 ready = true,
+            })
+        end)
+    end
+
+    function self:sendNeed(needsAction, ttlMs)
+        if not self.dropbox then return end
+        local now = lib.getTimeMs()
+        local value = needsAction == true
+        if self.lastNeedValue == value and (now - (self.lastNeedSentAt or 0)) < 100 then
+            return
+        end
+        self.lastNeedValue = value
+        self.lastNeedSentAt = now
+        pcall(function()
+            self.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
+                msgType = 'need',
+                module = self.name,
+                priority = self.priority,
+                needsAction = value,
+                ttlMs = ttlMs or 250,
             })
         end)
     end
@@ -190,6 +263,7 @@ function M.create(moduleName, priority)
         if not self.initialized then
             self.warmupUntil = lib.getTimeMs() + lib.Timing.WARMUP_MS
             self.initialized = true
+            debugLogToFile(self.name, 'First state received, epoch=%d priority=%d', content.epoch or -1, content.activePriority or -1)
             lib.log('info', self.name, 'First state received, warming up for %dms', lib.Timing.WARMUP_MS)
         end
 
@@ -217,6 +291,11 @@ function M.create(moduleName, priority)
     function self:tick()
         -- Safety: stop if no valid state
         if not self:hasValidState() then
+            -- Log occasionally to avoid spam
+            if not self._lastNoStateLog or (lib.getTimeMs() - self._lastNoStateLog) > 5000 then
+                self._lastNoStateLog = lib.getTimeMs()
+                debugLogToFile(self.name, 'tick: No valid state (state=%s)', self.state and 'exists' or 'nil')
+            end
             if self.currentClaimId then
                 lib.log('warn', self.name, 'State stale, releasing claim')
                 self:releaseClaim('state_stale')
@@ -240,9 +319,11 @@ function M.create(moduleName, priority)
         end
 
         -- If we already own the action, execute
-        if self:ownsAction() then
+        local ownsIt = self:ownsAction()
+        if ownsIt then
             if self.executeAction then
                 local success, reason = self.executeAction(self)
+                lib.log('debug', self.name, 'executeAction returned: success=%s reason=%s', tostring(success), tostring(reason))
                 if success or reason == 'completed' then
                     self:releaseClaim(reason or 'completed')
                 end
@@ -255,6 +336,7 @@ function M.create(moduleName, priority)
             if self.getAction then
                 local action = self.getAction(self)
                 if action then
+                    lib.log('debug', self.name, 'Requesting claim for action: %s', tostring(action.name or action.reason or 'unknown'))
                     self:requestClaim(action)
                 end
             end
@@ -266,6 +348,7 @@ function M.create(moduleName, priority)
     ---------------------------------------------------------------------------
 
     function self:initialize()
+        debugLogToFile(self.name, 'Initializing module (priority=%d)', self.priority)
         lib.log('info', self.name, 'Initializing module (priority=%d)', self.priority)
 
         -- Register actor to receive state broadcasts
@@ -280,7 +363,7 @@ function M.create(moduleName, priority)
         end)
 
         -- Also listen on state mailbox
-        actors.register(lib.Mailbox.STATE, function(message)
+        self.stateDropbox = actors.register(lib.Mailbox.STATE, function(message)
             local content = message()
             if type(content) == 'table' and content.tickId and content.epoch then
                 self:onStateReceived(content)

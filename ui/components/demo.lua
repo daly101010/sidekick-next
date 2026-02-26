@@ -70,13 +70,16 @@ local State = {
 }
 
 -- Available themes
-local THEME_NAMES = {}
-for name, _ in pairs(Themes.getThemeList and Themes.getThemeList() or {}) do
-    table.insert(THEME_NAMES, name)
-end
-table.sort(THEME_NAMES)
+local THEME_NAMES = Themes.getThemeNames and Themes.getThemeNames() or {}
 if #THEME_NAMES == 0 then
-    THEME_NAMES = { 'Classic', 'Dark', 'Neon', 'Forest', 'Blood', 'Royal', 'Velious', 'Kunark' }
+    -- Fallback if getThemeNames not available
+    for name, _ in pairs(Themes.presets or {}) do
+        table.insert(THEME_NAMES, name)
+    end
+    table.sort(THEME_NAMES)
+end
+if #THEME_NAMES == 0 then
+    THEME_NAMES = { 'Classic', 'ClassicEQ', 'ClassicEQ Textured', 'Dark', 'Neon', 'Forest', 'Blood', 'Royal', 'Velious', 'Kunark' }
 end
 
 -- Tab definitions
@@ -88,6 +91,7 @@ local TABS = {
     { name = 'Tables', icon = '▦' },
     { name = 'Feedback', icon = '!' },
     { name = 'Layout', icon = '▣' },
+    { name = 'Textures', icon = '▤' },
 }
 
 -- ============================================================
@@ -99,6 +103,17 @@ local function renderButtonsTab()
 
     -- DIAGNOSTIC: Test DrawList directly
     Components.SettingGroup.section('DrawList Diagnostic', theme)
+
+    -- Load Draw helpers for API info
+    local Draw = require('sidekick-next.ui.draw_helpers')
+    local apiInfo = Draw.getApiInfo()
+
+    imgui.Text('Draw API State:')
+    imgui.Text('  detected: ' .. tostring(apiInfo.detected))
+    imgui.Text('  useImVec2: ' .. tostring(apiInfo.useImVec2))
+    imgui.Text('  hasImVec2: ' .. tostring(apiInfo.hasImVec2))
+
+    imgui.Spacing()
 
     local dl = imgui.GetWindowDrawList()
     if dl then
@@ -114,42 +129,49 @@ local function renderButtonsTab()
             imgui.Text('CursorPos: ' .. tostring(cx) .. ', ' .. tostring(cy))
         end
 
-        -- Reserve space and try to draw
-        imgui.Dummy(100, 50)
+        -- Reserve space for the test boxes
+        imgui.Dummy(200, 60)
 
-        -- Check for ImVec2
+        -- Test 1: Direct ImVec2 call (what we know works)
         local ImVec2 = ImVec2 or imgui.ImVec2
-        imgui.Text('ImVec2 available: ' .. tostring(ImVec2 ~= nil))
-
         local col = 0xFF00FF00  -- Green, ABGR format
 
-        -- Try with ImVec2
         if ImVec2 then
             local ok, err = pcall(function()
                 dl:AddRectFilled(ImVec2(cx, cy), ImVec2(cx + 80, cy + 20), col, 4)
             end)
             if ok then
-                imgui.Text('AddRectFilled (ImVec2): OK - should see green box above')
+                imgui.Text('Direct ImVec2 call: OK (green box)')
             else
-                imgui.TextColored(1, 0.3, 0.3, 1, 'AddRectFilled (ImVec2): ' .. tostring(err))
-
-                -- Try without rounding param
-                local ok2, err2 = pcall(function()
-                    dl:AddRectFilled(ImVec2(cx, cy + 25), ImVec2(cx + 80, cy + 45), col)
-                end)
-                if ok2 then
-                    imgui.Text('AddRectFilled (no rounding): OK')
-                else
-                    imgui.TextColored(1, 0.3, 0.3, 1, 'AddRectFilled (no rounding): ' .. tostring(err2))
-                end
+                imgui.TextColored(1, 0.3, 0.3, 1, 'Direct ImVec2: ' .. tostring(err))
             end
-        else
-            imgui.TextColored(1, 0.5, 0, 1, 'ImVec2 not found - trying raw coords')
+        end
 
-            local ok, err = pcall(function()
-                dl:AddRectFilled(cx, cy, cx + 80, cy + 20, col, 4)
-            end)
-            imgui.Text('AddRectFilled (raw): ' .. (ok and 'OK' or tostring(err)))
+        -- Test 2: Through Draw helper
+        local colBlue = Draw.IM_COL32(0, 128, 255, 255)
+        local result = Draw.addRectFilled(dl, cx + 100, cy, cx + 180, cy + 20, colBlue, 4)
+        if result then
+            imgui.Text('Draw.addRectFilled: OK (blue box)')
+        else
+            imgui.TextColored(1, 0.5, 0, 1, 'Draw.addRectFilled: returned false')
+        end
+
+        -- Test 3: Draw a circle
+        local colRed = Draw.IM_COL32(255, 64, 64, 255)
+        local circleResult = Draw.addCircleFilled(dl, cx + 40, cy + 45, 12, colRed, 12)
+        if circleResult then
+            imgui.Text('Draw.addCircleFilled: OK (red circle)')
+        else
+            imgui.TextColored(1, 0.5, 0, 1, 'Draw.addCircleFilled: returned false')
+        end
+
+        -- Test 4: Draw text
+        local colYellow = Draw.IM_COL32(255, 255, 0, 255)
+        local textResult = Draw.addText(dl, cx + 100, cy + 40, colYellow, 'Test Text')
+        if textResult then
+            imgui.Text('Draw.addText: OK (yellow text)')
+        else
+            imgui.TextColored(1, 0.5, 0, 1, 'Draw.addText: returned false')
         end
     else
         imgui.TextColored(1, 0.3, 0.3, 1, 'DrawList: NIL!')
@@ -345,27 +367,27 @@ local function renderBarsTab()
 
     imgui.Text('Health:')
     imgui.SameLine(80)
-    Components.ResourceBar.health(7500, 10000, { width = 200, showPercent = true })
+    Components.ResourceBar.health(7500, 10000, { width = 200, showPercent = true, theme = theme })
 
     imgui.Text('Health (low):')
     imgui.SameLine(80)
-    Components.ResourceBar.health(2000, 10000, { width = 200, showPercent = true })
+    Components.ResourceBar.health(2000, 10000, { width = 200, showPercent = true, theme = theme })
 
     imgui.Text('Mana:')
     imgui.SameLine(80)
-    Components.ResourceBar.mana(4500, 8000, { width = 200, showText = true })
+    Components.ResourceBar.mana(4500, 8000, { width = 200, showText = true, theme = theme })
 
     imgui.Text('Endurance:')
     imgui.SameLine(80)
-    Components.ResourceBar.endurance(6000, 6000, { width = 200, showPercent = true })
+    Components.ResourceBar.endurance(6000, 6000, { width = 200, showPercent = true, theme = theme })
 
     imgui.Text('Experience:')
     imgui.SameLine(80)
-    Components.ResourceBar.experience(35, 100, { width = 200, showPercent = true })
+    Components.ResourceBar.experience(35, 100, { width = 200, showPercent = true, theme = theme })
 
     imgui.Text('Aggro:')
     imgui.SameLine(80)
-    Components.ResourceBar.aggro(85, 100, { width = 200, showPercent = true })
+    Components.ResourceBar.aggro(85, 100, { width = 200, showPercent = true, theme = theme })
 
     imgui.Spacing()
 
@@ -376,7 +398,7 @@ local function renderBarsTab()
 
     imgui.Text('Cooldown:')
     imgui.SameLine(80)
-    Components.ResourceBar.cooldown(10 - elapsed, 10, { width = 200 })
+    Components.ResourceBar.cooldown(10 - elapsed, 10, { width = 200, theme = theme })
 
     imgui.Spacing()
 
@@ -404,9 +426,9 @@ local function renderBarsTab()
     -- Labeled bars
     Components.SettingGroup.section('Labeled Bars', theme)
 
-    Components.ResourceBar.labeledHealth('Warrior', 9500, 12000, { width = 150, showPercent = true })
-    Components.ResourceBar.labeledHealth('Cleric', 6000, 8000, { width = 150, showPercent = true })
-    Components.ResourceBar.labeledHealth('Wizard', 3500, 5000, { width = 150, showPercent = true })
+    Components.ResourceBar.labeledHealth('Warrior', 9500, 12000, { width = 150, showPercent = true, theme = theme })
+    Components.ResourceBar.labeledHealth('Cleric', 6000, 8000, { width = 150, showPercent = true, theme = theme })
+    Components.ResourceBar.labeledHealth('Wizard', 3500, 5000, { width = 150, showPercent = true, theme = theme })
 end
 
 local function renderInputsTab()
@@ -663,6 +685,221 @@ local function renderLayoutTab()
 end
 
 -- ============================================================
+-- TEXTURES TAB
+-- ============================================================
+
+local TextureRenderer = nil
+local _textureRendererLoaded = false
+
+local function getTextureRenderer()
+    if _textureRendererLoaded then return TextureRenderer end
+    _textureRendererLoaded = true
+    local ok, tr = pcall(require, 'sidekick-next.ui.texture_renderer')
+    if ok and tr then TextureRenderer = tr end
+    return TextureRenderer
+end
+
+-- Curated list of background/panel textures to display
+local TEXTURE_GALLERY = {
+    { category = 'Full Backgrounds (Tileable)', items = {
+        { name = 'A_Listbox_Background1', label = 'Dark Rock (256x256)', desc = 'wnd_bg_dark_rock.tga' },
+        { name = 'A_Listbox_Background2', label = 'Dark Rock Half (128x256)', desc = 'wnd_bg_dark_rock.tga' },
+        { name = 'A_LightRockFrameTopBottom', label = 'Light Rock Top/Bottom (256x30)', desc = 'wnd_bg_light_rock.tga' },
+        { name = 'A_LightRockFrameSide', label = 'Light Rock Side (30x256)', desc = 'wnd_bg_light_rock.tga' },
+    }},
+    { category = 'Window Backgrounds', items = {
+        { name = 'ACTW_bg_TX', label = 'Action Window (121x173)', desc = 'classic_pieces04.tga' },
+        { name = 'GW_bg_TX', label = 'Group Window (95x124)', desc = 'classic_pieces03.tga' },
+        { name = 'TW_bgtop_TX', label = 'Target Window Top (121x256)', desc = 'classic_pieces03.tga' },
+        { name = 'TW_bgbot_TX', label = 'Target Window Bot (121x29)', desc = 'classic_pieces03.tga' },
+        { name = 'PW_bg_stats_TX', label = 'Player Stats (95x82)', desc = 'classic_pieces03.tga' },
+        { name = 'IW_bg_stats_TX', label = 'Inventory Stats (114x180)', desc = 'classic_pieces05.tga' },
+        { name = 'IW_bg_player_TX', label = 'Inventory Player (95x123)', desc = 'classic_pieces05.tga' },
+        { name = 'IW_bg_exp_TX', label = 'Inventory Exp (95x81)', desc = 'classic_pieces03.tga' },
+        { name = 'IW_bg_bags_1_TX', label = 'Inventory Bags 1 (103x75)', desc = 'classic_pieces05.tga' },
+        { name = 'IW_bg_bags_2_TX', label = 'Inventory Bags 2 (103x123)', desc = 'classic_pieces05.tga' },
+        { name = 'IW_bg_autoequip_TX', label = 'Auto Equip (188x63)', desc = 'classic_pieces04.tga' },
+        { name = 'BW_bgbot_TX', label = 'Bank Window Bot (121x21)', desc = 'classic_pieces03.tga' },
+    }},
+    { category = 'Overlap / Side Panels', items = {
+        { name = 'LEFTW_Overlap_bg_1_TX', label = 'Left Overlap 1 (119x256)', desc = 'classic_bg_left.tga' },
+        { name = 'LEFTW_Overlap_bg_2_TX', label = 'Left Overlap 2 (119x240)', desc = 'classic_bg_left.tga' },
+        { name = 'LEFT_bg_top', label = 'Left Top (119x7)', desc = 'classic_pieces01.tga' },
+        { name = 'LEFT_bg_bottom', label = 'Left Bottom (119x7)', desc = 'classic_pieces01.tga' },
+        { name = 'LEFT_bg_bottomright', label = 'Left Bottom Right (7x153)', desc = 'classic_bg_left.tga' },
+        { name = 'SELW_bg_Inv_Normal', label = 'Select Inv Normal (71x175)', desc = 'classic_pieces01.tga' },
+    }},
+    { category = 'Special Backgrounds', items = {
+        { name = 'A_ChatBackground', label = 'Chat Background (172x143)', desc = 'classic_chat01.tga' },
+        { name = 'PNW_BackgroundTexture', label = 'Note Background (201x185)', desc = 'note01.tga' },
+        { name = 'A_SpellGemBackground', label = 'Spell Gem Bg (36x32)', desc = 'window_pieces02.tga' },
+        { name = 'IW_GearSlot_TX', label = 'Gear Slot (49x48)', desc = 'classic_pieces02.tga' },
+    }},
+    { category = 'Gauge Backgrounds', items = {
+        { name = 'A_Classic_GaugeBackground', label = 'Classic Gauge Bg (65x12)', desc = 'classic_pieces02.tga' },
+        { name = 'A_GaugeBackground', label = 'Standard Gauge Bg (100x8)', desc = 'window_pieces01.tga' },
+    }},
+    { category = 'Gauge Fills', items = {
+        { name = 'A_Classic_GaugeFill', label = 'Gauge Fill 1 (65x12)', desc = 'Health' },
+        { name = 'A_Classic_GaugeFill2', label = 'Gauge Fill 2 (65x12)', desc = 'Endurance' },
+        { name = 'A_Classic_GaugeFill3', label = 'Gauge Fill 3 (65x12)', desc = 'Alt Fill' },
+        { name = 'A_Classic_GaugeFill4', label = 'Gauge Fill 4 (65x12)', desc = 'Alt Fill' },
+        { name = 'A_Classic_GaugeFill5', label = 'Gauge Fill 5 (65x12)', desc = 'Mana' },
+        { name = 'A_Classic_GaugeFill6', label = 'Gauge Fill 6 (65x12)', desc = 'Alt Fill' },
+    }},
+    { category = 'Gauge Parts', items = {
+        { name = 'A_Classic_GaugeEndCapLeft', label = 'Endcap Left (10x12)', desc = 'classic_pieces02.tga' },
+        { name = 'A_Classic_GaugeEndCapRight', label = 'Endcap Right (10x12)', desc = 'classic_pieces02.tga' },
+        { name = 'A_Classic_GaugeLines', label = 'Gauge Lines (65x12)', desc = 'classic_pieces02.tga' },
+        { name = 'A_Classic_GaugeLinesFill', label = 'Gauge Lines Fill (65x12)', desc = 'classic_pieces02.tga' },
+    }},
+    { category = 'Buttons', items = {
+        { name = 'A_BtnNormal', label = 'Btn Normal (96x19)', desc = 'window_pieces03.tga' },
+        { name = 'A_BtnFlyby', label = 'Btn Hover (96x19)', desc = 'window_pieces03.tga' },
+        { name = 'A_BtnPressed', label = 'Btn Pressed (96x19)', desc = 'window_pieces03.tga' },
+        { name = 'A_BtnDisabled', label = 'Btn Disabled (96x19)', desc = 'window_pieces03.tga' },
+        { name = 'A_BigBtnNormal', label = 'Big Btn Normal (120x24)', desc = 'window_pieces03.tga' },
+        { name = 'A_BigBtnFlyby', label = 'Big Btn Hover (120x24)', desc = 'window_pieces03.tga' },
+        { name = 'A_BigBtnPressed', label = 'Big Btn Pressed (120x24)', desc = 'window_pieces03.tga' },
+        { name = 'A_SmallBtnNormal', label = 'Small Btn Normal (48x19)', desc = 'window_pieces03.tga' },
+        { name = 'A_SmallBtnFlyby', label = 'Small Btn Hover (48x19)', desc = 'window_pieces03.tga' },
+        { name = 'A_SmallBtnPressed', label = 'Small Btn Pressed (48x19)', desc = 'window_pieces03.tga' },
+    }},
+    { category = 'Cast Bar Parts', items = {
+        { name = 'A_Castbar_bg1a_TX', label = 'Castbar Bg 1a (38x136)', desc = 'window_pieces02.tga' },
+        { name = 'A_Castbar_bg1b_TX', label = 'Castbar Bg 1b (38x136)', desc = 'window_pieces02.tga' },
+        { name = 'A_Castbar_bg1c_TX', label = 'Castbar Bg 1c (38x59)', desc = 'window_pieces02.tga' },
+    }},
+    { category = 'Misc Backgrounds', items = {
+        { name = 'BRTW_Bg1_TX', label = 'Breath Bg1 (95x7)', desc = 'classic_pieces03.tga' },
+        { name = 'BRTW_Bg2_TX', label = 'Breath Bg2 (95x16)', desc = 'classic_pieces03.tga' },
+        { name = 'CSTW_Bg1_TX', label = 'Cast Bg1 (95x7)', desc = 'classic_pieces03.tga' },
+        { name = 'CSTW_Bg2_TX', label = 'Cast Bg2 (95x16)', desc = 'classic_pieces03.tga' },
+        { name = 'BlueIconBackground', label = 'Blue Icon Bg (104x19)', desc = 'classic_debug01.tga' },
+        { name = 'RedIconBackground', label = 'Red Icon Bg (104x19)', desc = 'classic_debug01.tga' },
+        { name = 'IW_bg_done_TX', label = 'Done Bg (255x36)', desc = 'classic_debug01.tga' },
+    }},
+    { category = 'Drop Shadows', items = {
+        { name = 'ACTW_bg_dropshadow_bottom_TX', label = 'Shadow Bottom (85x5)', desc = 'classic_pieces05.tga' },
+        { name = 'ACTW_bg_dropshadow_left_TX', label = 'Shadow Left (5x120)', desc = 'classic_pieces05.tga' },
+    }},
+}
+
+-- Full raw texture files to display
+local RAW_TEXTURES = {
+    { name = 'wnd_bg_dark_rock.tga', label = 'Dark Rock (full 256x256)', w = 256, h = 256 },
+    { name = 'wnd_bg_light_rock.tga', label = 'Light Rock (full 256x256)', w = 256, h = 256 },
+    { name = 'classic_bg_left.tga', label = 'Classic Left (full 128x256)', w = 128, h = 256 },
+    { name = 'classic_bg_right.tga', label = 'Classic Right (full 128x256)', w = 128, h = 256 },
+}
+
+local function renderTexturesTab()
+    local TR = getTextureRenderer()
+
+    if not TR then
+        imgui.TextColored(1, 0.3, 0.3, 1, 'TextureRenderer not available')
+        return
+    end
+
+    if not TR.isAvailable or not TR.isAvailable() then
+        imgui.TextColored(1, 0.3, 0.3, 1, 'Texture data not loaded (eq_ui_data.lua missing?)')
+        return
+    end
+
+    local dl = imgui.GetWindowDrawList()
+    if not dl then
+        imgui.TextColored(1, 0.3, 0.3, 1, 'DrawList not available')
+        return
+    end
+
+    -- Render full raw texture files first
+    if imgui.CollapsingHeader('Raw Texture Files (Full)') then
+        imgui.Indent(8)
+        for _, entry in ipairs(RAW_TEXTURES) do
+            local tex = TR.getTexture(entry.name)
+            if tex then
+                local texId = tex:GetTextureID()
+                if texId then
+                    imgui.Text(entry.label)
+
+                    -- Draw at half scale to fit
+                    local scale = 0.5
+                    local drawW = entry.w * scale
+                    local drawH = entry.h * scale
+
+                    local sx, sy = imgui.GetCursorScreenPos()
+                    if type(sx) == 'table' then
+                        sy = sx.y or sx[2]
+                        sx = sx.x or sx[1]
+                    end
+
+                    imgui.Dummy(drawW, drawH)
+
+                    pcall(function()
+                        local ImVec2 = ImVec2 or imgui.ImVec2
+                        if ImVec2 then
+                            dl:AddImage(texId, ImVec2(sx, sy), ImVec2(sx + drawW, sy + drawH),
+                                       ImVec2(0, 0), ImVec2(1, 1))
+                        else
+                            dl:AddImage(texId, sx, sy, sx + drawW, sy + drawH, 0, 0, 1, 1)
+                        end
+                    end)
+
+                    imgui.Spacing()
+                end
+            else
+                imgui.TextColored(0.5, 0.5, 0.5, 1, entry.label .. ' (not found)')
+            end
+        end
+        imgui.Unindent(8)
+        imgui.Spacing()
+    end
+
+    -- Render animation-based textures by category
+    for _, cat in ipairs(TEXTURE_GALLERY) do
+        if imgui.CollapsingHeader(cat.category) then
+            imgui.Indent(8)
+            for _, entry in ipairs(cat.items) do
+                local uv = TR.getAnimUV(entry.name)
+                if uv then
+                    -- Scale: show at native size, but cap height at 150
+                    local drawW = uv.srcW
+                    local drawH = uv.srcH
+                    local maxH = 150
+                    if drawH > maxH then
+                        local s = maxH / drawH
+                        drawW = drawW * s
+                        drawH = maxH
+                    end
+
+                    imgui.Text(entry.label)
+                    imgui.SameLine(250)
+                    imgui.TextColored(0.6, 0.6, 0.6, 1, entry.name)
+
+                    local sx, sy = imgui.GetCursorScreenPos()
+                    if type(sx) == 'table' then
+                        sy = sx.y or sx[2]
+                        sx = sx.x or sx[1]
+                    end
+
+                    imgui.Dummy(drawW, drawH)
+
+                    pcall(function()
+                        TR.drawAnim(dl, entry.name, sx, sy, drawW, drawH)
+                    end)
+
+                    imgui.Spacing()
+                else
+                    imgui.TextColored(0.5, 0.5, 0.5, 1, entry.label .. ' (' .. entry.name .. ') - not found')
+                end
+            end
+            imgui.Unindent(8)
+            imgui.Spacing()
+        end
+    end
+end
+
+-- ============================================================
 -- MAIN RENDER FUNCTION
 -- ============================================================
 
@@ -688,7 +925,7 @@ local function renderDemoWindow()
         end
     end
 
-    imgui.SetNextWindowSize(550, 500, ImGuiCond.FirstUseEver or 0)
+    imgui.SetNextWindowSize(650, 550, ImGuiCond.FirstUseEver or 0)
 
     State.open, State.draw = imgui.Begin('SideKick UI Components Demo##ComponentsDemo', State.open)
 
@@ -729,6 +966,7 @@ local function renderDemoWindow()
                     elseif i == 5 then renderTablesTab()
                     elseif i == 6 then renderFeedbackTab()
                     elseif i == 7 then renderLayoutTab()
+                    elseif i == 8 then renderTexturesTab()
                     end
 
                     imgui.EndTabItem()
@@ -787,6 +1025,13 @@ function M.run()
     end
 
     print('\ay[SideKick]\ax UI Components Demo closed.')
+end
+
+-- Auto-run when executed standalone via /lua run
+-- (require passes a dotted module name as ..., /lua run does not)
+local _loadedAs = ...
+if not _loadedAs or not tostring(_loadedAs):find('%.') then
+    M.run()
 end
 
 return M

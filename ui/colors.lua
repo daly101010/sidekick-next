@@ -60,10 +60,15 @@ end
 function M.healthBarGradient(pct)
     local grad = M.getHpGradient()
     local ok, col = pcall(function()
-        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.OKLAB)
+        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.SRGB)
     end)
     if ok and col then
-        return { col.x, col.y, col.z }
+        -- Clamp to 0-1 to guard against out-of-gamut artifacts
+        return {
+            math.max(0, math.min(1, tonumber(col.x) or 0)),
+            math.max(0, math.min(1, tonumber(col.y) or 0)),
+            math.max(0, math.min(1, tonumber(col.z) or 0)),
+        }
     end
     -- Fallback to stepped colors
     return M.healthBar(pct * 100)
@@ -73,10 +78,14 @@ end
 function M.manaBarGradient(pct)
     local grad = M.getManaGradient()
     local ok, col = pcall(function()
-        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.OKLAB)
+        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.SRGB)
     end)
     if ok and col then
-        return { col.x, col.y, col.z }
+        return {
+            math.max(0, math.min(1, tonumber(col.x) or 0)),
+            math.max(0, math.min(1, tonumber(col.y) or 0)),
+            math.max(0, math.min(1, tonumber(col.z) or 0)),
+        }
     end
     return { 0.2, 0.4, 0.9 }
 end
@@ -85,10 +94,14 @@ end
 function M.enduranceBarGradient(pct)
     local grad = M.getEndGradient()
     local ok, col = pcall(function()
-        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.OKLAB)
+        return grad:Sample(math.max(0, math.min(1, pct)), IamColorSpace.SRGB)
     end)
     if ok and col then
-        return { col.x, col.y, col.z }
+        return {
+            math.max(0, math.min(1, tonumber(col.x) or 0)),
+            math.max(0, math.min(1, tonumber(col.y) or 0)),
+            math.max(0, math.min(1, tonumber(col.z) or 0)),
+        }
     end
     return { 0.9, 0.7, 0.2 }
 end

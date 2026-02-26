@@ -477,7 +477,15 @@ function M.doApplySet(setName)
 end
 
 --- Run buff-swap pass using the reserved gem (OOC only)
+--- DISABLED: Now handled by sk_buffs.lua coordinator module
 function M.runBuffSwap(buffSwapSpells, rotationSpells, waitForMemorizeFn)
+    -- Always skip - buffing is now handled by the coordinator (sk_buffs.lua)
+    -- This ensures no out-of-coordinator buff casting occurs
+    return
+end
+
+--[[ DISABLED: Original runBuffSwap code - now handled by sk_buffs.lua
+function M._runBuffSwap_DISABLED(buffSwapSpells, rotationSpells, waitForMemorizeFn)
     local me = mq.TLO.Me
     if not me or not me() then return end
 
@@ -961,6 +969,7 @@ function M.runBuffSwap(buffSwapSpells, rotationSpells, waitForMemorizeFn)
         mq.cmd('/target clear')
     end
 end
+--]] -- End of disabled _runBuffSwap_DISABLED
 
 --- Check for pending apply and execute when safe
 function M.checkPendingApply()

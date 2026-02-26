@@ -2,7 +2,7 @@
 -- SideKick Animation Helpers
 -- ============================================================
 -- Shared animation utilities for all SideKick bar UIs.
--- Provides spring-based button scaling, OKLAB color interpolation,
+-- Provides spring-based button scaling, smooth color interpolation,
 -- cooldown completion pulses, stagger animations, ready pulse,
 -- low resource warnings, damage flash, and toggle animations.
 --
@@ -30,9 +30,20 @@ local _ezOutElastic = iam.EasePreset(IamEaseType.OutElastic)
 local _ezOutSine    = iam.EasePreset(IamEaseType.OutSine)
 local _ezLinear     = iam.EasePreset(IamEaseType.Linear)
 
-local _ezSpringNormal = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS, C.ANIMATION.SPRING_DAMPING, 0.0)
-local _ezSpringFast   = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS_FAST, C.ANIMATION.SPRING_DAMPING_FAST, 0.0)
-local _ezSpringSlow   = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C.ANIMATION.SPRING_DAMPING_SLOW, 0.0)
+-- Helper: build spring IamEaseDesc manually (iam.EaseSpring may be nil in some builds)
+local function makeSpringEase(mass, stiffness, damping, v0)
+    local ez = IamEaseDesc()
+    ez.type = IamEaseType.Spring
+    ez.p0 = mass
+    ez.p1 = stiffness
+    ez.p2 = damping
+    ez.p3 = v0 or 0.0
+    return ez
+end
+
+local _ezSpringNormal = makeSpringEase(1.0, C.ANIMATION.SPRING_STIFFNESS, C.ANIMATION.SPRING_DAMPING, 0.0)
+local _ezSpringFast   = makeSpringEase(1.0, C.ANIMATION.SPRING_STIFFNESS_FAST, C.ANIMATION.SPRING_DAMPING_FAST, 0.0)
+local _ezSpringSlow   = makeSpringEase(1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C.ANIMATION.SPRING_DAMPING_SLOW, 0.0)
 
 -- ============================================================
 -- MODULE STATE
@@ -40,6 +51,7 @@ local _ezSpringSlow   = iam.EaseSpring(1.0, C.ANIMATION.SPRING_STIFFNESS_SLOW, C
 
 local _settings = nil  -- Reference to settings for early-exit checks
 local _lastCooldownState = {}
+local _lastCooldownPct = {}  -- Remember last pct for fade-out coloring
 local _lastFrameTime = os.clock()
 local _cachedDt = 0.016
 local _cachedFrame = nil
@@ -194,8 +206,22 @@ end
 
 function M.getCompletionPulse(uniqueId)
     if not featureEnabled('ClickBounceEnabled') then return 0 end
+    -- Only read shake if checkCooldownCompletion has tracked this ability.
+    -- If drawCooldownOverlay never ran (e.g. disabled with early return),
+    -- _lastCooldownState is never set, so no TriggerShake ever fired.
+    -- Calling iam.Shake without a prior trigger can return erratic values.
+    if _lastCooldownState[uniqueId] == nil then
+        return 0
+    end
     local dt = M.get_dt()
-    return iam.Shake(uniqueId, imgui.GetID('pulse'), C.ANIMATION.SHAKE_MAGNITUDE, C.ANIMATION.SHAKE_DECAY, dt)
+    local ok, val = pcall(iam.Shake, uniqueId, imgui.GetID('pulse'), C.ANIMATION.SHAKE_MAGNITUDE, C.ANIMATION.SHAKE_DECAY, dt)
+    if not ok then return 0 end
+    val = tonumber(val) or 0
+    -- Clamp to sane range — magnitude is 4, so pulse should never exceed that
+    if val ~= val or val < -C.ANIMATION.SHAKE_MAGNITUDE or val > C.ANIMATION.SHAKE_MAGNITUDE then
+        return 0
+    end
+    return val
 end
 
 -- ============================================================
@@ -492,13 +518,19 @@ function M.getToggleColor(uniqueId, isActive, onColor, offColor)
 
     local dt = M.get_dt()
     local target = isActive and onColor or offColor
-    local col = iam.TweenColor(
+    local ok, col = pcall(iam.TweenColor,
         uniqueId, imgui.GetID('tcol'),
         ImVec4(target[1], target[2], target[3], target[4] or 1.0),
         C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade,
-        IamColorSpace.OKLAB, dt
+        IamColorSpace.SRGB, dt
     )
-    return { col.x, col.y, col.z, col.w }
+    if not ok or not col then return target end
+    -- Clamp to 0-1 to guard against out-of-gamut conversion artifacts
+    local r = math.max(0, math.min(1, tonumber(col.x) or target[1]))
+    local g = math.max(0, math.min(1, tonumber(col.y) or target[2]))
+    local b = math.max(0, math.min(1, tonumber(col.z) or target[3]))
+    local a = math.max(0, math.min(1, tonumber(col.w) or target[4] or 1.0))
+    return { r, g, b, a }
 end
 
 function M.getTogglePop(uniqueId)
@@ -523,7 +555,7 @@ local function getTargetColorForPct(pct)
 end
 
 -- ============================================================
--- OKLAB COLOR INTERPOLATION FOR COOLDOWN BORDER
+-- SMOOTH COLOR INTERPOLATION FOR COOLDOWN BORDER
 -- ============================================================
 
 function M.getCooldownColor(uniqueId, pct)
@@ -535,13 +567,19 @@ function M.getCooldownColor(uniqueId, pct)
     end
 
     local dt = M.get_dt()
-    local col = iam.TweenColor(
+    local ok, col = pcall(iam.TweenColor,
         uniqueId, imgui.GetID('cdcol'),
         ImVec4(targetR, targetG, targetB, 1.0),
         C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade,
-        IamColorSpace.OKLAB, dt
+        IamColorSpace.SRGB, dt
     )
-    return col.x, col.y, col.z, col.w
+    if not ok or not col then return targetR, targetG, targetB, 1.0 end
+    -- Clamp to 0-1 to guard against out-of-gamut conversion artifacts
+    local r = math.max(0, math.min(1, tonumber(col.x) or targetR))
+    local g = math.max(0, math.min(1, tonumber(col.y) or targetG))
+    local b = math.max(0, math.min(1, tonumber(col.z) or targetB))
+    local a = math.max(0, math.min(1, tonumber(col.w) or 1.0))
+    return r, g, b, a
 end
 
 -- ============================================================
@@ -549,7 +587,10 @@ end
 -- ============================================================
 
 function M.drawOutlinedText(x, y, text, r, g, b)
-    Draw.drawOutlinedText(x, y, text, r, g, b)
+    -- Guard against NaN/nil coordinates that could corrupt ImGui cursor state
+    x = tonumber(x); y = tonumber(y)
+    if not x or not y or x ~= x or y ~= y then return end
+    pcall(Draw.drawOutlinedText, x, y, text, r, g, b)
 end
 
 -- ============================================================
@@ -558,6 +599,7 @@ end
 
 function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId, helpers, IM_COL32_fn, dlAddRectFilled_fn, dlAddRect_fn, themeName)
     if not dl then return end
+
     IM_COL32_fn = IM_COL32_fn or Draw.IM_COL32
     dlAddRectFilled_fn = dlAddRectFilled_fn or Draw.addRectFilled
     dlAddRect_fn = dlAddRect_fn or Draw.addRect
@@ -569,70 +611,79 @@ function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId,
     -- Check for cooldown completion (triggers pulse)
     M.checkCooldownCompletion(uniqueId, onCooldown)
 
-    local rounding = math.floor((maxX - minX) * C.LAYOUT.BUTTON_ROUNDING_PCT)
+    -- Smooth overlay fade (prevents brightness flash when cooldown ends)
+    local dt = M.get_dt()
+    local fadeTarget = onCooldown and 1.0 or 0.0
+    local ok, fadeMul = pcall(iam.TweenFloat,
+        uniqueId, imgui.GetID('cdFade'),
+        fadeTarget,
+        C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade, dt)
+    if not ok then fadeMul = fadeTarget end
+    fadeMul = tonumber(fadeMul)
+    if not fadeMul or fadeMul ~= fadeMul then fadeMul = fadeTarget end  -- NaN guard
+    fadeMul = math.max(0, math.min(1, fadeMul))
 
-    -- Ready state: enhanced pulsing glow
-    if not onCooldown then
-        local pulse = M.getReadyGlow()
-        local glowAlpha = math.floor(pulse * C.COLORS.READY_GLOW_ALPHA_MAX)
-        local readyRGB = Colors.ready(themeName)
-        local glowColor = IM_COL32_fn(readyRGB[1], readyRGB[2], readyRGB[3], glowAlpha)
-        dlAddRect_fn(dl, minX - 1, minY - 1, maxX + 1, maxY + 1, glowColor, rounding, 0, 2)
+    -- Skip drawing if overlay is fully faded
+    if fadeMul < 0.01 then
+        _lastCooldownPct[uniqueId] = nil
         return
     end
 
-    local pct = (total > 0) and (rem / total) or 1
-    pct = math.max(0, math.min(1, pct))
+    local cellW = maxX - minX
+    local cellH = maxY - minY
+    if cellW <= 0 or cellH <= 0 then return end  -- Degenerate rect guard
+    local rounding = math.floor(cellW * C.LAYOUT.BUTTON_ROUNDING_PCT)
 
-    -- Get smoothly interpolated color via OKLAB
+    -- Determine pct: use live value when on cooldown, stored value during fade-out
+    local pct
+    if onCooldown then
+        pct = (total > 0) and (rem / total) or 1
+        pct = math.max(0, math.min(1, pct))
+        _lastCooldownPct[uniqueId] = pct
+    else
+        pct = _lastCooldownPct[uniqueId] or 0
+    end
+
+    -- Get smoothly interpolated color via SRGB tween
     local r, g, b = M.getCooldownColor(uniqueId, pct)
+    -- NaN guard on color values
+    if r ~= r then r = 1 end
+    if g ~= g then g = 0.4 end
+    if b ~= b then b = 0.4 end
     local r255 = math.floor(r * 255)
     local g255 = math.floor(g * 255)
     local b255 = math.floor(b * 255)
 
-    -- Radial sweep cooldown: dark overlay + colored pie reveal
-    local cx = (minX + maxX) / 2
-    local cy = (minY + maxY) / 2
-    local radius = math.max(maxX - minX, maxY - minY) * 0.71  -- diagonal to cover corners
-    local completePct = 1.0 - pct  -- 0 = just started, 1 = done
-    local overlayAlpha = C.COLORS.COOLDOWN_OVERLAY_ALPHA
-    local tintAlpha = math.floor(C.COLORS.COOLDOWN_FILL_ALPHA * 0.5)
+    -- Scale alpha values by fade multiplier for smooth fade-out
+    local overlayAlpha = math.floor(C.COLORS.COOLDOWN_OVERLAY_ALPHA * fadeMul)
+    local tintAlpha = math.floor(C.COLORS.COOLDOWN_FILL_ALPHA * 0.5 * fadeMul)
 
-    -- Draw the REVEALED portion as clear (no overlay) via clipping:
-    -- Strategy: draw dark pie for the REMAINING cooldown portion only
-    if completePct < 0.999 then
-        local startAngle = -math.pi / 2  -- 12 o'clock
-        local remainStart = startAngle + completePct * math.pi * 2
-        local remainEnd = startAngle + math.pi * 2
+    -- Vertical wipe cooldown overlay (top-down fill proportional to remaining CD)
+    -- Uses simple rect operations only — avoids DrawList trig/path/triangle
+    -- operations that caused C++ state corruption ("Missing End()" crash).
+    local fillH = math.floor(cellH * pct + 0.5)  -- Height of dark portion (remaining CD)
 
-        -- Dark overlay pie (remaining portion)
-        Draw.pathClear(dl)
-        Draw.pathLineTo(dl, cx, cy)
-        Draw.pathArcTo(dl, cx, cy, radius, remainStart, remainEnd, 32)
-        Draw.pathFillConvex(dl, IM_COL32_fn(0, 0, 0, overlayAlpha))
-
-        -- Colored tint pie (remaining portion)
-        Draw.pathClear(dl)
-        Draw.pathLineTo(dl, cx, cy)
-        Draw.pathArcTo(dl, cx, cy, radius, remainStart, remainEnd, 32)
-        Draw.pathFillConvex(dl, IM_COL32_fn(r255, g255, b255, tintAlpha))
-    else
-        -- Fully on cooldown: dark overlay on entire cell
-        dlAddRectFilled_fn(dl, minX, minY, maxX, maxY, IM_COL32_fn(0, 0, 0, overlayAlpha), rounding)
-        dlAddRectFilled_fn(dl, minX, minY, maxX, maxY, IM_COL32_fn(r255, g255, b255, tintAlpha), rounding)
+    if fillH > 0 then
+        -- Dark overlay on remaining cooldown portion (top-down wipe)
+        dlAddRectFilled_fn(dl, minX, minY, maxX, minY + fillH,
+            IM_COL32_fn(0, 0, 0, overlayAlpha), rounding)
+        -- Colored tint on remaining cooldown portion
+        dlAddRectFilled_fn(dl, minX, minY, maxX, minY + fillH,
+            IM_COL32_fn(r255, g255, b255, tintAlpha), rounding)
     end
 
-    -- Cooldown border
+    -- Cooldown border (also fades)
+    local borderAlpha = math.floor(C.COLORS.COOLDOWN_BORDER_ALPHA * fadeMul)
     dlAddRect_fn(dl, minX, minY, maxX, maxY,
-        IM_COL32_fn(r255, g255, b255, C.COLORS.COOLDOWN_BORDER_ALPHA), rounding, 0, 1)
+        IM_COL32_fn(r255, g255, b255, borderAlpha), rounding, 0, 1)
 
-    -- Countdown text centered
-    if rem > 0 then
+    -- Countdown text centered (only while actively on cooldown, not during fade-out)
+    if onCooldown and rem > 0 then
         local txt = rem >= 10 and string.format('%d', math.ceil(rem)) or string.format('%.1f', rem)
         if helpers and helpers.fmtCooldown then
             txt = helpers.fmtCooldown(rem)
         end
-        M.drawOutlinedText(minX + 3, maxY - imgui.GetTextLineHeight() - 2, txt, r, g, b)
+        M.drawOutlinedText(minX + 3, maxY - imgui.GetTextLineHeight() + 2, txt, r, g, b)
     end
 end
 
@@ -854,6 +905,7 @@ end
 
 function M.cleanup()
     _lastCooldownState = {}
+    _lastCooldownPct = {}
     _lastHpValues = {}
     _damageFlashState = {}
     _toggleStates = {}

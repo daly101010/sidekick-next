@@ -1,4 +1,4 @@
--- F:/lua/SideKick/sk_lib.lua
+-- F:/lua/sidekick-next/sk_lib.lua
 -- Shared constants, types, and utilities for SideKick multi-script system
 
 local mq = require('mq')
@@ -16,16 +16,22 @@ M.Priority = {
     DEBUFF = 3,
     DPS = 4,
     IDLE = 5,
+    BUFF = 6,        -- OOC buffs
+    MEDITATION = 7,  -- Lowest priority (sit/stand)
 }
 
 -- Interrupt thresholds (seconds remaining to let cast finish)
+-- Lower threshold = cast can be interrupted sooner
+-- 999 = effectively never interrupt based on time
 M.InterruptThreshold = {
     [0] = 0.0,   -- Emergency: immediate
     [1] = 0.5,   -- Healing: 0.5s
     [2] = 1.0,   -- Resurrection: 1.0s
     [3] = 1.0,   -- Debuff: 1.0s
-    [4] = 999,   -- DPS: never interrupt (lowest priority)
+    [4] = 999,   -- DPS: never interrupt (lowest combat priority)
     [5] = 999,   -- Idle: never interrupt
+    [6] = 1.0,   -- Buff: can be interrupted (OOC, higher priorities like DPS can interrupt)
+    [7] = 999,   -- Meditation: never interrupt (no casts)
 }
 
 -- Mailbox names
@@ -36,6 +42,12 @@ M.Mailbox = {
     INTERRUPT = 'sk:interrupt',
     HEARTBEAT = 'sk:hb',
     NEED = 'sk:need',
+}
+
+-- Script names used for routing between multi-script modules
+M.Scripts = {
+    COORDINATOR = 'sidekick-next/sk_coordinator',
+    UI = { 'sidekick-next', 'sidekick-next/init' },
 }
 
 -- Timing constants (milliseconds)

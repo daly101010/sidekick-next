@@ -9,6 +9,7 @@
 --   local changed, newValue = SliderRow.float('Opacity', 'SideKickBgAlpha', current, 0, 1)
 
 local imgui = require('ImGui')
+require('sidekick-next.ui.imgui_compat')
 local C = require('sidekick-next.ui.constants')
 
 local M = {}
@@ -36,7 +37,7 @@ function M.int(label, settingKey, current, min, max, onChange, opts)
         imgui.SetNextItemWidth(width)
     end
 
-    local changed, newValue = imgui.SliderInt('##' .. settingKey, current, min, max, format)
+    local newValue, changed = imgui.SliderInt('##' .. settingKey, current, min, max, format)
 
     -- Tooltip on slider
     if tooltip and imgui.IsItemHovered() then
@@ -74,7 +75,7 @@ function M.float(label, settingKey, current, min, max, onChange, opts)
         imgui.SetNextItemWidth(width)
     end
 
-    local changed, newValue = imgui.SliderFloat('##' .. settingKey, current, min, max, format)
+    local newValue, changed = imgui.SliderFloat('##' .. settingKey, current, min, max, format)
 
     -- Tooltip on slider
     if tooltip and imgui.IsItemHovered() then
@@ -113,9 +114,9 @@ function M.labeled(label, settingKey, current, min, max, isFloat, onChange, opts
     -- Slider
     local changed, newValue
     if isFloat then
-        changed, newValue = imgui.SliderFloat('##' .. settingKey, current, min, max, format)
+        newValue, changed = imgui.SliderFloat('##' .. settingKey, current, min, max, format)
     else
-        changed, newValue = imgui.SliderInt('##' .. settingKey, current, min, max, format)
+        newValue, changed = imgui.SliderInt('##' .. settingKey, current, min, max, format)
     end
 
     -- Callback

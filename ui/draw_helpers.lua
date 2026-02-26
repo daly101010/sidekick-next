@@ -686,4 +686,38 @@ function M.pathClear(dl)
     return ok == true
 end
 
+-- AddTriangleFilled wrapper (safe: each triangle is always convex)
+function M.addTriangleFilled(dl, x1, y1, x2, y2, x3, y3, color)
+    if not dl then return false end
+    if not _apiDetected then detectApiSignature(dl) end
+    if _useImVec2 and _imVec2Func then
+        local ok = pcall(function()
+            dl:AddTriangleFilled(_imVec2Func(x1, y1), _imVec2Func(x2, y2), _imVec2Func(x3, y3), color)
+        end)
+        if ok then return true end
+    end
+    local ok = pcall(function()
+        dl:AddTriangleFilled(x1, y1, x2, y2, x3, y3, color)
+    end)
+    return ok == true
+end
+
+-- Draw a filled pie/wedge using individual triangles (crash-safe).
+-- Unlike PathFillConvex, this works for arcs > 180° because each
+-- triangle (center → arc_i → arc_i+1) is always convex.
+function M.drawPieFilled(dl, cx, cy, radius, startAngle, endAngle, color, segments)
+    if not dl then return end
+    segments = segments or 32
+    local step = (endAngle - startAngle) / segments
+    for i = 0, segments - 1 do
+        local a0 = startAngle + i * step
+        local a1 = startAngle + (i + 1) * step
+        local x0 = cx + math.cos(a0) * radius
+        local y0 = cy + math.sin(a0) * radius
+        local x1 = cx + math.cos(a1) * radius
+        local y1 = cy + math.sin(a1) * radius
+        M.addTriangleFilled(dl, cx, cy, x0, y0, x1, y1, color)
+    end
+end
+
 return M

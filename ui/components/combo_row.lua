@@ -39,8 +39,14 @@ function M.draw(label, settingKey, currentIndex, items, onChange, opts)
     if imgui.BeginCombo('##' .. settingKey, previewValue) then
         for i, item in ipairs(items) do
             local isSelected = (i - 1) == currentIndex
-            if imgui.Selectable(item, isSelected) then
-                newIndex = i - 1  -- Back to 0-indexed
+            -- MQ's Selectable returns true when isSelected=true (every frame)
+            -- So we need to detect actual clicks differently:
+            -- Pass isSelected for visual highlighting, but only count as changed
+            -- if user clicks a NON-selected item
+            local result = imgui.Selectable(item, isSelected)
+            if result and not isSelected then
+                -- User clicked on a different item (not currently selected)
+                newIndex = i - 1
                 changed = true
             end
             if isSelected then
@@ -75,6 +81,13 @@ function M.byValue(label, settingKey, currentValue, items, onChange, opts)
     end
 
     local changed, newIndex = M.draw(label, settingKey, currentIndex, items, nil, opts)
+
+    -- DEBUG: Log when changed is true
+    if changed and settingKey == 'SideKickTheme' then
+        local newValue = items[newIndex + 1]
+        print(string.format('\am[ComboRow.byValue] changed=true currentValue=%s newIndex=%d newValue=%s\ax',
+            tostring(currentValue), newIndex, tostring(newValue)))
+    end
 
     if changed then
         local newValue = items[newIndex + 1]
@@ -124,7 +137,10 @@ function M.keyValue(label, settingKey, currentKey, items, onChange, opts)
     if imgui.BeginCombo('##' .. settingKey, previewValue) then
         for i, item in ipairs(items) do
             local isSelected = item.key == currentKey
-            if imgui.Selectable(labels[i], isSelected) then
+            -- MQ's Selectable returns true when isSelected=true (every frame)
+            -- Only count as changed if clicking a non-selected item
+            local result = imgui.Selectable(labels[i], isSelected)
+            if result and not isSelected then
                 newKey = item.key
                 changed = true
             end

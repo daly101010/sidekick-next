@@ -138,11 +138,14 @@ local function comboString(label, current, options)
     if imgui.BeginCombo(label, preview) then
         for _, opt in ipairs(options) do
             local v = tostring(opt or '')
-            local selected = (v == current)
-            if imgui.Selectable(v, selected) then
+            local isSelected = (v == current)
+            -- MQ's Selectable returns true when isSelected=true (every frame)
+            -- Only count as changed if clicking a non-selected item
+            local result = imgui.Selectable(v, isSelected)
+            if result and not isSelected then
                 current = v
             end
-            if selected then imgui.SetItemDefaultFocus() end
+            if isSelected then imgui.SetItemDefaultFocus() end
         end
         imgui.EndCombo()
     end
@@ -171,11 +174,14 @@ local function comboKeyed(label, currentKey, options)
         for _, opt in ipairs(options) do
             local k = tostring(opt.key or '')
             local v = tostring(opt.label or k)
-            local selected = (k == currentKey)
-            if imgui.Selectable(v, selected) then
+            local isSelected = (k == currentKey)
+            -- MQ's Selectable returns true when isSelected=true (every frame)
+            -- Only count as changed if clicking a non-selected item
+            local result = imgui.Selectable(v, isSelected)
+            if result and not isSelected then
                 currentKey = k
             end
-            if selected then imgui.SetItemDefaultFocus() end
+            if isSelected then imgui.SetItemDefaultFocus() end
         end
         imgui.EndCombo()
     end
@@ -183,7 +189,10 @@ local function comboKeyed(label, currentKey, options)
 end
 
 local ANCHOR_TARGETS = {
-    { key = 'grouptarget', label = 'GroupTarget' },
+    { key = 'grouptarget', label = 'Group Window' },
+    { key = 'gt_commandbar', label = 'GT Command Bar' },
+    { key = 'target', label = 'Target Window' },
+    { key = 'xtarget', label = 'XTarget Window' },
     { key = 'sidekick_main', label = 'SideKick Main' },
     { key = 'sidekick_bar', label = 'SideKick Ability Bar' },
     { key = 'sidekick_special', label = 'SideKick Special Bar' },
@@ -194,12 +203,23 @@ local ANCHOR_TARGETS = {
 local function drawUI(settings, themeNames, onChange)
     local controlWidth = 150
 
+    -- DEBUG: Log theme state
+    local currentTheme = settings.SideKickTheme or 'Classic'
+
     imgui.Text('Theme')
     imgui.SameLine(200)
     imgui.SetNextItemWidth(controlWidth)
-    local theme = comboString('##Theme', settings.SideKickTheme or 'Classic', themeNames)
-    if theme ~= (settings.SideKickTheme or 'Classic') and onChange then
-        onChange('SideKickTheme', theme)
+    local theme = comboString('##Theme', currentTheme, themeNames)
+
+    -- DEBUG: Log if selection changed
+    if theme ~= currentTheme then
+        print(string.format('\ay[Settings] Theme combo changed: %s -> %s\ax', currentTheme, theme))
+        if onChange then
+            print('\ag[Settings] Calling onChange callback\ax')
+            onChange('SideKickTheme', theme)
+        else
+            print('\ar[Settings] ERROR: onChange is nil!\ax')
+        end
     end
 
     local sync = settings.SideKickSyncThemeWithGT == true
@@ -208,6 +228,10 @@ local function drawUI(settings, themeNames, onChange)
     if changed and onChange then
         onChange('SideKickSyncThemeWithGT', sync)
     end
+
+    local optManual = settings.SideKickOptionsManual ~= false
+    optManual, changed = imgui.Checkbox('Options Window: Allow Move/Resize', optManual)
+    if changed and onChange then onChange('SideKickOptionsManual', optManual) end
 
     imgui.Separator()
     imgui.Text('Main Window Docking')
@@ -229,12 +253,6 @@ local function drawUI(settings, themeNames, onChange)
     mainAnchor = comboString('##MainAnchorMode', mainAnchor, anchors)
     if mainAnchor ~= tostring(settings.SideKickMainAnchor or 'none') and onChange then
         onChange('SideKickMainAnchor', mainAnchor)
-    end
-
-    local matchW = settings.SideKickMainMatchGTWidth == true
-    matchW, changed = imgui.Checkbox('Match GroupTarget width', matchW)
-    if changed and onChange then
-        onChange('SideKickMainMatchGTWidth', matchW)
     end
 
     imgui.Text('Anchor Gap')
@@ -326,13 +344,24 @@ local function drawSpecial(settings, onChange)
     specEnabled, changed = imgui.Checkbox('Show special abilities', specEnabled)
     if changed and onChange then onChange('SideKickSpecialEnabled', specEnabled) end
 
+    local forceSingleRow = settings.SideKickSpecialForceSingleRow == true
+    forceSingleRow, changed = imgui.Checkbox('Force single row', forceSingleRow)
+    if changed and onChange then onChange('SideKickSpecialForceSingleRow', forceSingleRow) end
+
+    local forceSingleColumn = settings.SideKickSpecialForceSingleColumn == true
+    forceSingleColumn, changed = imgui.Checkbox('Force single column', forceSingleColumn)
+    if changed and onChange then onChange('SideKickSpecialForceSingleColumn', forceSingleColumn) end
+
+    local perButtonMove = settings.SideKickSpecialPerButtonMove == true
+    perButtonMove, changed = imgui.Checkbox('Enable per-button move', perButtonMove)
+    if changed and onChange then onChange('SideKickSpecialPerButtonMove', perButtonMove) end
+
     local specCell = tonumber(settings.SideKickSpecialCell) or 65
     local specRows = tonumber(settings.SideKickSpecialRows) or 1
     local specGap = tonumber(settings.SideKickSpecialGap) or 4
     local specAlpha = tonumber(settings.SideKickSpecialBgAlpha) or 0.85
     local specPad = tonumber(settings.SideKickSpecialPad) or 6
     local specAnchorGap = tonumber(settings.SideKickSpecialAnchorGap) or 2
-
     imgui.Text('Cell Size')
     imgui.SameLine(200)
     imgui.SetNextItemWidth(controlWidth)
