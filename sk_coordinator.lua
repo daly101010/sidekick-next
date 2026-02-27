@@ -604,6 +604,7 @@ end
 -- Watchdog state (declared early so onModuleHeartbeatReceived can reference it)
 local _restartTracker = {}  -- { [script] = { count, lastAttemptMs } }
 local _lastWatchdogCheck = 0
+local _pendingReload = nil  -- { module, script, restartAtMs } — deferred reload from /sk_coord reload
 
 --- Reset restart counter for a module when it sends a fresh heartbeat
 --- (called from onMessage heartbeat handler)
@@ -814,6 +815,14 @@ local _lastStatusLog = 0
 local function tick()
     local now = lib.getTimeMs()
 
+    -- Handle pending module reload (deferred from /sk_coord reload bind)
+    if _pendingReload and now >= _pendingReload.restartAtMs then
+        local pr = _pendingReload
+        _pendingReload = nil
+        debugLog('RELOAD: Restarting %s (%s)', pr.module, pr.script)
+        mq.cmdf('/lua run %s', pr.script)
+    end
+
     -- Periodic status log every 5 seconds
     if (now - _lastStatusLog) >= 5000 then
         _lastStatusLog = now
@@ -886,7 +895,7 @@ local function mainLoop()
 end
 
 -- Bind to /sk_coord command for stopping
-mq.bind('/sk_coord', function(cmd)
+mq.bind('/sk_coord', function(cmd, arg1)
     if cmd == 'stop' then
         State.running = false
         lib.log('info', M.MODULE_NAME, 'Stop requested')
@@ -895,6 +904,47 @@ mq.bind('/sk_coord', function(cmd)
             State.epoch, State.activePriority,
             State.castOwner and State.castOwner.module or 'nil',
             State.targetOwner and State.targetOwner.module or 'nil')
+    elseif cmd == 'reload' then
+        -- Reload a module by name: /sk_coord reload <modulename>
+        if not arg1 or arg1 == '' then
+            printf('\ay[SK-Coord]\ax Usage: /sk_coord reload <module>')
+            printf('\ay[SK-Coord]\ax Known modules:')
+            for moduleName, hb in pairs(State.moduleHeartbeats) do
+                printf('  \at%s\ax (%s)', moduleName, hb.script or '?')
+            end
+            return
+        end
+        -- Find module by partial match
+        local targetModule, targetScript
+        local searchLower = tostring(arg1):lower()
+        for moduleName, hb in pairs(State.moduleHeartbeats) do
+            if moduleName:lower():find(searchLower, 1, true) then
+                targetModule = moduleName
+                targetScript = hb.script
+                break
+            end
+        end
+        if targetModule and targetScript then
+            printf('\ay[SK-Coord]\ax Reloading %s (%s)', targetModule, targetScript)
+            -- Stop the module script
+            mq.cmdf('/lua stop %s', targetScript)
+            -- Clear heartbeat so it doesn't get marked as crashed during restart
+            State.moduleHeartbeats[targetModule] = nil
+            -- Clear any claims owned by this module
+            if State.castOwner and State.castOwner.module == targetModule then
+                State.castOwner = nil
+            end
+            if State.targetOwner and State.targetOwner.module == targetModule then
+                State.targetOwner = nil
+            end
+            -- Reset restart tracker for this script
+            _restartTracker[targetScript] = nil
+            -- Schedule restart in tick() (non-blocking — avoids 500ms main loop stall)
+            _pendingReload = { module = targetModule, script = targetScript, restartAtMs = lib.getTimeMs() + 500 }
+            debugLog('RELOAD: %s (%s) scheduled for restart in 500ms', targetModule, targetScript)
+        else
+            printf('\ar[SK-Coord]\ax Module "%s" not found. Use /sk_coord reload for list.', tostring(arg1))
+        end
     end
 end)
 

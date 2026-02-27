@@ -2,7 +2,8 @@ local mq = require('mq')
 local imgui = require('ImGui')
 local lazy = require('sidekick-next.utils.lazy_require')
 
-local debugLog = require('sidekick-next.utils.debug_log').tagged('Main', 'SideKick_Debug.log')
+local Logger = require('sidekick-next.utils.logger')
+local log = Logger.new('Main')
 
 local Core = require('sidekick-next.utils.core')
 local Themes = require('sidekick-next.themes')
@@ -109,6 +110,12 @@ end)()
 
 local Anchor = require('sidekick-next.ui.anchor')
 local Items = require('sidekick-next.utils.items')
+
+-- Loading screen overlay (rendered during phased healing load)
+local Loader = require('sidekick-next.ui.loader')
+
+-- Performance monitor (tracks per-module frame times)
+local PerfMonitor = require('sidekick-next.ui.perf_monitor')
 
 -- New enhancement modules (lazy-loaded: only used in UI callbacks and commands)
 local getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
@@ -1233,7 +1240,7 @@ local function draw()
                     State._lastThemeDebugLog = State._lastThemeDebugLog or 0
                     if os.clock() - State._lastThemeDebugLog > 1.0 then
                         State._lastThemeDebugLog = os.clock()
-                        print(string.format('\aw[SideKick] Options tab: %d themes, current=%s\ax', #themeNames, tostring(Core.Settings.SideKickTheme or 'nil')))
+                        log.verbose('Options tab: %d themes, current=%s', #themeNames, tostring(Core.Settings.SideKickTheme or 'nil'))
                     end
 
                     if debugSettings then
@@ -1266,13 +1273,13 @@ local function draw()
                         Core.Settings,
                         themeNames,
                         function(key, value)
-                            print(string.format('\ay[SideKick] onChange called: key=%s value=%s\ax', tostring(key), tostring(value)))
+                            log.debug('onChange: key=%s value=%s', tostring(key), tostring(value))
                             if tostring(key) == 'SideKickTheme' then
                                 State._themeLocalSetAt = os.clock()
-                                print(string.format('\ag[SideKick] Theme change detected, holdUntil set to %.2f\ax', State._themeLocalSetAt + 5.0))
+                                log.debug('Theme change, holdUntil=%.2f', State._themeLocalSetAt + 5.0)
                             end
                             Core.set(key, value)
-                            print(string.format('\ag[SideKick] Core.set completed, new value=%s\ax', tostring(Core.Settings[tostring(key)])))
+                            log.debug('Core.set done, new=%s', tostring(Core.Settings[tostring(key)]))
                         end
                     )
 
@@ -1480,47 +1487,63 @@ local function tickAutomation()
     local allowAbilityAutomation = (playStyle ~= 'manual')
     local allowMovementAutomation = (playStyle == 'auto')
 
+    PerfMonitor.beginFrame()
+
     -- Update runtime cache (before other automation)
+    PerfMonitor.begin('RuntimeCache')
     do local M = getRuntimeCache() if M then M.tick() end end
+    PerfMonitor.finish('RuntimeCache')
 
     -- Update CC tracking (mez broadcasts/receives)
+    PerfMonitor.begin('CC')
     local CC = getCC()
     if CC then CC.tick() end
-
     -- Mez casting tick (ENC/BRD only, checks isMezClass internally)
     if allowAbilityAutomation and CC then
         CC.mezTick(Core.Settings)
     end
+    PerfMonitor.finish('CC')
 
     -- Update buff tracking (buff broadcasts/receives)
+    PerfMonitor.begin('Buff')
     do local M = getBuff() if M then M.tick() end end
+    PerfMonitor.finish('Buff')
 
     -- Update spell engine state machine (non-blocking cast monitoring)
+    PerfMonitor.begin('SpellEngine')
     do local M = getSpellEngine() if M then M.tick() end end
+    PerfMonitor.finish('SpellEngine')
 
+    PerfMonitor.begin('SpellsetMgr')
     do local M = getSpellsetManager() if M then M.tick() end end
+    PerfMonitor.finish('SpellsetMgr')
 
     -- Process events for cast result detection
     mq.doevents()
 
     local priorityHealingActive = false
     if playStyle ~= 'manual' then
+        PerfMonitor.begin('Healing')
         Healing = getHealingModule()  -- Get appropriate module for current class
         if Healing and Healing.tick then
-            debugLog('[HealingTick] calling Healing.tick')
+            log.debug('[HealingTick] calling Healing.tick')
             priorityHealingActive = Healing.tick(Core.Settings) == true
-            debugLog('[HealingTick] result=%s', tostring(priorityHealingActive))
+            log.debug('[HealingTick] result=%s', tostring(priorityHealingActive))
         else
-            debugLog('[HealingTick] no Healing.tick available')
+            log.debug('[HealingTick] no Healing.tick available')
         end
+        PerfMonitor.finish('Healing')
     end
 
     -- Cure tick (after healing, before rotation engine)
+    PerfMonitor.begin('Cures')
     if allowAbilityAutomation and not priorityHealingActive and Cures and Cures.tick then
         Cures.tick(Core.Settings)
     end
+    PerfMonitor.finish('Cures')
 
     -- Run layered rotation engine (replaces flat Abilities.tryAllAbilities)
+    PerfMonitor.begin('Rotation')
     local TL = getThrottledLog()
     local RotationEngine = getRotationEngine()
     if allowAbilityAutomation and Core.Settings.AutoAbilitiesEnabled ~= false and RotationEngine then
@@ -1547,25 +1570,42 @@ local function tickAutomation()
                 tostring(allowAbilityAutomation), tostring(Core.Settings.AutoAbilitiesEnabled))
         end
     end
+    PerfMonitor.finish('Rotation')
 
+    PerfMonitor.begin('Burn')
     Burn.tick()
+    PerfMonitor.finish('Burn')
+
+    PerfMonitor.begin('Chase')
     if allowMovementAutomation then
         Chase.tick()
     elseif Chase and Chase.stopNav then
         Chase.stopNav()
     end
+    PerfMonitor.finish('Chase')
+
+    PerfMonitor.begin('Tank')
     local CombatMode = Core.Settings.CombatMode or 'off'
     if allowMovementAutomation and CombatMode == 'tank' then
         Tank.tick(State.abilities, Core.Settings)
     end
+    PerfMonitor.finish('Tank')
+
+    PerfMonitor.begin('Assist')
     if allowMovementAutomation then
         if not priorityHealingActive then
             Assist.tick()
         end
     end
+    PerfMonitor.finish('Assist')
+
+    PerfMonitor.begin('Items')
     if allowAbilityAutomation and Items and Items.tick and Core.Settings.AutoItemsEnabled ~= false then
         Items.tick()
     end
+    PerfMonitor.finish('Items')
+
+    PerfMonitor.finishFrame()
 end
 
 local function syncModulesFromSettings()
@@ -1867,35 +1907,32 @@ local function main()
             -- Debug combat spell executor
             local ok, CombatExec = pcall(require, 'sidekick-next.utils.combat_spell_executor')
             if not ok then
-                print('\ar[SideKick]\ax Failed to load combat_spell_executor: ' .. tostring(CombatExec))
+                log.error('Failed to load combat_spell_executor: %s', tostring(CombatExec))
             elseif CombatExec then
                 local a2 = tostring(args[2] or ''):lower()
                 if a2 == 'gems' then
                     if CombatExec.debugPrintAllGems then
                         CombatExec.debugPrintAllGems()
                     else
-                        print('\ar[SideKick]\ax debugPrintAllGems not found')
+                        log.error('debugPrintAllGems not found')
                     end
                 elseif a2 == 'state' then
                     if CombatExec.debugPrintState then
                         CombatExec.debugPrintState()
                     else
-                        print('\ar[SideKick]\ax debugPrintState not found')
+                        log.error('debugPrintState not found')
                     end
                 elseif a2 == 'list' then
                     if CombatExec.debugPrintCastList then
                         CombatExec.debugPrintCastList()
                     else
-                        print('\ar[SideKick]\ax debugPrintCastList not found')
+                        log.error('debugPrintCastList not found')
                     end
                 else
-                    print('\ay[SideKick]\ax Combat Debug Commands:')
-                    print('  /sidekick debugcombat gems  - Show all gems and their types')
-                    print('  /sidekick debugcombat state - Show combat state and target')
-                    print('  /sidekick debugcombat list  - Show castable spells (excludes heals)')
+                    log.info('Combat Debug: /sidekick debugcombat gems|state|list')
                 end
             else
-                print('\ar[SideKick]\ax CombatExec is nil')
+                log.error('CombatExec is nil')
             end
         elseif a1 == 'debugooc' then
             -- Debug OOC buff executor
@@ -1969,11 +2006,57 @@ local function main()
         end
     end)
 
+    _bindCmd('/skperf', function()
+        PerfMonitor.toggle()
+    end)
+
+    _bindCmd('/skloglevel', function(level)
+        level = tonumber(level)
+        if level and level >= 1 and level <= 5 then
+            Logger.setLevel(level)
+            local names = { 'error', 'warn', 'info', 'debug', 'verbose' }
+            log.info('Log level set to %d (%s)', level, names[level] or '?')
+        else
+            log.info('Usage: /skloglevel <1-5> (1=error 2=warn 3=info 4=debug 5=verbose) Current: %d', Logger.getLevel())
+        end
+    end)
+
+    _bindCmd('/sklogfilter', function(...)
+        local pattern = table.concat({ ... }, ' ')
+        if pattern == '' or pattern == 'clear' then
+            Logger.setFilter(nil)
+            log.info('Log filter cleared')
+        else
+            Logger.setFilter(pattern)
+            log.info('Log filter set: %s', pattern)
+        end
+    end)
+
+    _bindCmd('/sklogfile', function(toggle)
+        if toggle == 'on' then
+            Logger.setFileLogging(true)
+            log.info('File logging enabled')
+        elseif toggle == 'off' then
+            Logger.setFileLogging(false)
+            log.info('File logging disabled')
+        else
+            log.info('Usage: /sklogfile on|off')
+        end
+    end)
+
     mq.imgui.init('SideKick', function()
         -- Apply font scale for high-resolution monitors
         local fontScale = tonumber(Core.Settings.SideKickFontScale) or 1.0
         if fontScale ~= 1.0 then
             imgui.PushFont(imgui.GetFont(), imgui.GetFontSize() * fontScale)
+        end
+
+        -- Loading screen overlay during phased healing module init
+        if not _healLoadComplete and _healPhase > 0 then
+            local totalPhases = (_healMod and _healMod.TOTAL_INIT_PHASES or 5) + 2  -- +2 for warmup + require phases
+            Loader.draw(_healPhase, totalPhases, false)
+        elseif _healLoadComplete and _healPhase > 0 then
+            Loader.draw(_healPhase, _healPhase, true)
         end
 
         if Core.Settings.SideKickBarEnabled ~= false then
@@ -2031,6 +2114,7 @@ local function main()
         do local M = getActorsDebug() if M then M.render() end end
         do local M = getCoordinatorDebug() if M then M.render() end end
         do local M = getSpellSetEditor() if M then M.render() end end
+        PerfMonitor.draw()
 
         -- Healing monitor (new healing intelligence module)
         if NewHealing and NewHealing.drawMonitor then
