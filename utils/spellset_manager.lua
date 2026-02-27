@@ -3,6 +3,7 @@
 -- Note: Buff casting is handled by automation/buff.lua which uses getBuffSwapLines()
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -27,55 +28,11 @@ local function logMem(key, intervalSec, fmt, ...)
 end
 
 -- Lazy-load dependencies
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
-
-local _SpellsClr = nil
-local function getSpellsClr()
-    if not _SpellsClr then
-        local ok, s = pcall(require, 'sidekick-next.sk_spells_clr')
-        if ok then _SpellsClr = s end
-    end
-    return _SpellsClr
-end
-
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, cb = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = cb end
-    end
-    return _ConditionBuilder
-end
-
-local _RuntimeCache = nil
-local function getRuntimeCache()
-    if not _RuntimeCache then
-        local ok, rc = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _RuntimeCache = rc end
-    end
-    return _RuntimeCache
-end
-
-local _BuffLogger = nil
-local function getBuffLogger()
-    if not _BuffLogger then
-        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
-        if ok then
-            _BuffLogger = logger
-            if _BuffLogger and _BuffLogger.init then
-                _BuffLogger.init()
-            end
-        end
-    end
-    return _BuffLogger
-end
+local getCore = lazy('sidekick-next.utils.core')
+local getSpellsClr = lazy('sidekick-next.sk_spells_clr')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getRuntimeCache = lazy('sidekick-next.utils.runtime_cache')
+local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
 
 -- INI section for spell sets
 local SPELLSET_SECTION = 'SideKick-SpellSets'

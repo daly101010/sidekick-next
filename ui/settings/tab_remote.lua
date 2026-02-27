@@ -5,18 +5,12 @@
 
 local imgui = require('ImGui')
 local Settings = require('sidekick-next.ui.settings')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load RemoteAbilities module
-local _RemoteAbilities = nil
-local function getRemoteAbilities()
-    if not _RemoteAbilities then
-        local ok, mod = pcall(require, 'sidekick-next.ui.remote_abilities')
-        if ok then _RemoteAbilities = mod end
-    end
-    return _RemoteAbilities
-end
+local getRemoteAbilities = lazy('sidekick-next.ui.remote_abilities')
 
 function M.draw(settings, themeNames, onChange)
     local changed

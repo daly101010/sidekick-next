@@ -1,17 +1,11 @@
 -- healing/spell_events.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load Logger to avoid circular requires
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 local HealTracker = nil
 local IncomingHeals = nil
@@ -20,13 +14,7 @@ local Config = nil
 local CombatAssessor = nil
 
 -- Lazy-load CombatAssessor for throttle tracking
-local function getCombatAssessor()
-    if CombatAssessor == nil then
-        local ok, ca = pcall(require, 'sidekick-next.healing.combat_assessor')
-        CombatAssessor = ok and ca or false
-    end
-    return CombatAssessor or nil
-end
+local getCombatAssessor = lazy.once('sidekick-next.healing.combat_assessor')
 
 local _currentCast = nil
 local _eventHandlers = {}

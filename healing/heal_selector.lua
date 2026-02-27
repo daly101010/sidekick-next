@@ -1,6 +1,7 @@
 -- healing/heal_selector.lua
 -- healing/heal_selector.lua (DeficitHealer logic)
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -47,23 +48,9 @@ local TargetMonitor = nil
 local IncomingHeals = nil
 local CombatAssessor = nil
 
-local Proactive = nil
-local function getProactive()
-    if Proactive == nil then
-        local ok, p = pcall(require, 'sidekick-next.healing.proactive')
-        Proactive = ok and p or false
-    end
-    return Proactive or nil
-end
+local getProactive = lazy.once('sidekick-next.healing.proactive')
 
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 local function getExpectedHeal(tracker, spellName)
     if tracker and tracker.GetExpectedHeal then
@@ -164,14 +151,7 @@ local function predictedDeficit(deficit, dps, timeSec, maxHP)
 end
 
 -- Lazy-load CombatAssessor for centralized scoring weights (includes throttle logic)
-local CombatAssessor = nil
-local function getCombatAssessor()
-    if CombatAssessor == nil then
-        local ok, ca = pcall(require, 'sidekick-next.healing.combat_assessor')
-        CombatAssessor = ok and ca or false
-    end
-    return CombatAssessor or nil
-end
+local getCombatAssessor = lazy.once('sidekick-next.healing.combat_assessor')
 
 local function getSingleWeights(config, situation)
     local defaults = { coverage = 3.0, manaEff = 0.5, overheal = -1.5 }

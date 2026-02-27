@@ -1,26 +1,8 @@
 -- healing/init.lua (full implementation)
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
--- Debug logging to file (using centralized Paths)
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, p = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = p end
-    end
-    return _Paths
-end
-
-local function debugLog(fmt, ...)
-    local msg = string.format(fmt, ...)
-    local Paths = getPaths()
-    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_HealDebug.log')
-    local f = io.open(logPath, 'a')
-    if f then
-        f:write(string.format('[%s] [Heal] %s\n', os.date('%H:%M:%S'), msg))
-        f:close()
-    end
-end
+local debugLog = require('sidekick-next.utils.debug_log').tagged('Heal', 'SideKick_HealDebug.log')
 
 local Config = require('sidekick-next.healing.config')
 local HealTracker = require('sidekick-next.healing.heal_tracker')
@@ -33,43 +15,14 @@ local SpellEvents = require('sidekick-next.healing.spell_events')
 local Logger = require('sidekick-next.healing.logger')
 
 -- Lazy-load UI modules
-local Monitor = nil
-local function getMonitor()
-    if Monitor == nil then
-        local ok, m = pcall(require, 'sidekick-next.healing.ui.monitor')
-        Monitor = ok and m or false
-    end
-    return Monitor or nil
-end
-
-local Settings = nil
-local function getSettings()
-    if Settings == nil then
-        local ok, s = pcall(require, 'sidekick-next.healing.ui.settings')
-        Settings = ok and s or false
-    end
-    return Settings or nil
-end
+local getMonitor = lazy.once('sidekick-next.healing.ui.monitor')
+local getSettings = lazy.once('sidekick-next.healing.ui.settings')
 
 -- Lazy-load Proactive module (may not exist yet)
-local Proactive = nil
-local function getProactive()
-    if Proactive == nil then
-        local ok, p = pcall(require, 'sidekick-next.healing.proactive')
-        Proactive = ok and p or false
-    end
-    return Proactive or nil
-end
+local getProactive = lazy.once('sidekick-next.healing.proactive')
 
 -- Lazy-load HotAnalyzer (HoT trust calculations)
-local HotAnalyzer = nil
-local function getHotAnalyzer()
-    if HotAnalyzer == nil then
-        local ok, ha = pcall(require, 'sidekick-next.healing.hot_analyzer')
-        HotAnalyzer = ok and ha or false
-    end
-    return HotAnalyzer or nil
-end
+local getHotAnalyzer = lazy.once('sidekick-next.healing.hot_analyzer')
 
 -- Lazy-load MobAssessor (named mob detection and consider-based tier assessment)
 local MobAssessor = nil

@@ -1,29 +1,16 @@
 -- healing/target_monitor.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 local Config = nil
 
 -- Lazy-load DamageParser
-local DamageParser = nil
-local function getDamageParser()
-    if DamageParser == nil then
-        local ok, dp = pcall(require, 'sidekick-next.healing.damage_parser')
-        DamageParser = ok and dp or false
-    end
-    return DamageParser or nil
-end
+local getDamageParser = lazy.once('sidekick-next.healing.damage_parser')
 
 -- Lazy-load DamageAttribution
-local DamageAttribution = nil
-local function getDamageAttribution()
-    if DamageAttribution == nil then
-        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
-        DamageAttribution = ok and da or false
-    end
-    return DamageAttribution or nil
-end
+local getDamageAttribution = lazy.once('sidekick-next.healing.damage_attribution')
 
 -- Target data cache
 local _targets = {}

@@ -6,33 +6,11 @@
 local mq = require('mq')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
--- Debug logging
-local DEBUG_MEDITATION = true
-local DEBUG_LOG_FILE = mq.configDir .. '/sk_meditation_debug.log'
-
-local function debugLog(fmt, ...)
-    if not DEBUG_MEDITATION then return end
-    local msg = string.format(fmt, ...)
-    local timestamp = os.date('%H:%M:%S')
-    local f = io.open(DEBUG_LOG_FILE, 'a')
-    if f then
-        f:write(string.format('[%s] %s\n', timestamp, msg))
-        f:close()
-    end
-end
-
--- Clear log on startup
-local function clearLogFile()
-    local f = io.open(DEBUG_LOG_FILE, 'w')
-    if f then
-        f:write(string.format('=== SK_MEDITATION DEBUG LOG STARTED %s ===\n', os.date('%Y-%m-%d %H:%M:%S')))
-        f:close()
-    end
-end
-clearLogFile()
+local debugLog = require('sidekick-next.utils.debug_log').module('sk_meditation', 'SK_MEDITATION')
 
 -- Module identity
 M.MODULE_NAME = 'meditation'
@@ -135,24 +113,10 @@ local function getSettings()
 end
 
 -- Keep Core for backwards compatibility but don't rely on it
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
+local getCore = lazy('sidekick-next.utils.core')
 
 -- Lazy-load RuntimeCache (fallback, may not have data in separate script)
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
+local getCache = lazy('sidekick-next.utils.runtime_cache')
 
 -- Build me data directly from TLO (since we run as separate script)
 local function getMeData()
@@ -230,18 +194,6 @@ local function getAggroHolderId()
     return 0
 end
 
-local function countXtargetOnMe(cache)
-    local xt = cache.xtarget or {}
-    local haters = xt.haters or {}
-    local count = 0
-    for _, h in pairs(haters) do
-        if h and h.targetingMe == true then
-            count = count + 1
-        end
-    end
-    return count
-end
-
 local function iHaveAggro(me, settings)
     if settings.MeditationAggroCheck ~= true then return false end
     local thresh = tonumber(settings.MeditationAggroPct) or 95
@@ -255,14 +207,14 @@ local function iHaveAggro(me, settings)
         return true
     end
 
-    -- Check XTarget for haters targeting me
-    local xtCount = mq.TLO.Me.XTarget() or 0
-    for i = 1, xtCount do
-        local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt() and xt.TargetType() == 'Auto Hater' then
-            return true
-        end
-    end
+    -- NOTE: We intentionally do NOT check XTarget auto hater slots here.
+    -- XTarget 'Auto Hater' means "a mob hating someone in the group" — NOT
+    -- "a mob targeting the player."  For a cleric/healer in a group the tank
+    -- has aggro, but XTarget still shows auto haters.  Using that check would
+    -- block ALL in-combat meditation for every group member.
+    --
+    -- The pctAggro threshold and AggroHolder checks above are sufficient to
+    -- detect personal aggro.
 
     return false
 end
@@ -359,15 +311,17 @@ end
 -- Need Hint Communication
 -------------------------------------------------------------------------------
 
-local function sendNeed(needsAction, ttlMs)
+local function sendNeed(needsAction, ttlMs, reason)
     if not State.dropbox then return end
     local now = lib.getTimeMs()
     local value = needsAction == true
-    if State.lastNeedValue == value and (now - (State.lastNeedSentAt or 0)) < 100 then
+    local reasonChanged = reason ~= State.lastNeedReason
+    if not reasonChanged and State.lastNeedValue == value and (now - (State.lastNeedSentAt or 0)) < 100 then
         return
     end
     State.lastNeedValue = value
     State.lastNeedSentAt = now
+    State.lastNeedReason = reason
     pcall(function()
         State.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
             msgType = 'need',
@@ -375,6 +329,7 @@ local function sendNeed(needsAction, ttlMs)
             priority = lib.Priority.MEDITATION,
             needsAction = value,
             ttlMs = ttlMs or 500,
+            reason = reason,
         })
     end)
 end
@@ -402,21 +357,28 @@ end
 
 local function isCastOwnerActive()
     if not hasValidState() then return false end
-    return State.coordState.castOwner ~= nil
+    -- Only block when actively casting (castBusy), not just for having a claim.
+    -- A module can hold a cast claim while preparing (gem memorization, targeting)
+    -- and we should be able to sit during that prep time.
+    return State.coordState.castBusy == true
 end
 
 -- Check if we should block meditation due to other activity
--- Allow meditation when: IDLE (5) or MEDITATION (7)
--- Block meditation when: Combat priorities (0-4) or BUFF (6)
+-- Block ONLY when someone is actively casting or has a cast claim.
+-- We can safely sit between casts regardless of active priority.
+-- The casting check and castOwner check already handle "don't sit WHILE
+-- casting" individually, but this catches cast claims about to start.
 local function shouldBlockForOtherActivity()
     if not hasValidState() then return false end
+    -- Block if actively casting
+    if State.coordState.castBusy then return true end
+    -- Block during active buff casting (buff module holds long TTL claims)
     local ap = State.coordState.activePriority
-    -- Allow when IDLE or MEDITATION
-    if ap == lib.Priority.IDLE or ap == lib.Priority.MEDITATION then
-        return false
+    if ap == lib.Priority.BUFF and State.coordState.castOwner then
+        return true
     end
-    -- Block for any other priority (combat stuff or buffing)
-    return true
+    -- Allow meditation between casts for all other priorities
+    return false
 end
 
 
@@ -429,7 +391,7 @@ local _lastTickLog = 0
 local function tick()
     -- Safety: stop if no valid state
     if not hasValidState() then
-        sendNeed(false)
+        sendNeed(false, nil, 'no_state')
         return
     end
 
@@ -451,7 +413,7 @@ local function tick()
 
     if mode == 'off' then
         if shouldLog then debugLog('tick: mode is off, skipping') end
-        sendNeed(false)
+        sendNeed(false, nil, 'mode_off')
         return
     end
 
@@ -459,7 +421,7 @@ local function tick()
     local me = getMeData()
     if not me or (me.id or 0) <= 0 then
         if shouldLog then debugLog('tick: no me data') end
-        sendNeed(false)
+        sendNeed(false, nil, 'no_me')
         return
     end
 
@@ -474,8 +436,9 @@ local function tick()
         State.lastMoveAt = now
     end
 
-    -- Track combat state
-    local inCombat = me.combat == true
+    -- Track combat state (use lib.inCombat for XTarget hater detection,
+    -- not me.combat which only checks auto-attack state)
+    local inCombat = lib.inCombat()
     if inCombat then
         State.combatEndedAt = 0
     elseif State.wasInCombat == true then
@@ -488,28 +451,28 @@ local function tick()
     local hovering = safeBool(function() return mq.TLO.Me.Hovering and mq.TLO.Me.Hovering() end)
     if hovering then
         if shouldLog then debugLog('tick: blocked by hovering') end
-        sendNeed(false)
+        sendNeed(false, nil, 'hovering')
         return
     end
 
     -- Casting check - don't sit while casting
     if me.casting == true then
         if shouldLog then debugLog('tick: blocked by casting') end
-        sendNeed(false)
+        sendNeed(false, nil, 'casting')
         return
     end
 
     -- Don't sit while cast owner is active (someone is casting)
     if isCastOwnerActive() then
         if shouldLog then debugLog('tick: blocked by castOwner active') end
-        sendNeed(false)
+        sendNeed(false, nil, 'cast_owner_active')
         return
     end
 
-    -- Don't sit while combat or buffing is happening
+    -- Don't sit while actively casting spells or buff module is casting
     if shouldBlockForOtherActivity() then
         if shouldLog then debugLog('tick: blocked by other activity (priority=%s)', tostring(State.coordState and State.coordState.activePriority)) end
-        sendNeed(false)
+        sendNeed(false, nil, 'cast_busy')
         return
     end
 
@@ -536,7 +499,7 @@ local function tick()
             if shouldLog then debugLog('tick: standing due to combat (ooc mode)') end
             cmdStand(now)
         end
-        sendNeed(false)
+        sendNeed(false, nil, 'ooc_in_combat')
         return
     end
 
@@ -546,7 +509,7 @@ local function tick()
             if shouldLog then debugLog('tick: standing due to stunned') end
             cmdStand(now)
         end
-        sendNeed(false)
+        sendNeed(false, nil, 'stunned')
         return
     end
 
@@ -556,7 +519,7 @@ local function tick()
         local readyAt = State.combatEndedAt + delay + (State.postCombatJitter or 0)
         if now < readyAt then
             if shouldLog then debugLog('tick: post-combat delay (%.1fs remaining)', readyAt - now) end
-            sendNeed(false)
+            sendNeed(false, nil, 'post_combat_delay')
             return
         end
     end
@@ -564,7 +527,7 @@ local function tick()
     -- Moving check
     if me.moving == true then
         if shouldLog then debugLog('tick: blocked by moving') end
-        sendNeed(false)
+        sendNeed(false, nil, 'moving')
         return
     end
 
@@ -579,33 +542,45 @@ local function tick()
     end
 
     -- Block sit if aggro or movement unsafe
+    local blockedBy = nil
     if wantSit and aggroUnsafe then
         wantSit = false
+        blockedBy = 'aggro'
         if shouldLog then debugLog('tick: blocked by aggro') end
     end
     if wantSit and movementBlocking then
         wantSit = false
+        blockedBy = 'movement'
         if shouldLog then debugLog('tick: blocked by movement') end
     end
 
     -- Send need hint based on whether we want to change state
     local needsAction = false
+    local needReason = blockedBy
+        and string.format('blocked:%s(%s)', blockedBy, sitReason or '?')
+        or (sitReason or 'no_change')
     if wantSit and me.sitting ~= true then
         needsAction = true
+        needReason = 'want_sit:' .. (sitReason or '?')
     elseif not wantSit and me.sitting == true and settings.MeditationStandWhenDone == true then
         needsAction = true
+        needReason = 'want_stand:' .. (sitReason or '?')
+    elseif me.sitting == true then
+        needReason = 'sitting:' .. (sitReason or 'ok')
     end
 
     if shouldLog then
         debugLog('tick: needsAction=%s isMyPriority=%s', tostring(needsAction), tostring(isMyPriority()))
     end
 
-    sendNeed(needsAction)
+    sendNeed(needsAction, nil, needReason)
 
-    -- Only act if it's our priority
-    if not isMyPriority() then
-        return
-    end
+    -- Meditation acts independently of activePriority.
+    -- Sitting/standing doesn't use cast or target claims — it's just /sit or /stand.
+    -- The blocking checks above (castBusy, casting, hovering, aggro, movement) already
+    -- ensure we only sit when safe. The standard EQ healer loop is:
+    --   sit → stand → cast heal → sit again
+    -- Standing is instant so there's no delay if a heal needs to fire.
 
     -- Execute sit/stand
     if wantSit and me.sitting ~= true then
@@ -668,11 +643,23 @@ local function initialize()
     lib.log('info', M.MODULE_NAME, 'Meditation module ready, waiting for Coordinator state...')
 end
 
+--- Check if coordinator has been absent too long
+local function isCoordinatorAbsent()
+    -- Not initialized yet or never received state
+    if not State.initialized then return false end
+    if State.stateReceivedAt == 0 then return false end
+
+    local now = lib.getTimeMs()
+    local absence = now - State.stateReceivedAt
+    return absence > lib.Timing.COORDINATOR_ABSENCE_MS
+end
+
 local function mainLoop()
     initialize()
 
     local lastHeartbeat = 0
     local tickDelayMs = 100  -- Meditation can tick slower
+    local _coordinatorAbsentLogged = false
 
     while State.running do
         tick()
@@ -682,6 +669,22 @@ local function mainLoop()
         if (now - lastHeartbeat) >= lib.Timing.MODULE_HEARTBEAT_MS then
             sendHeartbeat()
             lastHeartbeat = now
+        end
+
+        -- Watchdog: check for coordinator absence
+        if isCoordinatorAbsent() then
+            if not _coordinatorAbsentLogged then
+                _coordinatorAbsentLogged = true
+                local absence = now - State.stateReceivedAt
+                print(string.format(
+                    '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
+                    M.MODULE_NAME, absence / 1000))
+                debugLog('WATCHDOG: Coordinator absent for %dms, shutting down', now - State.stateReceivedAt)
+            end
+            -- Meditation does not use claims, so no releaseClaim needed
+            State.running = false
+        else
+            _coordinatorAbsentLogged = false
         end
 
         mq.delay(tickDelayMs)

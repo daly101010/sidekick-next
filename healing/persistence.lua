@@ -3,16 +3,10 @@
 -- Handles save/load of learned heal amounts, cast history, and statistical data
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 -- Lazy-load Logger to avoid circular requires
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 local M = {}
 
@@ -275,14 +269,12 @@ function M.saveHealData(data)
 
     local content = serializeValue(dataToSave)
 
-    local file, err = io.open(path, 'w')
-    if not file then
+    local safeWrite = require('sidekick-next.utils.safe_write')
+    local ok, err = safeWrite(path, content)
+    if not ok then
         if log then log.error('persistence', 'Heal data save error: %s', tostring(err)) end
         return false
     end
-
-    file:write(content)
-    file:close()
     if log then log.info('persistence', 'Heal data saved to %s', path) end
     return true
 end

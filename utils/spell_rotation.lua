@@ -2,6 +2,7 @@
 -- Spell Rotation - Spell selection and execution for combat rotation
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -43,50 +44,11 @@ M.DEBUFF_CATEGORIES = {
 }
 
 -- Lazy-load dependencies
-local _SpellEngine = nil
-local function getSpellEngine()
-    if not _SpellEngine then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
-        if ok then _SpellEngine = se end
-    end
-    return _SpellEngine
-end
-
-local _SpellEvents = nil
-local function getSpellEvents()
-    if not _SpellEvents then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_events')
-        if ok then _SpellEvents = se end
-    end
-    return _SpellEvents
-end
-
-local _ImmuneDB = nil
-local function getImmuneDB()
-    if not _ImmuneDB then
-        local ok, db = pcall(require, 'sidekick-next.utils.immune_database')
-        if ok then _ImmuneDB = db end
-    end
-    return _ImmuneDB
-end
-
-local _SpellLineup = nil
-local function getSpellLineup()
-    if not _SpellLineup then
-        local ok, sl = pcall(require, 'sidekick-next.utils.spell_lineup')
-        if ok then _SpellLineup = sl end
-    end
-    return _SpellLineup
-end
-
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
+local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
+local getSpellEvents = lazy('sidekick-next.utils.spell_events')
+local getImmuneDB = lazy('sidekick-next.utils.immune_database')
+local getSpellLineup = lazy('sidekick-next.utils.spell_lineup')
+local getCache = lazy('sidekick-next.utils.runtime_cache')
 
 --- Get the layer for a spell based on its category
 -- @param category string Spell category

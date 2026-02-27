@@ -3,18 +3,12 @@
 -- Tracks buffs applied by self and peers, coordinates to avoid duplicate casting
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Logging
-local _ThrottledLog = nil
-local function getThrottledLog()
-    if not _ThrottledLog then
-        local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
-        if ok then _ThrottledLog = tl end
-    end
-    return _ThrottledLog
-end
+local getThrottledLog = lazy('sidekick-next.utils.throttled_log')
 
 -- Dedicated buff logger (file-based)
 local _BuffLogger = nil
@@ -51,41 +45,10 @@ M.debugBuffHotswap = false
 M.debugBuffTick = false
 
 -- Lazy-load dependencies to avoid circular requires
-local _Actors = nil
-local function getActors()
-    if not _Actors then
-        local ok, a = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok then _Actors = a end
-    end
-    return _Actors
-end
-
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
-
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
-
-local _SpellEngine = nil
-local function getSpellEngine()
-    if not _SpellEngine then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
-        if ok then _SpellEngine = se end
-    end
-    return _SpellEngine
-end
+local getActors = lazy('sidekick-next.utils.actors_coordinator')
+local getCache = lazy('sidekick-next.utils.runtime_cache')
+local getCore = lazy('sidekick-next.utils.core')
+local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
 
 local _SpellsetManager = nil
 local function getSpellsetManager()

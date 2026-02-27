@@ -1,28 +1,10 @@
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local RuntimeCache = require('sidekick-next.utils.runtime_cache')
 local ActionExecutor = require('sidekick-next.utils.action_executor')
 
--- Debug logging to file (using centralized Paths)
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, p = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = p end
-    end
-    return _Paths
-end
-
-local function debugLog(fmt, ...)
-    local msg = string.format(fmt, ...)
-    local Paths = getPaths()
-    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_MedDebug.log')
-    local f = io.open(logPath, 'a')
-    if f then
-        f:write(string.format('[%s] [Med] %s\n', os.date('%H:%M:%S'), msg))
-        f:close()
-    end
-end
+local debugLog = require('sidekick-next.utils.debug_log').tagged('Med', 'SideKick_MedDebug.log')
 
 -- Dedicated meditation logger (file-based) - for medLog calls
 local _MedLogger = nil
@@ -39,14 +21,7 @@ local function getMedLogger()
     return _MedLogger
 end
 
-local _Buff = nil
-local function getBuff()
-    if not _Buff then
-        local ok, b = pcall(require, 'sidekick-next.automation.buff')
-        if ok then _Buff = b end
-    end
-    return _Buff
-end
+local getBuff = lazy('sidekick-next.automation.buff')
 
 local M = {}
 

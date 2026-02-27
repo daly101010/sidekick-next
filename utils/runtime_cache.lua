@@ -3,6 +3,7 @@
 -- Computes expensive TLO queries on a cadence, all modules read from here
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -10,14 +11,7 @@ local M = {}
 M._settings = nil
 
 -- Lazy-load Targeting module to avoid circular dependency
-local _Targeting = nil
-local function getTargeting()
-    if not _Targeting then
-        local ok, targeting = pcall(require, 'sidekick-next.utils.targeting')
-        if ok then _Targeting = targeting end
-    end
-    return _Targeting
-end
+local getTargeting = lazy('sidekick-next.utils.targeting')
 
 -- Get setting value (with fallback)
 local function getSetting(key)
@@ -46,8 +40,8 @@ M.buffState = {}  -- { [memberId] = { [buffCategory] = { present, remaining, spe
 local _lastHeavyUpdate = 0
 local _lastLightUpdate = 0
 local _lastBuffScan = 0
-local HEAVY_INTERVAL = 0.25  -- 250ms for expensive scans
-local LIGHT_INTERVAL = 0.05  -- 50ms for lightweight checks
+local HEAVY_INTERVAL = 0.10  -- 100ms for group HP/position scans (healing needs fresh data)
+local LIGHT_INTERVAL = 0.05  -- 50ms for lightweight self checks
 local BUFF_SCAN_INTERVAL = 3.0  -- 3s between buff scans (expensive due to retargeting)
 
 function M.init()
@@ -67,7 +61,7 @@ function M.tick()
         M.updateLight()
     end
 
-    -- Heavy update (every 250ms)
+    -- Heavy update (every 100ms – group HP, xtarget, positions)
     if (now - _lastHeavyUpdate) >= HEAVY_INTERVAL then
         _lastHeavyUpdate = now
         M.updateHeavy()
@@ -307,6 +301,27 @@ function M.updateHeavy()
         haters = haters,
         aggroDeficitCount = aggroDeficitCount,
     }
+end
+
+-- Staleness accessors
+
+--- Get age of light-update data (self, target) in seconds
+---@return number Age in seconds since last light update
+function M.lightAge()
+    return os.clock() - _lastLightUpdate
+end
+
+--- Get age of heavy-update data (group, xtarget) in seconds
+---@return number Age in seconds since last heavy update
+function M.heavyAge()
+    return os.clock() - _lastHeavyUpdate
+end
+
+--- Check if heavy data is stale (older than threshold)
+---@param maxAge number|nil Max age in seconds (default 0.5)
+---@return boolean True if data is stale
+function M.isHeavyStale(maxAge)
+    return M.heavyAge() > (maxAge or 0.5)
 end
 
 -- Convenience accessors

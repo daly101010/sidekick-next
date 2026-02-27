@@ -10,6 +10,7 @@ local Settings = require('sidekick-next.ui.settings')
 local Components = require('sidekick-next.ui.components')
 local Core = require('sidekick-next.utils.core')
 local ConditionBuilder = require('sidekick-next.ui.condition_builder')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -28,14 +29,7 @@ local function formatTintColor(col)
 end
 
 -- Lazy-load Items module
-local _Items = nil
-local function getItems()
-    if not _Items then
-        local ok, mod = pcall(require, 'sidekick-next.utils.items')
-        if ok then _Items = mod end
-    end
-    return _Items
-end
+local getItems = lazy('sidekick-next.utils.items')
 
 -- Undo state for clear operations
 local _lastCleared = nil

@@ -1,16 +1,10 @@
 -- healing/ui/settings.lua
 local mq = require('mq')
 local imgui = require('ImGui')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 -- Lazy-load Logger to avoid circular requires
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 local M = {}
 

@@ -3,6 +3,7 @@
 
 local mq = require('mq')
 local imgui = require('ImGui')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -11,14 +12,7 @@ M.open = false
 M._showWindow = false
 
 -- Lazy-load actors coordinator
-local _ActorsCoord = nil
-local function getActorsCoord()
-    if not _ActorsCoord then
-        local ok, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok then _ActorsCoord = ac end
-    end
-    return _ActorsCoord
-end
+local getActorsCoord = lazy('sidekick-next.utils.actors_coordinator')
 
 -- Helper to format a value for display
 local function formatValue(v)

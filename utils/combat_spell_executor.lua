@@ -3,6 +3,7 @@
 -- Handles type-based priority ordering, condition evaluation, and buff targeting
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -27,59 +28,12 @@ local TYPE_PRIORITY_MULTIPLIER = 10
 -- Lazy-loaded Dependencies
 --------------------------------------------------------------------------------
 
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, mod = pcall(require, 'sidekick-next.core')
-        if ok then _Core = mod end
-    end
-    return _Core
-end
-
-local _SpellsetPersistence = nil
-local function getSpellsetPersistence()
-    if not _SpellsetPersistence then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_persistence')
-        if ok then _SpellsetPersistence = mod end
-    end
-    return _SpellsetPersistence
-end
-
-local _SpellbookScanner = nil
-local function getSpellbookScanner()
-    if not _SpellbookScanner then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellbook_scanner')
-        if ok then _SpellbookScanner = mod end
-    end
-    return _SpellbookScanner
-end
-
-local _ConditionDefaults = nil
-local function getConditionDefaults()
-    if not _ConditionDefaults then
-        local ok, mod = pcall(require, 'sidekick-next.utils.condition_defaults')
-        if ok then _ConditionDefaults = mod end
-    end
-    return _ConditionDefaults
-end
-
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, mod = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = mod end
-    end
-    return _ConditionBuilder
-end
-
-local _ConditionContext = nil
-local function getConditionContext()
-    if not _ConditionContext then
-        local ok, mod = pcall(require, 'sidekick-next.utils.condition_context')
-        if ok then _ConditionContext = mod end
-    end
-    return _ConditionContext
-end
+local getCore = lazy('sidekick-next.core')
+local getSpellsetPersistence = lazy('sidekick-next.utils.spellset_persistence')
+local getSpellbookScanner = lazy('sidekick-next.utils.spellbook_scanner')
+local getConditionDefaults = lazy('sidekick-next.utils.condition_defaults')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getConditionContext = lazy('sidekick-next.utils.condition_context')
 
 --------------------------------------------------------------------------------
 -- Sorted Cast List

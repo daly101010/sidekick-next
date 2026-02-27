@@ -3,6 +3,7 @@
 -- Handles saving/loading spell sets to disk using mq.pickle()
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -17,32 +18,9 @@ M.activeSetName = nil  -- Currently active set name
 -- Lazy-loaded dependencies
 --------------------------------------------------------------------------------
 
-local _SpellSetData = nil
-local function getSpellSetData()
-    if not _SpellSetData then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_data')
-        if ok then _SpellSetData = mod end
-    end
-    return _SpellSetData
-end
-
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, mod = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = mod end
-    end
-    return _ConditionBuilder
-end
-
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, mod = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = mod end
-    end
-    return _Paths
-end
+local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getPaths = lazy('sidekick-next.utils.paths')
 
 --------------------------------------------------------------------------------
 -- Path Helpers

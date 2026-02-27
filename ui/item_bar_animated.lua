@@ -7,21 +7,12 @@ local Items = require('sidekick-next.utils.items')
 local Themes = require('sidekick-next.themes')
 local Anchor = require('sidekick-next.ui.anchor')
 local Draw = require('sidekick-next.ui.draw_helpers')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-loaded texture renderer
-local _TextureRenderer = nil
-local _TextureRendererLoaded = false
-local function getTextureRenderer()
-    if _TextureRendererLoaded then return _TextureRenderer end
-    _TextureRendererLoaded = true
-    local ok, renderer = pcall(require, 'sidekick-next.ui.texture_renderer')
-    if ok and renderer then
-        _TextureRenderer = renderer
-    end
-    return _TextureRenderer
-end
+local getTextureRenderer = lazy.once('sidekick-next.ui.texture_renderer')
 
 -- Use centralized draw helpers
 local IM_COL32 = Draw.IM_COL32

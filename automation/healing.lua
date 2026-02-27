@@ -1,4 +1,5 @@
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local Core = require('sidekick-next.utils.core')
 local RuntimeCache = require('sidekick-next.utils.runtime_cache')
@@ -8,14 +9,7 @@ local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 local M = {}
 
 -- Logging
-local _ThrottledLog = nil
-local function getThrottledLog()
-    if not _ThrottledLog then
-        local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
-        if ok then _ThrottledLog = tl end
-    end
-    return _ThrottledLog
-end
+local getThrottledLog = lazy('sidekick-next.utils.throttled_log')
 
 M.debugHealLineMapping = false
 

@@ -1,5 +1,6 @@
 -- healing/proactive.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -22,14 +23,7 @@ local TargetMonitor = nil
 local CombatAssessor = nil
 
 -- Lazy-load ActorsCoordinator for peer HoT tracking
-local ActorsCoordinator = nil
-local function getActorsCoordinator()
-    if ActorsCoordinator == nil then
-        local ok, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        ActorsCoordinator = ok and ac or false
-    end
-    return ActorsCoordinator or nil
-end
+local getActorsCoordinator = lazy('sidekick-next.utils.actors_coordinator')
 
 -- Track active HoTs we've applied
 local _activeHoTs = {}  -- [targetName] = { spell, castTime, duration, expireTime }

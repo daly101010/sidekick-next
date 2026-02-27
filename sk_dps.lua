@@ -107,6 +107,37 @@ end
 -- Module Callbacks
 -------------------------------------------------------------------------------
 
+module.onTick = function(self)
+    -- Send need hints so the coordinator knows whether DPS can actually act.
+    -- Without this, the coordinator's worldState fallback assigns DPS priority
+    -- even when no DPS spells are available (e.g. cleric), creating a dead priority.
+    if not lib.inCombat() then
+        self:sendNeed(false, nil, 'ooc')
+        return
+    end
+
+    local nuke = resolveSpell('nuke')
+    local stun = resolveSpell('stun')
+    if not nuke and not stun then
+        self:sendNeed(false, nil, 'no_spells')
+        return
+    end
+
+    local target = getMATarget()
+    if not target then
+        self:sendNeed(false, nil, 'no_target')
+        return
+    end
+
+    local mana = lib.safeNum(function() return mq.TLO.Me.PctMana() end, 0)
+    if mana < Config.minManaPct then
+        self:sendNeed(false, nil, 'low_mana')
+        return
+    end
+
+    self:sendNeed(true, 500, 'ready')
+end
+
 module.shouldAct = function(self)
     if not self:hasValidState() then return false end
 
@@ -173,7 +204,8 @@ module.executeAction = function(self)
     -- Verify spell is still ready
     if not isSpellReady(spellName) then
         lib.log('debug', self.name, 'Spell no longer ready: %s', spellName)
-        return true, 'spell_not_ready'
+        -- Return false to KEEP the claim — spell may be ready next tick (GCD)
+        return false, 'spell_not_ready'
     end
 
     -- Target

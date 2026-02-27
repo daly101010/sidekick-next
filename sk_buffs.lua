@@ -6,34 +6,12 @@
 local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 -- Create module instance
 local module = ModuleBase.create('buffs', lib.Priority.BUFF)
 
--- Debug logging (set to true to enable)
-local DEBUG_BUFFS = true
-local DEBUG_LOG_FILE = mq.configDir .. '/sk_buffs_debug.log'
-
-local function debugLog(fmt, ...)
-    if not DEBUG_BUFFS then return end
-    local msg = string.format(fmt, ...)
-    local timestamp = os.date('%H:%M:%S')
-    local f = io.open(DEBUG_LOG_FILE, 'a')
-    if f then
-        f:write(string.format('[%s] %s\n', timestamp, msg))
-        f:close()
-    end
-end
-
--- Clear log file on startup
-local function clearLogFile()
-    local f = io.open(DEBUG_LOG_FILE, 'w')
-    if f then
-        f:write(string.format('=== SK_BUFFS DEBUG LOG STARTED %s ===\n', os.date('%Y-%m-%d %H:%M:%S')))
-        f:close()
-    end
-end
-clearLogFile()
+local debugLog = require('sidekick-next.utils.debug_log').module('sk_buffs', 'SK_BUFFS')
 
 -------------------------------------------------------------------------------
 -- Constants
@@ -92,32 +70,9 @@ local _lastGroupCastAt = {}
 -- Lazy-load Dependencies
 -------------------------------------------------------------------------------
 
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
-
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
-
-local _SpellEngine = nil
-local function getSpellEngine()
-    if not _SpellEngine then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
-        if ok then _SpellEngine = se end
-    end
-    return _SpellEngine
-end
+local getCore = lazy('sidekick-next.utils.core')
+local getCache = lazy('sidekick-next.utils.runtime_cache')
+local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
 
 local _SpellsetManager = nil
 local function getSpellsetManager()
@@ -133,14 +88,7 @@ local function getSpellsetManager()
     return _SpellsetManager
 end
 
-local _Buff = nil
-local function getBuff()
-    if not _Buff then
-        local ok, b = pcall(require, 'sidekick-next.automation.buff')
-        if ok then _Buff = b end
-    end
-    return _Buff
-end
+local getBuff = lazy('sidekick-next.automation.buff')
 
 -------------------------------------------------------------------------------
 -- Helper Functions
@@ -229,6 +177,19 @@ local function isSpellReady(spellName)
 
     local ready = me.SpellReady(spellName)
     return ready and ready() == true
+end
+
+--- Ensure we are targeting the given spawn ID before casting
+--- @param id number Spawn ID to target
+--- @return boolean True if current target matches id
+local function ensureTarget(id)
+    if not id or id <= 0 then return false end
+    local currentTargetId = lib.safeNum(function() return mq.TLO.Target.ID() end, 0)
+    if currentTargetId == id then return true end
+    mq.cmdf('/target id %d', id)
+    mq.delay(50)
+    currentTargetId = lib.safeNum(function() return mq.TLO.Target.ID() end, 0)
+    return currentTargetId == id
 end
 
 local function selfHasBuff(spellName)
@@ -569,8 +530,9 @@ local function canBuffNow()
     if not (me and me()) then return false, 'no_character' end
 
     -- Check combat state (buffing only allowed OOC)
-    local Cache = getCache()
-    local inCombat = Cache and Cache.inCombat and Cache.inCombat() or false
+    -- Use lib.inCombat() which checks XTarget haters directly,
+    -- not RuntimeCache which may not be ticked in this script process
+    local inCombat = lib.inCombat()
     if inCombat then return false, 'in_combat' end
 
     -- Check invis
@@ -757,7 +719,7 @@ module.onTick = function(self)
     if not settings then
         debugLog('onTick: No settings, returning')
         _pendingAction = nil
-        self:sendNeed(false)
+        self:sendNeed(false, nil, 'no_settings')
         return
     end
 
@@ -766,7 +728,7 @@ module.onTick = function(self)
     if buffingEnabled == false or buffingEnabled == 0 then
         _pendingAction = nil
         maybeRestoreBuffGem()
-        self:sendNeed(false)
+        self:sendNeed(false, nil, 'buffing_disabled')
         return
     end
 
@@ -782,14 +744,14 @@ module.onTick = function(self)
 
     if hasActiveBuff and isCasting then
         debugLog('onTick: Sending NEED=true (actively casting)')
-        self:sendNeed(true, 5000)  -- Long TTL while casting
+        self:sendNeed(true, 5000, 'casting_buff')  -- Long TTL while casting
         return
     end
 
     -- Also check cast ownership (in case _activeBuff got cleared but we still own)
     if ownsCast then
         debugLog('onTick: Sending NEED=true (owns cast)')
-        self:sendNeed(true, 5000)  -- Long TTL while casting
+        self:sendNeed(true, 5000, 'owns_cast')  -- Long TTL while casting
         return
     end
 
@@ -798,7 +760,7 @@ module.onTick = function(self)
     if (now - _lastBuffTick) < BUFF_TICK_INTERVAL then
         -- Still send need if we have pending action
         if _pendingAction then
-            self:sendNeed(true, 1000)
+            self:sendNeed(true, 1000, 'pending_buff')
         end
         return
     end
@@ -813,7 +775,7 @@ module.onTick = function(self)
     local needsAction = need ~= nil
     debugLog('onTick: findBuffNeed=%s needsAction=%s',
         need and need.spellName or 'nil', tostring(needsAction))
-    self:sendNeed(needsAction, needsAction and 1500 or nil)
+    self:sendNeed(needsAction, needsAction and 1500 or nil, needsAction and 'buff_needed' or 'no_buff_needed')
 
     -- Handle gem memorization while waiting
     if _buffGemSwap.active and _buffGemSwap.requestedSpell ~= '' then
@@ -900,7 +862,19 @@ module.executeAction = function(self)
     debugLog('executeAction: ENTERED')
 
     -- For buff claims, we need to handle differently based on claim type
-    local action = self.state and self.state.castOwner and self.state.castOwner.action
+    -- NOTE: explicit nil checks required — actors state can update between
+    -- the ownsAction() guard in module_base and this access (file I/O in
+    -- debugLog above can allow actors callbacks to deliver new state).
+    if not self.state then
+        debugLog('executeAction: no state')
+        return false, 'no_action'
+    end
+    local castOwner = self.state.castOwner
+    if not castOwner then
+        debugLog('executeAction: no castOwner in state')
+        return false, 'no_action'
+    end
+    local action = castOwner.action
     if not action then
         debugLog('executeAction: no action in castOwner')
         return false, 'no_action'
@@ -957,7 +931,13 @@ module.executeAction = function(self)
                 debugLog('executeAction: Memorized but not ready yet')
                 return false, 'spell_not_ready'
             end
-            -- Ready to cast - do it now
+            -- Ready to cast - ensure correct target first
+            if not action.isGroup then
+                if not ensureTarget(targetId) then
+                    debugLog('executeAction: Failed to target %d for cast', targetId)
+                    return false, 'target_failed'
+                end
+            end
             debugLog('executeAction: Spell ready, starting cast')
             _activeBuff.state = 'casting'
             mq.cmdf('/cast "%s"', spellName)
@@ -1018,6 +998,13 @@ module.executeAction = function(self)
 
     -- If already memorized, check if ready to cast
     if isSpellReady(spellName) then
+        -- Ensure correct target before casting
+        if not action.isGroup then
+            if not ensureTarget(targetId) then
+                debugLog('executeAction: Failed to target %d for cast', targetId)
+                return false, 'target_failed'
+            end
+        end
         debugLog('executeAction: Spell already ready, starting cast')
         _activeBuff.state = 'casting'
         mq.cmdf('/cast "%s"', spellName)

@@ -226,15 +226,10 @@ function M.migrateFile(oldPath, newPath)
         M.ensureDir(dir)
     end
 
-    -- Write to new location
-    local newFile = io.open(newPath, 'w')
-    if not newFile then
-        return false
-    end
-    newFile:write(content)
-    newFile:close()
-
-    return true
+    -- Write to new location (crash-safe)
+    local safeWrite = require('sidekick-next.utils.safe_write')
+    local ok = safeWrite(newPath, content)
+    return ok
 end
 
 --- Run all pending migrations

@@ -3,6 +3,7 @@
 -- Handles the actual gem memorization when applying spell sets
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -18,23 +19,8 @@ M.pendingSave = false   -- Whether to save before applying
 -- Lazy-loaded dependencies
 --------------------------------------------------------------------------------
 
-local _SpellSetPersistence = nil
-local function getPersistence()
-    if not _SpellSetPersistence then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_persistence')
-        if ok then _SpellSetPersistence = mod end
-    end
-    return _SpellSetPersistence
-end
-
-local _SpellSetData = nil
-local function getSpellSetData()
-    if not _SpellSetData then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_data')
-        if ok then _SpellSetData = mod end
-    end
-    return _SpellSetData
-end
+local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
+local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
 
 --------------------------------------------------------------------------------
 -- Constants
@@ -43,6 +29,7 @@ end
 local CLEAR_DELAY_MS = 500          -- Delay after right-click to clear gem
 local MEMORIZE_TIMEOUT_MS = 12000   -- Max time to wait for memorization
 local WAIT_POLL_MS = 100            -- Poll interval for wait functions
+local DIRTY_CHECK_INTERVAL = 30     -- Seconds between automatic dirty-gem checks
 
 --------------------------------------------------------------------------------
 -- Internal Helpers
@@ -307,10 +294,62 @@ function M.apply(setName)
     return true
 end
 
+--------------------------------------------------------------------------------
+-- Dirty-Gem Watchdog
+--------------------------------------------------------------------------------
+
+local _lastDirtyCheck = 0
+
+--- Compare live gems against the active spell set.
+--- If any slot mismatches, queue the active set for re-memorization.
+local function checkDirtyGems()
+    local now = os.clock()
+    if (now - _lastDirtyCheck) < DIRTY_CHECK_INTERVAL then return end
+    _lastDirtyCheck = now
+
+    if inCombat() then return end
+
+    local Persistence = getPersistence()
+    if not Persistence then return end
+
+    local activeSetName = Persistence.activeSetName
+    if not activeSetName then return end
+
+    local spellSet = Persistence.getSet(activeSetName)
+    if not spellSet or not spellSet.gems then return end
+
+    local SpellSetData = getSpellSetData()
+    if not SpellSetData then return end
+
+    local hasOocBuffs = SpellSetData.hasOocBuffs(spellSet)
+    local rotationGems = SpellSetData.getRotationGemCount(hasOocBuffs)
+
+    for slot = 1, rotationGems do
+        local gemConfig = spellSet.gems[slot]
+        if gemConfig and gemConfig.spellId then
+            local currentId = getCurrentGemSpellId(slot)
+            if currentId ~= gemConfig.spellId then
+                print(string.format(
+                    '\ay[SpellSetMemorize]\ax Gem %d is dirty — queuing "%s" for re-memorization',
+                    slot, activeSetName))
+                M.pendingSet = activeSetName
+                return
+            end
+        end
+    end
+end
+
 --- Process pending spell set if out of combat
 --- Called from main loop
 function M.processPending()
-    if not M.pendingSet then return end
+    -- If nothing pending, run the periodic dirty-gem check
+    if not M.pendingSet then
+        if not M.isMemorizing then
+            checkDirtyGems()
+        end
+        if not M.pendingSet then return end
+    end
+
     if M.isMemorizing then return end
     if inCombat() then return end
 

@@ -4,28 +4,15 @@
 
 local mq = require('mq')
 local imgui = require('ImGui')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load Logger
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 -- Lazy-load Buff module for isBuffingActive check
-local Buff = nil
-local function getBuff()
-    if Buff == nil then
-        local ok, b = pcall(require, 'sidekick-next.automation.buff')
-        Buff = ok and b or false
-    end
-    return Buff or nil
-end
+local getBuff = lazy.once('sidekick-next.automation.buff')
 
 -- Configuration
 local Config = {
@@ -181,21 +168,19 @@ function M.saveAllData()
         return false
     end
 
-    local file = io.open(path, 'w')
-    if not file then
+    local content = '-- SideKick MobAssessor Data\n'
+        .. '-- Named mob difficulty tiers across all zones\n'
+        .. '-- Format: { [zoneName] = { [mobName] = { tier, multiplier, level, manual } } }\n'
+        .. 'return ' .. serializeValue(_allZoneData) .. '\n'
+
+    local safeWrite = require('sidekick-next.utils.safe_write')
+    local ok, err = safeWrite(path, content)
+    if not ok then
         if log then
-            log.error('mob_assessor', 'Failed to open file for writing: %s', path)
+            log.error('mob_assessor', 'Failed to save data: %s', tostring(err))
         end
         return false
     end
-
-    file:write('-- SideKick MobAssessor Data\n')
-    file:write('-- Named mob difficulty tiers across all zones\n')
-    file:write('-- Format: { [zoneName] = { [mobName] = { tier, multiplier, level, manual } } }\n')
-    file:write('return ')
-    file:write(serializeValue(_allZoneData))
-    file:write('\n')
-    file:close()
 
     _dirty = false
 

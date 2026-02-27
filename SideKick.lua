@@ -1,26 +1,8 @@
 local mq = require('mq')
 local imgui = require('ImGui')
+local lazy = require('sidekick-next.utils.lazy_require')
 
--- Debug logging to file (using centralized Paths)
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, p = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = p end
-    end
-    return _Paths
-end
-
-local function debugLog(fmt, ...)
-    local msg = string.format(fmt, ...)
-    local Paths = getPaths()
-    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_Debug.log')
-    local f = io.open(logPath, 'a')
-    if f then
-        f:write(string.format('[%s] [Main] %s\n', os.date('%H:%M:%S'), msg))
-        f:close()
-    end
-end
+local debugLog = require('sidekick-next.utils.debug_log').tagged('Main', 'SideKick_Debug.log')
 
 local Core = require('sidekick-next.utils.core')
 local Themes = require('sidekick-next.themes')
@@ -112,85 +94,14 @@ local ClassConfigLoader = require('sidekick-next.utils.class_config_loader')
 local SpellsetManager = require('sidekick-next.utils.spellset_manager')
 local SpellSetEditor = require('sidekick-next.ui.spell_set_editor')
 
--- Spell set memorization (lazy-loaded for processPending in main loop)
-local _SpellSetMemorize = nil
-local function getSpellSetMemorize()
-    if not _SpellSetMemorize then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_memorize')
-        if ok then _SpellSetMemorize = mod end
-    end
-    return _SpellSetMemorize
-end
-
--- OOC buff executor (lazy-loaded for process in main loop)
-local _OocBuffExecutor = nil
-local function getOocBuffExecutor()
-    if not _OocBuffExecutor then
-        local ok, mod = pcall(require, 'sidekick-next.utils.ooc_buff_executor')
-        if ok then _OocBuffExecutor = mod end
-    end
-    return _OocBuffExecutor
-end
-
--- Combat spell executor (lazy-loaded for process in main loop)
-local _CombatSpellExecutor = nil
-local function getCombatSpellExecutor()
-    if not _CombatSpellExecutor then
-        local ok, mod = pcall(require, 'sidekick-next.utils.combat_spell_executor')
-        if ok then _CombatSpellExecutor = mod end
-    end
-    return _CombatSpellExecutor
-end
-
--- Throttled logging
-local _ThrottledLog = nil
-local function getThrottledLog()
-    if not _ThrottledLog then
-        local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
-        if ok then _ThrottledLog = tl end
-    end
-    return _ThrottledLog
-end
-
--- Healing monitor UI (lazy-loaded for Healing tab)
-local _HealingMonitor = nil
-local function getHealingMonitor()
-    if not _HealingMonitor then
-        local ok, mod = pcall(require, 'sidekick-next.healing.ui.monitor')
-        if ok then _HealingMonitor = mod end
-    end
-    return _HealingMonitor
-end
-
--- Healing settings tab (lazy-loaded for Healing tab)
-local _HealingSettingsTab = nil
-local function getHealingSettingsTab()
-    if not _HealingSettingsTab then
-        local ok, mod = pcall(require, 'sidekick-next.ui.settings.tab_healing')
-        if ok then _HealingSettingsTab = mod end
-    end
-    return _HealingSettingsTab
-end
-
--- Items tab (lazy-loaded)
-local _ItemsTab = nil
-local function getItemsTab()
-    if not _ItemsTab then
-        local ok, mod = pcall(require, 'sidekick-next.ui.settings.tab_items')
-        if ok then _ItemsTab = mod end
-    end
-    return _ItemsTab
-end
-
--- Buffs tab (lazy-loaded)
-local _BuffsTab = nil
-local function getBuffsTab()
-    if not _BuffsTab then
-        local ok, mod = pcall(require, 'sidekick-next.ui.settings.tab_buffs')
-        if ok then _BuffsTab = mod end
-    end
-    return _BuffsTab
-end
+local getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
+local getOocBuffExecutor = lazy('sidekick-next.utils.ooc_buff_executor')
+local getCombatSpellExecutor = lazy('sidekick-next.utils.combat_spell_executor')
+local getThrottledLog = lazy('sidekick-next.utils.throttled_log')
+local getHealingMonitor = lazy('sidekick-next.healing.ui.monitor')
+local getHealingSettingsTab = lazy('sidekick-next.ui.settings.tab_healing')
+local getItemsTab = lazy('sidekick-next.ui.settings.tab_items')
+local getBuffsTab = lazy('sidekick-next.ui.settings.tab_buffs')
 
 -- Debug logging flags for main automation loop
 local debugAutomationLogging = false

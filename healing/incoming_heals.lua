@@ -1,5 +1,6 @@
 -- healing/incoming_heals.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -7,14 +8,7 @@ local Config = nil
 local TargetMonitor = nil
 
 -- Lazy-load Analytics to avoid circular require
-local Analytics = nil
-local function getAnalytics()
-    if Analytics == nil then
-        local ok, a = pcall(require, 'sidekick-next.healing.analytics')
-        Analytics = ok and a or false
-    end
-    return Analytics or nil
-end
+local getAnalytics = lazy.once('sidekick-next.healing.analytics')
 
 -- Incoming heals from all healers: [targetId][healerId] = data
 local _incoming = {}

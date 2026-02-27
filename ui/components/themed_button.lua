@@ -17,18 +17,12 @@ local C = require('sidekick-next.ui.constants')
 local Colors = require('sidekick-next.ui.colors')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Draw = require('sidekick-next.ui.draw_helpers')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-loaded themes module for textured rendering
-local _Themes = nil
-local function getThemes()
-    if not _Themes then
-        local ok, t = pcall(require, 'sidekick-next.themes')
-        if ok then _Themes = t end
-    end
-    return _Themes
-end
+local getThemes = lazy('sidekick-next.themes')
 
 -- ============================================================
 -- TOGGLE BUTTON

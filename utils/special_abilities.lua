@@ -20,20 +20,28 @@ local function hasMeAA(idOrName)
     return aa and aa() ~= nil
 end
 
+-- Pre-built lookup sets (DEFS is static, no need to rebuild per call)
+local _cachedExcludedIds = nil
+local _cachedExcludedNames = nil
+
 function M.excludedAltIDs()
-    local s = {}
-    for _, def in ipairs(M.DEFS) do
-        if def.altID then s[tonumber(def.altID)] = true end
+    if not _cachedExcludedIds then
+        _cachedExcludedIds = {}
+        for _, def in ipairs(M.DEFS) do
+            if def.altID then _cachedExcludedIds[tonumber(def.altID)] = true end
+        end
     end
-    return s
+    return _cachedExcludedIds
 end
 
 function M.excludedNames()
-    local s = {}
-    for _, def in ipairs(M.DEFS) do
-        if def.altName then s[tostring(def.altName):lower()] = true end
+    if not _cachedExcludedNames then
+        _cachedExcludedNames = {}
+        for _, def in ipairs(M.DEFS) do
+            if def.altName then _cachedExcludedNames[tostring(def.altName):lower()] = true end
+        end
     end
-    return s
+    return _cachedExcludedNames
 end
 
 function M.getTrained()

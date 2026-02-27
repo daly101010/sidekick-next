@@ -5,6 +5,7 @@ local mq = require('mq')
 local imgui = require('ImGui')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -19,14 +20,7 @@ local State = {
 }
 
 -- Lazy-load healing module
-local _Healing = nil
-local function getHealing()
-    if _Healing == nil then
-        local ok, h = pcall(require, 'sidekick-next.healing')
-        _Healing = ok and h or false
-    end
-    return _Healing or nil
-end
+local getHealing = lazy.once('sidekick-next.healing')
 
 -- Get spell availability info
 local function getSpellAvailability(spellName)
@@ -112,6 +106,8 @@ local priorityNames = {
     [lib.Priority.DEBUFF] = 'Debuff',
     [lib.Priority.DPS] = 'DPS',
     [lib.Priority.IDLE] = 'Idle',
+    [lib.Priority.BUFF] = 'Buff',
+    [lib.Priority.MEDITATION] = 'Meditation',
 }
 
 local function formatBool(v)
@@ -198,6 +194,293 @@ local categoryLabels = {
     groupHot = 'Group HoT',
     promised = 'Promised',
 }
+
+-------------------------------------------------------------------------------
+-- Module Diagnostics
+-------------------------------------------------------------------------------
+
+local function renderModuleDiagnostics(moduleDiag)
+    if not moduleDiag or type(moduleDiag) ~= 'table' then
+        imgui.TextColored(0.6, 0.6, 0.6, 1, 'No module data in state broadcast')
+        return
+    end
+
+    -- Count modules
+    local moduleCount = 0
+    for _ in pairs(moduleDiag) do moduleCount = moduleCount + 1 end
+
+    if moduleCount == 0 then
+        imgui.TextColored(0.6, 0.6, 0.6, 1, 'No modules registered')
+        return
+    end
+
+    -- Sort modules by priority for display
+    local sorted = {}
+    for name, diag in pairs(moduleDiag) do
+        table.insert(sorted, { name = name, diag = diag })
+    end
+    table.sort(sorted, function(a, b)
+        local pa = a.diag.needPriority or 999
+        local pb = b.diag.needPriority or 999
+        if pa ~= pb then return pa < pb end
+        return a.name < b.name
+    end)
+
+    local flags = 0
+    if ImGuiTableFlags and bit32 and bit32.bor then
+        flags = bit32.bor(
+            ImGuiTableFlags.Borders,
+            ImGuiTableFlags.RowBg,
+            ImGuiTableFlags.Resizable
+        )
+    end
+
+    if imgui.BeginTable('##module_diag', 6, flags) then
+        imgui.TableSetupColumn('Module', ImGuiTableColumnFlags.WidthFixed, 130)
+        imgui.TableSetupColumn('HB', ImGuiTableColumnFlags.WidthFixed, 55)
+        imgui.TableSetupColumn('Needs', ImGuiTableColumnFlags.WidthFixed, 50)
+        imgui.TableSetupColumn('Priority', ImGuiTableColumnFlags.WidthFixed, 70)
+        imgui.TableSetupColumn('Age', ImGuiTableColumnFlags.WidthFixed, 60)
+        imgui.TableSetupColumn('Reason', ImGuiTableColumnFlags.WidthStretch)
+        imgui.TableHeadersRow()
+
+        for _, entry in ipairs(sorted) do
+            local name = entry.name
+            local diag = entry.diag
+            imgui.PushID(name)
+
+            imgui.TableNextRow()
+
+            -- Module name
+            imgui.TableNextColumn()
+            if diag.needValid then
+                imgui.TextColored(0.3, 1.0, 0.3, 1, name)  -- Green = active need
+            elseif diag.ready then
+                imgui.Text(name)  -- White = alive, no need
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, name)  -- Gray = not ready
+            end
+
+            -- Heartbeat age
+            imgui.TableNextColumn()
+            local hbAge = diag.heartbeatAge or 0
+            if hbAge < 500 then
+                imgui.TextColored(0.3, 1.0, 0.3, 1, string.format('%dms', hbAge))
+            elseif hbAge < 2000 then
+                imgui.TextColored(1.0, 1.0, 0.3, 1, string.format('%dms', hbAge))
+            else
+                imgui.TextColored(1.0, 0.3, 0.3, 1, string.format('%.1fs', hbAge / 1000))
+            end
+
+            -- Needs action
+            imgui.TableNextColumn()
+            if diag.needValid then
+                imgui.TextColored(0.3, 1.0, 0.3, 1, 'YES')
+            elseif diag.needsAction then
+                imgui.TextColored(1.0, 0.5, 0.3, 1, 'exp')  -- Sent need but expired
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, 'no')
+            end
+
+            -- Need priority
+            imgui.TableNextColumn()
+            if diag.needPriority then
+                local pName = priorityNames[diag.needPriority] or tostring(diag.needPriority)
+                imgui.Text(pName)
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
+            end
+
+            -- Need age
+            imgui.TableNextColumn()
+            if diag.needsAction or diag.needValid then
+                local age = diag.needAge or 0
+                local ttl = diag.needTtl or 250
+                local pct = ttl > 0 and (age / ttl) or 0
+                if pct < 0.5 then
+                    imgui.Text(string.format('%d/%d', age, ttl))
+                elseif pct < 1.0 then
+                    imgui.TextColored(1.0, 1.0, 0.3, 1, string.format('%d/%d', age, ttl))
+                else
+                    imgui.TextColored(1.0, 0.3, 0.3, 1, string.format('%d/%d', age, ttl))
+                end
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
+            end
+
+            -- Reason (diagnostic - why module does/doesn't need action)
+            imgui.TableNextColumn()
+            local reason = diag.reason
+            if reason and reason ~= '' then
+                -- Color code common reasons
+                if reason == 'no_action' or reason == 'no_emergency' or reason == 'no_emergency_action' then
+                    imgui.TextColored(0.6, 0.6, 0.6, 1, reason)
+                elseif reason == 'heals_disabled' or reason == 'spells_disabled' or reason == 'not_clr' then
+                    imgui.TextColored(1.0, 0.3, 0.3, 1, reason)  -- Red = config/class problem
+                elseif reason == 'init_failed' or reason == 'no_settings' then
+                    imgui.TextColored(1.0, 0.5, 0.3, 1, reason)  -- Orange = init problem
+                elseif reason == 'owns_cast' or reason == 'action found' then
+                    imgui.TextColored(0.3, 1.0, 0.3, 1, reason)  -- Green = working
+                else
+                    imgui.Text(reason)
+                end
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
+            end
+
+            imgui.PopID()
+        end
+
+        imgui.EndTable()
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Healing Decision Diagnostics
+-------------------------------------------------------------------------------
+
+-- Cache for healing decision to avoid calling every frame
+local _healDiagCache = {
+    lastCheckAt = 0,
+    result = nil,
+    reason = nil,
+    emergencyResult = nil,
+    emergencyReason = nil,
+}
+
+local function getHealingDecision()
+    local now = mq.gettime()
+    -- Refresh every 250ms
+    if (now - _healDiagCache.lastCheckAt) < 250 then
+        return _healDiagCache
+    end
+    _healDiagCache.lastCheckAt = now
+
+    local healing = getHealing()
+    if not healing then
+        _healDiagCache.result = nil
+        _healDiagCache.reason = 'module not loaded'
+        _healDiagCache.emergencyResult = nil
+        _healDiagCache.emergencyReason = 'module not loaded'
+        return _healDiagCache
+    end
+
+    if not healing.isInitialized or not healing.isInitialized() then
+        _healDiagCache.result = nil
+        _healDiagCache.reason = 'not initialized'
+        _healDiagCache.emergencyResult = nil
+        _healDiagCache.emergencyReason = 'not initialized'
+        return _healDiagCache
+    end
+
+    -- Check non-emergency heal decision
+    local ok1, action1, reason1 = pcall(function()
+        return healing.buildHealAction({
+            excludeEmergency = true,
+            ignoreSpellEngine = true,
+            skipIfCasting = true,
+        })
+    end)
+    if ok1 then
+        _healDiagCache.result = action1
+        _healDiagCache.reason = reason1 or (action1 and 'action found' or 'no action needed')
+    else
+        _healDiagCache.result = nil
+        _healDiagCache.reason = 'error: ' .. tostring(action1)
+    end
+
+    -- Check emergency heal decision
+    local ok2, action2, reason2 = pcall(function()
+        return healing.buildHealAction({
+            onlyEmergency = true,
+            ignoreSpellEngine = true,
+            skipIfCasting = true,
+        })
+    end)
+    if ok2 then
+        _healDiagCache.emergencyResult = action2
+        _healDiagCache.emergencyReason = reason2 or (action2 and 'action found' or 'no emergency')
+    else
+        _healDiagCache.emergencyResult = nil
+        _healDiagCache.emergencyReason = 'error: ' .. tostring(action2)
+    end
+
+    return _healDiagCache
+end
+
+local function renderHealingDecision()
+    local diag = getHealingDecision()
+    if not diag then
+        imgui.TextColored(0.6, 0.6, 0.6, 1, 'No healing data')
+        return
+    end
+
+    -- Emergency section
+    imgui.Text('Emergency:')
+    imgui.SameLine()
+    if diag.emergencyResult then
+        local a = diag.emergencyResult
+        imgui.TextColored(1.0, 0.3, 0.3, 1, string.format('%s on %s (id:%s)',
+            tostring(a.spellName or a.name or '?'),
+            tostring(a.targetName or '?'),
+            tostring(a.targetId or '?')))
+    else
+        imgui.TextColored(0.6, 0.6, 0.6, 1, tostring(diag.emergencyReason or 'none'))
+    end
+
+    -- Normal heal section
+    imgui.Text('Heal:')
+    imgui.SameLine()
+    if diag.result then
+        local a = diag.result
+        imgui.TextColored(0.3, 1.0, 0.3, 1, string.format('%s on %s (id:%s) [%s]',
+            tostring(a.spellName or a.name or '?'),
+            tostring(a.targetName or '?'),
+            tostring(a.targetId or '?'),
+            tostring(a.tier or '?')))
+    else
+        imgui.TextColored(0.6, 0.6, 0.6, 1, tostring(diag.reason or 'none'))
+    end
+
+    -- Show details if action exists
+    local action = diag.result or diag.emergencyResult
+    if action and type(action) == 'table' then
+        local flags = 0
+        if ImGuiTableFlags and bit32 and bit32.bor then
+            flags = bit32.bor(
+                ImGuiTableFlags.Borders,
+                ImGuiTableFlags.RowBg,
+                ImGuiTableFlags.Resizable
+            )
+        end
+        if imgui.BeginTable('##heal_decision_detail', 2, flags) then
+            imgui.TableSetupColumn('Key', ImGuiTableColumnFlags.WidthFixed, 100)
+            imgui.TableSetupColumn('Value', ImGuiTableColumnFlags.WidthStretch)
+            imgui.TableHeadersRow()
+
+            local details = {
+                { 'Spell', tostring(action.spellName or action.name or '?') },
+                { 'Target', string.format('%s (id:%s)', tostring(action.targetName or '?'), tostring(action.targetId or '?')) },
+                { 'Tier', tostring(action.tier or '?') },
+                { 'Reason', tostring(action.reason or '?') },
+            }
+            if action.expected then
+                table.insert(details, { 'Expected Heal', tostring(action.expected) })
+            end
+            if action.isHoT then
+                table.insert(details, { 'Is HoT', 'true' })
+            end
+            if action.details and type(action.details) == 'string' then
+                table.insert(details, { 'Details', action.details })
+            end
+
+            for _, row in ipairs(details) do
+                renderRow(row[1], row[2])
+            end
+            imgui.EndTable()
+        end
+    end
+end
 
 local function renderHealAvailability()
     local avail = getHealAvailability()
@@ -348,7 +631,23 @@ function M.render()
             imgui.Spacing()
             imgui.Separator()
 
-            if imgui.CollapsingHeader('Heals Available') then
+            -- Module Status (always visible - key diagnostic)
+            if imgui.CollapsingHeader('Module Status##modules') then
+                renderModuleDiagnostics(State.last.moduleDiag)
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+
+            -- Healing Decision (what HI thinks we should do right now)
+            if imgui.CollapsingHeader('Healing Decision##healdecision') then
+                renderHealingDecision()
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+
+            if imgui.CollapsingHeader('Heals Available##healavail') then
                 renderHealAvailability()
             end
         end

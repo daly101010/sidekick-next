@@ -2,6 +2,7 @@
 -- Immune Database - Persistent tracking of mob immunities per zone
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -18,14 +19,7 @@ M.currentZone = ''
 M.dirty = false
 
 -- Lazy-load Paths module
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, p = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = p end
-    end
-    return _Paths
-end
+local getPaths = lazy('sidekick-next.utils.paths')
 
 -- Database file path
 local function getDbPath()
@@ -80,8 +74,6 @@ function M.saveDatabase()
     end
 
     local path = getDbPath()
-    local file = io.open(path, 'w')
-    if not file then return end
 
     -- Escape special characters in strings for safe serialization
     local function escapeString(s)
@@ -107,8 +99,13 @@ function M.saveDatabase()
         return table.concat(lines, '\n')
     end
 
-    file:write(serialize(M.database))
-    file:close()
+    local content = serialize(M.database)
+    local safeWrite = require('sidekick-next.utils.safe_write')
+    local ok, err = safeWrite(path, content)
+    if not ok then
+        print(string.format('\ar[ImmuneDB]\ax Failed to save: %s', tostring(err)))
+        return
+    end
     M.dirty = false
 end
 

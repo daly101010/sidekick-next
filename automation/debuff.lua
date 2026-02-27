@@ -3,28 +3,15 @@
 -- Tracks slow, cripple, malo/tash across shamans, enchanters, mages
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load Actors to avoid circular requires
-local _Actors = nil
-local function getActors()
-    if not _Actors then
-        local ok, a = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok then _Actors = a end
-    end
-    return _Actors
-end
+local getActors = lazy('sidekick-next.utils.actors_coordinator')
 
 -- Lazy-load runtime cache
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
+local getCache = lazy('sidekick-next.utils.runtime_cache')
 
 -- Debuff types we track
 M.DEBUFF_TYPES = {

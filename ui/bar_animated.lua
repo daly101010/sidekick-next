@@ -11,21 +11,12 @@ local Draw = require('sidekick-next.ui.draw_helpers')
 local Helpers = require('sidekick-next.lib.helpers')
 local SpecialAbilities = require('sidekick-next.utils.special_abilities')
 local ContextMenu = require('sidekick-next.ui.components.animated_context_menu')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-loaded texture renderer
-local _TextureRenderer = nil
-local _TextureRendererLoaded = false
-local function getTextureRenderer()
-    if _TextureRendererLoaded then return _TextureRenderer end
-    _TextureRendererLoaded = true
-    local ok, renderer = pcall(require, 'sidekick-next.ui.texture_renderer')
-    if ok and renderer then
-        _TextureRenderer = renderer
-    end
-    return _TextureRenderer
-end
+local getTextureRenderer = lazy.once('sidekick-next.ui.texture_renderer')
 
 local _dragKey = nil
 local _pressKey = nil

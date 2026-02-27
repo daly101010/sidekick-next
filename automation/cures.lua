@@ -3,45 +3,15 @@
 -- Supports: Disease, Poison, Curse, Corruption
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load dependencies to avoid circular requires
-local _SpellEngine = nil
-local function getSpellEngine()
-    if not _SpellEngine then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
-        if ok then _SpellEngine = se end
-    end
-    return _SpellEngine
-end
-
-local _RuntimeCache = nil
-local function getRuntimeCache()
-    if not _RuntimeCache then
-        local ok, rc = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _RuntimeCache = rc end
-    end
-    return _RuntimeCache
-end
-
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
-
-local _ActorsCoordinator = nil
-local function getActors()
-    if not _ActorsCoordinator then
-        local ok, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok then _ActorsCoordinator = ac end
-    end
-    return _ActorsCoordinator
-end
+local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
+local getRuntimeCache = lazy('sidekick-next.utils.runtime_cache')
+local getCore = lazy('sidekick-next.utils.core')
+local getActors = lazy('sidekick-next.utils.actors_coordinator')
 
 -- Cure types we track and handle
 M.CURE_TYPES = { 'Disease', 'Poison', 'Curse', 'Corruption' }

@@ -4,16 +4,10 @@
 
 local mq = require('mq')
 local imgui = require('ImGui')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 -- Lazy-load Toast to avoid circular dependencies
-local _Toast = nil
-local function getToast()
-    if not _Toast then
-        local ok, mod = pcall(require, 'sidekick-next.ui.components.toast')
-        if ok then _Toast = mod end
-    end
-    return _Toast
-end
+local getToast = lazy('sidekick-next.ui.components.toast')
 
 local M = {}
 
@@ -37,59 +31,12 @@ local state = {
 -- Lazy-loaded dependencies
 --------------------------------------------------------------------------------
 
-local _Persistence = nil
-local function getPersistence()
-    if not _Persistence then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_persistence')
-        if ok then _Persistence = mod end
-    end
-    return _Persistence
-end
-
-local _Memorize = nil
-local function getMemorize()
-    if not _Memorize then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_memorize')
-        if ok then _Memorize = mod end
-    end
-    return _Memorize
-end
-
-local _Scanner = nil
-local function getScanner()
-    if not _Scanner then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellbook_scanner')
-        if ok then _Scanner = mod end
-    end
-    return _Scanner
-end
-
-local _CombatTab = nil
-local function getCombatTab()
-    if not _CombatTab then
-        local ok, mod = pcall(require, 'sidekick-next.ui.spell_set_combat_tab')
-        if ok then _CombatTab = mod end
-    end
-    return _CombatTab
-end
-
-local _OocTab = nil
-local function getOocTab()
-    if not _OocTab then
-        local ok, mod = pcall(require, 'sidekick-next.ui.spell_set_ooc_tab')
-        if ok then _OocTab = mod end
-    end
-    return _OocTab
-end
-
-local _SpellSetData = nil
-local function getSpellSetData()
-    if not _SpellSetData then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_data')
-        if ok then _SpellSetData = mod end
-    end
-    return _SpellSetData
-end
+local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
+local getMemorize = lazy('sidekick-next.utils.spellset_memorize')
+local getScanner = lazy('sidekick-next.utils.spellbook_scanner')
+local getCombatTab = lazy('sidekick-next.ui.spell_set_combat_tab')
+local getOocTab = lazy('sidekick-next.ui.spell_set_ooc_tab')
+local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
 
 --------------------------------------------------------------------------------
 -- Helper Functions
