@@ -2,7 +2,6 @@
 -- SideKick Texture Renderer
 -- ============================================================
 -- Core texture loading and rendering module for EQ-style textured UI.
--- Ports texture handling from eq_ui_rebuild.lua for use with themes.
 --
 -- Usage:
 --   local TextureRenderer = require('sidekick-next.ui.texture_renderer')
@@ -74,16 +73,16 @@ local function localAddRect(dl, x1, y1, x2, y2, col, rounding, flags, thickness)
     return ok == true
 end
 
--- Lazy-load eq_ui_data to avoid issues
+-- Lazy-load texture data to avoid issues
 local _data = nil
 local _dataLoadAttempted = false
 local function getData()
     if _dataLoadAttempted then return _data end
     _dataLoadAttempted = true
 
-    -- Try multiple require paths
+    -- Try multiple require paths for texture data
     local paths = {
-        'sidekick-next.eq_ui_data',
+        'eq_ui_rebuild.eq_ui_data',
         'eq_ui_data',
     }
 
@@ -540,7 +539,7 @@ end
 -- ============================================================
 
 -- Icon holder backgrounds
--- Note: eq_ui_data only has A_InvSlotFrame, use it for all states
+-- Note: texture data only has A_InvSlotFrame, use it for all states
 local ICON_HOLDERS = {
     normal = 'A_InvSlotFrame',
     hover  = 'A_InvSlotFrame',
@@ -1056,7 +1055,7 @@ function M.diagnose()
 
     -- Print results
     print('[TextureRenderer Diagnose]')
-    print('  eq_ui_data loaded: ' .. tostring(results.dataLoaded))
+    print('  texture data loaded: ' .. tostring(results.dataLoaded))
     print('  data.anims exists: ' .. tostring(results.dataHasAnims))
     print('  data.textures exists: ' .. tostring(results.dataHasTextures))
     print('  Test anim found: ' .. tostring(results.testAnimFound))

@@ -1,5 +1,6 @@
 -- healing/combat_assessor.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -7,34 +8,13 @@ local Config = nil
 local TargetMonitor = nil
 
 -- Lazy-load Logger
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 -- Lazy-load DamageAttribution
-local DamageAttribution = nil
-local function getDamageAttribution()
-    if DamageAttribution == nil then
-        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
-        DamageAttribution = ok and da or false
-    end
-    return DamageAttribution or nil
-end
+local getDamageAttribution = lazy.once('sidekick-next.healing.damage_attribution')
 
 -- Lazy-load MobAssessor for named/raid mob detection
-local MobAssessor = nil
-local function getMobAssessor()
-    if MobAssessor == nil then
-        local ok, ma = pcall(require, 'sidekick-next.healing.mob_assessor')
-        MobAssessor = ok and ma or false
-    end
-    return MobAssessor or nil
-end
+local getMobAssessor = lazy.once('sidekick-next.healing.mob_assessor')
 
 -- Mob HP tracking for TTK calculation
 local _mobSnapshots = {}  -- mobId -> { snapshots = [{hpPct, time}], name }

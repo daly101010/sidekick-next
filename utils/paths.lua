@@ -57,10 +57,16 @@ end
 --- Ensure a directory exists (creates parent dirs as needed)
 -- @param path string Directory path to create
 function M.ensureDir(path)
-    -- Try lfs first for cleaner creation
+    -- Fast path: check if directory already exists (avoids subprocess spawn)
+    local f = io.open(path .. '/._dircheck', 'w')
+    if f then
+        f:close()
+        os.remove(path .. '/._dircheck')
+        return
+    end
+    -- Try lfs first for cleaner creation (C call, no subprocess)
     local ok, lfs = pcall(require, 'lfs')
     if ok and lfs and lfs.mkdir then
-        -- Create parent directories iteratively
         local parts = {}
         for part in path:gmatch('[^/\\]+') do
             table.insert(parts, part)
@@ -71,7 +77,7 @@ function M.ensureDir(path)
             lfs.mkdir(current)
         end
     else
-        -- Fallback to os.execute with mkdir -p equivalent for Windows
+        -- Last resort: os.execute (spawns cmd.exe, can be slow with antivirus)
         os.execute('mkdir "' .. path .. '" 2>nul')
     end
 end
@@ -226,15 +232,10 @@ function M.migrateFile(oldPath, newPath)
         M.ensureDir(dir)
     end
 
-    -- Write to new location
-    local newFile = io.open(newPath, 'w')
-    if not newFile then
-        return false
-    end
-    newFile:write(content)
-    newFile:close()
-
-    return true
+    -- Write to new location (crash-safe)
+    local safeWrite = require('sidekick-next.utils.safe_write')
+    local ok = safeWrite(newPath, content)
+    return ok
 end
 
 --- Run all pending migrations

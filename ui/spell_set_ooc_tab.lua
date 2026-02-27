@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local imgui = require('ImGui')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -21,41 +22,10 @@ local state = {
 -- Lazy-loaded dependencies
 --------------------------------------------------------------------------------
 
-local _Scanner = nil
-local function getScanner()
-    if not _Scanner then
-        local ok, scanner = pcall(require, 'sidekick-next.utils.spellbook_scanner')
-        if ok then _Scanner = scanner end
-    end
-    return _Scanner
-end
-
-local _SpellsetData = nil
-local function getSpellsetData()
-    if not _SpellsetData then
-        local ok, data = pcall(require, 'sidekick-next.utils.spellset_data')
-        if ok then _SpellsetData = data end
-    end
-    return _SpellsetData
-end
-
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, builder = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = builder end
-    end
-    return _ConditionBuilder
-end
-
-local _Persistence = nil
-local function getPersistence()
-    if not _Persistence then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_persistence')
-        if ok then _Persistence = mod end
-    end
-    return _Persistence
-end
+local getScanner = lazy('sidekick-next.utils.spellbook_scanner')
+local getSpellsetData = lazy('sidekick-next.utils.spellset_data')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
 
 --------------------------------------------------------------------------------
 -- Helper Functions

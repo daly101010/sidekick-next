@@ -3,24 +3,13 @@
 -- Prevents spam, ensures proper sequencing, enables future spell integration
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 local Core = require('sidekick-next.utils.core')
 
 local M = {}
 
 -- Optional buff logger for tracing executor-level spell casts
-local _BuffLogger = nil
-local function getBuffLogger()
-    if not _BuffLogger then
-        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
-        if ok then
-            _BuffLogger = logger
-            if _BuffLogger and _BuffLogger.init then
-                _BuffLogger.init()
-            end
-        end
-    end
-    return _BuffLogger
-end
+local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
 
 local function isBuffSpell(opts)
     if not opts then return false end

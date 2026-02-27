@@ -2,6 +2,7 @@
 -- Caster-specific assist logic: stay-put casting with rooted-mob escape
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -30,23 +31,8 @@ M.escapeState = {
 }
 
 -- Lazy-load dependencies
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
-
-local _CombatAssist = nil
-local function getCombatAssist()
-    if not _CombatAssist then
-        local ok, ca = pcall(require, 'sidekick-next.utils.combatassist')
-        if ok then _CombatAssist = ca end
-    end
-    return _CombatAssist
-end
+local getCore = lazy('sidekick-next.utils.core')
+local getCombatAssist = lazy('sidekick-next.utils.combatassist')
 
 --- Check if a spawn is targeting me
 -- @param spawn userdata Spawn to check

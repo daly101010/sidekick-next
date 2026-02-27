@@ -6,18 +6,12 @@
 local imgui = require('ImGui')
 local Settings = require('sidekick-next.ui.settings')
 local Components = require('sidekick-next.ui.components')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load ActorsCoordinator
-local _ActorsCoordinator = nil
-local function getActorsCoordinator()
-    if not _ActorsCoordinator then
-        local ok, mod = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok then _ActorsCoordinator = mod end
-    end
-    return _ActorsCoordinator
-end
+local getActorsCoordinator = lazy('sidekick-next.utils.actors_coordinator')
 
 function M.draw(settings, themeNames, onChange)
     local themeName = settings.Theme or 'Classic'

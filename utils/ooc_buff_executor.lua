@@ -3,6 +3,7 @@
 -- Handles casting buffs when out of combat, including buff-swap for non-rotation spells
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -29,59 +30,12 @@ local GCD_MS = 2250                 -- Global cooldown in milliseconds
 -- Lazy-loaded Dependencies
 --------------------------------------------------------------------------------
 
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, mod = pcall(require, 'sidekick-next.core')
-        if ok then _Core = mod end
-    end
-    return _Core
-end
-
-local _SpellsetPersistence = nil
-local function getPersistence()
-    if not _SpellsetPersistence then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_persistence')
-        if ok then _SpellsetPersistence = mod end
-    end
-    return _SpellsetPersistence
-end
-
-local _SpellSetData = nil
-local function getSpellSetData()
-    if not _SpellSetData then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellset_data')
-        if ok then _SpellSetData = mod end
-    end
-    return _SpellSetData
-end
-
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, mod = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = mod end
-    end
-    return _ConditionBuilder
-end
-
-local _ConditionContext = nil
-local function getConditionContext()
-    if not _ConditionContext then
-        local ok, mod = pcall(require, 'sidekick-next.utils.condition_context')
-        if ok then _ConditionContext = mod end
-    end
-    return _ConditionContext
-end
-
-local _SpellbookScanner = nil
-local function getSpellbookScanner()
-    if not _SpellbookScanner then
-        local ok, mod = pcall(require, 'sidekick-next.utils.spellbook_scanner')
-        if ok then _SpellbookScanner = mod end
-    end
-    return _SpellbookScanner
-end
+local getCore = lazy('sidekick-next.core')
+local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
+local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getConditionContext = lazy('sidekick-next.utils.condition_context')
+local getSpellbookScanner = lazy('sidekick-next.utils.spellbook_scanner')
 
 --------------------------------------------------------------------------------
 -- Internal Helpers

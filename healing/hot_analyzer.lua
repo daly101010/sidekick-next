@@ -2,6 +2,7 @@
 -- HoT Trust & Healing Efficiency Module
 -- Determines when to trust active HoTs vs when to supplement with direct heals
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -12,24 +13,10 @@ local CombatAssessor = nil
 local Proactive = nil
 
 -- Lazy-load Logger
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 -- Lazy-load DamageAttribution
-local DamageAttribution = nil
-local function getDamageAttribution()
-    if DamageAttribution == nil then
-        local ok, da = pcall(require, 'sidekick-next.healing.damage_attribution')
-        DamageAttribution = ok and da or false
-    end
-    return DamageAttribution or nil
-end
+local getDamageAttribution = lazy.once('sidekick-next.healing.damage_attribution')
 
 --------------------------------------------------------------------------------
 -- Initialization

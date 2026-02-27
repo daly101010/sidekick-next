@@ -1,15 +1,9 @@
 -- healing/config.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 -- Lazy-load Logger to avoid circular requires
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 local M = {
     _version = "1.0",
@@ -627,21 +621,19 @@ end
 function M.save()
     local log = getLogger()
     local path = getConfigPath()
-    local file = io.open(path, 'w')
-    if not file then
-        if log then log.error('config', 'Failed to open config file for writing: %s', path) end
-        return false
-    end
     local snapshot = {}
     for k, v in pairs(M) do
         if type(v) ~= 'function' then
             snapshot[k] = v
         end
     end
-    file:write('return ')
-    file:write(serializeValue(snapshot))
-    file:write('\n')
-    file:close()
+    local content = 'return ' .. serializeValue(snapshot) .. '\n'
+    local safeWrite = require('sidekick-next.utils.safe_write')
+    local ok, err = safeWrite(path, content)
+    if not ok then
+        if log then log.error('config', 'Failed to save config: %s', tostring(err)) end
+        return false
+    end
     if log then log.info('config', 'Config saved to %s', path) end
     return true
 end

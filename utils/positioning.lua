@@ -1,4 +1,5 @@
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -8,14 +9,7 @@ M.originalStickMode = nil
 M.inSoftPause = false
 
 -- Lazy-load Core for settings access (avoid hard dependency cycles)
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, core = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = core end
-    end
-    return _Core
-end
+local getCore = lazy('sidekick-next.utils.core')
 
 local function getSetting(key)
     local Core = getCore()

@@ -2,6 +2,7 @@
 -- Spell Lineup - Gem scanning and spell categorization
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -11,14 +12,7 @@ M.lastScanZone = ''
 M.lastLoadout = ''
 
 -- Lazy-load class config loader (to map gem slots -> settingKey)
-local _ConfigLoader = nil
-local function getConfigLoader()
-    if not _ConfigLoader then
-        local ok, cl = pcall(require, 'sidekick-next.utils.class_config_loader')
-        if ok then _ConfigLoader = cl end
-    end
-    return _ConfigLoader
-end
+local getConfigLoader = lazy('sidekick-next.utils.class_config_loader')
 
 local function buildGemToSettingKey(settings)
     local gemToKey = {}

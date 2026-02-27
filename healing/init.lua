@@ -1,75 +1,32 @@
 -- healing/init.lua (full implementation)
+-- Submodules loaded incrementally via initPhased() to avoid blocking MQ frames.
+-- Each initPhased(n) call loads a batch of submodules, spreading ~6s of disk I/O
+-- across multiple main loop ticks with frame yields between them.
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
--- Debug logging to file (using centralized Paths)
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, p = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = p end
-    end
-    return _Paths
-end
+local debugLog = require('sidekick-next.utils.debug_log').tagged('Heal', 'SideKick_HealDebug.log')
 
-local function debugLog(fmt, ...)
-    local msg = string.format(fmt, ...)
-    local Paths = getPaths()
-    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_HealDebug.log')
-    local f = io.open(logPath, 'a')
-    if f then
-        f:write(string.format('[%s] [Heal] %s\n', os.date('%H:%M:%S'), msg))
-        f:close()
-    end
-end
-
-local Config = require('sidekick-next.healing.config')
-local HealTracker = require('sidekick-next.healing.heal_tracker')
-local TargetMonitor = require('sidekick-next.healing.target_monitor')
-local IncomingHeals = require('sidekick-next.healing.incoming_heals')
-local CombatAssessor = require('sidekick-next.healing.combat_assessor')
-local HealSelector = require('sidekick-next.healing.heal_selector')
-local Analytics = require('sidekick-next.healing.analytics')
-local SpellEvents = require('sidekick-next.healing.spell_events')
-local Logger = require('sidekick-next.healing.logger')
+-- Submodule references (nil until their init phase runs)
+local Config = nil
+local HealTracker = nil
+local TargetMonitor = nil
+local IncomingHeals = nil
+local CombatAssessor = nil
+local HealSelector = nil
+local Analytics = nil
+local SpellEvents = nil
+local Logger = nil
 
 -- Lazy-load UI modules
-local Monitor = nil
-local function getMonitor()
-    if Monitor == nil then
-        local ok, m = pcall(require, 'sidekick-next.healing.ui.monitor')
-        Monitor = ok and m or false
-    end
-    return Monitor or nil
-end
-
-local Settings = nil
-local function getSettings()
-    if Settings == nil then
-        local ok, s = pcall(require, 'sidekick-next.healing.ui.settings')
-        Settings = ok and s or false
-    end
-    return Settings or nil
-end
+local getMonitor = lazy.once('sidekick-next.healing.ui.monitor')
+local getSettings = lazy.once('sidekick-next.healing.ui.settings')
 
 -- Lazy-load Proactive module (may not exist yet)
-local Proactive = nil
-local function getProactive()
-    if Proactive == nil then
-        local ok, p = pcall(require, 'sidekick-next.healing.proactive')
-        Proactive = ok and p or false
-    end
-    return Proactive or nil
-end
+local getProactive = lazy.once('sidekick-next.healing.proactive')
 
 -- Lazy-load HotAnalyzer (HoT trust calculations)
-local HotAnalyzer = nil
-local function getHotAnalyzer()
-    if HotAnalyzer == nil then
-        local ok, ha = pcall(require, 'sidekick-next.healing.hot_analyzer')
-        HotAnalyzer = ok and ha or false
-    end
-    return HotAnalyzer or nil
-end
+local getHotAnalyzer = lazy.once('sidekick-next.healing.hot_analyzer')
 
 -- Lazy-load MobAssessor (named mob detection and consider-based tier assessment)
 local MobAssessor = nil
@@ -88,7 +45,16 @@ end
 
 local M = {}
 
+-- Phased init: 5 phases spread across separate main loop ticks
+-- Phase 1: Config + Logger (~1100 lines)
+-- Phase 2: HealTracker + TargetMonitor + IncomingHeals + CombatAssessor (~1600 lines)
+-- Phase 3: Analytics + SpellEvents + HealSelector + callbacks (~2500 lines) → _initialized = true
+-- Phase 4: Proactive + HotAnalyzer + DamageParser + DamageAttribution + ActorsCoordinator
+-- Phase 5: MobAssessor + UI modules + exposed references → _optionalReady = true
+M.TOTAL_INIT_PHASES = 5
+
 local _initialized = false
+local _optionalReady = false  -- True after all optional modules loaded (phases 4-5)
 local _lastHealAttempt = 0
 local _priorityActive = false
 local ActorsCoordinator = nil
@@ -771,50 +737,74 @@ local function monitorDuck(opts)
     return false
 end
 
-function M.init()
-    if _initialized then return end
-
-    local ok, err = pcall(function()
+--- Phased initialization: loads submodules in batches across separate main loop ticks.
+--- Call initPhased(1), then initPhased(2), etc. with mq.delay() between each call
+--- so MQ can process frames and prevent screen lockup.
+--- @param phase number Init phase (1..TOTAL_INIT_PHASES)
+function M.initPhased(phase)
+    if phase == 1 then
+        -- Phase 1: Config + Logger (~1100 lines)
+        Config = require('sidekick-next.healing.config')
+        Logger = require('sidekick-next.healing.logger')
         Config.load()
-        Config.autoAssignFromSpellBar()  -- Re-scan spell bar to update spell categories
-        Logger.init(Config)  -- Initialize logging first for troubleshooting
+        Config.autoAssignFromSpellBar()
+        Logger.init(Config)
+
+    elseif phase == 2 then
+        -- Phase 2: Core tracking modules (~1600 lines)
+        HealTracker = require('sidekick-next.healing.heal_tracker')
+        TargetMonitor = require('sidekick-next.healing.target_monitor')
+        IncomingHeals = require('sidekick-next.healing.incoming_heals')
+        CombatAssessor = require('sidekick-next.healing.combat_assessor')
         HealTracker.init(Config)
         TargetMonitor.init(Config)
         IncomingHeals.init(Config, TargetMonitor)
         CombatAssessor.init(Config, TargetMonitor)
-        HealSelector.init(Config, HealTracker, TargetMonitor, IncomingHeals, CombatAssessor)
+
+    elseif phase == 3 then
+        -- Phase 3: Heal selection + events (~2500 lines) → marks _initialized
+        Analytics = require('sidekick-next.healing.analytics')
+        SpellEvents = require('sidekick-next.healing.spell_events')
+        HealSelector = require('sidekick-next.healing.heal_selector')
         Analytics.init()
         SpellEvents.init(HealTracker, IncomingHeals, Analytics, Config)
-
-        -- Set broadcast callbacks for SpellEvents (avoids circular require)
         SpellEvents.setBroadcastCallbacks(
             function(targetId, spellName) M.broadcastLanded(targetId, spellName) end,
             function(targetId, spellName, reason) M.broadcastCancelled(targetId, spellName, reason) end
         )
+        HealSelector.init(Config, HealTracker, TargetMonitor, IncomingHeals, CombatAssessor)
 
-        -- Initialize Proactive if available
+        -- Update exposed module references (external code may access these)
+        M.Config = Config
+        M.HealTracker = HealTracker
+        M.TargetMonitor = TargetMonitor
+        M.IncomingHeals = IncomingHeals
+        M.CombatAssessor = CombatAssessor
+        M.HealSelector = HealSelector
+        M.Analytics = Analytics
+        M.SpellEvents = SpellEvents
+        M.Logger = Logger
+
+        _initialized = true
+        Logger.info('session', 'Healing Intelligence core initialized (phased) - fileLogging=%s', tostring(Config.fileLogging))
+
+    elseif phase == 4 then
+        -- Phase 4: Optional analysis modules + ActorsCoordinator
         local proactive = getProactive()
         if proactive and proactive.init then
             proactive.init(Config, HealTracker, TargetMonitor, CombatAssessor)
         end
-
-        -- Initialize HotAnalyzer
         local ha = getHotAnalyzer()
         if ha and ha.init then
             ha.init(Config, HealTracker, CombatAssessor, proactive)
         end
-
-        -- Initialize DamageParser early (registers damage events)
         getDamageParser()
-
-        -- Initialize DamageAttribution (registers damage events for mob attribution)
         getDamageAttribution()
 
         -- Load ActorsCoordinator for multi-healer coordination
         local acOk, ac = pcall(require, 'sidekick-next.utils.actors_coordinator')
         if acOk and ac then
             ActorsCoordinator = ac
-            -- Register callbacks to receive heal coordination messages (avoids circular require)
             if ac.registerHealingCallback then
                 ac.registerHealingCallback('heal:incoming', function(content, senderName)
                     M.handleActorMessage('heal:incoming', content, senderName)
@@ -828,10 +818,10 @@ function M.init()
             end
         end
 
-        -- Initialize MobAssessor for named mob detection
+    elseif phase == 5 then
+        -- Phase 5: MobAssessor + UI modules + finalize
         getMobAssessor()
 
-        -- Initialize UI modules if available
         local monitor = getMonitor()
         if monitor and monitor.init then
             local mobAssessor = getMobAssessor()
@@ -841,7 +831,6 @@ function M.init()
         local settings = getSettings()
         if settings and settings.init then
             settings.init(Config)
-            -- Wire up the toggle monitor callback
             if settings.setToggleMonitorCallback then
                 settings.setToggleMonitorCallback(function()
                     local mon = getMonitor()
@@ -849,25 +838,33 @@ function M.init()
                 end)
             end
         end
-    end)
 
-    if not ok then
-        Logger.error('session', 'Init error: %s', tostring(err))
-        return
+        _optionalReady = true
+        if Logger then
+            Logger.info('session', 'All optional modules loaded')
+        end
     end
+end
 
-    _initialized = true
-    Logger.info('session', 'Healing Intelligence initialized - fileLogging=%s', tostring(Config.fileLogging))
+--- Backward-compatible init: runs all phases synchronously.
+--- Use initPhased() for non-blocking startup.
+function M.init()
+    if _initialized then return end
+    for phase = 1, M.TOTAL_INIT_PHASES do
+        M.initPhased(phase)
+    end
 end
 
 function M.tick(settings)
+    if not _initialized then return false end
+
     -- DEBUG: Track which module stalls (logs to file)
     local _tickDbg = true
     local function tickLog(msg)
         if _tickDbg then debugLog('[HealTick] %s', msg) end
     end
 
-    -- Update all modules
+    -- Update core modules (loaded in phases 1-3)
     tickLog('1-TargetMonitor')
     TargetMonitor.tick()
     tickLog('2-IncomingHeals')
@@ -879,27 +876,27 @@ function M.tick(settings)
     tickLog('5-HealTracker')
     HealTracker.tick()
 
-    tickLog('6-Proactive')
-    local proactive = getProactive()
-    if proactive and proactive.tick then
-        proactive.tick()
+    -- Optional modules: only tick after phases 4-5 have initialized them
+    if _optionalReady then
+        tickLog('6-Proactive')
+        local proactive = getProactive()
+        if proactive and proactive.tick then
+            proactive.tick()
+        end
+
+        tickLog('7-DamageParser')
+        local dp = getDamageParser()
+        if dp and dp.tick then dp.tick() end
+
+        tickLog('8-DamageAttribution')
+        local da = getDamageAttribution()
+        if da and da.tick then da.tick() end
+
+        tickLog('9-MobAssessor')
+        local ma = getMobAssessor()
+        if ma and ma.tick then ma.tick() end
     end
-
-    -- Update DamageParser for dual-source DPS tracking
-    tickLog('7-DamageParser')
-    local dp = getDamageParser()
-    if dp and dp.tick then dp.tick() end
-
-    -- Update DamageAttribution for mob-specific damage tracking
-    tickLog('8-DamageAttribution')
-    local da = getDamageAttribution()
-    if da and da.tick then da.tick() end
-
-    -- Update MobAssessor for named mob scanning (runs when safe/idle)
-    tickLog('9-MobAssessor')
-    local ma = getMobAssessor()
-    if ma and ma.tick then ma.tick() end
-    tickLog('10-MobAssessor done')
+    tickLog('10-OptionalDone')
 
     -- Check if healing is enabled (Config.enabled is the single source of truth)
     tickLog('11-CheckEnabled')
@@ -1155,33 +1152,37 @@ function M.isInitialized()
 end
 
 function M.isCasting()
-    return SpellEvents.isCasting()
+    return SpellEvents and SpellEvents.isCasting and SpellEvents.isCasting() or false
 end
 
 function M.checkDucking(opts)
+    if not _initialized then return false end
     return monitorDuck(opts)
 end
 
 function M.tickSensors()
+    if not _initialized then return end
     TargetMonitor.tick()
     IncomingHeals.tick()
     CombatAssessor.tick()
     SpellEvents.tick()
     HealTracker.tick()
 
-    local proactive = getProactive()
-    if proactive and proactive.tick then
-        proactive.tick()
+    if _optionalReady then
+        local proactive = getProactive()
+        if proactive and proactive.tick then
+            proactive.tick()
+        end
+
+        local dp = getDamageParser()
+        if dp and dp.tick then dp.tick() end
+
+        local da = getDamageAttribution()
+        if da and da.tick then da.tick() end
+
+        local ma = getMobAssessor()
+        if ma and ma.tick then ma.tick() end
     end
-
-    local dp = getDamageParser()
-    if dp and dp.tick then dp.tick() end
-
-    local da = getDamageAttribution()
-    if da and da.tick then da.tick() end
-
-    local ma = getMobAssessor()
-    if ma and ma.tick then ma.tick() end
 end
 
 function M.buildHealAction(opts)
@@ -1193,14 +1194,16 @@ function M.prepareHealCast(action)
 end
 
 function M.setCastInfo(castInfo)
-    SpellEvents.setCastInfo(castInfo)
+    if SpellEvents then SpellEvents.setCastInfo(castInfo) end
 end
 
 function M.registerHealCast(castInfo)
+    if not _initialized then return end
     registerHealCast(castInfo)
 end
 
 function M.clearCastInfo()
+    if not _initialized then return end
     clearHealCast()
 end
 
@@ -1245,6 +1248,7 @@ end
 
 -- Handler for incoming messages from other healers
 function M.handleActorMessage(msgType, data, senderId)
+    if not IncomingHeals then return end
     if msgType == 'heal:incoming' then
         IncomingHeals.add(senderId, data.targetId, data)
     elseif msgType == 'heal:landed' then
@@ -1312,16 +1316,16 @@ function M.isMonitorOpen()
     return monitor and monitor.isOpen and monitor.isOpen() or false
 end
 
--- Expose modules
-M.Config = Config
-M.HealTracker = HealTracker
-M.TargetMonitor = TargetMonitor
-M.IncomingHeals = IncomingHeals
-M.CombatAssessor = CombatAssessor
-M.HealSelector = HealSelector
-M.Analytics = Analytics
-M.SpellEvents = SpellEvents
-M.Logger = Logger
+-- Expose modules (nil at load time, populated during initPhased phase 3)
+M.Config = nil
+M.HealTracker = nil
+M.TargetMonitor = nil
+M.IncomingHeals = nil
+M.CombatAssessor = nil
+M.HealSelector = nil
+M.Analytics = nil
+M.SpellEvents = nil
+M.Logger = nil
 
 -- UI modules are exposed via getter functions to allow late binding
 function M.getMonitor() return getMonitor() end

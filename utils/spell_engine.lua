@@ -3,72 +3,17 @@
 -- Blocking pre-checks, non-blocking cast monitoring, auto-interrupt
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
--- Debug logging to file (using centralized Paths)
-local _Paths = nil
-local function getPaths()
-    if not _Paths then
-        local ok, p = pcall(require, 'sidekick-next.utils.paths')
-        if ok then _Paths = p end
-    end
-    return _Paths
-end
-
-local function debugLog(fmt, ...)
-    local msg = string.format(fmt, ...)
-    local Paths = getPaths()
-    local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/SideKick_SpellEngine.log')
-    local f = io.open(logPath, 'a')
-    if f then
-        f:write(string.format('[%s] [SpellEngine] %s\n', os.date('%H:%M:%S'), msg))
-        f:close()
-    end
-end
+local debugLog = require('sidekick-next.utils.debug_log').tagged('SpellEngine', 'SideKick_SpellEngine.log')
 
 -- Lazy-load dependencies to avoid circular requires
-local _SpellEvents = nil
-local function getSpellEvents()
-    if not _SpellEvents then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_events')
-        if ok then _SpellEvents = se end
-    end
-    return _SpellEvents
-end
-
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
-
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
-
--- Optional buff logger for cast tracing
-local _BuffLogger = nil
-local function getBuffLogger()
-    if not _BuffLogger then
-        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
-        if ok then
-            _BuffLogger = logger
-            if _BuffLogger and _BuffLogger.init then
-                _BuffLogger.init()
-            end
-        end
-    end
-    return _BuffLogger
-end
+local getSpellEvents = lazy('sidekick-next.utils.spell_events')
+local getCache = lazy('sidekick-next.utils.runtime_cache')
+local getCore = lazy('sidekick-next.utils.core')
+local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
 
 -- Cast states
 M.STATE = {
@@ -101,10 +46,20 @@ local SELF_TARGET_TYPES = {
     ['Self Only'] = true,
 }
 
--- Current cast state
+-- Current cast state (use setState() to update — tracks entry time for watchdog)
 local _state = M.STATE.IDLE
 local _castData = nil
 local _initialized = false
+local _stateEnteredAt = os.clock()
+
+-- Maximum time any non-IDLE state can persist before forced reset (seconds)
+local MAX_CASTING_TIME = 15.0   -- Longest EQ spell is ~12s, add buffer
+local MAX_STATE_TIME = 20.0     -- Global watchdog for any stuck state
+
+local function setState(newState)
+    _state = newState
+    _stateEnteredAt = os.clock()
+end
 
 -- Settings cache
 local _settings = nil
@@ -133,7 +88,7 @@ function M.init()
         SpellEvents.registerEvents()
     end
     _initialized = true
-    _state = M.STATE.IDLE
+    setState(M.STATE.IDLE)
     _castData = nil
 end
 
@@ -144,7 +99,7 @@ function M.shutdown()
         SpellEvents.unregisterEvents()
     end
     _initialized = false
-    _state = M.STATE.IDLE
+    setState(M.STATE.IDLE)
     _castData = nil
 end
 
@@ -380,7 +335,7 @@ function M.cast(spellName, targetId, opts)
         opts = opts,
         spellCategory = opts.spellCategory or opts.category or 'unknown',
     }
-    _state = M.STATE.WAITING_START
+    setState(M.STATE.WAITING_START)
 
     if buffLog then
         buffLog.info('spell_engine', 'Cast issued: spell=%s targetId=%d category=%s retries=%d',
@@ -491,14 +446,14 @@ local function handleResult(result)
         SpellEvents.resetResult()
         mq.cmdf('/cast "%s"', _castData.spellName)
         _castData.startTime = os.clock()
-        _state = M.STATE.WAITING_START
+        setState(M.STATE.WAITING_START)
     else
         -- Cast complete (success or unrecoverable failure)
         if buffLog and _castData then
             buffLog.info('spell_engine', 'Cast completed: spell=%s result=%s',
                 tostring(_castData.spellName), SpellEvents.getResultName(result))
         end
-        _state = M.STATE.IDLE
+        setState(M.STATE.IDLE)
         _castData = nil
     end
 end
@@ -512,12 +467,26 @@ function M.tick()
     local me = mq.TLO.Me
     if not me or not me() then
         debugLog('[Tick] no me, resetting to IDLE')
-        _state = M.STATE.IDLE
+        setState(M.STATE.IDLE)
         _castData = nil
         return
     end
 
     local now = os.clock()
+
+    -- Global stuck-state watchdog: force reset if any state persists too long
+    local stateAge = now - _stateEnteredAt
+    local timeout = (_state == M.STATE.CASTING) and MAX_CASTING_TIME or MAX_STATE_TIME
+    if stateAge > timeout then
+        local stateName = M.STATE_NAMES[_state] or 'UNKNOWN'
+        debugLog('[Tick] WATCHDOG: state %s stuck for %.1fs (limit %.1fs), forcing IDLE',
+            stateName, stateAge, timeout)
+        print(string.format(
+            '\ar[SpellEngine]\ax Watchdog: stuck in %s for %.1fs, resetting', stateName, stateAge))
+        setState(M.STATE.IDLE)
+        _castData = nil
+        return
+    end
     local SpellEvents = getSpellEvents()
     local result, resultTime = 0, 0
     if SpellEvents then
@@ -532,7 +501,7 @@ function M.tick()
         -- Check for cast begin event
         if SpellEvents and result == SpellEvents.RESULT.SUCCESS then
             debugLog('[Tick] WAITING_START -> CASTING (success event)')
-            _state = M.STATE.CASTING
+            setState(M.STATE.CASTING)
             return
         end
 
@@ -555,7 +524,7 @@ function M.tick()
                 _castData.startTime = now
             else
                 debugLog('[Tick] WAITING_START -> IDLE (no retries left)')
-                _state = M.STATE.IDLE
+                setState(M.STATE.IDLE)
                 _castData = nil
             end
         end
@@ -587,7 +556,7 @@ function M.tick()
         if shouldStop then
             debugLog('[Tick] CASTING interrupted reason=%s', tostring(stopReason))
             mq.TLO.Me.StopCast()
-            _state = M.STATE.IDLE
+            setState(M.STATE.IDLE)
             _castData = nil
             return
         end
@@ -599,7 +568,7 @@ function M.tick()
     -- State: COMPLETED (cleanup)
     if _state == M.STATE.COMPLETED then
         debugLog('[Tick] COMPLETED -> IDLE')
-        _state = M.STATE.IDLE
+        setState(M.STATE.IDLE)
         _castData = nil
     end
 end
@@ -648,7 +617,7 @@ function M.abort()
         if casting ~= '' then
             mq.TLO.Me.StopCast()
         end
-        _state = M.STATE.IDLE
+        setState(M.STATE.IDLE)
         _castData = nil
     end
 end

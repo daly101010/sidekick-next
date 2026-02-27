@@ -3,6 +3,7 @@
 -- Computes expensive TLO queries on a cadence, all modules read from here
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -10,14 +11,7 @@ local M = {}
 M._settings = nil
 
 -- Lazy-load Targeting module to avoid circular dependency
-local _Targeting = nil
-local function getTargeting()
-    if not _Targeting then
-        local ok, targeting = pcall(require, 'sidekick-next.utils.targeting')
-        if ok then _Targeting = targeting end
-    end
-    return _Targeting
-end
+local getTargeting = lazy('sidekick-next.utils.targeting')
 
 -- Get setting value (with fallback)
 local function getSetting(key)
@@ -46,8 +40,8 @@ M.buffState = {}  -- { [memberId] = { [buffCategory] = { present, remaining, spe
 local _lastHeavyUpdate = 0
 local _lastLightUpdate = 0
 local _lastBuffScan = 0
-local HEAVY_INTERVAL = 0.25  -- 250ms for expensive scans
-local LIGHT_INTERVAL = 0.05  -- 50ms for lightweight checks
+local HEAVY_INTERVAL = 0.10  -- 100ms for group HP/position scans (healing needs fresh data)
+local LIGHT_INTERVAL = 0.05  -- 50ms for lightweight self checks
 local BUFF_SCAN_INTERVAL = 3.0  -- 3s between buff scans (expensive due to retargeting)
 
 function M.init()
@@ -56,23 +50,32 @@ function M.init()
     M.group = {}
     M.xtarget = {}
     M.buffState = {}
+    _identityCached = false
 end
 
 function M.tick()
     local now = os.clock()
 
-    -- Light update (every 50ms)
+    -- Light update (every 50ms) — self + target snapshot
     if (now - _lastLightUpdate) >= LIGHT_INTERVAL then
         _lastLightUpdate = now
         M.updateLight()
+        return  -- Stagger: only one update type per tick to spread TLO load
     end
 
-    -- Heavy update (every 250ms)
+    -- Heavy update (every 100ms) — group HP, xtarget, positions
     if (now - _lastHeavyUpdate) >= HEAVY_INTERVAL then
         _lastHeavyUpdate = now
         M.updateHeavy()
     end
 end
+
+-- Cached identity fields (id/name/class/level rarely change during a session)
+local _cachedId = 0
+local _cachedName = ''
+local _cachedClass = ''
+local _cachedLevel = 0
+local _identityCached = false
 
 function M.updateLight()
     local me = mq.TLO.Me
@@ -81,23 +84,36 @@ function M.updateLight()
         return
     end
 
-    -- Safe casting check: always boolean
+    -- Cache identity fields once (these don't change during gameplay)
+    if not _identityCached then
+        _cachedId = tonumber(me.ID()) or 0
+        _cachedName = me.CleanName() or ''
+        _cachedClass = (me.Class and me.Class.ShortName()) or ''
+        _cachedLevel = tonumber(me.Level()) or 0
+        _identityCached = (_cachedId > 0)
+    end
+
+    -- Casting state: check once, derive all fields
     local castSpell = me.Casting() or ''
-    local castingSpellObj = me.Casting
+    local isCasting = castSpell ~= ''
     local castingId = 0
     local castingTargetId = 0
-    if castingSpellObj and castingSpellObj() then
-        castingId = tonumber(castingSpellObj.ID()) or 0
-    end
-    if me.CastingTarget and me.CastingTarget() then
-        castingTargetId = tonumber(me.CastingTarget.ID()) or 0
+    if isCasting then
+        local castingObj = me.Casting
+        if castingObj and castingObj.ID then
+            castingId = tonumber(castingObj.ID()) or 0
+        end
+        local castTarget = me.CastingTarget
+        if castTarget and castTarget() then
+            castingTargetId = tonumber(castTarget.ID()) or 0
+        end
     end
 
     M.me = {
-        id = tonumber(me.ID()) or 0,
-        name = me.CleanName() or '',
-        class = (me.Class and me.Class.ShortName()) or '',
-        level = tonumber(me.Level()) or 0,
+        id = _cachedId,
+        name = _cachedName,
+        class = _cachedClass,
+        level = _cachedLevel,
 
         -- Resources (checked frequently for heals/burns)
         hp = tonumber(me.PctHPs()) or 0,
@@ -106,10 +122,10 @@ function M.updateLight()
 
         -- Combat state
         combat = me.Combat() == true,
-        casting = castSpell ~= '',
-        castingSpell = castSpell,                -- Spell name being cast
-        castingId = castingId,                   -- Spell ID being cast
-        castingTargetId = castingTargetId,       -- Target of current cast
+        casting = isCasting,
+        castingSpell = castSpell,
+        castingId = castingId,
+        castingTargetId = castingTargetId,
         moving = me.Moving() == true,
         sitting = me.Sitting() == true,
         standing = me.Standing() == true,
@@ -122,10 +138,10 @@ function M.updateLight()
 
     -- Self pet tracking
     local myPet = me.Pet
-    if myPet and myPet() and myPet.ID and myPet.ID() and myPet.ID() > 0 then
+    if myPet and myPet() then
         local petId = tonumber(myPet.ID()) or 0
         if petId > 0 then
-            M.buffState[petId] = M.buffState[petId] or {}
+            if not M.buffState[petId] then M.buffState[petId] = {} end
             M.me.pet = {
                 id = petId,
                 name = myPet.CleanName() or '',
@@ -133,6 +149,8 @@ function M.updateLight()
                 distance = tonumber(myPet.Distance()) or 0,
                 buffs = M.buffState[petId],
             }
+        else
+            M.me.pet = nil
         end
     else
         M.me.pet = nil
@@ -140,9 +158,10 @@ function M.updateLight()
 
     -- Target snapshot
     local target = mq.TLO.Target
-    if target and target() and target.ID() and target.ID() > 0 then
+    local targetId = target and target() and tonumber(target.ID()) or 0
+    if targetId > 0 then
         M.target = {
-            id = tonumber(target.ID()) or 0,
+            id = targetId,
             name = target.CleanName() or '',
             type = target.Type() or '',
             level = tonumber(target.Level()) or 0,
@@ -175,53 +194,54 @@ function M.updateHeavy()
 
     for i = 1, memberCount do
         local member = mq.TLO.Group.Member(i)
-        if member and member() then
-            local hp = tonumber(member.PctHPs()) or 100
-            local memberId = tonumber(member.ID()) or 0
+        if not member or not member() then goto nextMember end
 
-            -- Ensure buff state exists for this member
-            M.buffState[memberId] = M.buffState[memberId] or {}
+        local memberId = tonumber(member.ID()) or 0
+        if memberId <= 0 then goto nextMember end
 
-            -- Check for pet
-            local pet = nil
-            local memberPet = member.Pet
-            if memberPet and memberPet() and memberPet.ID and memberPet.ID() and memberPet.ID() > 0 then
-                local petId = tonumber(memberPet.ID()) or 0
-                if petId > 0 then
-                    -- Ensure buff state exists for pet
-                    M.buffState[petId] = M.buffState[petId] or {}
+        local hp = tonumber(member.PctHPs()) or 100
 
-                    pet = {
-                        id = petId,
-                        name = memberPet.CleanName() or '',
-                        hp = tonumber(memberPet.PctHPs()) or 100,
-                        distance = tonumber(memberPet.Distance()) or 999,
-                        buffs = M.buffState[petId],  -- Reference to persistent buff state
-                    }
-                end
-            end
+        -- Ensure buff state exists for this member
+        if not M.buffState[memberId] then M.buffState[memberId] = {} end
 
-            members[i] = {
-                id = memberId,
-                name = member.CleanName() or '',
-                class = (member.Class and member.Class.ShortName()) or '',
-                hp = hp,
-                distance = tonumber(member.Distance()) or 999,
-                buffs = M.buffState[memberId],  -- Reference to persistent buff state
-                pet = pet,  -- Pet info (nil if no pet)
-            }
-
-            if hp < injuredThreshold then
-                injuredCount = injuredCount + 1
-            end
-
-            -- Centroid calculation (exclude self)
-            if memberId ~= myId and memberId > 0 then
-                centroidX = centroidX + (tonumber(member.X()) or 0)
-                centroidY = centroidY + (tonumber(member.Y()) or 0)
-                centroidCount = centroidCount + 1
+        -- Check for pet
+        local pet = nil
+        local memberPet = member.Pet
+        if memberPet and memberPet() then
+            local petId = tonumber(memberPet.ID()) or 0
+            if petId > 0 then
+                if not M.buffState[petId] then M.buffState[petId] = {} end
+                pet = {
+                    id = petId,
+                    name = memberPet.CleanName() or '',
+                    hp = tonumber(memberPet.PctHPs()) or 100,
+                    distance = tonumber(memberPet.Distance()) or 999,
+                    buffs = M.buffState[petId],
+                }
             end
         end
+
+        members[i] = {
+            id = memberId,
+            name = member.CleanName() or '',
+            class = (member.Class and member.Class.ShortName()) or '',
+            hp = hp,
+            distance = tonumber(member.Distance()) or 999,
+            buffs = M.buffState[memberId],
+            pet = pet,
+        }
+
+        if hp < injuredThreshold then
+            injuredCount = injuredCount + 1
+        end
+
+        -- Centroid calculation (exclude self)
+        if memberId ~= myId then
+            centroidX = centroidX + (tonumber(member.X()) or 0)
+            centroidY = centroidY + (tonumber(member.Y()) or 0)
+            centroidCount = centroidCount + 1
+        end
+        ::nextMember::
     end
 
     M.group = {
@@ -237,67 +257,52 @@ function M.updateHeavy()
     local haters = {}
     local aggroDeficitCount = 0
 
+    -- Cache setting + targeting module outside loop (avoid per-iteration lookup)
+    local ignorePCPets = getSetting('IgnorePCPets') ~= false  -- Default true
+    local Targeting = ignorePCPets and getTargeting() or nil
+    local isPCPet = Targeting and Targeting.isPCPet or nil
+
     for i = 1, xtCount do
         local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt.ID and xt.ID() and xt.ID() > 0 then
-            -- Only count actual combat haters. XTarget slots can be configured to PCs/NPCs/etc.
-            local targetType = ''
-            if xt.TargetType then
-                local okTt, vTt = pcall(function() return xt.TargetType() end)
-                if okTt and vTt ~= nil then
-                    targetType = tostring(vTt or '')
-                end
-            end
-            targetType = targetType:lower()
+        if not xt then goto continue end
+        local xtId = tonumber(xt.ID()) or 0
+        if xtId <= 0 then goto continue end
 
-            local aggressive = false
-            if xt.Aggressive then
-                local okAgg, vAgg = pcall(function() return xt.Aggressive() end)
-                aggressive = okAgg and vAgg == true
-            end
+        -- Only count actual combat haters. XTarget slots can be configured to PCs/NPCs/etc.
+        local rawTT = xt.TargetType and xt.TargetType()
+        local targetType = rawTT and tostring(rawTT):lower() or ''
 
-            local isHater = aggressive or (targetType == 'auto hater')
-            if not isHater then
-                goto continue
-            end
+        local aggressive = xt.Aggressive and xt.Aggressive() == true
+        if not aggressive and targetType ~= 'auto hater' then
+            goto continue
+        end
 
-            local dead = false
-            if xt.Dead then
-                local okDead, vDead = pcall(function() return xt.Dead() end)
-                dead = okDead and vDead == true
-            end
-            local hpPct = tonumber(xt.PctHPs and xt.PctHPs()) or 100
-            if dead or hpPct <= 0 then
-                goto continue
-            end
+        local dead = xt.Dead and xt.Dead() == true
+        if dead then goto continue end
+        local hpPct = tonumber(xt.PctHPs and xt.PctHPs()) or 100
+        if hpPct <= 0 then goto continue end
 
-            -- Check if this is a PC pet and should be ignored
-            local xtId = tonumber(xt.ID()) or 0
-            local ignorePCPets = getSetting('IgnorePCPets')
-            if ignorePCPets ~= false then  -- Default true if not set
-                local Targeting = getTargeting()
-                if Targeting and Targeting.isPCPet and Targeting.isPCPet(xtId) then
-                    goto continue
-                end
-            end
+        -- Check if this is a PC pet and should be ignored
+        if isPCPet and isPCPet(xtId) then
+            goto continue
+        end
 
-            local aggro = tonumber(xt.PctAggro()) or 100
-            local totId = (xt.TargetOfTarget and xt.TargetOfTarget.ID and tonumber(xt.TargetOfTarget.ID())) or 0
+        local aggro = tonumber(xt.PctAggro()) or 100
+        local totId = (xt.TargetOfTarget and xt.TargetOfTarget.ID and tonumber(xt.TargetOfTarget.ID())) or 0
 
-            table.insert(haters, {
-                id = tonumber(xt.ID()) or 0,
-                name = xt.CleanName() or '',
-                hp = hpPct,
-                distance = tonumber(xt.Distance()) or 999,
-                aggro = aggro,
-                targetingMe = totId == myId,
-                mezzed = (xt.Mezzed and xt.Mezzed() ~= nil and xt.Mezzed() ~= ''),
-                targetType = targetType,
-            })
+        haters[#haters + 1] = {
+            id = xtId,
+            name = xt.CleanName() or '',
+            hp = hpPct,
+            distance = tonumber(xt.Distance()) or 999,
+            aggro = aggro,
+            targetingMe = totId == myId,
+            mezzed = (xt.Mezzed and xt.Mezzed() ~= nil and xt.Mezzed() ~= ''),
+            targetType = targetType,
+        }
 
-            if aggro < 100 then
-                aggroDeficitCount = aggroDeficitCount + 1
-            end
+        if aggro < 100 then
+            aggroDeficitCount = aggroDeficitCount + 1
         end
         ::continue::
     end
@@ -307,6 +312,27 @@ function M.updateHeavy()
         haters = haters,
         aggroDeficitCount = aggroDeficitCount,
     }
+end
+
+-- Staleness accessors
+
+--- Get age of light-update data (self, target) in seconds
+---@return number Age in seconds since last light update
+function M.lightAge()
+    return os.clock() - _lastLightUpdate
+end
+
+--- Get age of heavy-update data (group, xtarget) in seconds
+---@return number Age in seconds since last heavy update
+function M.heavyAge()
+    return os.clock() - _lastHeavyUpdate
+end
+
+--- Check if heavy data is stale (older than threshold)
+---@param maxAge number|nil Max age in seconds (default 0.5)
+---@return boolean True if data is stale
+function M.isHeavyStale(maxAge)
+    return M.heavyAge() > (maxAge or 0.5)
 end
 
 -- Convenience accessors

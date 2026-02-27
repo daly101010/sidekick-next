@@ -1,26 +1,12 @@
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
 
 -- Lazy-load modules to avoid circular requires
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, cb = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = cb end
-    end
-    return _ConditionBuilder
-end
-
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, core = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = core end
-    end
-    return _Core
-end
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getCore = lazy('sidekick-next.utils.core')
 
 -- Cache for bar order index (rebuilt when order changes)
 local _orderCache = {

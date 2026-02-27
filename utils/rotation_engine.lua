@@ -3,91 +3,24 @@
 -- Based on rgmercs pattern: Emergency > Aggro > Defenses > Burn > Combat
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load throttled logging
-local _ThrottledLog = nil
-local function getThrottledLog()
-    if not _ThrottledLog then
-        local ok, tl = pcall(require, 'sidekick-next.utils.throttled_log')
-        if ok then _ThrottledLog = tl end
-    end
-    return _ThrottledLog
-end
+local getThrottledLog = lazy('sidekick-next.utils.throttled_log')
 
 -- Enable/disable debug logging for rotation engine
 M.debugLogging = false -- Set to true to enable layer/ability logging
 
 -- Lazy-load dependencies to avoid circular requires
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
-
-local _Executor = nil
-local function getExecutor()
-    if not _Executor then
-        local ok, e = pcall(require, 'sidekick-next.utils.action_executor')
-        if ok then _Executor = e end
-    end
-    return _Executor
-end
-
-local _Abilities = nil
-local function getAbilities()
-    if not _Abilities then
-        local ok, a = pcall(require, 'sidekick-next.utils.abilities')
-        if ok then _Abilities = a end
-    end
-    return _Abilities
-end
-
-local _ConditionBuilder = nil
-local function getConditionBuilder()
-    if not _ConditionBuilder then
-        local ok, cb = pcall(require, 'sidekick-next.ui.condition_builder')
-        if ok then _ConditionBuilder = cb end
-    end
-    return _ConditionBuilder
-end
-
-local _SpellRotation = nil
-local function getSpellRotation()
-    if not _SpellRotation then
-        local ok, sr = pcall(require, 'sidekick-next.utils.spell_rotation')
-        if ok then _SpellRotation = sr end
-    end
-    return _SpellRotation
-end
-
-local _ConditionContext = nil
-local function getConditionContext()
-    if not _ConditionContext then
-        local ok, cc = pcall(require, 'sidekick-next.utils.condition_context')
-        if ok then _ConditionContext = cc end
-    end
-    return _ConditionContext
-end
-
--- Optional buff logger for tracing rotation-based buff casts
-local _BuffLogger = nil
-local function getBuffLogger()
-    if not _BuffLogger then
-        local ok, logger = pcall(require, 'sidekick-next.automation.buff_logger')
-        if ok then
-            _BuffLogger = logger
-            if _BuffLogger and _BuffLogger.init then
-                _BuffLogger.init()
-            end
-        end
-    end
-    return _BuffLogger
-end
+local getCache = lazy('sidekick-next.utils.runtime_cache')
+local getExecutor = lazy('sidekick-next.utils.action_executor')
+local getAbilities = lazy('sidekick-next.utils.abilities')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getSpellRotation = lazy('sidekick-next.utils.spell_rotation')
+local getConditionContext = lazy('sidekick-next.utils.condition_context')
+local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
 
 local _ClassConfigs = {}
 local function getClassConfig(classShort)

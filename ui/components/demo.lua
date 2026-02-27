@@ -802,7 +802,7 @@ local function renderTexturesTab()
     end
 
     if not TR.isAvailable or not TR.isAvailable() then
-        imgui.TextColored(1, 0.3, 0.3, 1, 'Texture data not loaded (eq_ui_data.lua missing?)')
+        imgui.TextColored(1, 0.3, 0.3, 1, 'Texture data not loaded')
         return
     end
 

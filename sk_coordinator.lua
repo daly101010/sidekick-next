@@ -11,30 +11,7 @@ local M = {}
 -- Module identity
 M.MODULE_NAME = 'coordinator'
 
--- Debug logging (set to true to enable)
-local DEBUG_COORDINATOR = true
-local DEBUG_LOG_FILE = mq.configDir .. '/sk_coordinator_debug.log'
-
-local function debugLog(fmt, ...)
-    if not DEBUG_COORDINATOR then return end
-    local msg = string.format(fmt, ...)
-    local timestamp = os.date('%H:%M:%S')
-    local f = io.open(DEBUG_LOG_FILE, 'a')
-    if f then
-        f:write(string.format('[%s] %s\n', timestamp, msg))
-        f:close()
-    end
-end
-
--- Clear log file on startup
-local function clearLogFile()
-    local f = io.open(DEBUG_LOG_FILE, 'w')
-    if f then
-        f:write(string.format('=== SK_COORDINATOR DEBUG LOG STARTED %s ===\n', os.date('%Y-%m-%d %H:%M:%S')))
-        f:close()
-    end
-end
-clearLogFile()
+local debugLog = require('sidekick-next.utils.debug_log').module('sk_coordinator', 'SK_COORDINATOR')
 
 -- Internal state
 local State = {
@@ -201,12 +178,26 @@ local function computeActivePriority()
         return lib.Priority.RESURRECTION
     end
 
-    -- In combat, default to DPS
+    -- In combat, default to DPS only if a DPS module can actually act.
+    -- Without this check, classes with no DPS spells (e.g. clerics) get stuck
+    -- at a dead DPS priority where no module requests claims.
     if ws.inCombat then
-        return lib.Priority.DPS
+        local dpsNeed = State.moduleNeeds['dps']
+        local dpsCanAct = dpsNeed and dpsNeed.needsAction == true
+            and (now - (dpsNeed.receivedAtMs or 0)) <= (dpsNeed.ttlMs or 250)
+        if dpsCanAct then
+            return lib.Priority.DPS
+        end
     end
 
-    -- Out of combat, idle
+    -- Check if meditation module needs to act (mana/hp/end regen)
+    local medNeed = State.moduleNeeds['meditation']
+    if medNeed and medNeed.needsAction == true
+        and (now - (medNeed.receivedAtMs or 0)) <= (medNeed.ttlMs or 500) then
+        return lib.Priority.MEDITATION
+    end
+
+    -- Nothing actionable
     return lib.Priority.IDLE
 end
 
@@ -228,25 +219,54 @@ local function isOwnerExpired(owner)
     return (now - owner.claimedAtMs) > owner.ttlMs
 end
 
+--- Check if a module has a valid (non-expired) need hint requesting action
+local function hasValidNeed(moduleName)
+    local need = State.moduleNeeds[moduleName]
+    if not need or not need.needsAction then return false end
+    local ttl = need.ttlMs or 250
+    local age = lib.getTimeMs() - (need.receivedAtMs or 0)
+    return age <= ttl
+end
+
 local function expireOwners()
     local changed = false
     -- Don't expire cast owner while actively casting - let the cast complete
+    -- Also don't expire if the owning module still has an active need hint
+    -- (covers multi-step operations like gem memorization where castBusy is
+    --  still false but the module is actively working toward a cast)
     if State.castOwner then
         local expired = isOwnerExpired(State.castOwner)
-        if expired and not State.castBusy then
+        local moduleHasNeed = hasValidNeed(State.castOwner.module)
+        if expired and not State.castBusy and not moduleHasNeed then
             lib.log('debug', M.MODULE_NAME, 'Cast owner expired: %s', State.castOwner.module)
-            debugLog('EXPIRE: Cast owner %s expired (castBusy=%s)', State.castOwner.module, tostring(State.castBusy))
+            debugLog('EXPIRE: Cast owner %s expired (castBusy=%s, moduleHasNeed=%s)',
+                State.castOwner.module, tostring(State.castBusy), tostring(moduleHasNeed))
             State.castOwner = nil
             changed = true
         elseif expired and State.castBusy then
             debugLog('EXPIRE: Cast owner %s expired but castBusy=true, keeping', State.castOwner.module)
+        elseif expired and moduleHasNeed then
+            debugLog('EXPIRE: Cast owner %s expired but module has active need, keeping', State.castOwner.module)
         end
     end
+    -- Target owner: same logic — extend if owning module has valid need OR castBusy
+    -- castBusy must protect BOTH cast and target owners to prevent epoch drift that
+    -- causes the casting module to lose ownership mid-cast via the epoch check
     if State.targetOwner and isOwnerExpired(State.targetOwner) then
-        lib.log('debug', M.MODULE_NAME, 'Target owner expired: %s', State.targetOwner.module)
-        debugLog('EXPIRE: Target owner %s expired', State.targetOwner.module)
-        State.targetOwner = nil
-        changed = true
+        local moduleHasNeed = hasValidNeed(State.targetOwner.module)
+        local castingModuleOwns = State.castBusy and State.castOwner
+            and State.castOwner.module == State.targetOwner.module
+        if not moduleHasNeed and not castingModuleOwns then
+            lib.log('debug', M.MODULE_NAME, 'Target owner expired: %s', State.targetOwner.module)
+            debugLog('EXPIRE: Target owner %s expired (castBusy=%s, moduleHasNeed=%s)',
+                State.targetOwner.module, tostring(State.castBusy), tostring(moduleHasNeed))
+            State.targetOwner = nil
+            changed = true
+        elseif castingModuleOwns then
+            debugLog('EXPIRE: Target owner %s expired but same module is casting, keeping', State.targetOwner.module)
+        else
+            debugLog('EXPIRE: Target owner %s expired but module has active need, keeping', State.targetOwner.module)
+        end
     end
     return changed
 end
@@ -300,12 +320,20 @@ local function processClaim(content, sender)
     debugLog('processClaim: module=%s type=%s priority=%d epochSeen=%d currentEpoch=%d activePriority=%d',
         content.module, content.type or 'nil', content.priority, content.epochSeen, State.epoch, State.activePriority)
 
-    -- Validate epochSeen
-    if content.epochSeen ~= State.epoch then
-        lib.log('debug', M.MODULE_NAME, 'Claim rejected (stale epoch): %s saw %d, current %d',
+    -- Validate epochSeen (allow small drift from async message delivery)
+    -- In multi-module systems, other modules' claims/releases increment epoch between
+    -- state broadcasts, causing valid claims to arrive with slightly stale epochs.
+    -- The priority check and resource availability checks below are the real guards
+    -- against genuinely stale claims.
+    local epochDrift = State.epoch - content.epochSeen
+    if epochDrift > 10 then
+        lib.log('debug', M.MODULE_NAME, 'Claim rejected (very stale epoch): %s saw %d, current %d',
             content.module, content.epochSeen, State.epoch)
-        debugLog('CLAIM REJECTED: stale epoch (saw=%d, current=%d)', content.epochSeen, State.epoch)
+        debugLog('CLAIM REJECTED: very stale epoch (saw=%d, current=%d, drift=%d)', content.epochSeen, State.epoch, epochDrift)
         return false
+    elseif epochDrift > 0 then
+        debugLog('CLAIM epoch drift: module=%s saw=%d current=%d drift=%d (allowed)',
+            content.module, content.epochSeen, State.epoch, epochDrift)
     end
 
     -- Validate priority
@@ -481,6 +509,29 @@ end
 -------------------------------------------------------------------------------
 
 local function buildStatePayload()
+    -- Build lightweight module diagnostics for UI consumption
+    local now = lib.getTimeMs()
+    local moduleDiag = {}
+    for moduleName, hb in pairs(State.moduleHeartbeats) do
+        local need = State.moduleNeeds[moduleName]
+        local needValid = false
+        local needAge = 0
+        if need then
+            needAge = now - (need.receivedAtMs or 0)
+            needValid = need.needsAction == true and needAge <= (need.ttlMs or 250)
+        end
+        moduleDiag[moduleName] = {
+            heartbeatAge = now - (hb.receivedAtMs or 0),
+            ready = hb.ready ~= false,
+            needsAction = need and need.needsAction or false,
+            needValid = needValid,
+            needPriority = need and need.priority or nil,
+            needAge = needAge,
+            needTtl = need and need.ttlMs or 0,
+            reason = need and need.reason or nil,
+        }
+    end
+
     return {
         tickId = State.tickId,
         epoch = State.epoch,
@@ -491,6 +542,7 @@ local function buildStatePayload()
         targetOwner = State.targetOwner,
         castBusy = State.castBusy,
         worldState = State.worldState,
+        moduleDiag = moduleDiag,
     }
 end
 
@@ -549,6 +601,19 @@ local function broadcastState()
     State.pendingBroadcast = false
 end
 
+-- Watchdog state (declared early so onModuleHeartbeatReceived can reference it)
+local _restartTracker = {}  -- { [script] = { count, lastAttemptMs } }
+local _lastWatchdogCheck = 0
+
+--- Reset restart counter for a module when it sends a fresh heartbeat
+--- (called from onMessage heartbeat handler)
+local function onModuleHeartbeatReceived(scriptPath)
+    if scriptPath and _restartTracker[scriptPath] then
+        -- Module is alive again — reset its restart counter
+        _restartTracker[scriptPath].count = 0
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Message Handlers
 -------------------------------------------------------------------------------
@@ -589,11 +654,14 @@ local function onMessage(message)
             debugLog('HEARTBEAT received: module=%s script=%s mailbox=%s',
                 tostring(content.module), tostring(senderScript), tostring(mailbox))
             State.moduleHeartbeats[content.module] = {
-                sentAtMs = content.sentAtMs or lib.getTimeMs(),
+                receivedAtMs = lib.getTimeMs(),  -- Use coordinator-local time for staleness (not sender time)
+                sentAtMs = content.sentAtMs,      -- Keep sender time for diagnostics only
                 ready = content.ready ~= false,
                 script = senderScript,
                 mailbox = mailbox,
             }
+            -- Reset restart counter — module is alive
+            onModuleHeartbeatReceived(senderScript)
         end
     elseif msgType == 'need' then
         -- Track module need hints
@@ -603,11 +671,118 @@ local function onMessage(message)
                 needsAction = content.needsAction,
                 ttlMs = content.ttlMs or 250,
                 receivedAtMs = lib.getTimeMs(),
+                reason = content.reason,
             }
-            debugLog('NEED received: module=%s priority=%d needsAction=%s ttlMs=%d',
+            debugLog('NEED received: module=%s priority=%d needsAction=%s ttlMs=%d reason=%s',
                 tostring(content.module), tonumber(content.priority) or -1,
-                tostring(content.needsAction), tonumber(content.ttlMs) or 250)
+                tostring(content.needsAction), tonumber(content.ttlMs) or 250,
+                tostring(content.reason or ''))
         end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- Module Crash Watchdog
+-------------------------------------------------------------------------------
+
+--- Revoke any claims owned by a crashed module
+local function revokeCrashedModuleClaims(moduleName)
+    local changed = false
+    if State.castOwner and State.castOwner.module == moduleName then
+        debugLog('WATCHDOG: Revoking cast claim from crashed module %s', moduleName)
+        State.castOwner = nil
+        changed = true
+    end
+    if State.targetOwner and State.targetOwner.module == moduleName then
+        debugLog('WATCHDOG: Revoking target claim from crashed module %s', moduleName)
+        State.targetOwner = nil
+        changed = true
+    end
+    if changed then
+        State.epoch = State.epoch + 1
+        State.pendingBroadcast = true
+    end
+end
+
+--- Attempt to restart a crashed module script
+local function attemptRestart(moduleName, scriptPath)
+    if not scriptPath or scriptPath == '' then
+        debugLog('WATCHDOG: Cannot restart %s — no script path', moduleName)
+        return false
+    end
+
+    local now = lib.getTimeMs()
+    local tracker = _restartTracker[scriptPath] or { count = 0, lastAttemptMs = 0 }
+
+    -- Enforce max restarts
+    if tracker.count >= lib.MAX_MODULE_RESTARTS then
+        debugLog('WATCHDOG: %s exceeded max restarts (%d/%d), giving up',
+            scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS)
+        return false
+    end
+
+    -- Enforce cooldown
+    if (now - tracker.lastAttemptMs) < lib.Timing.RESTART_COOLDOWN_MS then
+        return false  -- Still in cooldown, silently skip
+    end
+
+    tracker.count = tracker.count + 1
+    tracker.lastAttemptMs = now
+    _restartTracker[scriptPath] = tracker
+
+    debugLog('WATCHDOG: Restarting %s (attempt %d/%d)',
+        scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS)
+    -- print(string.format(
+    --     '\ay[SK-Watchdog]\ax Restarting crashed module: %s (attempt %d/%d)',
+    --     scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS))
+
+    mq.cmdf('/lua run %s', scriptPath)
+    return true
+end
+
+--- Check all module heartbeats for staleness
+local function checkModuleHealth()
+    local now = lib.getTimeMs()
+
+    -- Throttle checks
+    if (now - _lastWatchdogCheck) < lib.Timing.WATCHDOG_CHECK_MS then return end
+    _lastWatchdogCheck = now
+
+    -- Collect stale modules first (don't mutate table during pairs iteration)
+    local staleModules = {}
+    for moduleName, hb in pairs(State.moduleHeartbeats) do
+        if hb and hb.receivedAtMs then
+            local age = now - hb.receivedAtMs
+            if age > lib.Timing.MODULE_CRASH_MS then
+                table.insert(staleModules, { name = moduleName, hb = hb, age = age })
+            end
+        end
+    end
+
+    -- Process stale modules
+    for _, entry in ipairs(staleModules) do
+        debugLog('WATCHDOG: Module %s heartbeat stale (%dms), presumed crashed',
+            entry.name, entry.age)
+        -- print(string.format(
+        --     '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
+        --     entry.name, entry.age / 1000))
+
+        -- Revoke any claims this module held
+        revokeCrashedModuleClaims(entry.name)
+
+        -- Attempt restart (logs user-facing message on max restarts too)
+        local scriptPath = entry.hb.script
+        if not attemptRestart(entry.name, scriptPath) and scriptPath then
+            local tracker = _restartTracker[scriptPath]
+            if tracker and tracker.count >= lib.MAX_MODULE_RESTARTS then
+                -- print(string.format(
+                --     '\ar[SK-Watchdog]\ax Module "%s" exceeded max restarts (%d) — giving up',
+                --     entry.name, lib.MAX_MODULE_RESTARTS))
+            end
+        end
+
+        -- Remove stale heartbeat so we don't re-detect next scan
+        State.moduleHeartbeats[entry.name] = nil
     end
 end
 
@@ -628,6 +803,9 @@ local function initialize()
     mailboxDropboxes.heartbeat = actors.register(lib.Mailbox.HEARTBEAT, onMessage)
     mailboxDropboxes.need = actors.register(lib.Mailbox.NEED, onMessage)
 
+    debugLog('Watchdog: crash=%dms, cooldown=%dms, maxRestarts=%d, checkInterval=%dms',
+        lib.Timing.MODULE_CRASH_MS, lib.Timing.RESTART_COOLDOWN_MS,
+        lib.MAX_MODULE_RESTARTS, lib.Timing.WATCHDOG_CHECK_MS)
     lib.log('info', M.MODULE_NAME, 'Coordinator ready')
 end
 
@@ -672,6 +850,9 @@ local function tick()
         State.epoch = State.epoch + 1
         State.pendingBroadcast = true
     end
+
+    -- Watchdog: check for crashed modules
+    checkModuleHealth()
 
     -- Broadcast state
     local timeSinceBroadcast = now - State.lastBroadcastAt

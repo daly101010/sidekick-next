@@ -1,17 +1,11 @@
 -- healing/analytics.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load Logger to avoid circular requires
-local Logger = nil
-local function getLogger()
-    if Logger == nil then
-        local ok, l = pcall(require, 'sidekick-next.healing.logger')
-        Logger = ok and l or false
-    end
-    return Logger or nil
-end
+local getLogger = lazy.once('sidekick-next.healing.logger')
 
 local _stats = {
     totalCasts = 0,

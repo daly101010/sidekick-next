@@ -22,8 +22,15 @@ local _remoteCharacters = {}
 local _lastStatusPayload = nil
 
 -- Healing coordination state (claims + HoT presence)
-local _healClaims = {} -- [targetId][from] = { spellName, tier, expiresAt }
+local _healClaims = {} -- [targetId][from] = { spellName, tier, expiresAt, claimedAt }
 local _hotStates = {}  -- [targetId][from] = { spellName, expiresAt }
+local HEAL_CLAIM_TTL = 5.0        -- Default claim lifetime (seconds)
+local HOT_DEFAULT_TTL = 18.0      -- Default HoT tracking lifetime
+local PRUNE_INTERVAL = 1.0        -- How often to prune stale claims
+local _lastPruneAt = 0
+
+-- Forward declaration (defined after message handlers, used in tick)
+local pruneHealTables
 
 -- Healing message callbacks (registered by healing module to avoid circular require)
 local _healingCallbacks = {}
@@ -69,26 +76,45 @@ local function normalize_sender(sender)
     }
 end
 
+-- Send format: try absolute first, fall back to script+mailbox, cache what works
+local _sendFormat = nil  -- cached working format (1 = absolute, 2 = script+mailbox)
+
+local _ADDR_ABSOLUTE = { mailbox = 'lua:group:grouptarget', absolute_mailbox = true }
+local _ADDR_SCRIPT   = { mailbox = 'grouptarget', script = 'group' }
+
 local function sendToGroupTarget(payload)
     if not _dropbox then return end
     if type(payload) ~= 'table' then return end
     payload.from = payload.from or _selfName
     payload.server = payload.server or _selfServer
-    -- Try multiple send formats for compatibility
-    local ok1, res1 = pcall(function()
-        return _dropbox:send({ mailbox = 'lua:group:grouptarget', absolute_mailbox = true }, payload)
-    end)
-    local ok2, res2 = pcall(function()
-        return _dropbox:send({ mailbox = 'lua:group:GroupTarget', absolute_mailbox = true }, payload)
-    end)
-    -- Also try script+mailbox format
-    local ok3, res3 = pcall(function()
-        return _dropbox:send({ mailbox = 'grouptarget', script = 'group' }, payload)
-    end)
-    _lastSendResult = { ok1 = ok1, res1 = res1, ok2 = ok2, res2 = res2, ok3 = ok3, res3 = res3 }
+
+    -- Use cached working format if known
+    if _sendFormat == 1 then
+        local ok, res = pcall(_dropbox.send, _dropbox, _ADDR_ABSOLUTE, payload)
+        _lastSendResult = { ok1 = ok, res1 = res }
+        if not ok then _lastSendErr = tostring(res) end
+        return
+    elseif _sendFormat == 2 then
+        local ok, res = pcall(_dropbox.send, _dropbox, _ADDR_SCRIPT, payload)
+        _lastSendResult = { ok2 = ok, res2 = res }
+        if not ok then _lastSendErr = tostring(res) end
+        return
+    end
+
+    -- Discovery: try both, cache the first that doesn't throw
+    local ok1, res1 = pcall(_dropbox.send, _dropbox, _ADDR_ABSOLUTE, payload)
+    if ok1 then
+        _sendFormat = 1
+        _lastSendResult = { ok1 = ok1, res1 = res1 }
+        return
+    end
+    local ok2, res2 = pcall(_dropbox.send, _dropbox, _ADDR_SCRIPT, payload)
+    if ok2 then
+        _sendFormat = 2
+    end
+    _lastSendResult = { ok1 = ok1, res1 = res1, ok2 = ok2, res2 = res2 }
     if not ok1 then _lastSendErr = tostring(res1) end
     if not ok2 then _lastSendErr = tostring(res2) end
-    if not ok3 then _lastSendErr = tostring(res3) end
 end
 
 function M.sendToGroupTarget(payload)
@@ -431,10 +457,12 @@ function M.init(opts)
             local from = tostring(content.from or sender.character or '')
             if from == '' then return end
             _healClaims[tid] = _healClaims[tid] or {}
+            local now = os.clock()
             _healClaims[tid][from] = {
                 spellName = tostring(content.spellName or ''),
                 tier = tostring(content.tier or ''),
-                expiresAt = tonumber(content.expiresAt) or (os.clock() + 3.0),
+                expiresAt = tonumber(content.expiresAt) or (now + HEAL_CLAIM_TTL),
+                claimedAt = now,
                 from = from,
             }
             return
@@ -452,7 +480,7 @@ function M.init(opts)
             _hotStates[tid] = _hotStates[tid] or {}
             _hotStates[tid][from] = {
                 spellName = spellName,
-                expiresAt = tonumber(content.expiresAt) or (os.clock() + 18.0),
+                expiresAt = tonumber(content.expiresAt) or (os.clock() + HOT_DEFAULT_TTL),
                 from = from,
             }
             return
@@ -545,6 +573,12 @@ function M.tick(opts)
     opts = opts or {}
     local now = os.clock()
 
+    -- Periodic heal-claim pruning (every PRUNE_INTERVAL seconds)
+    if (now - _lastPruneAt) >= PRUNE_INTERVAL then
+        _lastPruneAt = now
+        pruneHealTables()
+    end
+
     -- If docked, broadcast frequently so GT can hide its control column with staleness check.
     if M._docked then
         if (now - _lastDockedSendAt) >= 0.25 then
@@ -558,16 +592,27 @@ function M.tick(opts)
         end
     end
 
-    -- Status broadcast (hp/mana/end + selected ability readiness) ~5 Hz
+    -- Status broadcast — rate limited + dedup (skip if nothing meaningful changed)
     if opts.status and (now - _lastStatusSendAt) >= 0.2 then
-        _lastStatusSendAt = now
-        _lastStatusPayload = opts.status
-        sendToGroupTarget(opts.status)
-        -- Also broadcast to other SideKick instances for remote abilities
-        if _dropbox then
-            pcall(function()
-                _dropbox:send({ mailbox = 'sidekick' }, opts.status)
-            end)
+        local prev = _lastStatusPayload
+        local changed = not prev
+            or (opts.status.hp or 0) ~= (prev.hp or 0)
+            or (opts.status.mana or 0) ~= (prev.mana or 0)
+            or (opts.status.endur or 0) ~= (prev.endur or 0)
+            or (opts.status.targetId or 0) ~= (prev.targetId or 0)
+            or (opts.status.combat) ~= (prev.combat)
+            or (opts.status.casting or '') ~= (prev.casting or '')
+            or (now - _lastStatusSendAt) >= 2.0  -- Force send every 2s as heartbeat
+        if changed then
+            _lastStatusSendAt = now
+            _lastStatusPayload = opts.status
+            sendToGroupTarget(opts.status)
+            -- Also broadcast to other SideKick instances for remote abilities
+            if _dropbox then
+                pcall(function()
+                    _dropbox:send({ mailbox = 'sidekick' }, opts.status)
+                end)
+            end
         end
     end
 end
@@ -583,13 +628,17 @@ function M.getRemoteCharacters()
     return _remoteCharacters
 end
 
-local function pruneHealTables()
+pruneHealTables = function()
     local now = os.clock()
 
+    -- Remove expired claims + claims from peers no longer seen
     for tid, perFrom in pairs(_healClaims) do
         local any = false
         for from, c in pairs(perFrom or {}) do
-            if (tonumber(c.expiresAt) or 0) <= now then
+            local expired = (tonumber(c.expiresAt) or 0) <= now
+            local stalePeer = from ~= _selfName
+                and _remoteCharacters[from] == nil
+            if expired or stalePeer then
                 perFrom[from] = nil
             else
                 any = true
@@ -601,7 +650,10 @@ local function pruneHealTables()
     for tid, perFrom in pairs(_hotStates) do
         local any = false
         for from, h in pairs(perFrom or {}) do
-            if (tonumber(h.expiresAt) or 0) <= now then
+            local expired = (tonumber(h.expiresAt) or 0) <= now
+            local stalePeer = from ~= _selfName
+                and _remoteCharacters[from] == nil
+            if expired or stalePeer then
                 perFrom[from] = nil
             else
                 any = true
@@ -623,6 +675,26 @@ end
 function M.getHoTStates()
     pruneHealTables()
     return _hotStates
+end
+
+--- Check if a target is already claimed by another healer.
+--- Returns the most recent (winning) claim, or nil if unclaimed.
+--- @param targetId number The spawn ID to check
+--- @return table|nil The winning claim { from, spellName, tier, claimedAt, expiresAt } or nil
+function M.getWinningClaim(targetId)
+    pruneHealTables()
+    local perFrom = _healClaims[targetId]
+    if not perFrom then return nil end
+    local best = nil
+    for _, claim in pairs(perFrom) do
+        -- Skip our own claims
+        if claim.from ~= _selfName then
+            if not best or (claim.claimedAt or 0) > (best.claimedAt or 0) then
+                best = claim
+            end
+        end
+    end
+    return best
 end
 
 --- Register a callback for healing-related Actor messages
@@ -800,25 +872,15 @@ function M.getSelfInfo()
     }
 end
 
---- Get heal claims for debug display
+--- Get heal claims for debug display (no pruning, raw snapshot)
 -- @return table Heal claims table
 function M.getHealClaimsRaw()
     return _healClaims
 end
 
---- Get heal claims (alias)
-function M.getHealClaims()
-    return _healClaims
-end
-
---- Get HoT states for debug display
+--- Get HoT states for debug display (no pruning, raw snapshot)
 -- @return table HoT states table
 function M.getHoTStatesRaw()
-    return _hotStates
-end
-
---- Get HoT states (alias)
-function M.getHoTStates()
     return _hotStates
 end
 

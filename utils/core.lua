@@ -77,28 +77,33 @@ function Core.load()
     Core.Ini['SideKick'] = Core.Ini['SideKick'] or {}
     Core.Ini['SideKick-Abilities'] = Core.Ini['SideKick-Abilities'] or {}
 
-    -- Migration: older versions incorrectly wrote some global Registry settings
-    -- (e.g. AssistMode/CombatMode) into the SideKick-Abilities section because they end with "Mode".
-    do
-        local side = Core.Ini['SideKick']
-        local abil = Core.Ini['SideKick-Abilities']
-        for _, key in Registry.iter_all() do
-            if abil[key] ~= nil then
-                if side[key] == nil then
-                    side[key] = abil[key]
-                end
-                abil[key] = nil
-            end
-        end
-        Core.Ini['SideKick'] = side
-        Core.Ini['SideKick-Abilities'] = abil
-    end
+    local side = Core.Ini['SideKick']
+    local abil = Core.Ini['SideKick-Abilities']
+    local registryKeys = {}
+    local migrated = false
+    local defaultsWritten = false
 
+    -- Single pass over Registry: migrate stale keys, apply defaults, parse values
     for _, key in Registry.iter_all() do
-        local meta = Registry.meta(key)
-        if meta and Core.Ini['SideKick'][key] == nil and meta.Default ~= nil then
-            writeValue('SideKick', key, meta.Default)
+        registryKeys[key] = true
+
+        -- Migration: older versions wrote global settings into SideKick-Abilities
+        if abil[key] ~= nil then
+            if side[key] == nil then
+                side[key] = abil[key]
+            end
+            abil[key] = nil
+            migrated = true
         end
+
+        -- Apply defaults for missing keys
+        local meta = Registry.meta(key)
+        if meta and side[key] == nil and meta.Default ~= nil then
+            writeValue('SideKick', key, meta.Default)
+            defaultsWritten = true
+        end
+
+        -- Parse value into Settings
         local raw = Core.Ini['SideKick'][key]
         if meta and meta.type == 'bool' then
             Core.Settings[key] = toBool(raw)
@@ -109,15 +114,9 @@ function Core.load()
         end
     end
 
-    -- Also load any non-registry keys from SideKick section (e.g., class config settings)
-    -- These are dynamic settings like DoMez, DoSlow, SpellLoadout that come from class configs
-    local registryKeys = {}
-    for _, key in Registry.iter_all() do
-        registryKeys[key] = true
-    end
-    for key, raw in pairs(Core.Ini['SideKick'] or {}) do
+    -- Load dynamic (non-registry) keys from SideKick section
+    for key, raw in pairs(side) do
         if not registryKeys[key] and Core.Settings[key] == nil then
-            -- Infer type from value
             if raw == '0' or raw == '1' or raw == 'true' or raw == 'false' then
                 Core.Settings[key] = toBool(raw)
             elseif tonumber(raw) then
@@ -128,26 +127,37 @@ function Core.load()
         end
     end
 
+    -- Only write INI back if migrations or new defaults changed data
+    if migrated or defaultsWritten then
+        Core.save()
+    end
+end
+
+local _dirty = false
+local _lastSaveAt = 0
+local SAVE_DEBOUNCE_SEC = 1.0  -- Don't write INI more than once per second
+
+function Core.save()
+    local ok, err = pcall(lip.save, iniPath(), Core.Ini)
+    _dirty = false
+    _lastSaveAt = os.clock()
+end
+
+--- Flush pending saves if debounce period elapsed.  Call from main loop.
+function Core.flush()
+    if not _dirty then return end
+    if (os.clock() - _lastSaveAt) < SAVE_DEBOUNCE_SEC then return end
     Core.save()
 end
 
-function Core.save()
-    if Core.Settings and Core.Settings.SideKickDebugSettings == true then
-        debugEcho('Core.save() path=%s', tostring(iniPath()))
-    end
-    local ok, err = pcall(lip.save, iniPath(), Core.Ini)
-    -- Errors logged to file only, not in-game
+--- Force save immediately (for shutdown).
+function Core.forceSave()
+    if _dirty then Core.save() end
 end
 
 function Core.set(key, value)
     if key == nil then return end
     local k = tostring(key)
-
-    -- DEBUG: Always log theme changes
-    if k == 'SideKickTheme' then
-        local prev = Core.Settings and Core.Settings[k]
-        print(string.format('\ay[Core.set] Theme: %s -> %s\ax', tostring(prev), tostring(value)))
-    end
 
     local debug = Core.Settings and Core.Settings.SideKickDebugSettings == true
     if debug then
@@ -155,11 +165,6 @@ function Core.set(key, value)
         debugEcho('Core.set(%s): %s -> %s', k, tostring(prev), tostring(value))
     end
     Core.Settings[k] = value
-
-    -- DEBUG: Verify assignment
-    if k == 'SideKickTheme' then
-        print(string.format('\ag[Core.set] Theme now: %s\ax', tostring(Core.Settings[k])))
-    end
 
     -- Ability toggles/modes/conditions always begin with "do" (e.g. doFoo, doFooMode, doFooCondition).
     -- Global settings like AssistMode/CombatMode must stay in the SideKick section.
@@ -173,12 +178,7 @@ function Core.set(key, value)
         local stored = Core.Ini and Core.Ini[sec] and Core.Ini[sec][k]
         debugEcho('INI[%s].%s=%s', sec, k, tostring(stored))
     end
-    Core.save()
-
-    -- DEBUG: Final verification
-    if k == 'SideKickTheme' then
-        print(string.format('\ag[Core.set] Save complete, Settings.SideKickTheme=%s\ax', tostring(Core.Settings.SideKickTheme)))
-    end
+    _dirty = true
 end
 
 function Core.ensureSeeded(abilities, MODE)

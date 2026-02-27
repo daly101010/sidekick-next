@@ -3,6 +3,7 @@
 -- Used when spells are added to a spell set; users can customize via condition_builder UI
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
@@ -10,14 +11,7 @@ local M = {}
 -- Dependencies (lazy-loaded)
 --------------------------------------------------------------------------------
 
-local _Scanner = nil
-local function getScanner()
-    if not _Scanner then
-        local ok, scanner = pcall(require, 'sidekick-next.utils.spellbook_scanner')
-        if ok then _Scanner = scanner end
-    end
-    return _Scanner
-end
+local getScanner = lazy('sidekick-next.utils.spellbook_scanner')
 
 --------------------------------------------------------------------------------
 -- SPA Constants (imported from spellbook_scanner)

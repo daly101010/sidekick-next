@@ -60,7 +60,16 @@ M.Timing = {
     TARGET_CLAIM_TTL_MS = 2000,
     WARMUP_MS = 500,
     COALESCE_MS = 20,
+
+    -- Watchdog thresholds
+    MODULE_CRASH_MS = 10000,        -- 10s without heartbeat = module presumed crashed (zone loads can stall 3-5s)
+    COORDINATOR_ABSENCE_MS = 10000, -- 10s without state = coordinator presumed crashed
+    RESTART_COOLDOWN_MS = 15000,    -- 15s between restart attempts for same module
+    WATCHDOG_CHECK_MS = 1000,       -- 1s between watchdog scans
 }
+
+-- Watchdog limits
+M.MAX_MODULE_RESTARTS = 3  -- Max restart attempts per module per session
 
 -- Action kinds
 M.ActionKind = {
@@ -154,11 +163,28 @@ function M.getCastTimeRemaining()
     return ms / 1000
 end
 
---- Check if in combat
+--- Check if in combat (XTarget haters OR auto-attack active)
+-- Me.Combat() only returns true when auto-attack is on, which is always false
+-- for casters/healers. Check XTarget hater count for actual combat detection.
 -- @return boolean
 function M.inCombat()
     if not M.isMeValid() then return false end
-    return M.safeTLO(function() return mq.TLO.Me.Combat() end, false) == true
+    -- Auto-attack active counts as combat
+    if M.safeTLO(function() return mq.TLO.Me.Combat() end, false) == true then
+        return true
+    end
+    -- Check XTarget for aggressive mobs (reliable for all classes)
+    local xtCount = M.safeNum(function() return mq.TLO.Me.XTarget() end, 0)
+    for i = 1, xtCount do
+        local xt = mq.TLO.Me.XTarget(i)
+        if xt and xt() and xt.ID and xt.ID() and xt.ID() > 0 then
+            local targetType = M.safeTLO(function() return xt.TargetType() end, '') or ''
+            if targetType:lower():find('hater') then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 --- Get group member count

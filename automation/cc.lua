@@ -3,28 +3,15 @@
 -- Broadcasts mezzed mob list to group, receives from other mezzers
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 -- Lazy-load Actors to avoid circular requires
-local _Actors = nil
-local function getActors()
-    if not _Actors then
-        local ok, a = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok then _Actors = a end
-    end
-    return _Actors
-end
+local getActors = lazy('sidekick-next.utils.actors_coordinator')
 
 -- Lazy-load runtime cache for fallback checks
-local _Cache = nil
-local function getCache()
-    if not _Cache then
-        local ok, c = pcall(require, 'sidekick-next.utils.runtime_cache')
-        if ok then _Cache = c end
-    end
-    return _Cache
-end
+local getCache = lazy('sidekick-next.utils.runtime_cache')
 
 -- Local mez tracking (mobs we mezzed)
 M.localMezzes = {}  -- { [mobId] = { expires = os.clock(), name = 'mob name' } }
@@ -563,24 +550,10 @@ end
 --------------------------------------------------------------------------------
 
 -- Lazy-load Core for settings
-local _Core = nil
-local function getCore()
-    if not _Core then
-        local ok, c = pcall(require, 'sidekick-next.utils.core')
-        if ok then _Core = c end
-    end
-    return _Core
-end
+local getCore = lazy('sidekick-next.utils.core')
 
 -- Lazy-load SpellEngine for casting
-local _SpellEngine = nil
-local function getSpellEngine()
-    if not _SpellEngine then
-        local ok, se = pcall(require, 'sidekick-next.utils.spell_engine')
-        if ok then _SpellEngine = se end
-    end
-    return _SpellEngine
-end
+local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
 
 -- Mez casting state
 local _mezCastState = {

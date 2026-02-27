@@ -8,33 +8,7 @@ local lib = require('sidekick-next.sk_lib')
 
 local M = {}
 
--- Debug file logging
-local DEBUG_LOG_FILE = mq.configDir .. '/sk_module_base_debug.log'
-local DEBUG_ENABLED = true
-
-local function debugLogToFile(moduleName, fmt, ...)
-    if not DEBUG_ENABLED then return end
-    local msg = string.format(fmt, ...)
-    local timestamp = os.date('%H:%M:%S')
-    local f = io.open(DEBUG_LOG_FILE, 'a')
-    if f then
-        f:write(string.format('[%s] [%s] %s\n', timestamp, moduleName, msg))
-        f:close()
-    end
-end
-
--- Clear on first load
-local _logCleared = false
-local function ensureLogCleared()
-    if _logCleared then return end
-    _logCleared = true
-    local f = io.open(DEBUG_LOG_FILE, 'w')
-    if f then
-        f:write(string.format('=== SK_MODULE_BASE DEBUG LOG STARTED %s ===\n', os.date('%Y-%m-%d %H:%M:%S')))
-        f:close()
-    end
-end
-ensureLogCleared()
+local debugLogToFile = require('sidekick-next.utils.debug_log').moduleTagged('sk_module_base', 'SK_MODULE_BASE')
 
 --- Create a new module instance
 -- @param moduleName string Unique module name
@@ -56,6 +30,7 @@ function M.create(moduleName, priority)
         claimRequestedAt = 0,
         lastNeedSentAt = 0,
         lastNeedValue = nil,
+        lastNeedReason = nil,
 
         -- Running flag
         running = true,
@@ -110,7 +85,9 @@ function M.create(moduleName, priority)
             self.claimPending = false
         end
 
-        return owner.epoch == self.state.epoch
+        -- The coordinator includes this module as owner in the state broadcast,
+        -- which means ownership is still valid. Module name match is authoritative.
+        return true
     end
 
     function self:ownsTarget()
@@ -127,7 +104,9 @@ function M.create(moduleName, priority)
             self.claimPending = false
         end
 
-        return owner.epoch == self.state.epoch
+        -- The coordinator includes this module as owner in the state broadcast,
+        -- which means ownership is still valid. Module name match is authoritative.
+        return true
     end
 
     function self:ownsAction()
@@ -231,15 +210,18 @@ function M.create(moduleName, priority)
         end)
     end
 
-    function self:sendNeed(needsAction, ttlMs)
+    function self:sendNeed(needsAction, ttlMs, reason)
         if not self.dropbox then return end
         local now = lib.getTimeMs()
         local value = needsAction == true
-        if self.lastNeedValue == value and (now - (self.lastNeedSentAt or 0)) < 100 then
+        -- Always send if reason changed (diagnostic updates matter)
+        local reasonChanged = reason ~= self.lastNeedReason
+        if not reasonChanged and self.lastNeedValue == value and (now - (self.lastNeedSentAt or 0)) < 100 then
             return
         end
         self.lastNeedValue = value
         self.lastNeedSentAt = now
+        self.lastNeedReason = reason
         pcall(function()
             self.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
                 msgType = 'need',
@@ -247,6 +229,7 @@ function M.create(moduleName, priority)
                 priority = self.priority,
                 needsAction = value,
                 ttlMs = ttlMs or 250,
+                reason = reason,
             })
         end)
     end
@@ -373,12 +356,26 @@ function M.create(moduleName, priority)
         lib.log('info', self.name, 'Module ready, waiting for Coordinator state...')
     end
 
+    --- Check if coordinator has been absent too long
+    ---@return boolean True if coordinator is presumed crashed
+    function self:isCoordinatorAbsent()
+        -- Not initialized yet = still waiting, not absent
+        if not self.initialized then return false end
+        -- Never received state = still in startup
+        if self.stateReceivedAt == 0 then return false end
+
+        local now = lib.getTimeMs()
+        local absence = now - self.stateReceivedAt
+        return absence > lib.Timing.COORDINATOR_ABSENCE_MS
+    end
+
     function self:run(tickDelayMs)
         tickDelayMs = tickDelayMs or 50
 
         self:initialize()
 
         local lastHeartbeat = 0
+        local _coordinatorAbsentLogged = false
 
         while self.running do
             self:tick()
@@ -388,6 +385,21 @@ function M.create(moduleName, priority)
             if (now - lastHeartbeat) >= lib.Timing.MODULE_HEARTBEAT_MS then
                 self:sendHeartbeat()
                 lastHeartbeat = now
+            end
+
+            -- Watchdog: check for coordinator absence
+            if self:isCoordinatorAbsent() then
+                if not _coordinatorAbsentLogged then
+                    _coordinatorAbsentLogged = true
+                    local absence = now - self.stateReceivedAt
+                    -- print(string.format(
+                    --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
+                    --     self.name, absence / 1000))
+                    debugLogToFile(self.name, 'WATCHDOG: Coordinator absent for %dms, shutting down', now - self.stateReceivedAt)
+                end
+                self:stop()
+            else
+                _coordinatorAbsentLogged = false
             end
 
             mq.delay(tickDelayMs)

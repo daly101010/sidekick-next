@@ -71,19 +71,31 @@ module.onTick = function(self)
     local settings = syncSettings()
     if not settings then
         _pendingAction = nil
-        self:sendNeed(false)
+        self:sendNeed(false, nil, 'no_settings')
         return
     end
 
-    if settings.UseSpells == false or settings.DoHeals ~= true then
+    if settings.UseSpells == false then
         _pendingAction = nil
-        self:sendNeed(false)
+        self:sendNeed(false, nil, 'spells_disabled')
+        return
+    end
+
+    if settings.DoHeals ~= true then
+        _pendingAction = nil
+        self:sendNeed(false, nil, 'heals_disabled')
+        return
+    end
+
+    if not isClr() then
+        _pendingAction = nil
+        self:sendNeed(false, nil, 'not_clr')
         return
     end
 
     if not ensureHealingInitialized(settings) then
         _pendingAction = nil
-        self:sendNeed(false)
+        self:sendNeed(false, nil, 'init_failed')
         return
     end
 
@@ -99,7 +111,7 @@ module.onTick = function(self)
                 ttlMs = castInfo.castTimeMs + 1500
             end
         end
-        self:sendNeed(true, ttlMs)
+        self:sendNeed(true, ttlMs, 'owns_cast')
         return
     end
 
@@ -122,7 +134,7 @@ module.onTick = function(self)
             needTtlMs = 1000
         end
     end
-    self:sendNeed(needs, needTtlMs)
+    self:sendNeed(needs, needTtlMs, reason or 'no_emergency')
 
     if needs and self.state and self.state.castBusy and not self:ownsCast() then
         local owner = self.state.castOwner
@@ -192,7 +204,8 @@ module.executeAction = function(self)
 
     if not isSpellReady(spellName) then
         lib.log('debug', self.name, 'Spell not ready: %s', spellName)
-        return true, 'spell_not_ready'
+        -- Return false to KEEP the claim — spell may be ready next tick (GCD)
+        return false, 'spell_not_ready'
     end
 
     local castInfo = Healing.prepareHealCast(action)
