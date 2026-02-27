@@ -26,9 +26,22 @@ end
 function M.ensureLogDir()
     local configDir = mq.configDir or 'config'
     local logDir = configDir .. '/HealingLogs'
-    -- Create directory if needed (MQ creates parent dirs)
-    os.execute('mkdir "' .. logDir .. '" 2>nul')
     _logPath = logDir
+    -- Fast path: check if directory already exists (avoids subprocess spawn)
+    local f = io.open(logDir .. '/._dircheck', 'w')
+    if f then
+        f:close()
+        os.remove(logDir .. '/._dircheck')
+        return
+    end
+    -- Directory doesn't exist — try lfs.mkdir (C call, no subprocess)
+    local ok, lfs = pcall(require, 'lfs')
+    if ok and lfs and lfs.mkdir then
+        pcall(lfs.mkdir, logDir)
+        return
+    end
+    -- Last resort: os.execute (spawns cmd.exe, can be slow with antivirus)
+    os.execute('mkdir "' .. logDir .. '" 2>nul')
 end
 
 function M.rotate()

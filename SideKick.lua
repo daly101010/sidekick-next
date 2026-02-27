@@ -17,31 +17,67 @@ local Chase = require('sidekick-next.automation.chase')
 local Assist = require('sidekick-next.automation.assist')
 local Burn = require('sidekick-next.automation.burn')
 local Tank = require('sidekick-next.automation.tank')
-local Meditation = require('sidekick-next.automation.meditation')
 local LegacyHealing = require('sidekick-next.automation.healing')
 local NewHealing = nil  -- Lazy-loaded for CLR
 
--- Function to get the appropriate healing module based on class
+-- Phased healing module loader: spreads the ~6 second CLR healing module load
+-- across multiple main loop ticks to avoid blocking MQ frames.
+-- Phase 0: warmup (3s, legacy healing covers)
+-- Phase 1: require module (fast since submodule requires are deferred)
+-- Phases 2-6: initPhased(1..5), one per tick
+-- Phase 7+: fully ready
+local _healPhase = 0            -- Current loading phase
+local _healMod = nil            -- Module reference during phased loading
+local _healLoadComplete = false  -- True when all phases finished
+local _healingWarmupStart = nil  -- Set when main loop begins
+local HEALING_WARMUP_SEC = 3.0  -- Seconds before starting phased load
+
 local function getHealingModule()
     local me = mq.TLO.Me
     if not me or not me() then return LegacyHealing end
     local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
-    classShort = classShort:upper()
+    if classShort:upper() ~= 'CLR' then return LegacyHealing end
 
-    -- CLR uses new healing intelligence module
-    if classShort == 'CLR' then
-        if not NewHealing then
+    -- Advance one phase per call until complete
+    if not _healLoadComplete then
+        -- Phase 0: warmup (use legacy healing while other systems stabilize)
+        if _healPhase == 0 then
+            if _healingWarmupStart and (os.clock() - _healingWarmupStart) >= HEALING_WARMUP_SEC then
+                _healPhase = 1
+            end
+
+        -- Phase 1: require the module (fast since submodule requires are now deferred)
+        elseif _healPhase == 1 then
             local ok, mod = pcall(require, 'sidekick-next.healing')
-            if ok then
-                NewHealing = mod
-                NewHealing.init()
+            if ok and mod then
+                _healMod = mod
+                _healPhase = 2
+            else
+                _healLoadComplete = true
+            end
+
+        -- Phases 2+: incremental init (one phase per tick)
+        elseif _healMod then
+            local initPhase = _healPhase - 1
+            local totalPhases = _healMod.TOTAL_INIT_PHASES or 5
+            if initPhase <= totalPhases then
+                pcall(_healMod.initPhased, initPhase)
+                _healPhase = _healPhase + 1
+
+                if not NewHealing and _healMod.isInitialized and _healMod.isInitialized() then
+                    NewHealing = _healMod
+                end
+
+                if initPhase >= totalPhases then
+                    _healLoadComplete = true
+                end
+            else
+                _healLoadComplete = true
             end
         end
-        return NewHealing or LegacyHealing
     end
 
-    -- All other classes use legacy module
-    return LegacyHealing
+    return NewHealing or LegacyHealing
 end
 
 local Healing = nil  -- Will be set dynamically by getHealingModule()
@@ -49,12 +85,12 @@ local Healing = nil  -- Will be set dynamically by getHealingModule()
 local Cures = require('sidekick-next.automation.cures')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 local SharedData = require('sidekick-next.actors.shareddata')
-local Grids = require('sidekick-next.ui.grids')
+local getGrids = lazy('sidekick-next.ui.grids')
 local SettingsUI = require('sidekick-next.ui.settings')
-local Bar = require('sidekick-next.ui.bar_animated')
-local SpecialBar = require('sidekick-next.ui.special_bar_animated')
-local DiscBar = require('sidekick-next.ui.disc_bar_animated')
-local ItemBar = require('sidekick-next.ui.item_bar_animated')
+local getBar = lazy('sidekick-next.ui.bar_animated')
+local getSpecialBar = lazy('sidekick-next.ui.special_bar_animated')
+local getDiscBar = lazy('sidekick-next.ui.disc_bar_animated')
+local getItemBar = lazy('sidekick-next.ui.item_bar_animated')
 local iam = require('ImAnim')
 
 -- Cached spring ease descriptors (iam.EaseSpring may be nil in some builds)
@@ -74,25 +110,24 @@ end)()
 local Anchor = require('sidekick-next.ui.anchor')
 local Items = require('sidekick-next.utils.items')
 
--- New enhancement modules
-local RemoteAbilities = require('sidekick-next.ui.remote_abilities')
-local AggroWarning = require('sidekick-next.ui.aggro_warning')
-local ActorsDebug = require('sidekick-next.ui.actors_debug')
-local CoordinatorDebug = require('sidekick-next.ui.coordinator_debug')
+-- New enhancement modules (lazy-loaded: only used in UI callbacks and commands)
+local getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
+local getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
+local getActorsDebug = lazy('sidekick-next.ui.actors_debug')
+local getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
 
--- Runtime cache, action executor, rotation engine, CC, and spell engine
-local RuntimeCache = require('sidekick-next.utils.runtime_cache')
-local ActionExecutor = require('sidekick-next.utils.action_executor')
-local RotationEngine = require('sidekick-next.utils.rotation_engine')
-local CC = require('sidekick-next.automation.cc')
-local Buff = require('sidekick-next.automation.buff')
-local SpellEngine = require('sidekick-next.utils.spell_engine')
-local SpellEvents = require('sidekick-next.utils.spell_events')
-local ImmuneDB = require('sidekick-next.utils.immune_database')
-local SpellLineup = require('sidekick-next.utils.spell_lineup')
-local ClassConfigLoader = require('sidekick-next.utils.class_config_loader')
-local SpellsetManager = require('sidekick-next.utils.spellset_manager')
-local SpellSetEditor = require('sidekick-next.ui.spell_set_editor')
+-- Runtime cache, action executor, rotation engine, CC, and spell engine (lazy-loaded)
+local getRuntimeCache = lazy.init('sidekick-next.utils.runtime_cache')
+local getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
+local getRotationEngine = lazy('sidekick-next.utils.rotation_engine')
+local getCC = lazy.init('sidekick-next.automation.cc')
+local getBuff = lazy.init('sidekick-next.automation.buff')
+local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
+local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
+local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
+local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
+local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
+local getSpellSetEditor = lazy.init('sidekick-next.ui.spell_set_editor')
 
 local getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
 local getOocBuffExecutor = lazy('sidekick-next.utils.ooc_buff_executor')
@@ -710,6 +745,7 @@ local function draw()
         imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, rounding)
         imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, 8, 6)
 
+        local shown
         State.open, shown = imgui.Begin('SideKick##MainBar', State.open, flags)
         if shown then
         -- Draw textured background for ClassicEQ Textured theme
@@ -1175,7 +1211,8 @@ local function draw()
 
             if imgui.BeginTabBar('##sidekick_popup_tabs') then
                 if imgui.BeginTabItem("AA's") then
-                    Grids.drawAbilities({
+                    local Grids = getGrids()
+                    if Grids then Grids.drawAbilities({
                         abilities = State.abilities,
                         settings = Core.Settings,
                         modeLabels = Abilities.MODE_LABELS,
@@ -1184,7 +1221,7 @@ local function draw()
                         onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
                         cooldownProbe = function(row) return Cooldowns.probe(row) end,
                         helpers = Helpers,
-                    })
+                    }) end
                     imgui.EndTabItem()
                 end
 
@@ -1242,20 +1279,24 @@ local function draw()
                     -- Remote Abilities settings section
                     imgui.Separator()
                     if imgui.CollapsingHeader('Remote Abilities') then
-                        local raOpen = RemoteAbilities.isOpen()
-                        local changed
-                        raOpen, changed = imgui.Checkbox('Show Remote Ability Bar', raOpen)
-                        if changed then
-                            RemoteAbilities.setOpen(raOpen)
-                        end
-                        if imgui.Button('Configure Remote Abilities') then
-                            RemoteAbilities.toggleSettings()
+                        local RemoteAbilities = getRemoteAbilities()
+                        if RemoteAbilities then
+                            local raOpen = RemoteAbilities.isOpen()
+                            local changed
+                            raOpen, changed = imgui.Checkbox('Show Remote Ability Bar', raOpen)
+                            if changed then
+                                RemoteAbilities.setOpen(raOpen)
+                            end
+                            if imgui.Button('Configure Remote Abilities') then
+                                RemoteAbilities.toggleSettings()
+                            end
                         end
                     end
 
                     -- Aggro Warning settings section
                     if imgui.CollapsingHeader('Warnings') then
-                        AggroWarning.drawSettings()
+                        local AggroWarning = getAggroWarning()
+                        if AggroWarning then AggroWarning.drawSettings() end
                     end
 
                     imgui.EndTabItem()
@@ -1263,11 +1304,12 @@ local function draw()
 
                 -- Spell Set tab
                 if imgui.BeginTabItem('Spell Set') then
-                    local ok, err = pcall(function()
-                        SpellSetEditor.drawContent()
-                    end)
-                    if not ok then
-                        imgui.TextColored(1, 0.3, 0.3, 1, 'Error: ' .. tostring(err))
+                    local SSE = getSpellSetEditor()
+                    if SSE then
+                        local ok, err = pcall(function() SSE.drawContent() end)
+                        if not ok then
+                            imgui.TextColored(1, 0.3, 0.3, 1, 'Error: ' .. tostring(err))
+                        end
                     end
                     imgui.EndTabItem()
                 end
@@ -1417,10 +1459,19 @@ local function draw()
     end
 end
 
+local _automationInitDone = false
 local function tickAutomation()
     local now = os.clock()
     if (now - (State.lastAutomationTick or 0)) < 0.05 then return end
     State.lastAutomationTick = now
+
+    -- Deferred init: trigger lazy.init() modules on first tick (spreads load after startup)
+    if not _automationInitDone then
+        local ae = getActionExecutor()
+        local sl = getSpellLineup()
+        local ccl = getClassConfigLoader()
+        _automationInitDone = (ae ~= nil) and (sl ~= nil) and (ccl ~= nil)
+    end
 
     -- Global pause check - stop all automation when paused
     if Core.Settings.AutomationPaused == true then return end
@@ -1430,22 +1481,24 @@ local function tickAutomation()
     local allowMovementAutomation = (playStyle == 'auto')
 
     -- Update runtime cache (before other automation)
-    RuntimeCache.tick()
+    do local M = getRuntimeCache() if M then M.tick() end end
 
     -- Update CC tracking (mez broadcasts/receives)
-    CC.tick()
+    local CC = getCC()
+    if CC then CC.tick() end
 
     -- Mez casting tick (ENC/BRD only, checks isMezClass internally)
-    if allowAbilityAutomation then
+    if allowAbilityAutomation and CC then
         CC.mezTick(Core.Settings)
     end
 
     -- Update buff tracking (buff broadcasts/receives)
-    Buff.tick()
+    do local M = getBuff() if M then M.tick() end end
 
     -- Update spell engine state machine (non-blocking cast monitoring)
-    SpellEngine.tick()
-    SpellsetManager.tick()
+    do local M = getSpellEngine() if M then M.tick() end end
+
+    do local M = getSpellsetManager() if M then M.tick() end end
 
     -- Process events for cast result detection
     mq.doevents()
@@ -1469,7 +1522,8 @@ local function tickAutomation()
 
     -- Run layered rotation engine (replaces flat Abilities.tryAllAbilities)
     local TL = getThrottledLog()
-    if allowAbilityAutomation and Core.Settings.AutoAbilitiesEnabled ~= false then
+    local RotationEngine = getRotationEngine()
+    if allowAbilityAutomation and Core.Settings.AutoAbilitiesEnabled ~= false and RotationEngine then
         if debugAutomationLogging and TL then
             TL.log('rotation_start', 15, 'RotationEngine.tick: abilities=%d, burnActive=%s, priorityHealing=%s',
                 #(State.abilities or {}), tostring(Burn.active), tostring(priorityHealingActive))
@@ -1494,26 +1548,12 @@ local function tickAutomation()
         end
     end
 
-    -- Buff casting - DISABLED: Now handled by sk_buffs.lua coordinator module
-    -- if allowAbilityAutomation and not priorityHealingActive then
-    --     Buff.buffTick()
-    -- else
-    --     if debugAutomationLogging and TL then
-    --         TL.log('buff_tick_skip', 15, 'Buff.buffTick SKIP: allowAbilityAutomation=%s, priorityHealingActive=%s',
-    --             tostring(allowAbilityAutomation), tostring(priorityHealingActive))
-    --     end
-    -- end
-    -- NOTE: Buff.tick() is still called above (line ~1223) for broadcast/cleanup tasks (non-casting logic)
-
     Burn.tick()
-
     if allowMovementAutomation then
         Chase.tick()
     elseif Chase and Chase.stopNav then
         Chase.stopNav()
     end
-
-    -- Combat mode: tank handles targeting/aggro, assist handles engagement
     local CombatMode = Core.Settings.CombatMode or 'off'
     if allowMovementAutomation and CombatMode == 'tank' then
         Tank.tick(State.abilities, Core.Settings)
@@ -1523,16 +1563,9 @@ local function tickAutomation()
             Assist.tick()
         end
     end
-
     if allowAbilityAutomation and Items and Items.tick and Core.Settings.AutoItemsEnabled ~= false then
         Items.tick()
     end
-
-    -- Meditation (sit/stand) - DISABLED: Now handled by sk_meditation.lua coordinator module
-    -- if playStyle ~= 'manual' and Meditation and Meditation.tick then
-    --     debugLog('[MedTick] calling meditation.tick playStyle=%s mode=%s', tostring(playStyle), tostring(Core.Settings.MeditationMode or 'unknown'))
-    --     Meditation.tick(Core.Settings)
-    -- end
 end
 
 local function syncModulesFromSettings()
@@ -1712,6 +1745,7 @@ end
 
 local function main()
     Core.load()
+
     if _G.SIDEKICK_NEXT_CONFIG then
         _G.SIDEKICK_NEXT_CONFIG.DEBUG_SETTINGS = Core.Settings.SideKickDebugSettings == true
     end
@@ -1739,24 +1773,8 @@ local function main()
     })
     Assist.init({ Core = Core, CombatAssist = CombatAssist, Chase = Chase })
     Tank.init(Core.Settings)
-
-    -- Initialize new enhancement modules
-    RemoteAbilities.init()
-    AggroWarning.init()
-    CoordinatorDebug.init()
-
-    -- Initialize runtime cache, action executor, CC, cures, and spell engine
-    RuntimeCache.init()
-    ActionExecutor.init()
-    CC.init()
-    Buff.init()
     Cures.init()
-    SpellEngine.init()
-    ImmuneDB.init()
-    SpellLineup.init()
-    ClassConfigLoader.init()
-    SpellsetManager.init()
-    SpellSetEditor.init()
+    -- All other modules init on first access via lazy.init()
 
     -- Launch Group script on startup if enabled (default true)
     if Core.Settings.SideKickLaunchGroup ~= false then
@@ -1792,10 +1810,10 @@ local function main()
             end)
         elseif a1 == 'remote' then
             -- New command: toggle remote ability bar
-            RemoteAbilities.toggle()
+            local M = getRemoteAbilities() if M then M.toggle() end
         elseif a1 == 'remoteconfig' then
             -- New command: open remote abilities settings
-            RemoteAbilities.toggleSettings()
+            local M = getRemoteAbilities() if M then M.toggleSettings() end
         elseif a1 == 'debugsettings' then
             -- Toggle settings persistence debugging (/SideKick debugsettings on|off|toggle)
             local a2 = tostring(args[2] or ''):lower()
@@ -1815,9 +1833,9 @@ local function main()
             end
         elseif a1 == 'actorsdebug' then
             -- Opens actors debug window instead of echoing
-            ActorsDebug.toggle()
+            do local M = getActorsDebug() if M then M.toggle() end end
         elseif a1 == 'coord' or a1 == 'coordinator' then
-            CoordinatorDebug.toggle()
+            do local M = getCoordinatorDebug() if M then M.toggle() end end
         elseif a1 == 'cache' then
             -- Debug command disabled (no in-game output)
         elseif a1 == 'cc' then
@@ -1830,7 +1848,8 @@ local function main()
             if spellName then
                 local target = mq.TLO.Target
                 local targetId = target and target() and target.ID() or 0
-                SpellEngine.cast(spellName, targetId)
+                local SE = getSpellEngine()
+                if SE then SE.cast(spellName, targetId) end
             end
         elseif a1 == 'healmonitor' then
             local mod = getHealingModule()
@@ -1843,7 +1862,7 @@ local function main()
                 ActorsCoordinator.broadcastAssistMe()
             end)
         elseif a1 == 'spellset' or a1 == 'ss' then
-            SpellSetEditor.toggle()
+            do local M = getSpellSetEditor() if M then M.toggle() end end
         elseif a1 == 'debugcombat' then
             -- Debug combat spell executor
             local ok, CombatExec = pcall(require, 'sidekick-next.utils.combat_spell_executor')
@@ -1912,7 +1931,7 @@ local function main()
         end)
     end)
     _bindCmd('/skactors', function()
-        ActorsDebug.toggle()
+        local M = getActorsDebug() if M then M.toggle() end
     end)
     _bindCmd('/skspells', function(cmd)
         enqueue(function()
@@ -1958,7 +1977,8 @@ local function main()
         end
 
         if Core.Settings.SideKickBarEnabled ~= false then
-            Bar.draw({
+            local Bar = getBar()
+            if Bar then Bar.draw({
                 abilities = State.barAbilities,
                 settings = Core.Settings,
                 animSpellIcons = animSpellIcons,
@@ -1968,46 +1988,49 @@ local function main()
                 modeLabels = Abilities.MODE_LABELS,
                 onMode = function(key, value) Core.set(key, value) end,
                 onOpenSettings = function() State.settingsOpen = true end,
-            })
+            }) end
         end
 
         if Core.Settings.SideKickSpecialEnabled ~= false then
-            SpecialBar.draw({
+            local SpecialBar = getSpecialBar()
+            if SpecialBar then SpecialBar.draw({
                 settings = Core.Settings,
                 animSpellIcons = animSpellIcons,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
                 onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
                 onSettingChange = function(key, value) Core.set(key, value) end,
-            })
+            }) end
         end
 
         if Core.Settings.SideKickDiscBarEnabled ~= false and tostring(State.classShort or '') == 'BER' then
-            DiscBar.draw({
+            local DiscBar = getDiscBar()
+            if DiscBar then DiscBar.draw({
                 abilities = State.abilities,
                 settings = Core.Settings,
                 animSpellIcons = animSpellIcons,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
                 onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
-            })
+            }) end
         end
 
         if Core.Settings.SideKickItemBarEnabled ~= false then
-            ItemBar.draw({
+            local ItemBar = getItemBar()
+            if ItemBar then ItemBar.draw({
                 settings = Core.Settings,
                 animItems = animItems,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
-            })
+            }) end
         end
 
-        -- Draw new enhancement UIs
-        RemoteAbilities.draw()
-        AggroWarning.draw()
-        ActorsDebug.render()
-        CoordinatorDebug.render()
-        SpellSetEditor.render()
+        -- Draw new enhancement UIs (lazy-loaded)
+        do local M = getRemoteAbilities() if M then M.draw() end end
+        do local M = getAggroWarning() if M then M.draw() end end
+        do local M = getActorsDebug() if M then M.render() end end
+        do local M = getCoordinatorDebug() if M then M.render() end end
+        do local M = getSpellSetEditor() if M then M.render() end end
 
         -- Healing monitor (new healing intelligence module)
         if NewHealing and NewHealing.drawMonitor then
@@ -2027,6 +2050,8 @@ local function main()
         end
     end)
 
+    _healingWarmupStart = os.clock()  -- Start warmup timer (defers heavy CLR healing load)
+
     while State.isRunning and mq.TLO.MacroQuest.GameState() == 'INGAME' do
         refreshClassAbilitiesIfNeeded()
         drainQueue()
@@ -2034,6 +2059,7 @@ local function main()
         tickAutomation()
 
         -- Process pending spell set memorization (must be in main loop, not ImGui)
+
         local Memorize = getSpellSetMemorize()
         if Memorize and Memorize.processPending then
             Memorize.processPending()
@@ -2052,10 +2078,10 @@ local function main()
         -- end
 
         -- Check for zone change (immune database)
-        ImmuneDB.loadZone()
+        do local M = getImmuneDB() if M then M.loadZone() end end
 
         -- Update aggro warning state
-        AggroWarning.update()
+        do local M = getAggroWarning() if M and M.update then M.update() end end
 
         -- Actors + GT dock/status updates (runs in main loop so yields are allowed elsewhere).
         if Core.Settings.ActorsEnabled ~= false then
@@ -2093,6 +2119,9 @@ local function main()
             end
         end
 
+        -- Flush pending settings writes (debounced, max once/sec)
+        Core.flush()
+
         mq.doevents()
         mq.delay(1)
     end
@@ -2103,7 +2132,10 @@ local function main()
     end
 
     -- Shutdown: save immune database
-    ImmuneDB.shutdown()
+    do local M = getImmuneDB() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: flush any pending Core settings
+    Core.forceSave()
 end
 
 return main

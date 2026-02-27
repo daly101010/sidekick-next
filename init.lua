@@ -24,6 +24,7 @@ end
 
 -- Load main module
 local main = require(BASE .. 'SideKick')
+
 if type(main) == 'function' then
     main()
 end

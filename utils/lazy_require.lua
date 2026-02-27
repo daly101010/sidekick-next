@@ -9,9 +9,11 @@
 ---
 ---   -- Once mode (tries once, returns nil forever after failure, like Form B/C):
 ---   local getMonitor = lazy.once('sidekick-next.healing.ui.monitor')
+---
+---   -- Init mode (like retry, but calls module.init() on first successful load):
+---   local getCC = lazy.init('sidekick-next.automation.cc')
 
 local _cache = {}      -- shared cache: modulePath -> loaded module (or false sentinel)
-local _attempted = {}  -- tracks whether a once() path has been attempted
 
 local lazy = {}
 
@@ -21,7 +23,6 @@ local function retryLoader(modulePath)
     return function()
         local cached = _cache[modulePath]
         if cached then return cached end
-        if cached == false and _attempted[modulePath] then return nil end
         local ok, m = pcall(require, modulePath)
         if ok and m then
             _cache[modulePath] = m
@@ -34,12 +35,12 @@ end
 --- Once mode: tries once, returns nil forever on failure.
 --- Replaces Form B (PascalCase + false sentinel) and Form C (loaded-flag boolean).
 function lazy.once(modulePath)
+    local attempted = false
     return function()
-        if _attempted[modulePath] then
-            local cached = _cache[modulePath]
-            return cached or nil
+        if attempted then
+            return _cache[modulePath] or nil
         end
-        _attempted[modulePath] = true
+        attempted = true
         local ok, m = pcall(require, modulePath)
         if ok and m then
             _cache[modulePath] = m
@@ -50,7 +51,30 @@ function lazy.once(modulePath)
     end
 end
 
--- Make lazy callable as lazy('path') for retry mode, and indexable for lazy.once()
+--- Init mode: like retry, but calls module.init() on first successful load.
+--- Replaces deferred init patterns where a module needs init() on first access.
+--- init() is only called once; if init() throws, it will be retried on next call.
+function lazy.init(modulePath)
+    local inited = false
+    local getter = retryLoader(modulePath)
+    return function()
+        local m = getter()
+        if m and not inited then
+            if type(m.init) == 'function' then
+                local ok, err = pcall(m.init)
+                if ok then
+                    inited = true
+                end
+                -- On failure, inited stays false so next call retries init()
+            else
+                inited = true  -- No init method, nothing to retry
+            end
+        end
+        return m
+    end
+end
+
+-- Make lazy callable as lazy('path') for retry mode, and indexable for lazy.once() / lazy.init()
 setmetatable(lazy, { __call = function(_, modulePath) return retryLoader(modulePath) end })
 
 return lazy

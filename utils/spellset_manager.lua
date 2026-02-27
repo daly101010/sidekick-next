@@ -1197,18 +1197,20 @@ function M.init()
     M.updateCapacity()
 
     -- Ensure we always have at least one set to edit
+    local needsSave = false
     if not next(M.spellSets) then
         local defaultName = 'Default'
         M.spellSets[defaultName] = { name = defaultName, lines = {} }
         M.activeSetName = defaultName
-        M.saveSpellSets()
+        needsSave = true
     elseif not M.activeSetName then
         local names = M.getSetNames()
         if names[1] then
             M.activeSetName = names[1]
-            M.saveSpellSets()
+            needsSave = true
         end
     end
+    if needsSave then M.saveSpellSets() end
 
     M.initialized = true
     if M.activeSetName then

@@ -187,7 +187,7 @@ function M.save()
     for _ in pairs(M.spellSets) do
         setCount = setCount + 1
     end
-    print(string.format('\\ay[SpellSetPersistence]\\ax Saving %d spell set(s) to: %s', setCount, path))
+    -- print(string.format('\\ay[SpellSetPersistence]\\ax Saving %d spell set(s) to: %s', setCount, path))
 
     -- Build data structure for persistence
     local data = {
@@ -198,7 +198,7 @@ function M.save()
 
     -- Serialize each spell set
     for name, spellSet in pairs(M.spellSets) do
-        print(string.format('\\ay[SpellSetPersistence]\\ax   - Serializing set: "%s"', name))
+        -- print(string.format('\\ay[SpellSetPersistence]\\ax   - Serializing set: "%s"', name))
         local setData = {
             name = spellSet.name,
             gems = {},
@@ -248,7 +248,7 @@ function M.save()
     for _ in pairs(data.sets) do
         savedCount = savedCount + 1
     end
-    print(string.format('\ag[SpellSetPersistence]\ax Save complete: %d set(s) saved successfully', savedCount))
+    -- print(string.format('\ag[SpellSetPersistence]\ax Save complete: %d set(s) saved successfully', savedCount))
 
     return true
 end
@@ -260,7 +260,7 @@ end
 --- Ensures activeSetName points to valid set
 function M.load()
     local path = M.getConfigPath()
-    print(string.format('\\ay[SpellSetPersistence]\\ax Loading spell sets from: %s', path))
+    -- print(string.format('\\ay[SpellSetPersistence]\\ax Loading spell sets from: %s', path))
 
     -- Try to load file
     local data = nil
@@ -268,7 +268,7 @@ function M.load()
 
     if ok and type(result) == 'table' then
         data = result
-        print(string.format('\\ag[SpellSetPersistence]\\ax Loaded data, version=%s', tostring(data.version or 'nil')))
+        -- print(string.format('\\ag[SpellSetPersistence]\\ax Loaded data, version=%s', tostring(data.version or 'nil')))
     else
         print(string.format('\\ar[SpellSetPersistence]\\ax Failed to load: %s', tostring(result)))
     end
@@ -287,11 +287,11 @@ function M.load()
         for _ in pairs(data.sets) do
             loadedSetCount = loadedSetCount + 1
         end
-        print(string.format('\\ag[SpellSetPersistence]\\ax Found %d spell set(s) in file', loadedSetCount))
+        -- print(string.format('\\ag[SpellSetPersistence]\\ax Found %d spell set(s) in file', loadedSetCount))
 
         -- Deserialize each spell set
         for name, setData in pairs(data.sets) do
-            print(string.format('\\ag[SpellSetPersistence]\\ax   - Loading set: "%s"', name))
+            -- print(string.format('\\ag[SpellSetPersistence]\\ax   - Loading set: "%s"', name))
             local SpellSetData = getSpellSetData()
             local spellSet = nil
 
@@ -377,11 +377,11 @@ function M.createSet(name)
 
     -- Don't overwrite existing set
     if M.spellSets[name] then
-        print(string.format('\\ay[SpellSetPersistence]\\ax Set "%s" already exists, returning existing', name))
+        -- print(string.format('\\ay[SpellSetPersistence]\\ax Set "%s" already exists, returning existing', name))
         return M.spellSets[name]
     end
 
-    print(string.format('\\ag[SpellSetPersistence]\\ax Creating new spell set: "%s"', name))
+    -- print(string.format('\\ag[SpellSetPersistence]\\ax Creating new spell set: "%s"', name))
 
     local SpellSetData = getSpellSetData()
     local spellSet = nil

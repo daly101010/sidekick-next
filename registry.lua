@@ -340,12 +340,18 @@ function M.getValidator(key)
     return VALIDATORS[key]
 end
 
+-- Cache sorted keys (M.defaults is static, never changes at runtime)
+local _sortedKeys = nil
+
 function M.iter_all()
-    local keys = {}
-    for k, _ in pairs(M.defaults) do
-        table.insert(keys, k)
+    if not _sortedKeys then
+        _sortedKeys = {}
+        for k, _ in pairs(M.defaults) do
+            _sortedKeys[#_sortedKeys + 1] = k
+        end
+        table.sort(_sortedKeys)
     end
-    table.sort(keys)
+    local keys = _sortedKeys
     local i = 0
     return function()
         i = i + 1

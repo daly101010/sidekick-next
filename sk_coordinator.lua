@@ -732,9 +732,9 @@ local function attemptRestart(moduleName, scriptPath)
 
     debugLog('WATCHDOG: Restarting %s (attempt %d/%d)',
         scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS)
-    print(string.format(
-        '\ay[SK-Watchdog]\ax Restarting crashed module: %s (attempt %d/%d)',
-        scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS))
+    -- print(string.format(
+    --     '\ay[SK-Watchdog]\ax Restarting crashed module: %s (attempt %d/%d)',
+    --     scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS))
 
     mq.cmdf('/lua run %s', scriptPath)
     return true
@@ -763,9 +763,9 @@ local function checkModuleHealth()
     for _, entry in ipairs(staleModules) do
         debugLog('WATCHDOG: Module %s heartbeat stale (%dms), presumed crashed',
             entry.name, entry.age)
-        print(string.format(
-            '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
-            entry.name, entry.age / 1000))
+        -- print(string.format(
+        --     '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
+        --     entry.name, entry.age / 1000))
 
         -- Revoke any claims this module held
         revokeCrashedModuleClaims(entry.name)
@@ -775,9 +775,9 @@ local function checkModuleHealth()
         if not attemptRestart(entry.name, scriptPath) and scriptPath then
             local tracker = _restartTracker[scriptPath]
             if tracker and tracker.count >= lib.MAX_MODULE_RESTARTS then
-                print(string.format(
-                    '\ar[SK-Watchdog]\ax Module "%s" exceeded max restarts (%d) — giving up',
-                    entry.name, lib.MAX_MODULE_RESTARTS))
+                -- print(string.format(
+                --     '\ar[SK-Watchdog]\ax Module "%s" exceeded max restarts (%d) — giving up',
+                --     entry.name, lib.MAX_MODULE_RESTARTS))
             end
         end
 

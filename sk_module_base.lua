@@ -392,9 +392,9 @@ function M.create(moduleName, priority)
                 if not _coordinatorAbsentLogged then
                     _coordinatorAbsentLogged = true
                     local absence = now - self.stateReceivedAt
-                    print(string.format(
-                        '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
-                        self.name, absence / 1000))
+                    -- print(string.format(
+                    --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
+                    --     self.name, absence / 1000))
                     debugLogToFile(self.name, 'WATCHDOG: Coordinator absent for %dms, shutting down', now - self.stateReceivedAt)
                 end
                 self:stop()

@@ -115,9 +115,6 @@ end
 -- Keep Core for backwards compatibility but don't rely on it
 local getCore = lazy('sidekick-next.utils.core')
 
--- Lazy-load RuntimeCache (fallback, may not have data in separate script)
-local getCache = lazy('sidekick-next.utils.runtime_cache')
-
 -- Build me data directly from TLO (since we run as separate script)
 local function getMeData()
     local me = mq.TLO.Me
@@ -425,9 +422,6 @@ local function tick()
         return
     end
 
-    -- Get cache for additional data (may be empty)
-    local cache = getCache() or {}
-
     local now = os.clock()
     updateResourceFlags(now)
 
@@ -676,9 +670,9 @@ local function mainLoop()
             if not _coordinatorAbsentLogged then
                 _coordinatorAbsentLogged = true
                 local absence = now - State.stateReceivedAt
-                print(string.format(
-                    '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
-                    M.MODULE_NAME, absence / 1000))
+                -- print(string.format(
+                --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
+                --     M.MODULE_NAME, absence / 1000))
                 debugLog('WATCHDOG: Coordinator absent for %dms, shutting down', now - State.stateReceivedAt)
             end
             -- Meditation does not use claims, so no releaseClaim needed
