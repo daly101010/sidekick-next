@@ -147,12 +147,6 @@ function M.getAbilityLayer(def, settings, classConfig)
         end
     end
 
-    -- Check if marked for aggro use (tank abilities)
-    local aggroKey = def.settingKey and (def.settingKey .. 'UseForAggro')
-    if aggroKey and settings and settings[aggroKey] == true then
-        return 'aggro'
-    end
-
     -- Default to combat layer
     return 'combat'
 end
