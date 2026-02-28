@@ -1551,11 +1551,17 @@ local function tickAutomation()
             TL.log('rotation_start', 15, 'RotationEngine.tick: abilities=%d, burnActive=%s, priorityHealing=%s',
                 #(State.abilities or {}), tostring(Burn.active), tostring(priorityHealingActive))
         end
+        -- When tank mode is active, tank module owns the aggro layer
+        local skipLayers = nil
+        if (Core.Settings.CombatMode or 'off') == 'tank' then
+            skipLayers = { aggro = true }
+        end
         RotationEngine.tick({
             abilities = State.abilities,
             settings = Core.Settings,
             burnActive = Burn.active,
             priorityHealingActive = priorityHealingActive,
+            skipLayers = skipLayers,
         })
 
         -- Process mash queue (ON_COOLDOWN abilities) after rotation
