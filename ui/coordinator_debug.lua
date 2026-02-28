@@ -580,77 +580,88 @@ function M.init()
     end)
 end
 
+--- Render the coordinator debug content (no window wrapper).
+--- Can be embedded inside another window or settings tab.
+function M.drawContent()
+    -- Ensure Actor listener is registered
+    M.init()
+
+    if not State.last then
+        imgui.TextColored(0.7, 0.7, 0.7, 1, 'Waiting for coordinator state...')
+        return
+    end
+
+    local nowMs = mq.gettime()
+    local sentAt = State.last.sentAtMs or State.receivedAtMs
+    local ageMs = nowMs - (sentAt or nowMs)
+    local ttlMs = State.last.ttlMs or 0
+    local stale = ttlMs > 0 and ageMs > ttlMs
+
+    local rows = {
+        { 'Active Priority', tostring(priorityNames[State.last.activePriority] or State.last.activePriority or '?') },
+        { 'Cast Busy', formatBool(State.last.castBusy) },
+        { 'Epoch', tostring(State.last.epoch or '?') },
+        { 'Tick ID', tostring(State.last.tickId or '?') },
+        { 'Age (s)', string.format('%.2f', ageMs / 1000) },
+        { 'Stale', formatBool(stale) },
+    }
+
+    renderTable('##coord_summary', rows)
+
+    imgui.Spacing()
+    imgui.Separator()
+
+    renderOwnerBlock('Cast Owner', State.last.castOwner)
+    imgui.Spacing()
+    renderOwnerBlock('Target Owner', State.last.targetOwner)
+
+    imgui.Spacing()
+    imgui.Separator()
+
+    imgui.Text('World State')
+    local ws = State.last.worldState or {}
+    local wrows = {
+        { 'In Combat', formatBool(ws.inCombat) },
+        { 'My HP %', tostring(ws.myHpPct or '?') },
+        { 'My Mana %', tostring(ws.myManaPct or '?') },
+        { 'Group Needs Healing', formatBool(ws.groupNeedsHealing) },
+        { 'Emergency Active', formatBool(ws.emergencyActive) },
+        { 'Dead Count', tostring(ws.deadCount or '?') },
+        { 'Main Assist ID', tostring(ws.mainAssistId or '?') },
+    }
+    renderTable('##coord_world', wrows)
+
+    imgui.Spacing()
+    imgui.Separator()
+
+    -- Module Status (always visible - key diagnostic)
+    if imgui.CollapsingHeader('Module Status##modules') then
+        renderModuleDiagnostics(State.last.moduleDiag)
+    end
+
+    imgui.Spacing()
+    imgui.Separator()
+
+    -- Healing Decision (what HI thinks we should do right now)
+    if imgui.CollapsingHeader('Healing Decision##healdecision') then
+        renderHealingDecision()
+    end
+
+    imgui.Spacing()
+    imgui.Separator()
+
+    if imgui.CollapsingHeader('Heals Available##healavail') then
+        renderHealAvailability()
+    end
+end
+
+--- Render the standalone coordinator debug window.
 function M.render()
     if not M.open then return end
 
     M.open, M._showWindow = imgui.Begin('SideKick Coordinator', M.open)
     if M._showWindow then
-        if not State.last then
-            imgui.TextColored(0.7, 0.7, 0.7, 1, 'Waiting for coordinator state...')
-        else
-            local nowMs = mq.gettime()
-            local sentAt = State.last.sentAtMs or State.receivedAtMs
-            local ageMs = nowMs - (sentAt or nowMs)
-            local ttlMs = State.last.ttlMs or 0
-            local stale = ttlMs > 0 and ageMs > ttlMs
-
-            local rows = {
-                { 'Active Priority', tostring(priorityNames[State.last.activePriority] or State.last.activePriority or '?') },
-                { 'Cast Busy', formatBool(State.last.castBusy) },
-                { 'Epoch', tostring(State.last.epoch or '?') },
-                { 'Tick ID', tostring(State.last.tickId or '?') },
-                { 'Age (s)', string.format('%.2f', ageMs / 1000) },
-                { 'Stale', formatBool(stale) },
-            }
-
-            renderTable('##coord_summary', rows)
-
-            imgui.Spacing()
-            imgui.Separator()
-
-            renderOwnerBlock('Cast Owner', State.last.castOwner)
-            imgui.Spacing()
-            renderOwnerBlock('Target Owner', State.last.targetOwner)
-
-            imgui.Spacing()
-            imgui.Separator()
-
-            imgui.Text('World State')
-            local ws = State.last.worldState or {}
-            local wrows = {
-                { 'In Combat', formatBool(ws.inCombat) },
-                { 'My HP %', tostring(ws.myHpPct or '?') },
-                { 'My Mana %', tostring(ws.myManaPct or '?') },
-                { 'Group Needs Healing', formatBool(ws.groupNeedsHealing) },
-                { 'Emergency Active', formatBool(ws.emergencyActive) },
-                { 'Dead Count', tostring(ws.deadCount or '?') },
-                { 'Main Assist ID', tostring(ws.mainAssistId or '?') },
-            }
-            renderTable('##coord_world', wrows)
-
-            imgui.Spacing()
-            imgui.Separator()
-
-            -- Module Status (always visible - key diagnostic)
-            if imgui.CollapsingHeader('Module Status##modules') then
-                renderModuleDiagnostics(State.last.moduleDiag)
-            end
-
-            imgui.Spacing()
-            imgui.Separator()
-
-            -- Healing Decision (what HI thinks we should do right now)
-            if imgui.CollapsingHeader('Healing Decision##healdecision') then
-                renderHealingDecision()
-            end
-
-            imgui.Spacing()
-            imgui.Separator()
-
-            if imgui.CollapsingHeader('Heals Available##healavail') then
-                renderHealAvailability()
-            end
-        end
+        M.drawContent()
     end
     imgui.End()
 end

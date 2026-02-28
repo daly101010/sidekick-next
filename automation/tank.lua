@@ -4,9 +4,9 @@ local Aggro = require('sidekick-next.utils.aggro')
 local Positioning = require('sidekick-next.utils.positioning')
 local Actors = require('sidekick-next.utils.actors_coordinator')
 local Abilities = require('sidekick-next.utils.abilities')
-local Helpers = require('sidekick-next.lib.helpers')
 local Cache = require('sidekick-next.utils.runtime_cache')
 local Executor = require('sidekick-next.utils.action_executor')
+local RotationEngine = require('sidekick-next.utils.rotation_engine')
 local CC = require('sidekick-next.automation.cc')
 
 local M = {}
@@ -36,53 +36,11 @@ local _state = {
     reposition = {
         settleUntil = 0,
     },
-    lastAbilityUse = 0,
 }
-
--- Minimum time between ability activations (prevents spam)
-local ABILITY_COOLDOWN = 0.05  -- 50ms
 
 function M.init(settings)
     M.settings = settings or {}
     _state.current = STATE.IDLE
-end
-
--- Check if an ability is ready to use
-local function isAbilityReady(def)
-    local me = mq.TLO.Me
-    if not me or not me() then return false end
-
-    local kind = tostring(def.kind or 'aa')
-
-    if kind == 'aa' then
-        if def.altID and me.AltAbilityReady then
-            return me.AltAbilityReady(tonumber(def.altID))() == true
-        elseif def.altName and me.AltAbilityReady then
-            return me.AltAbilityReady(def.altName)() == true
-        end
-    elseif kind == 'disc' then
-        local discName = tostring(def.discName or def.altName or '')
-        if discName ~= '' and me.CombatAbilityReady then
-            for _, candidate in ipairs(Helpers.discNameCandidates(discName)) do
-                local ok, ready = pcall(function()
-                    return me.CombatAbilityReady(candidate)() == true
-                end)
-                if ok and ready then return true end
-            end
-        end
-    end
-    return false
-end
-
--- Safe ability activation with cooldown check
-local function activateAbility(def)
-    local now = os.clock()
-    if (now - _state.lastAbilityUse) < ABILITY_COOLDOWN then
-        return false
-    end
-    Abilities.activate(def)
-    _state.lastAbilityUse = now
-    return true
 end
 
 function M.tick(abilities, settings)
@@ -162,11 +120,31 @@ function M.runAutoMode(myId, abilities, settings)
     M.handlePositioning()
 end
 
-function M.handleAggro(myId, abilities, settings)
-    -- Use runtime cache for mob counts
-    local unmezzedCount = Cache.unmezzedHaterCount()
+--- Execute aggro abilities from the rotation engine's aggro layer
+-- Applies tank-specific domain logic: AoE/single split, mob thresholds, mez safety
+-- @param abilities table All ability definitions (passed to rotation engine)
+-- @param settings table Settings table
+-- @return boolean True if any ability was executed
+function M.aggroSweep(abilities, settings)
+    -- Get all aggro-layer abilities that pass enabled + mode + condition gates
+    local aggroAbilities = RotationEngine.getLayerAbilities('aggro', {
+        abilities = abilities,
+        settings = settings,
+    })
+    if #aggroAbilities == 0 then return false end
 
-    -- AoE hate gen if 3+ mobs (or configured threshold)
+    -- Split into AoE and single-target
+    local aoe, single = {}, {}
+    for _, def in ipairs(aggroAbilities) do
+        if Abilities.detectAggroType(def) == 'aoe' then
+            table.insert(aoe, def)
+        else
+            table.insert(single, def)
+        end
+    end
+
+    -- AoE aggro: check mob count threshold + safety
+    local unmezzedCount = Cache.unmezzedHaterCount()
     if unmezzedCount >= (settings.TankAoEThreshold or 3) then
         local shouldAoE = true
 
@@ -174,7 +152,6 @@ function M.handleAggro(myId, abilities, settings)
             shouldAoE = (Cache.xtarget.aggroDeficitCount or 0) > 0
         end
 
-        -- Safety check: don't AoE if mezzed mobs on XTarget
         if shouldAoE and settings.TankSafeAECheck then
             if CC.hasAnyMezzedOnXTarget() then
                 shouldAoE = false
@@ -182,9 +159,29 @@ function M.handleAggro(myId, abilities, settings)
         end
 
         if shouldAoE then
-            M.tryAoEAggroAbility(abilities, settings)
+            for _, def in ipairs(aoe) do
+                if Executor.executeAbility(def) then
+                    return true
+                end
+            end
         end
     end
+
+    -- Single-target aggro: check if aggro lead is low
+    if Cache.aggroLeadLow() then
+        for _, def in ipairs(single) do
+            if Executor.executeAbility(def) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+function M.handleAggro(myId, abilities, settings)
+    -- Run aggro ability sweep (reads from rotation engine layer system)
+    M.aggroSweep(abilities, settings)
 
     -- Reactive taunt: only check when taunt is ready and not already taunting
     if _state.current == STATE.IDLE then
@@ -194,15 +191,10 @@ function M.handleAggro(myId, abilities, settings)
                 local dist = looseMob.Distance() or 999
                 if dist <= Aggro.TAUNT_CHASE_RANGE then
                     M.startReactiveTaunt(looseMob)
-                    return  -- Exit to let state machine handle it
+                    return
                 end
             end
         end
-    end
-
-    -- Single-target hate gen if aggro lead is low (use cache)
-    if Cache.aggroLeadLow() then
-        M.trySingleAggroAbility(abilities, settings)
     end
 end
 
@@ -300,29 +292,6 @@ function M.finishTaunt()
     _state.current = STATE.IDLE
 end
 
-function M.tryAoEAggroAbility(abilities, settings)
-    local aoe, _ = Abilities.getAggroAbilities(abilities, settings)
-    local sorted = Abilities.sortByPriority(aoe)
-    for _, def in ipairs(sorted) do
-        -- Use action executor which handles ready checks and lockouts
-        if Executor.executeAbility(def) then
-            return true
-        end
-    end
-    return false
-end
-
-function M.trySingleAggroAbility(abilities, settings)
-    local _, single = Abilities.getAggroAbilities(abilities, settings)
-    local sorted = Abilities.sortByPriority(single)
-    for _, def in ipairs(sorted) do
-        -- Use action executor which handles ready checks and lockouts
-        if Executor.executeAbility(def) then
-            return true
-        end
-    end
-    return false
-end
 
 function M.handlePositioning()
     if not M.settings.TankRepositionEnabled then return end

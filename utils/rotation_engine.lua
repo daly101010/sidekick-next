@@ -147,12 +147,6 @@ function M.getAbilityLayer(def, settings, classConfig)
         end
     end
 
-    -- Check if marked for aggro use (tank abilities)
-    local aggroKey = def.settingKey and (def.settingKey .. 'UseForAggro')
-    if aggroKey and settings and settings[aggroKey] == true then
-        return 'aggro'
-    end
-
     -- Default to combat layer
     return 'combat'
 end
@@ -436,6 +430,59 @@ function M.categorizeByLayer(abilities, settings, classConfig)
     return byLayer
 end
 
+--- Get abilities for a specific layer that pass all gates
+-- For use by external modules (e.g., tank) that own specific layers
+-- @param layerName string Layer name (e.g., 'aggro')
+-- @param opts table Options: abilities, settings
+-- @return table Array of abilities that pass enabled + mode + condition gates
+function M.getLayerAbilities(layerName, opts)
+    opts = opts or {}
+    local abilities = opts.abilities or {}
+    local settings = opts.settings or {}
+    local Abilities = getAbilities()
+    if not Abilities then return {} end
+
+    -- Get character class for config lookup
+    local Cache = getCache()
+    local myClass = (Cache and Cache.me and Cache.me.class) or ''
+    if myClass == '' and mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName then
+        myClass = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
+    end
+    local classConfig = getClassConfig(myClass)
+
+    -- Categorize all abilities by layer
+    local byLayer = M.categorizeByLayer(abilities, settings, classConfig)
+    local layerAbilities = byLayer[layerName] or {}
+    if #layerAbilities == 0 then return {} end
+
+    -- Build state and context for gate checks
+    local state = {
+        burnActive = opts.burnActive,
+        combatMode = settings.CombatMode or 'off',
+        myClass = myClass,
+        emergencyHpThreshold = settings.EmergencyHpThreshold or 35,
+    }
+    local ctx = nil
+    local ConditionContext = getConditionContext()
+    if ConditionContext then
+        ctx = ConditionContext.build()
+    end
+
+    -- Filter by all gates (enabled, master toggle, mode, condition)
+    local passing = {}
+    local sorted = Abilities.sortByPriority(layerAbilities)
+    for _, def in ipairs(sorted) do
+        if M.checkMasterToggle(def, settings) then
+            local enabled = def.settingKey and settings[def.settingKey] == true
+            if enabled and M.checkModeGate(def, settings, state, ctx, classConfig) then
+                table.insert(passing, def)
+            end
+        end
+    end
+
+    return passing
+end
+
 --- Run a single layer's rotation
 -- @param layer table Layer definition
 -- @param abilities table Array of abilities in this layer
@@ -609,8 +656,13 @@ function M.tick(opts)
     end
 
     -- Process each layer in priority order
+    local skipLayers = opts.skipLayers or {}
     for _, layer in ipairs(M.LAYERS) do
-        if M.shouldLayerRun(layer, state) then
+        if skipLayers[layer.name] then
+            if M.debugLogging and TL then
+                TL.log('layer_ext_skip_' .. layer.name, 10, 'Layer %s SKIP: owned by external module', layer.name)
+            end
+        elseif M.shouldLayerRun(layer, state) then
             local layerAbilities = byLayer[layer.name] or {}
             if #layerAbilities > 0 then
                 M.runLayer(layer, layerAbilities, settings, state, ctx, classConfig)

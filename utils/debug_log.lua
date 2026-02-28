@@ -1,91 +1,61 @@
---- Debug logging factory: eliminates duplicated debugLog/clearLogFile boilerplate.
+--- Debug logging factory — backward-compatible wrapper over utils/logger.lua.
 ---
---- Two modes:
----   1. Centralized (Pattern A) - logs to Paths.getLogPath('debug'), tagged
----   2. Per-module  (Pattern B) - logs to mq.configDir/<name>_debug.log, with enable flag + startup clear
+--- Existing callers continue to work unchanged. New code should use Logger directly:
+---   local Logger = require('sidekick-next.utils.logger')
+---   local log = Logger.new('MyModule')
+---   log.info('hello %s', world)
 ---
---- Usage:
+--- Legacy patterns (still supported):
 ---   local debugLog = require('sidekick-next.utils.debug_log')
----
----   -- Pattern A: centralized debug log with tag
 ---   local log = debugLog.tagged('Main', 'SideKick_Debug.log')
 ---   log('something happened: %s', detail)
----
----   -- Pattern B: per-module log with startup clear
----   local log = debugLog.module('sk_coordinator', 'SK_COORDINATOR')
----   log('tick %d', tickId)
 
 local mq = require('mq')
-local lazy = require('sidekick-next.utils.lazy_require')
-
-local getPaths = lazy('sidekick-next.utils.paths')
+local Logger = require('sidekick-next.utils.logger')
 
 local M = {}
 
 --- Pattern A: tagged centralized log.
+--- Now delegates to Logger at debug level (file + console when level >= 4).
 --- @param tag string  Bracket tag like 'Main', 'Heal', 'SpellEngine', 'Med'
---- @param fallbackFile string  Fallback filename if Paths unavailable
+--- @param fallbackFile string  Ignored (kept for API compat)
 --- @return fun(fmt: string, ...: any)
 function M.tagged(tag, fallbackFile)
-    return function(fmt, ...)
-        local msg = string.format(fmt, ...)
-        local Paths = getPaths()
-        local logPath = Paths and Paths.getLogPath('debug') or (mq.configDir .. '/' .. fallbackFile)
-        local f = io.open(logPath, 'a')
-        if f then
-            f:write(string.format('[%s] [%s] %s\n', os.date('%H:%M:%S'), tag, msg))
-            f:close()
-        end
-    end
+    local log = Logger.new(tag)
+    return log.debug
 end
 
---- Pattern B: per-module debug log with enable flag and startup clear.
---- @param filename string  Log filename without path (e.g. 'sk_coordinator_debug.log')
---- @param header string  Header label for startup line (e.g. 'SK_COORDINATOR')
+--- Pattern B: per-module debug log with enable flag.
+--- @param filename string  Module name (used as Logger tag)
+--- @param header string  Header label (used as Logger tag)
 --- @param enabled? boolean  Enable flag (default true)
 --- @return fun(fmt: string, ...: any)
 function M.module(filename, header, enabled)
-    if enabled == nil then enabled = true end
-    local logPath = mq.configDir .. '/' .. filename .. '_debug.log'
-    -- Clear log on creation
-    local f = io.open(logPath, 'w')
-    if f then
-        f:write(string.format('=== %s DEBUG LOG STARTED %s ===\n', header, os.date('%Y-%m-%d %H:%M:%S')))
-        f:close()
+    if enabled == false then
+        return function() end  -- noop
     end
-    return function(fmt, ...)
-        if not enabled then return end
-        local msg = string.format(fmt, ...)
-        local fh = io.open(logPath, 'a')
-        if fh then
-            fh:write(string.format('[%s] %s\n', os.date('%H:%M:%S'), msg))
-            fh:close()
-        end
-    end
+    local log = Logger.new(header or filename)
+    return log.debug
 end
 
---- Pattern B variant: per-module with a tag per-call (like sk_module_base).
---- @param filename string  Log filename without path
---- @param header string  Header label for startup line
+--- Pattern B variant: per-module with a tag per-call.
+--- @param filename string  Module name (used as Logger tag)
+--- @param header string  Header label (used as Logger tag)
 --- @param enabled? boolean  Enable flag (default true)
 --- @return fun(moduleName: string, fmt: string, ...: any)
 function M.moduleTagged(filename, header, enabled)
-    if enabled == nil then enabled = true end
-    local logPath = mq.configDir .. '/' .. filename .. '_debug.log'
-    -- Clear log on creation
-    local f = io.open(logPath, 'w')
-    if f then
-        f:write(string.format('=== %s DEBUG LOG STARTED %s ===\n', header, os.date('%Y-%m-%d %H:%M:%S')))
-        f:close()
+    if enabled == false then
+        return function() end  -- noop
     end
+    local cache = {}
     return function(moduleName, fmt, ...)
-        if not enabled then return end
-        local msg = string.format(fmt, ...)
-        local fh = io.open(logPath, 'a')
-        if fh then
-            fh:write(string.format('[%s] [%s] %s\n', os.date('%H:%M:%S'), moduleName, msg))
-            fh:close()
+        local tag = moduleName or header or filename
+        local log = cache[tag]
+        if not log then
+            log = Logger.new(tag, 1)  -- depthOffset=1 for extra closure frame
+            cache[tag] = log
         end
+        log.debug(fmt, ...)
     end
 end
 

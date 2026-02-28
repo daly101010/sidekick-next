@@ -153,26 +153,6 @@ function M.detectAggroType(def)
     return 'single'
 end
 
---- Get abilities marked for aggro use, separated by AoE vs single-target
--- @param abilities table Array of ability definitions
--- @param settings table Settings table with UseForAggro flags
--- @return table, table Two arrays: aoe abilities, single-target abilities
-function M.getAggroAbilities(abilities, settings)
-    local aoe, single = {}, {}
-    for _, def in ipairs(abilities) do
-        local aggroKey = def.settingKey and (def.settingKey .. 'UseForAggro')
-        if aggroKey and settings[aggroKey] == true then
-            local aggroType = M.detectAggroType(def)
-            if aggroType == 'aoe' then
-                table.insert(aoe, def)
-            else
-                table.insert(single, def)
-            end
-        end
-    end
-    return aoe, single
-end
-
 --- Check if character has learned/scribed this ability
 -- @param def table Ability definition
 -- @return boolean True if character has the ability

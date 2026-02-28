@@ -167,7 +167,7 @@ M.defaults = {
     HealPetsEnabled = { type = 'bool', Default = false, Category = 'Spells', DisplayName = 'Heal Pets' },
 
     -- Healing (rgmercs-style tiers; excludes PAL in implementation)
-    DoHeals = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Enable Heals' },
+    DoHeals = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Enable Heals' },
     PriorityHealing = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Priority Healing' },
     HealBreakInvisOOC = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Break Invis OOC To Heal' },
 

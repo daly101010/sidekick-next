@@ -122,6 +122,35 @@ local function loadTabs()
             })
         end
     end
+
+    -- Diagnostic tabs: Performance Monitor and Coordinator Debug
+    -- These embed the content from standalone debug windows into settings tabs.
+    local diagDefs = {
+        {
+            name = 'Performance',
+            module = 'sidekick-next.ui.perf_monitor',
+            drawFn = 'drawContent',
+        },
+        {
+            name = 'Coordinator',
+            module = 'sidekick-next.ui.coordinator_debug',
+            drawFn = 'drawContent',
+        },
+    }
+
+    for _, def in ipairs(diagDefs) do
+        local ok, mod = pcall(require, def.module)
+        if ok and mod and mod[def.drawFn] then
+            table.insert(_tabs, {
+                name = def.name,
+                module = {
+                    draw = function()
+                        mod[def.drawFn]()
+                    end
+                }
+            })
+        end
+    end
 end
 
 -- ============================================================
@@ -386,6 +415,116 @@ function M.drawAnchorSettings(prefix, settings, onChange)
 end
 
 -- ============================================================
+-- SEARCH FUNCTIONALITY
+-- ============================================================
+
+local _searchFilter = ''
+local _searchResultsCache = nil   -- cached filtered results
+local _searchCacheKey = ''        -- filter string that produced the cache
+
+--- Lazy-load the registry for search
+local _registry = nil
+local function getRegistry()
+    if not _registry then
+        local ok, reg = pcall(require, 'sidekick-next.registry')
+        if ok then _registry = reg end
+    end
+    return _registry
+end
+
+--- Build filtered search results from registry
+local function buildSearchResults(filter, settings)
+    local Registry = getRegistry()
+    if not Registry then return {} end
+
+    local lowerFilter = filter:lower()
+    local results = {}   -- { { key, meta, category } ... }
+
+    for _, key in Registry.iter_all() do
+        local meta = Registry.defaults[key]
+        if meta then
+            local displayName = meta.DisplayName or key
+            local category = meta.Category or 'Other'
+            local searchable = (displayName .. ' ' .. category .. ' ' .. key):lower()
+
+            if searchable:find(lowerFilter, 1, true) then
+                table.insert(results, { key = key, meta = meta, category = category })
+            end
+        end
+    end
+
+    -- Sort by category then display name
+    table.sort(results, function(a, b)
+        if a.category ~= b.category then return a.category < b.category end
+        return (a.meta.DisplayName or a.key) < (b.meta.DisplayName or b.key)
+    end)
+
+    return results
+end
+
+--- Render a single setting widget based on its type
+local function drawSettingWidget(key, meta, settings, onChange)
+    local displayName = meta.DisplayName or key
+    local settingType = meta.type or 'text'
+    local value = settings[key]
+    local changed
+
+    if settingType == 'bool' then
+        local boolVal = (value == true)
+        boolVal, changed = M.labeledCheckbox(displayName .. '##search_' .. key, boolVal)
+        if changed and onChange then onChange(key, boolVal) end
+    elseif settingType == 'number' then
+        local numVal = tonumber(value) or meta.Default or 0
+        -- Use slider for bounded numbers, input for unbounded
+        if meta.Min and meta.Max then
+            numVal, changed = M.labeledSliderInt(displayName .. '##search_' .. key, math.floor(numVal), meta.Min, meta.Max)
+        else
+            numVal, changed = M.labeledSliderFloat(displayName .. '##search_' .. key, numVal, 0, 100)
+        end
+        if changed and onChange then onChange(key, numVal) end
+    elseif settingType == 'text' then
+        local textVal = tostring(value or meta.Default or '')
+        local newVal = M.labeledInputText(displayName .. '##search_' .. key, textVal)
+        if newVal ~= textVal and onChange then onChange(key, newVal) end
+    end
+end
+
+--- Render search results grouped by category
+local function drawSearchResults(settings, onChange)
+    local filter = _searchFilter
+    if filter == '' then return end
+
+    -- Use cached results if filter hasn't changed
+    if _searchCacheKey ~= filter then
+        _searchResultsCache = buildSearchResults(filter, settings)
+        _searchCacheKey = filter
+    end
+
+    local results = _searchResultsCache or {}
+
+    if #results == 0 then
+        imgui.TextDisabled('No settings match "' .. filter .. '"')
+        return
+    end
+
+    imgui.TextDisabled(string.format('%d settings found', #results))
+    imgui.Separator()
+
+    local lastCategory = nil
+    for _, entry in ipairs(results) do
+        -- Category header
+        if entry.category ~= lastCategory then
+            lastCategory = entry.category
+            imgui.Spacing()
+            imgui.TextColored(0.5, 0.8, 1.0, 1.0, entry.category)
+            imgui.Separator()
+        end
+
+        drawSettingWidget(entry.key, entry.meta, settings, onChange)
+    end
+end
+
+-- ============================================================
 -- MAIN DRAW FUNCTION
 -- ============================================================
 
@@ -401,27 +540,50 @@ function M.draw(settings, themeNames, onChange, opts)
     M._currentThemeNames = themeNames
     M._currentOnChange = onChange
 
-    -- Begin tab bar
-    if imgui.BeginTabBar('SideKickSettings') then
-        for _, tab in ipairs(_tabs) do
-            if imgui.BeginTabItem(tab.name) then
-                imgui.BeginChild('##' .. tab.name .. '_content', 0, 0, false)
+    -- Search bar
+    imgui.PushItemWidth(-60)
+    _searchFilter = imgui.InputText('##sk_settings_search', _searchFilter, 256)
+    imgui.PopItemWidth()
+    imgui.SameLine()
+    if imgui.SmallButton('X##sk_search_clear') then
+        _searchFilter = ''
+        _searchResultsCache = nil
+        _searchCacheKey = ''
+    end
+    if _searchFilter == '' then
+        imgui.SameLine()
+        imgui.TextDisabled('Search settings...')
+    end
+    imgui.Separator()
 
-                -- Draw tab content
-                local ok, err = pcall(function()
-                    tab.module.draw(settings, themeNames, onChange)
-                end)
+    -- If searching, show flat filtered results; otherwise show tabs
+    if _searchFilter ~= '' then
+        imgui.BeginChild('##search_results', 0, 0, false)
+        drawSearchResults(settings, onChange)
+        imgui.EndChild()
+    else
+        -- Begin tab bar
+        if imgui.BeginTabBar('SideKickSettings') then
+            for _, tab in ipairs(_tabs) do
+                if imgui.BeginTabItem(tab.name) then
+                    imgui.BeginChild('##' .. tab.name .. '_content', 0, 0, false)
 
-                if not ok then
-                    imgui.TextColored(1, 0.3, 0.3, 1, 'Error in ' .. tab.name .. ':')
-                    imgui.TextWrapped(tostring(err))
+                    -- Draw tab content
+                    local ok, err = pcall(function()
+                        tab.module.draw(settings, themeNames, onChange)
+                    end)
+
+                    if not ok then
+                        imgui.TextColored(1, 0.3, 0.3, 1, 'Error in ' .. tab.name .. ':')
+                        imgui.TextWrapped(tostring(err))
+                    end
+
+                    imgui.EndChild()
+                    imgui.EndTabItem()
                 end
-
-                imgui.EndChild()
-                imgui.EndTabItem()
             end
+            imgui.EndTabBar()
         end
-        imgui.EndTabBar()
     end
 end
 
