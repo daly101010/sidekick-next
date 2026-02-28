@@ -686,8 +686,10 @@ function M.SelectHeal(targetInfo, situation)
 
     if deficit <= 0 then return nil, 'no_deficit' end
 
+    local isSelf = targetInfo._isSelf or false
+
     if targetInfo.pctHP < config.emergencyPct then
-        local heal = M.FindFastestHeal(deficit)
+        local heal = M.FindFastestHeal(deficit, isSelf)
         if heal then
             heal.details = joinDetails(heal.details, 'trigger=emergency')
         end
@@ -855,6 +857,7 @@ function M.SelectHeal(targetInfo, situation)
             recentDps = targetInfo.recentDps,
             isSquishy = targetInfo.isSquishy,
             incomingHotRemaining = 0,
+            _isSelf = targetInfo._isSelf,
         }
 
         local supplementHeal = M.FindEfficientHeal(gapTargetInfo, false, situation)
@@ -910,7 +913,7 @@ function M.SelectHeal(targetInfo, situation)
     end
 
     if not config.quickHealsEmergencyOnly and situation.multipleHurt and deficitPct <= config.quickHealMaxPct then
-        local heal = M.FindFastestHeal(deficit)
+        local heal = M.FindFastestHeal(deficit, isSelf)
         if heal then
             heal.details = joinDetails(
                 heal.details,
@@ -974,6 +977,9 @@ function M.GetMinExpectedHeal()
 
     -- Check all direct heal categories (not HoTs)
     local categories = { 'fast', 'small', 'medium', 'large' }
+    if config.selfHealEnabled then
+        table.insert(categories, 'selfHeal')
+    end
     for _, cat in ipairs(categories) do
         for _, spellName in ipairs(config.spells[cat] or {}) do
             local expected = getExpectedHeal(tracker, spellName)
@@ -993,12 +999,15 @@ function M.GetMinExpectedHeal()
     return minExpected
 end
 
-function M.FindFastestHeal(deficit)
+function M.FindFastestHeal(deficit, isSelf)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
     local tracker = HealTracker
     local candidates = {}
     local categories = { 'fast', 'small', 'medium', 'large' }
+    if isSelf and config.selfHealEnabled then
+        table.insert(categories, 'selfHeal')
+    end
 
     for _, cat in ipairs(categories) do
         for _, spellName in ipairs(config.spells[cat] or {}) do
@@ -1085,6 +1094,9 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
     local categories = { 'small', 'medium', 'large' }
     if allowFast then
         table.insert(categories, 1, 'fast')
+    end
+    if targetInfo._isSelf and config.selfHealEnabled then
+        table.insert(categories, 'selfHeal')
     end
 
     for _, cat in ipairs(categories) do

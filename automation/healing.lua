@@ -85,9 +85,6 @@ local function load_class_config(classShort)
 end
 
 local function get_profile(classShort, classConfig)
-    -- Exclude PAL explicitly.
-    if classShort == 'PAL' then return nil end
-
     -- Profiles are line-name lists; resolve_spell_line chooses the best memorized spell.
     if classShort == 'CLR' then
         return {
@@ -276,11 +273,6 @@ function M.tick(settings)
     end
 
     local classShort = normalize_class()
-    if classShort == 'PAL' then
-        _state.priorityActive = false
-        return false
-    end
-
     local now = os.clock()
     prune_map(_state.localHots, now)
     if ActorsCoordinator and ActorsCoordinator.pruneHealState then

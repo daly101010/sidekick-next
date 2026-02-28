@@ -37,7 +37,8 @@ local function getHealingModule()
     local me = mq.TLO.Me
     if not me or not me() then return LegacyHealing end
     local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
-    if classShort:upper() ~= 'CLR' then return LegacyHealing end
+    local upper = classShort:upper()
+    if upper ~= 'CLR' and upper ~= 'PAL' then return LegacyHealing end
 
     -- Advance one phase per call until complete
     if not _healLoadComplete then
@@ -1352,7 +1353,7 @@ local function draw()
                                     HealMonitor.drawContent()
                                     imgui.EndTabItem()
                                 end
-                            elseif State.classShort == 'CLR' then
+                            elseif State.classShort == 'CLR' or State.classShort == 'PAL' then
                                 if imgui.BeginTabItem('Monitor') then
                                     imgui.TextDisabled('Healing monitor initializing...')
                                     imgui.TextDisabled('Enter combat to activate')

@@ -96,7 +96,7 @@ local function isHealerClass()
     if not me or not me() then return false end
     local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
     classShort = classShort:upper()
-    return classShort == 'CLR'  -- Only CLR for now
+    return classShort == 'CLR' or classShort == 'PAL'
 end
 
 -- Check if we can heal right now
@@ -944,11 +944,13 @@ function M.tick(settings)
     local priorityTargets = {}
     local groupTargets = {}
 
+    local myId = mq.TLO.Me.ID and mq.TLO.Me.ID() or 0
     local targets = TargetMonitor.getAllTargets() or {}
     tickLog(string.format('16-Targets count=%d', #targets))
     for _, t in pairs(targets) do
         if Config.healPetsEnabled or t.role ~= 'pet' then
             local entry = cloneTarget(t)
+            entry._isSelf = (entry.id == myId)
             local incomingTotal = IncomingHeals.sumForTarget(entry.id)
             entry.incomingTotal = incomingTotal
             entry.deficit = math.max(0, (entry.deficit or 0) - incomingTotal)

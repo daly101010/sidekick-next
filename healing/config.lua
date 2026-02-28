@@ -137,6 +137,10 @@ local M = {
     healPetsEnabled = false,     -- Whether to include pets in healing targets
     petHealMinPct = 40,          -- Minimum HP% to heal pets
 
+    -- Self-healing (PAL off-tank use case)
+    selfHealEnabled = false,     -- Whether to include selfHeal spells
+    selfHealPct = 60,            -- HP% threshold for self-heal consideration
+
     -- Learning
     learningWeight = 0.1,
     minSamplesForReliable = 10,
@@ -201,6 +205,7 @@ local M = {
         hotLight = {},
         groupHot = {},
         promised = {},
+        selfHeal = {},  -- Self-only heals (PAL SelfHeal line)
     },
 }
 
@@ -233,6 +238,11 @@ local function isGroupV1(targetType)
     return t:match('^group v1') ~= nil
 end
 
+local function isSelfTarget(targetType)
+    local t = normalizeText(targetType)
+    return t == 'self'
+end
+
 local function getCastTimeMs(spell)
     ---@diagnostic disable-next-line: undefined-field
     local mySpell = mq.TLO.Me.Spell(spell.Name())
@@ -258,7 +268,9 @@ function M.IsValidSpellForCategory(category, spellName)
     local subcategory = normalizeText(spell.Subcategory())
     local targetType = normalizeText(spell.TargetType())
 
-    if category == 'hot' or category == 'hotLight' then
+    if category == 'selfHeal' then
+        return (subcategory == 'heals' or subcategory == 'quick heal') and isSelfTarget(targetType)
+    elseif category == 'hot' or category == 'hotLight' then
         return subcategory == 'duration heals' and isSingleTarget(targetType)
     elseif category == 'groupHot' then
         return subcategory == 'duration heals' and isGroupV1(targetType)
@@ -370,6 +382,12 @@ local function categorizeHealSpell(spellName)
         return 'fast'
     end
 
+    -- Self-target heals (PAL SelfHeal line)
+    local selfTarget = isSelfTarget(targetType)
+    if (subcategory == 'heals' or subcategory == 'quick heal') and selfTarget then
+        return 'selfHeal', getSpellLevel(spell)
+    end
+
     -- Single target direct heals - return special marker for dynamic sizing by level
     if subcategory == 'heals' and singleTarget then
         return 'direct_single', getSpellLevel(spell)
@@ -400,6 +418,7 @@ function M.autoAssignFromSpellBar()
         hotLight = {},
         groupHot = {},
         promised = {},
+        selfHeal = {},
     }
 
     -- Track which spells we've assigned to avoid duplicates
@@ -552,8 +571,9 @@ function M.getAssignmentSummary()
         hotLight = 'HoT (Low DPS)',
         groupHot = 'Group HoT',
         promised = 'Promised',
+        selfHeal = 'Self Heal',
     }
-    local categoryOrder = { 'fast', 'small', 'medium', 'large', 'group', 'hot', 'hotLight', 'groupHot', 'promised' }
+    local categoryOrder = { 'fast', 'small', 'medium', 'large', 'group', 'hot', 'hotLight', 'groupHot', 'promised', 'selfHeal' }
 
     for _, category in ipairs(categoryOrder) do
         local spells = M.spells[category]
@@ -638,12 +658,47 @@ function M.save()
     return true
 end
 
+-- Class-specific default overrides (applied before user config)
+local CLASS_DEFAULTS = {
+    PAL = {
+        emergencyPct = 30,       -- Slightly higher than CLR's 25 (off-healer needs headroom)
+        groupHealMinCount = 2,   -- Aurora is PAL's strongest heal, use it more
+        hotEnabled = false,      -- PAL has no HoTs
+        selfHealEnabled = true,  -- PAL needs self-heal while tanking
+        selfHealPct = 60,        -- Matches PAL config doSelfHeal condition
+        healPetsEnabled = false, -- Limited heal bandwidth
+    },
+}
+
+function M.applyClassDefaults()
+    local me = mq.TLO.Me
+    if not me or not me() then
+        local log = getLogger()
+        if log then log.warn('config', 'applyClassDefaults: character not available yet, skipping') end
+        return
+    end
+    local classShort = (me.Class and me.Class.ShortName and me.Class.ShortName() or ''):upper()
+    local defaults = CLASS_DEFAULTS[classShort]
+    if not defaults then return end
+    local log = getLogger()
+    for k, v in pairs(defaults) do
+        if M[k] ~= nil then
+            M[k] = v
+        end
+    end
+    if log then log.info('config', 'Applied class defaults for %s', classShort) end
+end
+
 function M.load()
     local log = getLogger()
+
+    -- Apply class defaults first, then user config overrides them
+    M.applyClassDefaults()
+
     local path = getConfigPath()
     local file = io.open(path, 'r')
     if not file then
-        if log then log.info('config', 'No config file found, using defaults') end
+        if log then log.info('config', 'No config file found, using class defaults') end
         return
     end
     local content = file:read('*a')
