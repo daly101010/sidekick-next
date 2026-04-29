@@ -10,7 +10,7 @@ local Components = require('sidekick-next.ui.components')
 local M = {}
 
 function M.draw(settings, themeNames, onChange)
-    local themeName = settings.Theme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
 
     -- Main toggle (clickable badge)
     local buffingEnabled = settings.BuffingEnabled ~= false

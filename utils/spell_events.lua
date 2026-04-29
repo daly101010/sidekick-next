@@ -76,6 +76,7 @@ local _lastResistTarget = nil
 
 -- Callback for external notification
 local _onResultCallback = nil
+local _resultListeners = {}   -- additional fan-out subscribers (resist_log etc.)
 
 -- Internal: set result and notify
 local function setResult(result, extra)
@@ -87,6 +88,9 @@ local function setResult(result, extra)
     end
     if _onResultCallback then
         pcall(_onResultCallback, result, extra)
+    end
+    for _, fn in ipairs(_resultListeners) do
+        pcall(fn, result, extra)
     end
 end
 
@@ -104,10 +108,20 @@ function M.getResultName(result)
     return M.RESULT_NAMES[result] or 'UNKNOWN'
 end
 
---- Set callback for result notifications
+--- Set callback for result notifications. Single-slot; only one consumer.
+--- For additional consumers without clobbering the primary, use addResultListener.
 -- @param fn function Callback(result, extra)
 function M.setResultCallback(fn)
     _onResultCallback = fn
+end
+
+--- Add a fan-out listener for spell-cast results. Callback receives (result, extra)
+--- where extra may contain { spell, target }. Multiple listeners are supported
+--- and called in registration order after the primary callback.
+-- @param fn function
+function M.addResultListener(fn)
+    if type(fn) ~= 'function' then return end
+    table.insert(_resultListeners, fn)
 end
 
 --- Reset result state
@@ -163,6 +177,14 @@ function M.registerEvents()
         setResult(M.RESULT.SUCCESS)
     end)
 
+    mq.event('sk_overwritten1', "Your#*#has been overwritten#*#", function()
+        setResult(M.RESULT.OVERWRITTEN)
+    end)
+
+    mq.event('sk_collapsed1', "Your gate is too unstable, and collapses#*#", function()
+        setResult(M.RESULT.COLLAPSE)
+    end)
+
     -- ============================================
     -- FIZZLE EVENTS
     -- ============================================
@@ -171,6 +193,10 @@ function M.registerEvents()
     end)
 
     mq.event('sk_fizzle2', "You miss a note, bringing your song to a close#*#", function()
+        setResult(M.RESULT.FIZZLE)
+    end)
+
+    mq.event('sk_fizzle3', "You miss a note, bringing your #*#", function()
         setResult(M.RESULT.FIZZLE)
     end)
 
@@ -211,6 +237,14 @@ function M.registerEvents()
         setResult(M.RESULT.NOTARGET)
     end)
 
+    mq.event('sk_notarget3', "This spell only works on#*#", function()
+        setResult(M.RESULT.NOTARGET)
+    end)
+
+    mq.event('sk_notarget4', "You must first target a group member#*#", function()
+        setResult(M.RESULT.NOTARGET)
+    end)
+
     -- ============================================
     -- OUT OF RANGE EVENTS
     -- ============================================
@@ -248,6 +282,18 @@ function M.registerEvents()
         setResult(M.RESULT.DISTRACTED)
     end)
 
+    mq.event('sk_distracted3', "You need to play a#*#instrument for this song#*#", function()
+        setResult(M.RESULT.DISTRACTED)
+    end)
+
+    mq.event('sk_distracted4', "You can't cast spells while invulnerable#*#", function()
+        setResult(M.RESULT.DISTRACTED)
+    end)
+
+    mq.event('sk_distracted5', "You do not have sufficient focus to maintain that ability.", function()
+        setResult(M.RESULT.DISTRACTED)
+    end)
+
     -- ============================================
     -- IMMUNE/TAKE HOLD EVENTS
     -- ============================================
@@ -267,11 +313,23 @@ function M.registerEvents()
         setResult(M.RESULT.IMMUNE)
     end)
 
+    mq.event('sk_immune5', "Your target is immune to the stun portion of this effect#*#", function()
+        setResult(M.RESULT.IMMUNE, { immuneType = 'stun' })
+    end)
+
     mq.event('sk_takehold1', "Your spell did not take hold#*#", function()
         setResult(M.RESULT.TAKEHOLD)
     end)
 
     mq.event('sk_takehold2', "Your spell would not have taken hold#*#", function()
+        setResult(M.RESULT.TAKEHOLD)
+    end)
+
+    mq.event('sk_takehold3', "Your #*# did not take hold on #*#. (Blocked by #*#.)", function()
+        setResult(M.RESULT.TAKEHOLD)
+    end)
+
+    mq.event('sk_takehold4', "Your spell is too powerfull for your intended target#*#", function()
         setResult(M.RESULT.TAKEHOLD)
     end)
 
@@ -283,6 +341,10 @@ function M.registerEvents()
     end)
 
     mq.event('sk_immune_snare', "Your target is immune to changes in its run speed#*#", function()
+        setResult(M.RESULT.IMMUNE, { immuneType = 'snare' })
+    end)
+
+    mq.event('sk_immune_snare2', "Your target is immune to snare spells#*#", function()
         setResult(M.RESULT.IMMUNE, { immuneType = 'snare' })
     end)
 
@@ -320,10 +382,18 @@ function M.registerEvents()
         setResult(M.RESULT.OUTDOORS)
     end)
 
+    mq.event('sk_outdoors2', "You can only cast this spell in the outdoors#*#", function()
+        setResult(M.RESULT.OUTDOORS)
+    end)
+
     -- ============================================
     -- COMPONENTS/REAGENTS EVENTS
     -- ============================================
     mq.event('sk_components1', "You are missing some required components#*#", function()
+        setResult(M.RESULT.COMPONENTS)
+    end)
+
+    mq.event('sk_components2', "Your ability to use this item has been disabled because you do not have at least a gold membership#*#", function()
         setResult(M.RESULT.COMPONENTS)
     end)
 
@@ -332,6 +402,18 @@ function M.registerEvents()
     -- ============================================
     mq.event('sk_recover1', "Spell recovery time not yet met#*#", function()
         setResult(M.RESULT.RECOVER)
+    end)
+
+    mq.event('sk_recover2', "You haven't recovered yet#*#", function()
+        setResult(M.RESULT.RECOVER)
+    end)
+
+    mq.event('sk_notready1', "Spell recast time not yet met#*#", function()
+        setResult(M.RESULT.NOTREADY)
+    end)
+
+    mq.event('sk_fdfail1', "#1# has fallen to the ground.#*#", function()
+        setResult(M.RESULT.FDFAIL)
     end)
 
     -- ============================================
@@ -363,10 +445,13 @@ function M.unregisterEvents()
     mq.unevent('sk_cast_begin1')
     mq.unevent('sk_cast_begin2')
     mq.unevent('sk_cast_begin3')
+    mq.unevent('sk_overwritten1')
+    mq.unevent('sk_collapsed1')
 
     -- Fizzle events
     mq.unevent('sk_fizzle1')
     mq.unevent('sk_fizzle2')
+    mq.unevent('sk_fizzle3')
 
     -- Interrupted events
     mq.unevent('sk_interrupt1')
@@ -380,6 +465,8 @@ function M.unregisterEvents()
     -- No target events
     mq.unevent('sk_notarget1')
     mq.unevent('sk_notarget2')
+    mq.unevent('sk_notarget3')
+    mq.unevent('sk_notarget4')
 
     -- Out of range events
     mq.unevent('sk_oor1')
@@ -393,18 +480,25 @@ function M.unregisterEvents()
     mq.unevent('sk_stunned2')
     mq.unevent('sk_distracted1')
     mq.unevent('sk_distracted2')
+    mq.unevent('sk_distracted3')
+    mq.unevent('sk_distracted4')
+    mq.unevent('sk_distracted5')
 
     -- Immune/Take hold events
     mq.unevent('sk_immune1')
     mq.unevent('sk_immune2')
     mq.unevent('sk_immune3')
     mq.unevent('sk_immune4')
+    mq.unevent('sk_immune5')
     mq.unevent('sk_takehold1')
     mq.unevent('sk_takehold2')
+    mq.unevent('sk_takehold3')
+    mq.unevent('sk_takehold4')
 
     -- Additional immune events
     mq.unevent('sk_immune_slow')
     mq.unevent('sk_immune_snare')
+    mq.unevent('sk_immune_snare2')
     mq.unevent('sk_immune_root')
     mq.unevent('sk_immune_charm')
     mq.unevent('sk_immune_stun')
@@ -416,12 +510,17 @@ function M.unregisterEvents()
     -- Standing/Position events
     mq.unevent('sk_standing1')
     mq.unevent('sk_outdoors1')
+    mq.unevent('sk_outdoors2')
 
     -- Components events
     mq.unevent('sk_components1')
+    mq.unevent('sk_components2')
 
     -- Recovery events
     mq.unevent('sk_recover1')
+    mq.unevent('sk_recover2')
+    mq.unevent('sk_notready1')
+    mq.unevent('sk_fdfail1')
 
     -- Memorization events
     mq.unevent('sk_mem_begin')

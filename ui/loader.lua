@@ -7,7 +7,7 @@
 ---   Loader.draw(phase, totalPhases, isComplete)
 
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 
 local M = {}
 

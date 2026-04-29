@@ -107,9 +107,15 @@ local function isSafeToMem()
     local me = mq.TLO.Me
     if not me or not me() then return false end
     local inCombat = me.Combat()
-    local casting = me.Casting and me.Casting()
+    -- me.Casting() returns the spell name when casting OR the literal string
+    -- "NULL" when idle. The previous `not casting` test treated "NULL" as
+    -- truthy and silently disabled the entire manager memorize path —
+    -- isSafeToMem returned false whenever the player wasn't in combat AND
+    -- not actively casting, which is most of the time.
+    local castingRaw = me.Casting and me.Casting() or ''
+    local actuallyCasting = castingRaw ~= '' and castingRaw ~= 'NULL'
     local castingWindow = mq.TLO.Window("CastingWindow").Open()
-    return (not inCombat) and (not casting) and (not castingWindow)
+    return (not inCombat) and (not actuallyCasting) and (not castingWindow)
 end
 
 --------------------------------------------------------------------------------
@@ -317,22 +323,24 @@ function M.applySet(setName)
     return 'queued'
 end
 
---- Actually apply a spell set (memorize spells)
--- Only call when OOC and castBusy == false
-function M.doApplySet(setName)
-    local set = M.spellSets[setName]
-    if not set then return end
-    if M.applying then return end
-    M.applying = true
+-- State-machine-driven apply. Replaces the previous synchronous loop that
+-- ran `mq.delay(12000, predicate)` per gem (~144s freeze worst-case across
+-- a full swap). Setup happens immediately; advancement happens one step
+-- per M.tick() call via _stepApplyJob().
+local APPLY_MEM_TIMEOUT_MS = 12000
 
+M._applyJob = nil  -- nil when idle; populated table when in progress
+
+local function _applyNowMs()
+    return (mq.gettime and mq.gettime()) or (os.clock() * 1000)
+end
+
+-- Build the rotation/buff-swap list and seed _applyJob. Returns false on
+-- validation failure (caller resets M.applying).
+local function _setupApplyJob(setName, set)
     local me = mq.TLO.Me
-    if not me or not me() then
-        logMem('apply_no_me', 1, 'Apply aborted (no character)')
-        M.applying = false
-        return
-    end
+    if not me or not me() then return false end
 
-    -- Build list of rotation spells in priority order
     local rotationSpells = {}
     local buffSwapSpells = {}
     for lineName, lineData in pairs(set.lines) do
@@ -343,7 +351,6 @@ function M.doApplySet(setName)
                     lineName = lineName,
                     spellName = lineData.resolved,
                     priority = lineData.priority or 999,
-                    condition = lineData.condition,
                 })
             end
         elseif lineData.enabled and lineData.slotType == 'buff_swap' then
@@ -353,18 +360,13 @@ function M.doApplySet(setName)
                     lineName = lineName,
                     spellName = lineData.resolved,
                     priority = lineData.priority or 999,
-                    condition = lineData.condition,
                 })
             end
         end
     end
 
-    table.sort(rotationSpells, function(a, b)
-        return a.priority < b.priority
-    end)
-    table.sort(buffSwapSpells, function(a, b)
-        return a.priority < b.priority
-    end)
+    table.sort(rotationSpells, function(a, b) return a.priority < b.priority end)
+    table.sort(buffSwapSpells, function(a, b) return a.priority < b.priority end)
 
     local enabledLines = {}
     for lineName, lineData in pairs(set.lines) do
@@ -383,54 +385,107 @@ function M.doApplySet(setName)
     logMem('apply_enabled', 0, 'Apply enabled lines: %s',
         (#enabledLines > 0) and table.concat(enabledLines, ', ') or '<none>')
 
-    local function waitForMemorize(slot, spellName)
-        -- Wait for the gem to reflect the memorized spell (prevents memspell overlap).
-        local timeoutMs = 12000
-        logMem('mem_wait_' .. tostring(slot), 0, 'Waiting for gem %d -> "%s"', slot, tostring(spellName))
-        mq.delay(timeoutMs, function()
-            if not me or not me() then return true end
-            local gem = me.Gem(slot)
-            local name = gem and gem() and gem.Name() or ''
-            return name == spellName and not me.Casting()
-        end)
-        local gem = me.Gem(slot)
-        local name = gem and gem() and gem.Name() or ''
-        if name == spellName then
-            logMem('mem_ok_' .. tostring(slot), 0, 'Gem %d now "%s"', slot, tostring(name))
-            return true
-        end
-        logMem('mem_timeout_' .. tostring(slot), 0, 'Timeout waiting for gem %d (current="%s", expected="%s")',
-            slot, tostring(name), tostring(spellName))
-        return false
+    M._applyJob = {
+        setName = setName,
+        rotationSpells = rotationSpells,
+        buffSwapSpells = buffSwapSpells,
+        numGems = M.getRotationCapacity(),
+        index = 0,
+        phase = 'next_slot',
+        targetName = nil,
+        deadlineMs = 0,
+    }
+    return true
+end
+
+local function _stepApplyJob()
+    local job = M._applyJob
+    if not job then return end
+
+    local me = mq.TLO.Me
+    if not me or not me() then
+        logMem('apply_no_me', 1, 'Apply aborted (no character)')
+        M._applyJob = nil
+        M.pendingApply = nil
+        M.applying = false
+        return
     end
 
-    local numGems = M.getRotationCapacity()
-    for i, spell in ipairs(rotationSpells) do
-        if i > numGems then break end
+    local now = _applyNowMs()
 
-        local currentGem = me.Gem(i)
+    if job.phase == 'next_slot' then
+        job.index = job.index + 1
+        if job.index > #job.rotationSpells or job.index > (job.numGems or 0) then
+            -- Buff-swap is currently a no-op stub (delegated to sk_buffs).
+            if #job.buffSwapSpells > 0 then
+                M.runBuffSwap(job.buffSwapSpells, job.rotationSpells, nil)
+            end
+            job.phase = 'done'
+            return
+        end
+
+        local spell = job.rotationSpells[job.index]
+        local currentGem = me.Gem(job.index)
         local currentName = currentGem and currentGem() and currentGem.Name() or ''
 
-        if currentName ~= spell.spellName then
-            logMem('mem_start_' .. tostring(i), 0, 'Memorizing gem %d: "%s" (was "%s")',
-                i, tostring(spell.spellName), tostring(currentName))
-            mq.cmdf('/memspell %d "%s"', i, spell.spellName)
-            waitForMemorize(i, spell.spellName)
-        else
-            logMem('mem_skip_' .. tostring(i), 0, 'Gem %d already "%s"', i, tostring(currentName))
+        if currentName == spell.spellName then
+            logMem('mem_skip_' .. tostring(job.index), 0, 'Gem %d already "%s"', job.index, tostring(currentName))
+            return  -- stay in next_slot; index advances next call
         end
+
+        logMem('mem_start_' .. tostring(job.index), 0, 'Memorizing gem %d: "%s" (was "%s")',
+            job.index, tostring(spell.spellName), tostring(currentName))
+        mq.cmdf('/memspell %d "%s"', job.index, spell.spellName)
+        job.targetName = spell.spellName
+        job.deadlineMs = now + APPLY_MEM_TIMEOUT_MS
+        job.phase = 'wait_mem'
+        return
     end
 
-    -- Buff-swap processing (OOC only, reserved gem)
-    if #buffSwapSpells > 0 then
-        M.runBuffSwap(buffSwapSpells, rotationSpells, waitForMemorize)
+    if job.phase == 'wait_mem' then
+        local gem = me.Gem(job.index)
+        local name = gem and gem() and gem.Name() or ''
+        local casting = me.Casting and me.Casting() or ''
+        local notCasting = casting == '' or casting == 'NULL'
+        if name == job.targetName and notCasting then
+            logMem('mem_ok_' .. tostring(job.index), 0, 'Gem %d now "%s"', job.index, tostring(name))
+            job.phase = 'next_slot'
+            return
+        end
+        if now >= job.deadlineMs then
+            logMem('mem_timeout_' .. tostring(job.index), 0,
+                'Timeout waiting for gem %d (current="%s", expected="%s")',
+                job.index, tostring(name), tostring(job.targetName))
+            job.phase = 'next_slot'
+        end
+        return
     end
 
-    M.activeSetName = setName
-    M.pendingApply = nil
-    M.saveSpellSets()
-    logMem('apply_done', 0.5, 'Apply complete for set "%s"', tostring(setName))
-    M.applying = false
+    if job.phase == 'done' then
+        M.activeSetName = job.setName
+        M.pendingApply = nil
+        M.saveSpellSets()
+        logMem('apply_done', 0.5, 'Apply complete for set "%s"', tostring(job.setName))
+        M._applyJob = nil
+        M.applying = false
+        return
+    end
+end
+
+--- Actually apply a spell set (memorize spells).
+--- Sets up the state machine; the actual memorize advances one step per
+--- M.tick() call. Returns immediately — never blocks the main loop.
+function M.doApplySet(setName)
+    local set = M.spellSets[setName]
+    if not set then return end
+    if M.applying then return end
+    M.applying = true
+
+    if not _setupApplyJob(setName, set) then
+        M.applying = false
+        return
+    end
+    -- _applyJob is now populated; M.tick() will drive it.
 end
 
 --- Run buff-swap pass using the reserved gem (OOC only)
@@ -939,7 +994,7 @@ function M.checkPendingApply()
         local me = mq.TLO.Me
         local inCombat = me and me.Combat() or false
         local castingSpell = me and me.Casting and me.Casting() or ''
-        local casting = castingSpell ~= ''
+        local casting = castingSpell ~= '' and castingSpell ~= 'NULL'
         local castingWindow = mq.TLO.Window("CastingWindow").Open()
         logMem('pending_blocked', 1.0,
             'Pending blocked (set="%s" inCombat=%s casting=%s castingWindow=%s)',
@@ -1220,7 +1275,13 @@ end
 
 function M.tick()
     if not M.initialized then return end
-    M.checkPendingApply()
+    -- Drive the apply state machine first if a job is in flight; otherwise
+    -- let checkPendingApply potentially start a new one.
+    if M._applyJob then
+        _stepApplyJob()
+    else
+        M.checkPendingApply()
+    end
     -- Note: OOC buff maintenance has been moved to automation/buff.lua
     -- which uses getBuffSwapLines() and handles buffing via the last gem hot-swap
 end

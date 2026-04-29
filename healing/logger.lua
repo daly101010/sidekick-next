@@ -1,5 +1,7 @@
 -- healing/logger.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
+local getPaths = lazy('sidekick-next.utils.paths')
 
 local M = {}
 
@@ -27,21 +29,12 @@ function M.ensureLogDir()
     local configDir = mq.configDir or 'config'
     local logDir = configDir .. '/HealingLogs'
     _logPath = logDir
-    -- Fast path: check if directory already exists (avoids subprocess spawn)
-    local f = io.open(logDir .. '/._dircheck', 'w')
-    if f then
-        f:close()
-        os.remove(logDir .. '/._dircheck')
-        return
+    local Paths = getPaths()
+    if Paths and Paths.ensureDir then
+        Paths.ensureDir(logDir)
+    else
+        os.execute('mkdir "' .. logDir .. '" 2>nul')
     end
-    -- Directory doesn't exist — try lfs.mkdir (C call, no subprocess)
-    local ok, lfs = pcall(require, 'lfs')
-    if ok and lfs and lfs.mkdir then
-        pcall(lfs.mkdir, logDir)
-        return
-    end
-    -- Last resort: os.execute (spawns cmd.exe, can be slow with antivirus)
-    os.execute('mkdir "' .. logDir .. '" 2>nul')
 end
 
 function M.rotate()

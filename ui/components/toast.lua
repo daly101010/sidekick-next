@@ -15,7 +15,7 @@
 --   Toast.render('Classic')
 
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Colors = require('sidekick-next.ui.colors')
 

@@ -82,13 +82,6 @@ function M.byValue(label, settingKey, currentValue, items, onChange, opts)
 
     local changed, newIndex = M.draw(label, settingKey, currentIndex, items, nil, opts)
 
-    -- DEBUG: Log when changed is true
-    if changed and settingKey == 'SideKickTheme' then
-        local newValue = items[newIndex + 1]
-        print(string.format('\am[ComboRow.byValue] changed=true currentValue=%s newIndex=%d newValue=%s\ax',
-            tostring(currentValue), newIndex, tostring(newValue)))
-    end
-
     if changed then
         local newValue = items[newIndex + 1]
         if onChange then

@@ -25,6 +25,13 @@ local _aeDamage = {}  -- [mobId] = { targets = {}, isAE, totalDps }
 -- Mob name-to-ID resolution cache
 local _mobNameCache = {}  -- [mobName] = { id, lastSeen }
 
+-- Cache of findTargetIdByName results (keyed by lowercased attacker/target
+-- name, populated on cache miss). Every damage event passes through this
+-- function; each miss used to iterate the full group. We invalidate when
+-- group membership changes or on combat timeout.
+local _targetIdCache = {}
+local _lastGroupSignature = ''
+
 function M.init(config)
     Config = config
     COMBAT_TIMEOUT = Config and Config.combatTimeoutSec or 5
@@ -34,6 +41,8 @@ function M.init(config)
     _targetDamage = {}
     _aeDamage = {}
     _mobNameCache = {}
+    _targetIdCache = {}
+    _lastGroupSignature = ''
     _lastDamageEvent = 0
 end
 
@@ -72,19 +81,43 @@ local function resolveMobId(attackerName)
     if not attackerName then return nil end
 
     -- Normalize to lowercase for consistent cache lookup
-    local cached = _mobNameCache[attackerName:lower()]
+    local key = attackerName:lower()
+    local cached = _mobNameCache[key]
     if cached then return cached.id end
 
-    -- Fallback: direct spawn lookup
+    -- Fallback: direct spawn lookup. Hot path in AE fights — back-fill the
+    -- cache so subsequent hits on the same mob don't re-scan spawns.
     local spawn = mq.TLO.Spawn('npc "' .. attackerName .. '"')
     if spawn and spawn() and spawn.ID() > 0 then
-        return spawn.ID()
+        local id = spawn.ID()
+        _mobNameCache[key] = { id = id, lastSeen = mq.gettime() }
+        return id
     end
 
     return nil
 end
 
--- Find target ID by name (group members only)
+-- Refresh the group signature used to key findTargetIdByName cache. Called
+-- from the hot path; short-circuits on cached match.
+local function _currentGroupSignature()
+    local me = mq.TLO.Me
+    local myId = (me and me() and me.ID()) or 0
+    local sig = tostring(myId)
+    local groupCount = tonumber(mq.TLO.Group.Members()) or 0
+    for i = 1, groupCount do
+        local member = mq.TLO.Group.Member(i)
+        if member and member() then
+            local id = member.ID and member.ID()
+            if id and id > 0 then
+                sig = sig .. ',' .. id
+            end
+        end
+    end
+    return sig, myId, groupCount
+end
+
+-- Find target ID by name (group members only). Cached by lowercased name;
+-- invalidated when the group-id signature changes (member joins/leaves/zones).
 local function findTargetIdByName(name)
     if not name or name == '' then return nil end
 
@@ -98,32 +131,32 @@ local function findTargetIdByName(name)
         return nil
     end
 
-    -- Check self
-    local me = mq.TLO.Me
-    if me and me() then
-        local myName = me.CleanName()
-        if myName and myName:lower() == lname then
-            return me.ID()
-        end
-    end
+    -- Rebuild name->id map when group membership changes.
+    local sig, myId, groupCount = _currentGroupSignature()
+    if sig ~= _lastGroupSignature then
+        _targetIdCache = {}
+        _lastGroupSignature = sig
 
-    -- Check group members
-    local groupCount = tonumber(mq.TLO.Group.Members()) or 0
-    for i = 1, groupCount do
-        local member = mq.TLO.Group.Member(i)
-        if member and member() then
-            local memberName = member.CleanName and member.CleanName() or (member.Name and member.Name())
-            if memberName and memberName:lower() == lname then
-                -- Group.Member has ID directly, no need to go through Spawn
+        local me = mq.TLO.Me
+        if me and me() then
+            local myName = me.CleanName()
+            if myName and myName ~= '' and myName ~= 'NULL' then
+                _targetIdCache[myName:lower()] = myId
+            end
+        end
+        for i = 1, groupCount do
+            local member = mq.TLO.Group.Member(i)
+            if member and member() then
+                local memberName = member.CleanName and member.CleanName() or (member.Name and member.Name())
                 local id = member.ID and member.ID()
-                if id and id > 0 then
-                    return id
+                if memberName and memberName ~= '' and memberName ~= 'NULL' and id and id > 0 then
+                    _targetIdCache[memberName:lower()] = id
                 end
             end
         end
     end
 
-    return nil
+    return _targetIdCache[lname]
 end
 
 -- Check if combat has timed out (no damage for N seconds)
@@ -265,16 +298,22 @@ end
 local function calculateAeStatus()
     local now = mq.gettime()
     local cutoff = now - WINDOW_DURATION_MS
+    -- Mobs with no recent hits for this long get evicted entirely (they're
+    -- dead or out of range). Without this, _aeDamage grew unbounded through
+    -- long pulls and was only cleared on full combat timeout.
+    local AE_EVICT_MS = WINDOW_DURATION_MS * 4
 
     for mobId, aeData in pairs(_aeDamage) do
         -- Count targets hit recently
         local activeTargets = {}
+        local newestHit = 0
         for targetId, lastHit in pairs(aeData.targets) do
             if lastHit >= cutoff then
                 table.insert(activeTargets, targetId)
             else
                 aeData.targets[targetId] = nil  -- Prune stale
             end
+            if lastHit > newestHit then newestHit = lastHit end
         end
 
         aeData.activeTargetCount = #activeTargets
@@ -289,6 +328,11 @@ local function calculateAeStatus()
             end
         end
         aeData.totalDps = totalMobDps
+
+        -- Evict mobs with no active targets whose newest hit is stale.
+        if aeData.activeTargetCount == 0 and (newestHit == 0 or (now - newestHit) > AE_EVICT_MS) then
+            _aeDamage[mobId] = nil
+        end
     end
 end
 

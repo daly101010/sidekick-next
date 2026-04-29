@@ -123,7 +123,7 @@ local function loadTabs()
         end
     end
 
-    -- Diagnostic tabs: Performance Monitor and Coordinator Debug
+    -- Diagnostic tabs: Performance Monitor, Coordinator Debug, Rotation Debug
     -- These embed the content from standalone debug windows into settings tabs.
     local diagDefs = {
         {
@@ -134,6 +134,11 @@ local function loadTabs()
         {
             name = 'Coordinator',
             module = 'sidekick-next.ui.coordinator_debug',
+            drawFn = 'drawContent',
+        },
+        {
+            name = 'Rotation',
+            module = 'sidekick-next.ui.rotation_debug',
             drawFn = 'drawContent',
         },
     }

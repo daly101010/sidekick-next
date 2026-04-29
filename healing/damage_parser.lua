@@ -70,54 +70,73 @@ function M.recordDamage(targetName, amount, source, dmgType)
     })
 end
 
+-- Per-group-signature cache for name → spawn ID. The previous implementation
+-- ran a full TLO group iteration on every damage event (multiple per second
+-- in AE fights), each with pcall overhead. Caching keyed by a stable group
+-- signature (concatenation of member IDs) lets us serve hits in O(1) and
+-- only rebuild when group composition changes.
+local _idCache = {}
+local _lastGroupSignature = ''
+
+local function _currentGroupSignature()
+    local me = mq.TLO.Me
+    local myId = (me and me() and me.ID()) or 0
+    local sig = tostring(myId)
+    local groupCount = 0
+    local ok, n = pcall(function() return mq.TLO.Group.Members() end)
+    if ok and n then groupCount = tonumber(n) or 0 end
+    for i = 1, groupCount do
+        local member = mq.TLO.Group.Member(i)
+        if member and member() then
+            local id = member.ID and member.ID()
+            if id and id > 0 then sig = sig .. ',' .. id end
+        end
+    end
+    return sig, myId, groupCount
+end
+
 function M.findTargetIdByName(name)
     if not name or name == '' then return nil end
 
     local lname = tostring(name):lower()
+    if lname == 'you' then
+        local me = mq.TLO.Me
+        return (me and me() and me.ID()) or nil
+    end
 
-    -- Check self (with pcall for safety)
-    local ok, selfId = pcall(function()
+    -- Refresh the cache only when group membership changes.
+    local sig, myId, groupCount = _currentGroupSignature()
+    if sig ~= _lastGroupSignature then
+        _idCache = {}
+        _lastGroupSignature = sig
+
         local me = mq.TLO.Me
         if me and me() then
-            if lname == 'you' then
-                return me.ID()
-            end
-            local cleanName = me.CleanName()
-            if cleanName and cleanName:lower() == lname then
-                return me.ID()
+            local myName = me.CleanName and me.CleanName() or nil
+            if myName and myName ~= '' and myName ~= 'NULL' then
+                _idCache[myName:lower()] = myId
             end
         end
-        return nil
-    end)
-    if ok and selfId then return selfId end
-
-    -- Check group members (with safe nil handling)
-    local groupCount = 0
-    local countOk, countVal = pcall(function() return mq.TLO.Group.Members() end)
-    if countOk and countVal then
-        groupCount = tonumber(countVal) or 0
-    end
-
-    for i = 1, groupCount do
-        local ok2, memberId = pcall(function()
-            local member = mq.TLO.Group.Member(i)
-            if not member or not member() then return nil end
-            local spawn = member
-            if member.Spawn and member.Spawn() then
-                spawn = member.Spawn()
-            end
-            if spawn and spawn() then
-                local cleanName = spawn.CleanName()
-                if cleanName and cleanName:lower() == lname then
-                    return spawn.ID()
+        for i = 1, groupCount do
+            local ok, _ = pcall(function()
+                local member = mq.TLO.Group.Member(i)
+                if not member or not member() then return end
+                local spawn = member
+                if member.Spawn and member.Spawn() then
+                    spawn = member.Spawn()
                 end
-            end
-            return nil
-        end)
-        if ok2 and memberId then return memberId end
+                if spawn and spawn() then
+                    local cleanName = spawn.CleanName and spawn.CleanName() or nil
+                    local id = spawn.ID and spawn.ID() or 0
+                    if cleanName and cleanName ~= '' and cleanName ~= 'NULL' and id > 0 then
+                        _idCache[cleanName:lower()] = id
+                    end
+                end
+            end)
+        end
     end
 
-    return nil
+    return _idCache[lname]
 end
 
 function M.getLogDps(targetId)

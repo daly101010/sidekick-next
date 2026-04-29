@@ -34,10 +34,6 @@ function M.draw(settings, themeNames, onChange)
         tooltip = 'Visual theme for SideKick windows',
         width = 150,
     })
-    -- DEBUG: Log theme change detection
-    if themeChanged then
-        print(string.format('\ar[tab_ui] themeChanged=true newTheme=%s current=%s\ax', tostring(newTheme), tostring(settings.SideKickTheme)))
-    end
     if themeChanged and onChange then
         onChange('SideKickTheme', newTheme)
     end

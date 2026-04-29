@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local SafeLoad = require('sidekick-next.utils.safe_load')
 
 local M = {}
 
@@ -254,7 +255,7 @@ function M.save()
 end
 
 --- Load spell sets from disk
---- Uses pcall(dofile, path) to load
+--- Loads saved spellset data from a table literal file.
 --- Deserializes conditions
 --- If load fails or empty, creates "Default" set
 --- Ensures activeSetName points to valid set
@@ -262,15 +263,34 @@ function M.load()
     local path = M.getConfigPath()
     -- print(string.format('\\ay[SpellSetPersistence]\\ax Loading spell sets from: %s', path))
 
-    -- Try to load file
-    local data = nil
-    local ok, result = pcall(dofile, path)
-
-    if ok and type(result) == 'table' then
-        data = result
-        -- print(string.format('\\ag[SpellSetPersistence]\\ax Loaded data, version=%s', tostring(data.version or 'nil')))
+    -- Probe for file existence before dofile so the normal "first-run, no
+    -- saved sets" case stays silent. A red error should only fire for actual
+    -- parse/format problems, not for the expected absence of the file.
+    local fh = io.open(path, 'r')
+    if not fh then
+        -- No file yet — treat as "no sets saved". Fall through to the
+        -- default-set bootstrap below.
     else
-        print(string.format('\\ar[SpellSetPersistence]\\ax Failed to load: %s', tostring(result)))
+        fh:close()
+    end
+
+    local data = nil
+    if fh then
+        local content
+        do
+            local f = io.open(path, 'r')
+            if f then
+                content = f:read('*all')
+                f:close()
+            end
+        end
+        local result, err = SafeLoad.tableLiteral(content, path)
+        if type(result) == 'table' then
+            data = result
+        else
+            -- File exists but failed to parse — this IS an error worth surfacing.
+            print(string.format('\\ar[SpellSetPersistence]\\ax Failed to load: %s', tostring(err)))
+        end
     end
 
     -- Reset state

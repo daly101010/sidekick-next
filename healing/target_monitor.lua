@@ -290,11 +290,14 @@ local function updateTargetData(spawnId, spawn, roleOverride)
 end
 
 function M.tick()
-    -- Use mq.gettime() for wall-clock accuracy (os.clock() can drift)
+    -- Use mq.gettime() for wall-clock accuracy (os.clock() can drift).
+    -- Returns milliseconds — the throttle threshold below must also be in ms.
     local now = mq.gettime()
 
-    -- Full scan every 100ms
-    if (now - _lastFullScan) < 0.1 then return end
+    -- Full scan every 100ms (was `< 0.1`, which treated a 100ms threshold as
+    -- 0.1ms and effectively disabled throttling — the full group scan ran
+    -- every frame).
+    if (now - _lastFullScan) < 100 then return end
     _lastFullScan = now
 
     local me = mq.TLO.Me

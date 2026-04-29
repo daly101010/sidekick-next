@@ -847,7 +847,13 @@ M.DEFAULT_SLOT_TYPES = {
     GroupBuffs = 'buff_swap',
     Procs = 'buff_swap',
     Persistent = 'buff_swap',
-    Resurrection = 'buff_swap',
+    -- Rez spells are intentionally NOT in the slot-type table. The dedicated
+    -- sk_resurrection module casts them directly via /cast against a corpse
+    -- target; they don't belong in the buff-swap rotation (which expects
+    -- spells that apply a persistent buff and would otherwise loop forever
+    -- on rez spells, since rezzes never "stick" as a buff on the caster).
+    -- Resurrection lines are also no longer enumerated for slot assignment
+    -- (see enumerateLines below).
 }
 
 --- Enumerate all spell lines with their category
@@ -889,7 +895,9 @@ function M.enumerateLines()
     processCategory('GroupBuffs', M.GroupBuffs)
     processCategory('Procs', M.Procs)
     processCategory('Persistent', M.Persistent)
-    processCategory('Resurrection', M.Resurrection)
+    -- Resurrection intentionally excluded — handled out-of-band by
+    -- sk_resurrection.lua. Including it here put rez spells into the
+    -- buff-swap rotation, which would loop-cast them indefinitely.
 
     -- Sort by category then line name
     table.sort(lines, function(a, b)

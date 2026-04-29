@@ -74,6 +74,12 @@ function M.getForTarget(targetId)
     return _incoming[targetId] or {}
 end
 
+--- Read-only snapshot of all in-flight heals across every target.
+--- Caller must treat as read-only.
+function M.getAll()
+    return _incoming
+end
+
 function M.sumForTarget(targetId)
     local total = 0
     local entries = _incoming[targetId]

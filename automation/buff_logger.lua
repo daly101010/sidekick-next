@@ -1,5 +1,7 @@
 -- automation/buff_logger.lua
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
+local getPaths = lazy('sidekick-next.utils.paths')
 
 local M = {}
 
@@ -36,9 +38,9 @@ end
 function M.ensureLogDir()
     local configDir = mq.configDir or 'config'
     local logDir = configDir .. '/BuffLogs'
-    local ok, lfs = pcall(require, 'lfs')
-    if ok and lfs and lfs.mkdir then
-        lfs.mkdir(logDir)
+    local Paths = getPaths()
+    if Paths and Paths.ensureDir then
+        Paths.ensureDir(logDir)
     else
         os.execute('mkdir "' .. logDir .. '" 2>nul')
     end

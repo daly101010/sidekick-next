@@ -40,9 +40,11 @@ M.buffState = {}  -- { [memberId] = { [buffCategory] = { present, remaining, spe
 local _lastHeavyUpdate = 0
 local _lastLightUpdate = 0
 local _lastBuffScan = 0
+local _lastBuffCleanup = 0
 local HEAVY_INTERVAL = 0.10  -- 100ms for group HP/position scans (healing needs fresh data)
 local LIGHT_INTERVAL = 0.05  -- 50ms for lightweight self checks
 local BUFF_SCAN_INTERVAL = 3.0  -- 3s between buff scans (expensive due to retargeting)
+local BUFFSTATE_CLEANUP_INTERVAL = 30.0  -- 30s between prunes of stale buffState entries
 
 function M.init()
     M.me = {}
@@ -67,6 +69,14 @@ function M.tick()
     if (now - _lastHeavyUpdate) >= HEAVY_INTERVAL then
         _lastHeavyUpdate = now
         M.updateHeavy()
+    end
+
+    -- Periodic buffState prune (keeps the table from growing unbounded as mobs
+    -- cycle through XTarget). Must run after heavy update so M.group/xtarget
+    -- are populated for the valid-id set.
+    if (now - _lastBuffCleanup) >= BUFFSTATE_CLEANUP_INTERVAL then
+        _lastBuffCleanup = now
+        M.cleanupBuffState()
     end
 end
 
@@ -95,7 +105,7 @@ function M.updateLight()
 
     -- Casting state: check once, derive all fields
     local castSpell = me.Casting() or ''
-    local isCasting = castSpell ~= ''
+    local isCasting = castSpell ~= '' and castSpell ~= 'NULL'
     local castingId = 0
     local castingTargetId = 0
     if isCasting then
@@ -160,6 +170,14 @@ function M.updateLight()
     local target = mq.TLO.Target
     local targetId = target and target() and tonumber(target.ID()) or 0
     if targetId > 0 then
+        -- Resolve debuff spell names once; MQ Spell-typed TLOs stringify to
+        -- "NULL" when empty, so a raw `~= nil and ~= ''` check would report
+        -- every non-mezzed mob as mezzed.
+        local function _debuffActive(accessor)
+            if not accessor then return false end
+            local v = accessor()
+            return v ~= nil and v ~= '' and v ~= 'NULL'
+        end
         M.target = {
             id = targetId,
             name = target.CleanName() or '',
@@ -171,9 +189,9 @@ function M.updateLight()
             named = target.Named() == true,
 
             -- Debuff state (for CC/tank decisions)
-            mezzed = (target.Mezzed and target.Mezzed() ~= nil and target.Mezzed() ~= ''),
-            slowed = (target.Slowed and target.Slowed() ~= nil and target.Slowed() ~= ''),
-            rooted = (target.Rooted and target.Rooted() ~= nil and target.Rooted() ~= ''),
+            mezzed = _debuffActive(target.Mezzed),
+            slowed = _debuffActive(target.Slowed),
+            rooted = _debuffActive(target.Rooted),
 
             -- Target of target (for aggro decisions)
             totId = (target.TargetOfTarget and target.TargetOfTarget.ID and tonumber(target.TargetOfTarget.ID())) or 0,
@@ -290,6 +308,8 @@ function M.updateHeavy()
         local aggro = tonumber(xt.PctAggro()) or 100
         local totId = (xt.TargetOfTarget and xt.TargetOfTarget.ID and tonumber(xt.TargetOfTarget.ID())) or 0
 
+        local mezVal = xt.Mezzed and xt.Mezzed() or nil
+        local isMezzed = mezVal ~= nil and mezVal ~= '' and mezVal ~= 'NULL'
         haters[#haters + 1] = {
             id = xtId,
             name = xt.CleanName() or '',
@@ -297,7 +317,7 @@ function M.updateHeavy()
             distance = tonumber(xt.Distance()) or 999,
             aggro = aggro,
             targetingMe = totId == myId,
-            mezzed = (xt.Mezzed and xt.Mezzed() ~= nil and xt.Mezzed() ~= ''),
+            mezzed = isMezzed,
             targetType = targetType,
         }
 
@@ -749,6 +769,8 @@ function M.getOOGNeedingBuff(source, buffCategory, rebuffWindow)
 end
 
 --- Clean up stale buff state for members no longer in group
+--- Includes current XTarget ids (mobs we might be debuffing) as valid; also
+--- TTL-drops any entry whose newest checkedAt is older than BUFFSTATE_TTL.
 function M.cleanupBuffState()
     local validIds = {}
 
@@ -771,10 +793,32 @@ function M.cleanupBuffState()
         end
     end
 
-    -- Remove entries for IDs no longer in group
-    for memberId, _ in pairs(M.buffState) do
+    -- Current XTarget haters are valid — they may hold active debuff state.
+    if M.xtarget and M.xtarget.haters then
+        for _, hater in ipairs(M.xtarget.haters) do
+            if hater.id and hater.id > 0 then validIds[hater.id] = true end
+        end
+    end
+
+    -- TTL: drop buff state entries whose most recent check is older than this.
+    local BUFFSTATE_TTL = 60.0  -- seconds
+    local now = os.clock()
+
+    -- Remove entries for IDs no longer valid, OR whose latest check is too old
+    -- (prevents unbounded growth across mob kills / zone-ins where the valid-id
+    -- set would otherwise forget mobs we stopped tracking).
+    for memberId, categories in pairs(M.buffState) do
         if not validIds[memberId] then
             M.buffState[memberId] = nil
+        elseif type(categories) == 'table' then
+            local newestCheck = 0
+            for _, entry in pairs(categories) do
+                local ts = type(entry) == 'table' and tonumber(entry.checkedAt) or nil
+                if ts and ts > newestCheck then newestCheck = ts end
+            end
+            if newestCheck > 0 and (now - newestCheck) > BUFFSTATE_TTL then
+                M.buffState[memberId] = nil
+            end
         end
     end
 end

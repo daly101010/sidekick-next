@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local C = require('sidekick-next.ui.constants')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Items = require('sidekick-next.utils.items')
@@ -119,7 +119,8 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, rounding)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
-    local shown = imgui.Begin('SideKick Items##SideKickItemBar', true, flags)
+    local _, shown = imgui.Begin('SideKick Items##SideKickItemBar', true, flags)
+    if shown == nil then shown = true end
     if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_items', imgui)

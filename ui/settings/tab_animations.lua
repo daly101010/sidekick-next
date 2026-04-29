@@ -11,7 +11,7 @@ local Components = require('sidekick-next.ui.components')
 local M = {}
 
 function M.draw(settings, themeNames, onChange)
-    local themeName = settings.Theme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
 
     -- Master toggle (clickable badge)
     local animEnabled = settings.AnimationsEnabled ~= false

@@ -22,7 +22,11 @@ local _pendingHotHeals = {}
 local _pendingGroupHot = nil
 local TICK_MS = 6000  -- 6 seconds in milliseconds
 
--- Get current time in milliseconds (consistent with deficithealer)
+-- Get current time in milliseconds. Prefers mq.TLO.Time.MillisecondsSinceEpoch
+-- when available; falls back to mq.gettime() so the clock baseline matches
+-- everything else in the system. Previously fell back to os.time()*1000
+-- (epoch ms ~1.7e12), which would silently disagree with mq.gettime() values
+-- (boot ms ~1e7) elsewhere — any cross-comparison would be wildly off.
 local function nowMs()
     local tloTime = mq.TLO.Time.MillisecondsSinceEpoch
     if tloTime then
@@ -31,7 +35,7 @@ local function nowMs()
             return value
         end
     end
-    return os.time() * 1000
+    return mq.gettime and mq.gettime() or (os.time() * 1000)
 end
 
 -- Callbacks for broadcasting (set by init.lua to avoid circular require)
@@ -579,6 +583,13 @@ function M.onHealLanded(targetName, amount, spellName, isCrit, isHoT, potential)
                 local now = nowMs()
                 local windowMs = ticksTotal * TICK_MS
 
+                -- The first observed tick fires ~one tick interval after the
+                -- actual cast. Anchor castTime backwards by TICK_MS so the
+                -- expiry isn't overestimated by ~6s of healing — otherwise
+                -- getIncomingHotRemaining over-counts and SelectHeal skips
+                -- direct heals it should have fired.
+                local castTime = now - TICK_MS
+
                 _pendingHotHeals[keyTarget] = _pendingHotHeals[keyTarget] or {}
                 _pendingHotHeals[keyTarget][keySpell] = {
                     target = targetName,
@@ -589,9 +600,9 @@ function M.onHealLanded(targetName, amount, spellName, isCrit, isHoT, potential)
                     ticksSeen = 0,
                     expectedUsed = 0,
                     actualTotal = 0,
-                    castTimeMs = now,
+                    castTimeMs = castTime,
                     durationMs = windowMs,
-                    expiresAtMs = now + windowMs,
+                    expiresAtMs = castTime + windowMs,
                     autoRegistered = true,
                 }
                 hotInfo = _pendingHotHeals[keyTarget][keySpell]

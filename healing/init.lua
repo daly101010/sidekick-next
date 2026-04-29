@@ -99,6 +99,11 @@ local function isHealerClass()
     return classShort == 'CLR' or classShort == 'PAL'
 end
 
+local function isCastingValueActive(casting)
+    casting = tostring(casting or '')
+    return casting ~= '' and casting ~= 'NULL'
+end
+
 -- Check if we can heal right now
 local function canHealNow(opts)
     opts = opts or {}
@@ -116,7 +121,7 @@ local function canHealNow(opts)
 
     -- Already casting (Casting() returns spell name string, empty if not casting)
     local casting = me.Casting and me.Casting() or ''
-    if casting ~= '' then
+    if isCastingValueActive(casting) then
         debugLog('[CanHealNow] FAIL: casting spell=%s', casting)
         return false
     end
@@ -267,7 +272,9 @@ local function executeHeal(spellName, targetId, tier, isHoT)
                 SpellEvents.registerHotCast(targetName, spellName, hotTickAmount, hotDuration, mq.gettime())
             end
             if ActorsCoordinator and ActorsCoordinator.broadcast and Config and Config.broadcastEnabled then
-                local exp = mq.gettime() + castTimeMs + ((hotDuration or 18) * 1000)
+                -- Wall-clock epoch seconds for cross-peer comparison.
+                local castTimeSec = (castTimeMs or 0) / 1000
+                local exp = os.time() + castTimeSec + (hotDuration or 18)
                 ActorsCoordinator.broadcast('heal:hots', {
                     targetId = targetId,
                     spellName = spellName,
@@ -445,10 +452,10 @@ local function buildHealAction(opts)
     local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(ctx.allTargets)
     if useGroup and groupHeal then
         local myId = mq.TLO.Me.ID()
-        if myId and myId() then
+        if myId and myId > 0 then
             return {
                 spellName = groupHeal.spell,
-                targetId = tonumber(myId()) or 0,
+                targetId = tonumber(myId) or 0,
                 targetName = mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or 'Me',
                 tier = 'group',
                 isHoT = false,
@@ -464,7 +471,7 @@ local function buildHealAction(opts)
         local useGroupHot, groupHot, _, _ = proactive.ShouldApplyGroupHot(ctx.allTargets, situation)
         if useGroupHot and groupHot then
             local myId = mq.TLO.Me.ID()
-            if myId and myId() then
+            if myId and myId > 0 then
                 local targetNames = {}
                 for _, t in ipairs(ctx.allTargets) do
                     if (t.deficit or 0) > 0 and t.name then
@@ -473,7 +480,7 @@ local function buildHealAction(opts)
                 end
                 return {
                     spellName = groupHot.spell,
-                    targetId = tonumber(myId()) or 0,
+                    targetId = tonumber(myId) or 0,
                     targetName = mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or 'Me',
                     tier = 'groupHot',
                     isHoT = true,
@@ -492,7 +499,9 @@ local function buildHealAction(opts)
                 local heal, reason = HealSelector.SelectHeal(t, situation)
                 if heal then
                     if heal.category == 'hot' and proactive and proactive.HasActiveHot and proactive.HasActiveHot(t.name) then
-                        local canRefresh = proactive.ShouldRefreshHot and proactive.ShouldRefreshHot(t.name, Config) or false
+                        -- Post-selection: heal.spell is the HoT we'd cast, so pass it
+                        -- so the self-buff check can match (targetHasHoTBuff is self-only).
+                        local canRefresh = proactive.ShouldRefreshHot and proactive.ShouldRefreshHot(t.name, heal.spell) or false
                         if not canRefresh then
                             local deficitPct = (t.maxHP and t.maxHP > 0) and (t.deficit / t.maxHP * 100) or 0
                             local fallbackMinPct = Config.minHealPct or 10
@@ -637,7 +646,9 @@ local function registerHealCast(castInfo)
             SpellEvents.registerHotCast(castInfo.targetName or '', spellName, hotTickAmount, hotDuration, mq.gettime())
         end
         if ActorsCoordinator and ActorsCoordinator.broadcast and Config and Config.broadcastEnabled then
-            local exp = mq.gettime() + (castInfo.castTimeMs or 0) + ((hotDuration or 18) * 1000)
+            -- Wall-clock epoch seconds so cross-peer receivers can compare.
+            local castTimeSec = (castInfo.castTimeMs or 0) / 1000
+            local exp = os.time() + castTimeSec + (hotDuration or 18)
             ActorsCoordinator.broadcast('heal:hots', {
                 targetId = targetId,
                 spellName = spellName,
@@ -693,7 +704,7 @@ local function monitorDuck(opts)
     if not castInfo then return false end
 
     local me = mq.TLO.Me
-    local currentlyCasting = me and me() and me.Casting and (me.Casting() or '') ~= ''
+    local currentlyCasting = me and me() and me.Casting and isCastingValueActive(me.Casting())
     if not currentlyCasting then
         -- Cast ended naturally - DON'T clear cast info here!
         -- Let the heal event (onHealLanded) clear it so analytics can record properly.
@@ -701,7 +712,7 @@ local function monitorDuck(opts)
         local now = mq.gettime()
         local castStart = castInfo.startTime or now
         local expectedEnd = castInfo.expectedEnd or (castStart + 2.5)
-        local staleTimeout = 2.0  -- Wait 2 seconds after expected end before clearing
+        local staleTimeout = 2000  -- Wait 2 seconds after expected end before clearing
         if now > (expectedEnd + staleTimeout) then
             -- Stale cast info - heal event probably didn't fire, clear it
             SpellEvents.setCastInfo(nil)
@@ -858,8 +869,8 @@ end
 function M.tick(settings)
     if not _initialized then return false end
 
-    -- DEBUG: Track which module stalls (logs to file)
-    local _tickDbg = true
+    -- Enable briefly when diagnosing a specific healing stall; file IO here is expensive in combat.
+    local _tickDbg = false
     local function tickLog(msg)
         if _tickDbg then debugLog('[HealTick] %s', msg) end
     end
@@ -922,7 +933,7 @@ function M.tick(settings)
 
     -- Throttle heal attempts (use mq.gettime() for wall-clock accuracy)
     local now = mq.gettime()
-    if (now - _lastHealAttempt) < 0.1 then
+    if (now - _lastHealAttempt) < 100 then
         return _priorityActive
     end
     _lastHealAttempt = now
@@ -939,6 +950,8 @@ function M.tick(settings)
         for k, v in pairs(t) do out[k] = v end
         return out
     end
+
+    local proactive = _optionalReady and getProactive() or nil
 
     local allTargets = {}
     local priorityTargets = {}
@@ -1080,7 +1093,9 @@ function M.tick(settings)
                 tickLog(string.format('22-HealSelected: spell=%s reason=%s', tostring(heal and heal.spell), tostring(reason)))
                 if heal then
                     if heal.category == 'hot' and proactive and proactive.HasActiveHot and proactive.HasActiveHot(t.name) then
-                        local canRefresh = proactive.ShouldRefreshHot and proactive.ShouldRefreshHot(t.name, Config) or false
+                        -- Post-selection: heal.spell is the HoT we'd cast, so pass it
+                        -- so the self-buff check can match (targetHasHoTBuff is self-only).
+                        local canRefresh = proactive.ShouldRefreshHot and proactive.ShouldRefreshHot(t.name, heal.spell) or false
                         if not canRefresh then
                             local deficitPct = (t.maxHP and t.maxHP > 0) and (t.deficit / t.maxHP * 100) or 0
                             local fallbackMinPct = Config.minHealPct or 10

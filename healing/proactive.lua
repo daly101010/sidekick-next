@@ -29,6 +29,32 @@ local getActorsCoordinator = lazy('sidekick-next.utils.actors_coordinator')
 local _activeHoTs = {}  -- [targetName] = { spell, castTime, duration, expireTime }
 local _activePromised = {}  -- [targetName] = { spell, castTime, delay, landingTime, expireTime, expectedHeal }
 
+-- Short-TTL cache of name → spawn ID. The hot HoT query paths used to do
+-- `mq.TLO.Spawn('pc <name>')` on every call; in a 6-player group this fired
+-- 6+ spawn searches per heal-context build. Cache for 2s with explicit
+-- invalidation helpers exposed to consumers that know better (e.g. on group
+-- member change or zone-in).
+local _pcIdCache = {}  -- [lowerName] = { id, at }
+local _PC_ID_TTL_MS = 2000
+
+local function resolvePcSpawnId(targetName)
+    if not targetName or targetName == '' then return 0 end
+    local key = targetName:lower()
+    local now = mq.gettime()
+    local entry = _pcIdCache[key]
+    if entry and (now - entry.at) < _PC_ID_TTL_MS then
+        return entry.id
+    end
+    local spawn = mq.TLO.Spawn('pc ' .. targetName)
+    local id = spawn and spawn() and spawn.ID and tonumber(spawn.ID()) or 0
+    _pcIdCache[key] = { id = id, at = now }
+    return id
+end
+
+function M.invalidatePcIdCache()
+    _pcIdCache = {}
+end
+
 local function resolveTargetName(targetIdOrName)
     if not targetIdOrName then return nil end
     if type(targetIdOrName) == 'string' then
@@ -53,12 +79,15 @@ end
 function M.recordHoT(targetIdOrName, spellName, duration)
     local targetName = resolveTargetName(targetIdOrName)
     if not targetName then return end
-    local now = mq.gettime()
+    local now = mq.gettime()  -- milliseconds
+    local durSec = duration or 18
+    local durMs = durSec * 1000
     _activeHoTs[targetName] = {
         spell = spellName,
         castTime = now,
-        duration = duration or 18,
-        expireTime = now + (duration or 18),
+        duration = durSec,           -- kept in seconds for external consumers
+        durationMs = durMs,          -- canonical ms form used internally
+        expireTime = now + durMs,    -- ms, matches mq.gettime()
     }
 end
 
@@ -66,55 +95,43 @@ function M.GetHotData(targetName)
     return _activeHoTs[targetName]
 end
 
--- Check if target actually has the HoT buff on them (via MQ)
--- NOTE: Player-cast HoTs appear in the Song window, not Buff window
+-- Check if target has a named HoT active, via authoritative game-client state.
+--
+-- Only self can be checked this way: mq.TLO.Me.Song/Buff are the caster's own
+-- windows, so they reflect *our* buff state but never another player's.
+-- Group.Member.Buff only exposes buffs the server broadcasts to the group
+-- window (songs/target-only debuffs aren't in that list), so it was
+-- misleading for HoT checks — it would return false even when the HoT was
+-- active. For non-self targets we return false here and let callers fall
+-- through to _activeHoTs (HoTs we recorded casting) + actor peer data.
+--
+-- Returns: hasBuff (bool), remainingSeconds (number)
 local function targetHasHoTBuff(targetId, hotSpellName)
     if not targetId or not hotSpellName then return false end
 
-    -- Get target spawn
     local spawn = mq.TLO.Spawn(targetId)
     if not spawn or not spawn() then return false end
 
     local targetName = spawn.CleanName() or spawn.Name()
     if not targetName then return false end
 
-    -- Check if it's us
     local myName = mq.TLO.Me.CleanName() or mq.TLO.Me.Name()
-    if targetName == myName then
-        -- HoTs go in the Song window for the player
-        local song = mq.TLO.Me.Song(hotSpellName)
-        if song and song() and song.ID() then
-            ---@diagnostic disable-next-line: undefined-field
-            return true, song.Duration and song.Duration.TotalSeconds and tonumber(song.Duration.TotalSeconds()) or 0
-        end
-        -- Also check buff window as fallback (some HoTs might be there)
-        local buff = mq.TLO.Me.Buff(hotSpellName)
-        if buff and buff() and buff.ID() then
-            ---@diagnostic disable-next-line: undefined-field
-            return true, buff.Duration and buff.Duration.TotalSeconds and tonumber(buff.Duration.TotalSeconds()) or 0
-        end
+    if targetName ~= myName then
+        -- Non-self: no reliable client-side source. Caller's fallback handles it.
         return false
     end
 
-    -- For group members, use Group.Member buff checking
-    -- Group member buffs include both buff and song windows
-    local groupCount = tonumber(mq.TLO.Group.Members()) or 0
-    for i = 1, groupCount do
-        local member = mq.TLO.Group.Member(i)
-        if member and member() then
-            local memberName = member.CleanName() or member.Name()
-            if memberName and memberName == targetName then
-                -- Check member's buffs (includes songs for group members)
-                local buff = member.Buff(hotSpellName)
-                if buff and buff() and buff.ID() then
-                    ---@diagnostic disable-next-line: undefined-field
-                    return true, buff.Duration and buff.Duration.TotalSeconds and tonumber(buff.Duration.TotalSeconds()) or 0
-                end
-                return false
-            end
-        end
+    -- Self path: HoTs typically land in the Song window; some may land in Buff.
+    local song = mq.TLO.Me.Song(hotSpellName)
+    if song and song() and song.ID() then
+        ---@diagnostic disable-next-line: undefined-field
+        return true, song.Duration and song.Duration.TotalSeconds and tonumber(song.Duration.TotalSeconds()) or 0
     end
-
+    local buff = mq.TLO.Me.Buff(hotSpellName)
+    if buff and buff() and buff.ID() then
+        ---@diagnostic disable-next-line: undefined-field
+        return true, buff.Duration and buff.Duration.TotalSeconds and tonumber(buff.Duration.TotalSeconds()) or 0
+    end
     return false
 end
 
@@ -130,25 +147,31 @@ function M.hasActiveHoT(targetIdOrName)
         return hasBuff, data.spell, remaining
     end
 
-    -- Check peer-reported HoTs via actors (if available)
+    -- Check peer-reported HoTs via actors (if available).
+    -- Peer HoT timestamps are wall-clock epoch seconds (os.time()), NOT
+    -- mq.gettime() ms — the two clocks can't be compared directly. Use
+    -- os.time() locally and convert the result back to ms so the return
+    -- type (remaining in ms) matches the self-path above.
     local ac = getActorsCoordinator()
     if ac and ac.getHoTStates then
-        local spawn = mq.TLO.Spawn('pc ' .. targetName)
-        local tid = spawn and spawn() and spawn.ID and tonumber(spawn.ID()) or 0
+        local tid = resolvePcSpawnId(targetName)
         local perTarget = tid > 0 and ac.getHoTStates()[tid] or nil
         if perTarget then
-            local best = 0
-            local bestSpell = nil
-            for _, info in pairs(perTarget) do
-                local exp = tonumber(info.expiresAt) or 0
-                local rem = exp - now
-                if rem > best then
-                    best = rem
-                    bestSpell = info.spellName or bestSpell
+            local nowSec = os.time()
+            local bestSec, bestSpell = 0, nil
+            -- Nested shape: perTarget[from][spellName] = { expiresAt, ... }
+            for _, perSpell in pairs(perTarget) do
+                for _, info in pairs(perSpell) do
+                    local exp = tonumber(info.expiresAt) or 0
+                    local remSec = exp - nowSec
+                    if remSec > bestSec then
+                        bestSec = remSec
+                        bestSpell = info.spellName or bestSpell
+                    end
                 end
             end
-            if best > 0 then
-                return true, bestSpell or 'unknown', best
+            if bestSec > 0 then
+                return true, bestSpell or 'unknown', bestSec * 1000
             end
         end
     end
@@ -160,17 +183,30 @@ function M.HasActiveHot(targetIdOrName)
     return M.hasActiveHoT(targetIdOrName)
 end
 
+-- Hard floor for HoT refresh: never overwrite an existing HoT that has
+-- more than this many milliseconds left. HoT ticks fire every 6 seconds,
+-- so a 2s floor guarantees we don't clobber a HoT that still has at least
+-- one more tick coming. Applies in addition to hotRefreshWindowPct.
+local HOT_REFRESH_MIN_REMAINING_MS = 2000
+
+-- shouldRefreshHoT(target, hotSpellName)
+--   hotSpellName may be nil — in that case we skip the authoritative self-buff
+--   lookup (there's no specific spell to check) and rely solely on the
+--   fallback path (_activeHoTs + actor peer state), which already covers
+--   "is there any HoT on this target we'd be overwriting?"
 function M.shouldRefreshHoT(targetIdOrName, hotSpellName)
-    -- First check if target actually has the buff
     local targetName = resolveTargetName(targetIdOrName)
     if not targetName then return false end
-    local spawn = mq.TLO.Spawn('pc ' .. targetName)
-    local targetId = spawn and spawn() and spawn.ID and tonumber(spawn.ID()) or 0
-    local hasBuff, buffRemaining = targetHasHoTBuff(targetId, hotSpellName)
+    local targetId = resolvePcSpawnId(targetName)
+
+    local hasBuff, buffRemaining = false, 0
+    if hotSpellName then
+        hasBuff, buffRemaining = targetHasHoTBuff(targetId, hotSpellName)
+    end
     if not hasBuff then
         -- Fallback: use cached/peer-reported remaining time if buff lookup failed
         local now = mq.gettime()
-        local bestRemaining = 0
+        local bestRemaining = 0  -- milliseconds
 
         local data = _activeHoTs[targetName]
         if data and data.expireTime and data.expireTime > now then
@@ -181,42 +217,57 @@ function M.shouldRefreshHoT(targetIdOrName, hotSpellName)
         if ac and ac.getHoTStates and targetId > 0 then
             local perTarget = ac.getHoTStates()[targetId]
             if perTarget then
-                for _, info in pairs(perTarget) do
-                    local exp = tonumber(info.expiresAt) or 0
-                    local rem = exp - now
-                    if rem > bestRemaining then bestRemaining = rem end
+                -- Peer HoT expiresAt is epoch seconds; convert remaining to ms
+                -- before comparing with self-tracked (mq.gettime-based) values.
+                local nowSec = os.time()
+                for _, perSpell in pairs(perTarget) do
+                    for _, info in pairs(perSpell) do
+                        local exp = tonumber(info.expiresAt) or 0
+                        local remMs = (exp - nowSec) * 1000
+                        if remMs > bestRemaining then bestRemaining = remMs end
+                    end
                 end
             end
         end
 
         if bestRemaining > 0 then
-            local refreshPct = Config and Config.hotRefreshWindowPct or 0
-            if refreshPct <= 0 then
+            -- Absolute floor: don't clobber a HoT with a remaining tick.
+            if bestRemaining > HOT_REFRESH_MIN_REMAINING_MS then
                 return false
             end
-            local spell = mq.TLO.Spell(hotSpellName)
-            local duration = 0
-            if spell and spell() and spell.Duration and spell.Duration.TotalSeconds then
-                duration = tonumber(spell.Duration.TotalSeconds()) or 0
+            local refreshPct = Config and Config.hotRefreshWindowPct or 0
+            if refreshPct <= 0 then
+                -- Inside the 2s floor window and no pct policy → refresh.
+                return true
             end
-            if duration > 0 then
-                local remainingPct = (bestRemaining / duration) * 100
+            local spell = mq.TLO.Spell(hotSpellName)
+            local durationSec = 0
+            if spell and spell() and spell.Duration and spell.Duration.TotalSeconds then
+                durationSec = tonumber(spell.Duration.TotalSeconds()) or 0
+            end
+            if durationSec > 0 then
+                local remainingPct = (bestRemaining / (durationSec * 1000)) * 100
                 return remainingPct <= refreshPct
             end
-            return false
+            return true
         end
 
         -- No known HoT remaining, safe to cast
         return true
     end
 
-    -- Buff is on target - check if we should refresh based on remaining duration
+    -- Buff is on target — `buffRemaining` is in SECONDS (from Duration.TotalSeconds).
     local remaining = buffRemaining or 0
     if remaining <= 0 then return true end
 
-    -- Check refresh window from config
+    -- Absolute floor: HoT still has a live tick — don't overwrite.
+    if (remaining * 1000) > HOT_REFRESH_MIN_REMAINING_MS then
+        return false
+    end
+
+    -- Inside the 2s floor window — optional pct gate, else refresh.
     local refreshPct = Config and Config.hotRefreshWindowPct or 0
-    if refreshPct <= 0 then return false end  -- Wait until expired
+    if refreshPct <= 0 then return true end
 
     -- Get spell duration to calculate percentage remaining
     local spell = mq.TLO.Spell(hotSpellName)
@@ -244,10 +295,12 @@ function M.getHotRemainingPct(targetIdOrName)
     if not data or not data.duration or data.duration <= 0 then
         return 0
     end
+    -- All math in ms (matches mq.gettime() and data.castTime / data.durationMs).
     local now = mq.gettime()
-    local elapsed = now - (data.castTime or now)
-    local remaining = math.max(0, data.duration - elapsed)
-    return (remaining / data.duration) * 100
+    local durationMs = data.durationMs or (data.duration * 1000)
+    local elapsedMs = now - (data.castTime or now)
+    local remainingMs = math.max(0, durationMs - elapsedMs)
+    return (remainingMs / durationMs) * 100
 end
 
 function M.GetHotRemainingPct(targetIdOrName)
@@ -312,12 +365,17 @@ function M.getHotHealingInWindow(targetIdOrName, windowSec)
     local hpPerTick = tracker.getExpected(data.spell, 'tick') or 0
     if hpPerTick <= 0 then return 0 end
 
-    local now = os.time()
-    local elapsed = now - (data.castTime or now)
-    local remaining = math.max(0, (data.duration or 0) - elapsed)
-    local tickInterval = 6
-    local windowRemaining = math.min(windowSec or 0, remaining)
-    local ticksInWindow = math.floor(windowRemaining / tickInterval)
+    -- Keep all arithmetic in milliseconds: castTime/expireTime come from
+    -- mq.gettime() and the older code here mixed os.time() (seconds) with
+    -- ms values, making this function always return 0.
+    local now = mq.gettime()
+    local elapsedMs = now - (data.castTime or now)
+    local durationMs = data.durationMs or ((data.duration or 0) * 1000)
+    local remainingMs = math.max(0, durationMs - elapsedMs)
+    local tickIntervalMs = 6000
+    local windowMs = (windowSec or 0) * 1000
+    local windowRemainingMs = math.min(windowMs, remainingMs)
+    local ticksInWindow = math.floor(windowRemainingMs / tickIntervalMs)
     return ticksInWindow * hpPerTick
 end
 
@@ -343,16 +401,19 @@ function M.getIncomingHotRemaining(targetIdOrName)
         end
     end
 
-    local function addRemaining(spellName, expiresAt, castTime, duration)
+    -- All time math in milliseconds; `now` = mq.gettime(). `expiresAt` and
+    -- `castTime` come from mq.gettime() too. `durationMs` is the canonical
+    -- internal duration; fall back to `duration * 1000` for older entries.
+    local function addRemaining(spellName, expiresAt, castTime, durationMs)
         if not spellName then return end
-        local remaining = 0
+        local remainingMs = 0
         if expiresAt and expiresAt > now then
-            remaining = expiresAt - now
-        elseif castTime and duration then
-            local elapsed = now - castTime
-            remaining = math.max(0, duration - elapsed)
+            remainingMs = expiresAt - now
+        elseif castTime and durationMs then
+            local elapsedMs = now - castTime
+            remainingMs = math.max(0, durationMs - elapsedMs)
         end
-        if remaining <= 0 then return end
+        if remainingMs <= 0 then return end
 
         local tick = HealTracker and HealTracker.getExpected(spellName, 'tick') or 0
         if tick <= 0 then
@@ -367,24 +428,34 @@ function M.getIncomingHotRemaining(targetIdOrName)
         end
         if tick <= 0 then return end
 
-        local ticksRemaining = math.floor(remaining / 6)
+        local ticksRemaining = math.floor(remainingMs / 6000)
         if ticksRemaining <= 0 then return end
         total = total + (tick * ticksRemaining)
     end
 
     local data = _activeHoTs[targetName]
     if data then
-        addRemaining(data.spell, data.expireTime, data.castTime, data.duration)
+        local dms = data.durationMs or ((data.duration or 0) * 1000)
+        addRemaining(data.spell, data.expireTime, data.castTime, dms)
     end
 
     local ac = getActorsCoordinator()
     if ac and ac.getHoTStates then
-        local spawn = mq.TLO.Spawn('pc ' .. targetName)
-        local tid = spawn and spawn() and spawn.ID and tonumber(spawn.ID()) or 0
+        local tid = resolvePcSpawnId(targetName)
         local perTarget = tid > 0 and ac.getHoTStates()[tid] or nil
         if perTarget then
-            for _, info in pairs(perTarget) do
-                addRemaining(info.spellName, info.expiresAt)
+            -- Peer HoT expiresAt is epoch seconds. addRemaining() computes in
+            -- mq.gettime() ms, so project peer's expiresAt onto the local
+            -- ms-clock by taking (exp - os.time()) * 1000 and adding `now`.
+            local nowSec = os.time()
+            for _, perSpell in pairs(perTarget) do
+                for _, info in pairs(perSpell) do
+                    local expSec = tonumber(info.expiresAt) or 0
+                    local remMs = (expSec - nowSec) * 1000
+                    if remMs > 0 then
+                        addRemaining(info.spellName, now + remMs)
+                    end
+                end
             end
         end
     end

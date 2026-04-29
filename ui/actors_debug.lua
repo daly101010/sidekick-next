@@ -200,7 +200,8 @@ local function renderIncomingTab()
             imgui.TableSetupColumn('Expires', ImGuiTableColumnFlags.WidthFixed, 60)
             imgui.TableHeadersRow()
 
-            local now = os.clock()
+            -- expiresAt values are stored as wall-clock epoch seconds.
+            local now = os.time()
             for tid, perFrom in pairs(healClaims) do
                 for from, claim in pairs(perFrom) do
                     imgui.TableNextRow()
@@ -223,12 +224,14 @@ local function renderIncomingTab()
     imgui.Spacing()
     imgui.Separator()
 
-    -- HoT states
+    -- HoT states — now nested [tid][from][spellName].
     imgui.TextColored(1, 0.8, 0.5, 1, 'HoT States (from other healers):')
     local hotStates = ActorsCoord.getHoTStatesRaw()
     local hotCount = 0
-    for tid, perFrom in pairs(hotStates) do
-        for _ in pairs(perFrom) do hotCount = hotCount + 1 end
+    for _, perFrom in pairs(hotStates) do
+        for _, perSpell in pairs(perFrom) do
+            for _ in pairs(perSpell) do hotCount = hotCount + 1 end
+        end
     end
 
     if hotCount == 0 then
@@ -242,19 +245,21 @@ local function renderIncomingTab()
             imgui.TableSetupColumn('Expires', ImGuiTableColumnFlags.WidthFixed, 60)
             imgui.TableHeadersRow()
 
-            local now = os.clock()
+            local now = os.time()
             for tid, perFrom in pairs(hotStates) do
-                for from, hot in pairs(perFrom) do
-                    imgui.TableNextRow()
-                    imgui.TableNextColumn()
-                    imgui.Text(tostring(tid))
-                    imgui.TableNextColumn()
-                    imgui.Text(from)
-                    imgui.TableNextColumn()
-                    imgui.Text(hot.spellName or '?')
-                    imgui.TableNextColumn()
-                    local ttl = (hot.expiresAt or now) - now
-                    imgui.Text(string.format('%.1fs', ttl))
+                for from, perSpell in pairs(perFrom) do
+                    for spellName, hot in pairs(perSpell) do
+                        imgui.TableNextRow()
+                        imgui.TableNextColumn()
+                        imgui.Text(tostring(tid))
+                        imgui.TableNextColumn()
+                        imgui.Text(from)
+                        imgui.TableNextColumn()
+                        imgui.Text(hot.spellName or spellName or '?')
+                        imgui.TableNextColumn()
+                        local ttl = (hot.expiresAt or now) - now
+                        imgui.Text(string.format('%.1fs', ttl))
+                    end
                 end
             end
 

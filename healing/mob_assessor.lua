@@ -5,6 +5,7 @@
 local mq = require('mq')
 local imgui = require('ImGui')
 local lazy = require('sidekick-next.utils.lazy_require')
+local NamedDetector = require('sidekick-next.utils.named_detector')
 
 local M = {}
 
@@ -14,6 +15,8 @@ local getLogger = lazy.once('sidekick-next.healing.logger')
 -- Lazy-load Buff module for isBuffingActive check
 local getBuff = lazy.once('sidekick-next.automation.buff')
 
+local getCore = lazy.once('sidekick-next.utils.core')
+
 -- Configuration
 local Config = {
     scanIntervalMs = 60000,       -- Rescan interval when idle (60 seconds)
@@ -21,6 +24,12 @@ local Config = {
     targetDelayMs = 200,          -- Delay after targeting before consider
     defaultNamedMultiplier = 1.3, -- Multiplier for named mobs without consider data
 }
+
+local function isNamedSpawn(spawn)
+    local Core = getCore()
+    local settings = Core and Core.Settings or nil
+    return NamedDetector.isNamed(spawn, settings)
+end
 
 -- Consider tier definitions (ordered from hardest to easiest)
 -- Multipliers represent expected DPS scaling relative to a normal mob
@@ -580,13 +589,13 @@ end
 
 local function findNamedMobs()
     local named = {}
-    local count = mq.TLO.SpawnCount('npc named')() or 0
+    local count = mq.TLO.SpawnCount('npc')() or 0
 
     for i = 1, count do
-        local spawn = mq.TLO.NearestSpawn(i, 'npc named')
+        local spawn = mq.TLO.NearestSpawn(i, 'npc')
         if spawn and spawn() and spawn.ID() > 0 then
             -- Filter to likely combat NPCs only
-            if isLikelyCombatNpc(spawn) then
+            if isLikelyCombatNpc(spawn) and isNamedSpawn(spawn) then
                 local name = spawn.CleanName()
                 local id = spawn.ID()
                 if name and name ~= '' then
@@ -629,9 +638,9 @@ function M.isSafeToConsider()
     local me = mq.TLO.Me
     if not me or not me() then return false end
 
-    -- Not casting
+    -- Not casting (Casting() stringifies to "NULL" when idle)
     local casting = me.Casting()
-    if casting and casting ~= '' then
+    if casting and casting ~= '' and casting ~= 'NULL' then
         return false
     end
 
@@ -750,9 +759,10 @@ local function canCombatConsider()
     local me = mq.TLO.Me
     if not me or not me() then return false end
 
-    -- Not casting (critical - don't interrupt heals)
+    -- Not casting (critical - don't interrupt heals).
+    -- Casting() can stringify to "NULL" when no spell is in flight.
     local casting = me.Casting()
-    if casting and casting ~= '' then
+    if casting and casting ~= '' and casting ~= 'NULL' then
         return false
     end
 
@@ -790,7 +800,7 @@ function M.checkEngagedMob(mobId)
     end
 
     -- Not a named mob? Skip consider, return normal
-    local isNamed = spawn.Named and spawn.Named()
+    local isNamed = isNamedSpawn(spawn)
     if not isNamed then
         return 1.0, 'normal', false
     end
@@ -993,7 +1003,7 @@ function M.getMobMultiplier(mobNameOrId)
     end
 
     -- Not in cache - check if it's a named mob
-    if spawn and spawn() and spawn.Named and spawn.Named() then
+    if spawn and spawn() and isNamedSpawn(spawn) then
         -- It's named but we haven't considered it yet
         -- Queue it for consideration if not already queued
         local alreadyQueued = false

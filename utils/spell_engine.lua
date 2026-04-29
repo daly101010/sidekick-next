@@ -14,6 +14,7 @@ local getSpellEvents = lazy('sidekick-next.utils.spell_events')
 local getCache = lazy('sidekick-next.utils.runtime_cache')
 local getCore = lazy('sidekick-next.utils.core')
 local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
+local getResistLog = lazy('sidekick-next.utils.resist_log')
 
 -- Cast states
 M.STATE = {
@@ -142,9 +143,10 @@ local function preCastChecks(spellName, targetId, opts)
         return false, 'insufficient_endurance'
     end
 
-    -- Check not already casting (Casting() returns spell name string, empty if not)
+    -- Check not already casting. Casting() returns the spell name when active,
+    -- empty string OR the literal "NULL" when idle — must reject both.
     local casting = me.Casting() or ''
-    if casting ~= '' then
+    if casting ~= '' and casting ~= 'NULL' then
         return false, 'already_casting'
     end
 
@@ -224,24 +226,40 @@ local function checkMemorized(spellName)
     return false, 'not_memorized'
 end
 
---- Wait for spell to be ready
--- @param spellName string Spell name
--- @param maxWait number Maximum wait time in ms
--- @return boolean Success
-local function waitSpellReady(spellName, maxWait)
+--- Check whether a spell is ready right now (no waiting).
+--- The previous `waitSpellReady` polled for up to 5 seconds, which froze the
+--- entire main loop (no healing, no defensives) whenever the rotation
+--- dispatched a spell still on cooldown. The rotation/executor now treat
+--- "not ready" as a soft skip and move on to the next ready spell.
+local function isSpellReady(spellName)
     local me = mq.TLO.Me
-    maxWait = maxWait or 5000
-    local startTime = mq.gettime()
+    return me and me.SpellReady(spellName)() == true
+end
 
-    while (mq.gettime() - startTime) < maxWait do
-        if me.SpellReady(spellName)() then
-            return true
-        end
-        mq.delay(50)
-        mq.doevents()
+local function shouldRecordResistCast(opts)
+    opts = opts or {}
+    local category = tostring(opts.spellCategory or opts.category or ''):lower()
+    local layer = tostring(opts.sourceLayer or ''):lower()
+    if category == 'heal' or category == 'buff' or category == 'selfbuff'
+        or category == 'groupbuff' or category == 'aura' then
+        return false
     end
+    return category == 'nuke' or category == 'dot' or category == 'damage'
+        or category == 'debuff' or layer == 'combat' or layer == 'support'
+        or layer == 'aggro' or layer == 'burn'
+end
 
-    return me.SpellReady(spellName)() == true
+local function recordResistCast(spellName, targetId, opts)
+    if not shouldRecordResistCast(opts) then return end
+    targetId = tonumber(targetId) or 0
+    if targetId <= 0 then return end
+    local ResistLog = getResistLog()
+    if not (ResistLog and ResistLog.recordCast) then return end
+    local target = mq.TLO.Spawn(targetId)
+    local targetName = target and target() and target.CleanName and target.CleanName() or ''
+    if spellName and spellName ~= '' and targetName ~= '' then
+        ResistLog.recordCast(spellName, targetName)
+    end
 end
 
 --- Main cast function (blocking pre-checks, then transitions to state machine)
@@ -288,8 +306,10 @@ function M.cast(spellName, targetId, opts)
         return false, reason
     end
 
-    -- Wait for spell to be ready (blocking)
-    if not waitSpellReady(spellName, getSetting('SpellReadyTimeout', 5000)) then
+    -- Soft-skip if the spell isn't ready right now. Caller (rotation/executor)
+    -- will move on to the next ready spell; trying to wait here used to stall
+    -- the main loop for up to 5s.
+    if not isSpellReady(spellName) then
         if buffLog then
             buffLog.warn('spell_engine', 'Cast rejected: spell=%s reason=not_ready',
                 tostring(spellName))
@@ -311,17 +331,23 @@ function M.cast(spellName, targetId, opts)
     -- Target if needed
     if targetId and targetId > 0 then
         local currentTarget = mq.TLO.Target
-        if not currentTarget or currentTarget.ID() ~= targetId then
+        local currentTargetId = currentTarget and currentTarget() and currentTarget.ID() or 0
+        if currentTargetId ~= targetId then
             mq.cmdf('/target id %d', targetId)
             mq.delay(100, function()
                 local t = mq.TLO.Target
-                return t and t.ID() == targetId
+                return t and t() and t.ID() == targetId
             end)
+            local t = mq.TLO.Target
+            if not (t and t() and t.ID() == targetId) then
+                return false, 'target_failed'
+            end
         end
     end
 
     -- Issue cast command
     mq.cmdf('/cast "%s"', spellName)
+    recordResistCast(spellName, targetId, opts)
 
     -- Set up cast tracking
     _castData = {
@@ -533,9 +559,11 @@ function M.tick()
 
     -- State: CASTING (non-blocking monitoring)
     if _state == M.STATE.CASTING then
-        -- Check if still casting (Casting() returns spell name string, empty if not casting)
+        -- Check if still casting (Casting() returns spell name string, empty
+        -- or "NULL" when not casting).
         local castingSpell = me.Casting() or ''
-        local isCasting = castingSpell ~= '' or mq.TLO.Window("CastingWindow").Open()
+        local isCasting = (castingSpell ~= '' and castingSpell ~= 'NULL')
+            or mq.TLO.Window("CastingWindow").Open()
         if not isCasting then
             debugLog('[Tick] CASTING -> handleResult (cast finished)')
             -- Cast finished, check result
@@ -614,7 +642,7 @@ function M.abort()
     if _state ~= M.STATE.IDLE then
         local me = mq.TLO.Me
         local casting = me and me.Casting() or ''
-        if casting ~= '' then
+        if casting ~= '' and casting ~= 'NULL' then
             mq.TLO.Me.StopCast()
         end
         setState(M.STATE.IDLE)

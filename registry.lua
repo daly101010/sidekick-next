@@ -4,6 +4,8 @@ M.defaults = {
     SideKickTheme = { type = 'text', Default = 'Classic', Category = 'UI', DisplayName = 'Theme' },
     SideKickSyncThemeWithGT = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Sync Theme With GroupTarget' },
     SideKickDebugSettings = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Debug Settings Logging' },
+    DashboardVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Dashboard Visible' },
+    HealPreviewVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Heal Preview Visible' },
     SideKickMainEnabled = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Show Main Bar' },
     SideKickOptionsManual = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Options Window Manual Move/Resize' },
     SideKickOptionsPosX = { type = 'number', Default = -1, Category = 'UI', DisplayName = 'Options Window X' },
@@ -76,6 +78,7 @@ M.defaults = {
     AutomationPaused = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Global Pause' },
     AutoAbilitiesEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Abilities (AAs/Discs)' },
     AutoItemsEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Items (Clickies)' },
+    TravelBrokerEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Travel Broker Enabled' },
 
     MeditationMode = { type = 'text', Default = 'off', Category = 'Automation', DisplayName = 'Meditation (off/ooc/in combat)' },
     MeditationAfterCombatDelay = { type = 'number', Default = 2, Category = 'Automation', DisplayName = 'Meditation After Combat Delay (sec)' },
@@ -160,6 +163,7 @@ M.defaults = {
     RetryOnResist = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Retry on Resist' },
     RetryOnInterrupt = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Retry on Interrupt' },
     UseImmuneDatabase = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Use Immune Database' },
+    AdaptiveResistSkip = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Adaptive Resist Skip' },
 
     -- Spell Lineup Settings
     SpellRescanOnZone = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Rescan Gems on Zone' },
@@ -195,6 +199,16 @@ M.defaults = {
     CCPrioritizeSelfHeal = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Prioritize Self Heals/Runes' },
     CCSelfHealHpThreshold = { type = 'number', Default = 60, Category = 'CC', DisplayName = 'Self Heal HP Threshold' },
     CCMaxMezTargets = { type = 'number', Default = 3, Category = 'CC', DisplayName = 'Max Mez Targets' },
+
+    -- Mez/charm immune persistence — records mobs that fail mez/charm
+    -- attempts to a per-zone persistent DB; future attempts skip them.
+    MezImmunePersistEnabled = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Persist Mez/Charm Immune Mobs' },
+
+    -- Discipline / burn ability framework — evaluates per-class config
+    -- predicates and fires the matching disc/AA on combat ticks.
+    DisciplinesEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Use Class Disciplines/AAs' },
+    -- Mid-fight toggle for "spend cooldowns now". Flipped via /sk_burn.
+    BurnNow = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Burn Now (long-CD AAs/discs)' },
 
     -- Mez Casting Settings (ENC, BRD, NEC)
     MezzingEnabled = { type = 'bool', Default = false, Category = 'CC', DisplayName = 'Mezzing Enabled' },
@@ -238,6 +252,17 @@ M.defaults = {
     SafeTargetingCheckRaid = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Safe Targeting: Check Raid Members' },
     SafeTargetingCheckPeers = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Safe Targeting: Check Actor Peers' },
 
+    -- Target Overrides
+    TargetingForcedTargetName = { type = 'text', Default = '', Category = 'Combat', DisplayName = 'Targeting: Forced Target (name)' },
+    TargetingIgnoredTargetNames = { type = 'text', Default = '', Category = 'Combat', DisplayName = 'Targeting: Ignored Targets (comma-separated names)' },
+
+    -- Named Detection
+    NamedDetectionUseSpawnMaster = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Named Detection: Use MQ2SpawnMaster' },
+    NamedDetectionUseAlertMaster = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Named Detection: Use AlertMaster' },
+    NamedDetectionMinLevel = { type = 'number', Default = 0, Category = 'Combat', DisplayName = 'Named Detection: Minimum Level' },
+    NamedDetectionCustomNames = { type = 'text', Default = '', Category = 'Combat', DisplayName = 'Named Detection: Custom Names' },
+    NamedDetectionForceNamed = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Named Detection: Force Current Mobs Named' },
+
     -- AssistOutside: Enable assisting group, raid, and actor peers
     AssistOutsideGroup = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Assist Outside: Group Members' },
     AssistOutsideRaid = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Assist Outside: Raid Members' },
@@ -248,6 +273,11 @@ M.defaults = {
     CurePrioritySelf = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Cure Self First' },
     CureInCombat = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Cure During Combat' },
     CureCoordinateActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Coordinate Cures via Actors' },
+
+    -- Resurrection Settings (group-only auto-rez; first-cast-wins coordination)
+    AutoRezOOC = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Auto-Rez Out of Combat' },
+    AutoRezInCombat = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Auto Battle-Rez (AA only)' },
+    AutoAcceptRez = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Auto-Accept Rez Offers' },
 
     -- Animation Settings
     AnimationsEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Enable Animations' },

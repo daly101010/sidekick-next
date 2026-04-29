@@ -52,12 +52,22 @@ local _state = {
 
     -- Recent cures (for coordination)
     recentCures = {},  -- { [targetId] = { [debuffType] = { curedAt, curer } } }
+
+    -- Sharding: per-debuff-type capability map shared by peers in the same
+    -- zone. Used to deterministically split (targetId, debuffType) responsibility
+    -- across capable curers so they don't race for the same debuff.
+    remoteCapabilities = {},   -- { [charName] = { Curse=true, Disease=true, ... } }
+    lastCapsBroadcast = 0,
+    shardObservedAt = {},      -- { ['<tid>:<type>'] = os.clock() } — first time we saw a non-shard debuff
 }
 
 local TICK_INTERVAL = 0.25       -- Check for cures every 250ms
 local CLAIM_TIMEOUT = 8.0        -- Claims expire after 8 seconds
 local RECENT_CURE_WINDOW = 10.0  -- Consider cure "recent" for 10 seconds
 local MAX_BUFF_SLOTS = 42        -- Maximum buff slots to scan
+local CAPS_BROADCAST_INTERVAL = 30.0  -- Re-share cure capabilities every 30s
+local SHARD_FALLBACK_SECONDS = 5.0    -- Take a non-shard cure if owner hasn't acted in this many sec
+local CAPS_PEER_TTL = 60.0            -- Drop a peer's capability record after this many sec without re-share
 
 --------------------------------------------------------------------------------
 -- Initialization
@@ -91,6 +101,9 @@ function M.init()
     end
 
     _state.initialized = true
+
+    -- Send our capabilities ASAP so other curers shard against us from the start.
+    pcall(M.broadcastCapabilities)
 end
 
 --------------------------------------------------------------------------------
@@ -103,15 +116,26 @@ local function loadClassConfig(classShort)
     return nil
 end
 
+-- Compare base names so unranked config entries match ranked memorized spells
+-- (gems hold "Avowed Restoration Rk. II", configs say "Avowed Restoration").
+local function stripRank(name)
+    if not name then return '' end
+    return tostring(name):gsub(' Rk%. %u+$', '')
+end
+
 local function spellMemorized(spellName)
     if not spellName or spellName == '' then return false end
     local me = mq.TLO.Me
     if not (me and me()) then return false end
+    local base = stripRank(spellName)
     local gems = tonumber(me.NumGems()) or 13
     for i = 1, gems do
         local gem = me.Gem(i)
-        if gem and gem() and (gem.Name() or '') == spellName then
-            return true
+        if gem and gem() then
+            local gemName = gem.Name() or ''
+            if stripRank(gemName) == base then
+                return true
+            end
         end
     end
     return false
@@ -287,9 +311,23 @@ local function scanSpawnForDebuffs(spawn)
     return debuffs
 end
 
-local function scanGroupForDebuffs()
+-- Throttle the group debuff scan. Each scan walks 42 buff slots × (self +
+-- group + group pets) which costs ~500 TLO reads. The previous design ran
+-- this on every M.tick() (250ms) — a clear hot path. Cures are not
+-- millisecond-critical (a 1s detection delay is fine), and any successful
+-- cure invalidates the cache via _invalidateDebuffScan() so the next
+-- decision pass sees a fresh state.
+local SCAN_THROTTLE_MS = 1000
+local _cachedDebuffScan = nil
+local _lastDebuffScanAt = 0  -- mq.gettime() ms
+
+local function _invalidateDebuffScan()
+    _lastDebuffScanAt = 0
+    _cachedDebuffScan = nil
+end
+
+local function _doFullScan()
     local allDebuffs = {}  -- { [targetId] = { [debuffType] = { ... } } }
-    local now = os.clock()
 
     -- Scan self
     local me = mq.TLO.Me
@@ -336,6 +374,16 @@ local function scanGroupForDebuffs()
     return allDebuffs
 end
 
+local function scanGroupForDebuffs()
+    local nowMs = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
+    if _cachedDebuffScan and (nowMs - _lastDebuffScanAt) < SCAN_THROTTLE_MS then
+        return _cachedDebuffScan
+    end
+    _cachedDebuffScan = _doFullScan()
+    _lastDebuffScanAt = nowMs
+    return _cachedDebuffScan
+end
+
 --------------------------------------------------------------------------------
 -- Claim System (prevent duplicate cures)
 --------------------------------------------------------------------------------
@@ -364,14 +412,18 @@ local function claimCure(targetId, debuffType)
         claimedAt = os.clock(),
     }
 
-    -- Broadcast claim
+    -- Broadcast claim. Include zone explicitly so the receiver doesn't have
+    -- to depend on the _remoteCharacters fallback during zone-in.
     local Actors = getActors()
     if Actors and Actors.broadcast then
+        local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+        if myZone == '' or myZone == 'NULL' then myZone = nil end
         Actors.broadcast('cure:claim', {
             targetId = id,
             debuffType = debuffType,
             claimer = _state.selfName,
             claimedAt = os.clock(),
+            zone = myZone,
         })
     end
 
@@ -451,6 +503,11 @@ function M.receiveClaim(payload)
         claimedAt = os.clock(),
         claimer = claimer,
     }
+
+    -- Owner is acting; reset our fallback timer for this debuff so we don't
+    -- pile on if the owner's claim arrives close to the fallback threshold.
+    local key = tostring(targetId) .. ':' .. debuffType
+    _state.shardObservedAt[key] = nil
 end
 
 function M.receiveCureLanded(payload)
@@ -468,6 +525,10 @@ function M.receiveCureLanded(payload)
         curer = curer,
     }
 
+    -- A peer just cured this target — our cached scan is stale until we
+    -- can re-read the buff bar.
+    _invalidateDebuffScan()
+
     -- Clear claims for this cure
     if _state.remoteClaims[targetId] then
         _state.remoteClaims[targetId][debuffType] = nil
@@ -481,13 +542,131 @@ local function broadcastCureLanded(targetId, debuffType, spellName)
     local Actors = getActors()
     if not Actors or not Actors.broadcast then return end
 
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+
     Actors.broadcast('cure:landed', {
         targetId = targetId,
         debuffType = debuffType,
         spellName = spellName or '',
         curer = _state.selfName,
+        zone = myZone,
     })
 end
+
+--------------------------------------------------------------------------------
+-- Capability Sharing (for sharding)
+--------------------------------------------------------------------------------
+
+--- Broadcast our cure capabilities to peers in zone so they can shard with us.
+function M.broadcastCapabilities()
+    local Actors = getActors()
+    if not Actors or not Actors.broadcast then return end
+
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+
+    -- Send a copy so receivers don't share table identity with our state.
+    local caps = {}
+    for k, v in pairs(_state.canCure) do caps[k] = v end
+
+    Actors.broadcast('cure:capabilities', {
+        canCure = caps,
+        zone = myZone,
+        sentAt = os.time(),
+    })
+    _state.lastCapsBroadcast = os.clock()
+end
+
+--- Receive a peer's cure capabilities.
+--- @param payload table { from, canCure = {Disease=true,...}, zone, sentAt }
+function M.receiveCapabilities(payload)
+    if type(payload) ~= 'table' then return end
+    local from = tostring(payload.from or '')
+    if from == '' or from == _state.selfName then return end
+    local caps = payload.canCure
+    if type(caps) ~= 'table' then return end
+    _state.remoteCapabilities[from] = {
+        Disease    = caps.Disease == true,
+        Poison     = caps.Poison == true,
+        Curse      = caps.Curse == true,
+        Corruption = caps.Corruption == true,
+        seenAt     = os.clock(),
+    }
+end
+
+local function pruneStaleCapabilities()
+    local now = os.clock()
+    for name, caps in pairs(_state.remoteCapabilities) do
+        if (now - (caps.seenAt or 0)) > CAPS_PEER_TTL then
+            _state.remoteCapabilities[name] = nil
+        end
+    end
+end
+
+--- Compute the deterministic shard owner for (targetId, debuffType).
+--- All peers compute the same answer because the input is sorted by name.
+--- @return string|nil ownerName, table sortedCapable list of capable peers
+local function computeShardOwner(targetId, debuffType)
+    local capable = {}
+    if _state.canCure[debuffType] then
+        capable[#capable + 1] = _state.selfName
+    end
+    for name, caps in pairs(_state.remoteCapabilities) do
+        if caps[debuffType] then
+            capable[#capable + 1] = name
+        end
+    end
+    if #capable == 0 then return nil, capable end
+    if #capable == 1 then return capable[1], capable end
+
+    table.sort(capable)
+
+    -- FNV-1a hash for deterministic peer selection (same hash on every client).
+    local key = tostring(targetId) .. ':' .. tostring(debuffType)
+    local h = 2166136261
+    for i = 1, #key do
+        h = bit32.bxor(h, key:byte(i))
+        h = bit32.band(h * 16777619, 0xFFFFFFFF)
+    end
+    local idx = (h % #capable) + 1
+    return capable[idx], capable
+end
+
+--- Should we attempt this cure given the deterministic shard? Returns true
+--- if we own the shard, OR if the shard owner has been silent for the
+--- fallback window so we should pick up the slack.
+local function isMyShardOrFallback(targetId, debuffType, settings)
+    if (settings.CureSharding == false) then return true end
+    if not _state.canCure[debuffType] then return false end
+
+    local owner = computeShardOwner(targetId, debuffType)
+    if not owner or owner == _state.selfName then
+        return true
+    end
+
+    -- Not our shard. Track first-observed time; fall through if owner has
+    -- failed to claim within the fallback window.
+    local key = tostring(targetId) .. ':' .. debuffType
+    local now = os.clock()
+    local first = _state.shardObservedAt[key]
+    if not first then
+        _state.shardObservedAt[key] = now
+        return false
+    end
+    if (now - first) >= SHARD_FALLBACK_SECONDS then
+        return true
+    end
+    return false
+end
+
+local function clearShardObservation(targetId, debuffType)
+    local key = tostring(targetId) .. ':' .. tostring(debuffType)
+    _state.shardObservedAt[key] = nil
+end
+
+M._isMyShardOrFallback = isMyShardOrFallback   -- exposed for testing
+M._computeShardOwner = computeShardOwner
 
 --------------------------------------------------------------------------------
 -- Target Selection
@@ -560,18 +739,26 @@ function M.getBestCureTarget(settings)
                 if not M.isCureClaimed(targetId, debuffType) then
                     -- Was it recently cured?
                     if not M.wasRecentlyCured(targetId, debuffType) then
-                        -- Do we have a spell to cure it?
-                        local cureSpell = getBestCureSpell(debuffType, false)
-                        if cureSpell then
-                            local priority = getTargetPriority(targetId, debuffType, settings)
-                            table.insert(candidates, {
-                                targetId = targetId,
-                                debuffType = debuffType,
-                                debuffCount = #debuffList,
-                                cureSpell = cureSpell,
-                                priority = priority,
-                            })
+                        -- Sharding: only attempt our shard, or fall back if
+                        -- the shard owner has been silent past the threshold.
+                        if isMyShardOrFallback(targetId, debuffType, settings) then
+                            -- Do we have a spell to cure it?
+                            local cureSpell = getBestCureSpell(debuffType, false)
+                            if cureSpell then
+                                local priority = getTargetPriority(targetId, debuffType, settings)
+                                table.insert(candidates, {
+                                    targetId = targetId,
+                                    debuffType = debuffType,
+                                    debuffCount = #debuffList,
+                                    cureSpell = cureSpell,
+                                    priority = priority,
+                                })
+                            end
                         end
+                    else
+                        -- Recently cured: clear shard observation so the next
+                        -- detection is fresh.
+                        clearShardObservation(targetId, debuffType)
                     end
                 end
             end
@@ -610,9 +797,10 @@ local function canCureNow(settings)
     -- Not if dead
     if me.Hovering and me.Hovering() then return false end
 
-    -- Not if already casting (Casting() returns spell name string, empty if not)
+    -- Not if already casting. Casting() can stringify to "NULL" when idle —
+    -- treating that as truthy would block all cure casts.
     local casting = me.Casting() or ''
-    if casting ~= '' then return false end
+    if casting ~= '' and casting ~= 'NULL' then return false end
 
     -- Not if spell engine is busy
     local SpellEngine = getSpellEngine()
@@ -653,6 +841,10 @@ function M.castCure(targetId, debuffType, cureSpell)
             curedAt = os.clock(),
             curer = _state.selfName,
         }
+
+        -- The buff bar we cached is now stale — force the next scan to refresh
+        -- so we don't keep targeting the same already-cured debuff.
+        _invalidateDebuffScan()
 
         -- Broadcast that we cured
         broadcastCureLanded(targetId, debuffType, cureSpell)
@@ -728,6 +920,12 @@ function M.tick(settings)
 
     -- Cleanup expired data
     cleanupExpired()
+    pruneStaleCapabilities()
+
+    -- Broadcast our cure capabilities so peers can shard with us.
+    if (now - _state.lastCapsBroadcast) >= CAPS_BROADCAST_INTERVAL then
+        M.broadcastCapabilities()
+    end
 
     -- Get settings
     local Core = getCore()

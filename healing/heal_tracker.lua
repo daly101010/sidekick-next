@@ -227,8 +227,13 @@ function M.RecordHeal(spellName, amount, isCrit, isHot)
         isCrit = isCrit,
         time = os.time(),
     })
-    while #M.recentHeals > 100 do
-        table.remove(M.recentHeals, 1)
+    -- Bulk-trim rather than repeatedly `table.remove(,1)` (which is O(n) per
+    -- call because it shifts the whole array). We let the list grow a bit past
+    -- 100 and then drop the oldest 50 in one `table.move` operation.
+    if #M.recentHeals > 150 then
+        local n = #M.recentHeals
+        table.move(M.recentHeals, n - 99, n, 1, M.recentHeals)
+        for i = 101, n do M.recentHeals[i] = nil end
     end
 
     if M.learningMode then
@@ -353,9 +358,14 @@ function M.recordHeal(spellName, amount, isCrit, isHoT)
     return M.RecordHeal(spellName, amount, isCrit, isHoT)
 end
 
+-- Save no more often than every 60s when dirty. mq.gettime() is milliseconds,
+-- so the threshold must also be in ms — a bare `60` previously fired a disk
+-- write every 60 milliseconds when state was dirty.
+local SAVE_INTERVAL_MS = 60 * 1000
+
 function M.tick()
     local now = mq.gettime()
-    if _dirty and (now - _lastSaveCheck) > 60 then
+    if _dirty and (now - _lastSaveCheck) > SAVE_INTERVAL_MS then
         _lastSaveCheck = now
         Persistence.data.spells = M.heals
         Persistence.saveHealData()

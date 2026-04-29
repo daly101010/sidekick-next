@@ -6,6 +6,15 @@
 local mq = require('mq')
 local imgui = require('ImGui')
 
+-- Hoisted optional dependencies. These used to be loaded via pcall(require, ...)
+-- inside the per-condition evaluator, which paid the pcall-wrap cost on every
+-- ability draw. `require` is cached, but `pcall` still allocates around each
+-- call; loading once at module scope is effectively free afterwards.
+local _rcOk, RuntimeCache = pcall(require, 'sidekick-next.utils.runtime_cache')
+if not _rcOk then RuntimeCache = nil end
+local _ccOk, CC = pcall(require, 'sidekick-next.automation.cc')
+if not _ccOk then CC = nil end
+
 local M = {}
 
 -- Dependencies (set via init)
@@ -917,8 +926,8 @@ local function evaluateSingleCondition(cond)
   elseif cond.type == "beneficial" then
     if cond.subject == "Me" then
       -- Try to get values from runtime cache first (more efficient)
-      local ok, Cache = pcall(require, 'sidekick-next.utils.runtime_cache')
-      if ok and Cache and Cache.me then
+      local Cache = RuntimeCache
+      if Cache and Cache.me then
         if cond.property == 'PctAggro' then
           value = Cache.me.pctAggro or 0
         elseif cond.property == 'SecondaryPctAggro' then
@@ -927,16 +936,15 @@ local function evaluateSingleCondition(cond)
           value = Cache.xtarget.count or 0
         elseif cond.property == 'XTargetHasMezzed' then
           -- Check CC module for mezzed mobs on XTarget
-          local ccOk, CC = pcall(require, 'sidekick-next.automation.cc')
-          if ccOk and CC and CC.hasAnyMezzedOnXTarget then
+          if CC and CC.hasAnyMezzedOnXTarget then
             value = CC.hasAnyMezzedOnXTarget()
           else
             value = Cache.hasAnyMezzedOnXTarget and Cache.hasAnyMezzedOnXTarget() or false
           end
         elseif cond.property == 'Pet' then
-          -- Pet is "active" if Me.Pet() is not "NO PET"
+          -- Pet is "active" if Me.Pet() is a real name (not NO PET / NULL).
           local petName = mq.TLO.Me.Pet()
-          value = petName ~= nil and petName ~= 'NO PET'
+          value = petName ~= nil and petName ~= 'NO PET' and petName ~= 'NULL'
         end
       end
 
@@ -944,9 +952,8 @@ local function evaluateSingleCondition(cond)
       if value == nil then
         local Me = mq.TLO.Me
         if cond.property == 'Pet' then
-          -- Special handling for Pet - check if we have an active pet
           local petName = Me.Pet()
-          value = petName ~= nil and petName ~= 'NO PET'
+          value = petName ~= nil and petName ~= 'NO PET' and petName ~= 'NULL'
         elseif propType == "boolean" then
           value = Me[cond.property]() == true
         else

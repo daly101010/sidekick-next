@@ -14,7 +14,7 @@ local M = {}
 local getActorsCoordinator = lazy('sidekick-next.utils.actors_coordinator')
 
 function M.draw(settings, themeNames, onChange)
-    local themeName = settings.Theme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
 
     -- ========== ACTORS SECTION ==========
     Components.SettingGroup.section('Actors (Cross-Character Communication)', themeName)
@@ -98,6 +98,45 @@ function M.draw(settings, themeNames, onChange)
         end, { id = 'safe_target_checks', defaultOpen = true })
     end
 
+    -- ========== TARGET OVERRIDES SECTION ==========
+    imgui.Spacing()
+    Components.SettingGroup.section('Target Overrides', themeName)
+
+    Components.SettingGroup.draw('Manual Target Control', function()
+        local forced = tostring(settings.TargetingForcedTargetName or '')
+        local newForced = Settings.labeledInputText('Forced Target (name)', forced, 'If set, targeting will prefer this NPC when present.')
+        if newForced ~= forced and onChange then onChange('TargetingForcedTargetName', newForced) end
+
+        local ignored = tostring(settings.TargetingIgnoredTargetNames or '')
+        local newIgnored = Settings.labeledInputText('Ignored Targets (comma-separated)', ignored, 'Names to never auto-target (e.g. \"a_bunny, a_rat\").')
+        if newIgnored ~= ignored and onChange then onChange('TargetingIgnoredTargetNames', newIgnored) end
+    end, { id = 'target_overrides', defaultOpen = true })
+
+    imgui.Spacing()
+    Components.SettingGroup.section('Named Detection', themeName)
+
+    Components.SettingGroup.draw('Named Sources', function()
+        local useSM = settings.NamedDetectionUseSpawnMaster ~= false
+        local smVal, smChanged = Components.CheckboxRow.draw('Use MQ2SpawnMaster', 'NamedDetectionUseSpawnMaster', useSM, nil, {
+            tooltip = 'Treat SpawnMaster watch-list mobs as named when MQ2SpawnMaster is loaded.',
+        })
+        if smChanged and onChange then onChange('NamedDetectionUseSpawnMaster', smVal) end
+
+        local useAM = settings.NamedDetectionUseAlertMaster ~= false
+        local amVal, amChanged = Components.CheckboxRow.draw('Use AlertMaster', 'NamedDetectionUseAlertMaster', useAM, nil, {
+            tooltip = 'Treat AlertMaster named matches as named when available.',
+        })
+        if amChanged and onChange then onChange('NamedDetectionUseAlertMaster', amVal) end
+
+        local custom = tostring(settings.NamedDetectionCustomNames or '')
+        local newCustom = Settings.labeledInputText('Custom Named Names', custom, 'Comma-separated NPC names to treat as named.')
+        if newCustom ~= custom and onChange then onChange('NamedDetectionCustomNames', newCustom) end
+
+        local minLevel = tonumber(settings.NamedDetectionMinLevel) or 0
+        local newMin = Settings.labeledSliderInt('Minimum Level', minLevel, 0, 125, 'Ignore named detection below this level.')
+        if newMin ~= minLevel and onChange then onChange('NamedDetectionMinLevel', newMin) end
+    end, { id = 'named_sources', defaultOpen = false })
+
     -- ========== ASSIST OUTSIDE GROUP SECTION ==========
     imgui.Spacing()
     Components.SettingGroup.section('Assist Outside Group', themeName)
@@ -125,6 +164,12 @@ function M.draw(settings, themeNames, onChange)
     -- ========== MISC INTEGRATION ==========
     imgui.Spacing()
     Components.SettingGroup.section('Miscellaneous', themeName)
+
+    local travelBroker = settings.TravelBrokerEnabled ~= false
+    local travelVal, travelChanged = Components.CheckboxRow.draw('Enable Travel Broker', 'TravelBrokerEnabled', travelBroker, nil, {
+        tooltip = 'Share transport spells and allow peers to request ports through SideKick actors.',
+    })
+    if travelChanged and onChange then onChange('TravelBrokerEnabled', travelVal) end
 
     -- Ignore PC Pets
     local ignorePets = settings.IgnorePCPets ~= false

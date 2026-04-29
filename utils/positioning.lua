@@ -7,6 +7,8 @@ M.repositionCooldown = 5000  -- 5 seconds in milliseconds
 M.lastReposition = 0
 M.originalStickMode = nil
 M.inSoftPause = false
+M._softPauseEnteredAt = 0     -- mq.gettime() ms when soft-pause was entered
+M.SOFT_PAUSE_MAX_MS = 15000   -- auto-expire safety cap (tank crash / zone / msg loss)
 
 -- Lazy-load Core for settings access (avoid hard dependency cycles)
 local getCore = lazy('sidekick-next.utils.core')
@@ -81,6 +83,7 @@ function M.enterSoftPause(currentStick)
     if M.inSoftPause then return end
     M.originalStickMode = currentStick or getStickCommand()
     M.inSoftPause = true
+    M._softPauseEnteredAt = mq.gettime()
     mq.cmd(getSoftPauseStick())
 end
 
@@ -88,15 +91,26 @@ end
 function M.exitSoftPause()
     if not M.inSoftPause then return end
     M.inSoftPause = false
+    M._softPauseEnteredAt = 0
     if M.originalStickMode then
         mq.cmd(M.originalStickMode)
     end
 end
 
---- Check if currently in soft-pause mode
--- @return boolean
+--- Check if currently in soft-pause mode. Auto-expires after
+--- SOFT_PAUSE_MAX_MS to recover from missed `tank:settled` /
+--- `tank:taunt_done` messages (tank crash, zone, network drop) — without
+--- this, assisters could stay in soft-pause forever and never re-stick.
 function M.isInSoftPause()
-    return M.inSoftPause
+    if M.inSoftPause then
+        local now = mq.gettime()
+        if (now - (M._softPauseEnteredAt or 0)) > M.SOFT_PAUSE_MAX_MS then
+            M.exitSoftPause()
+            return false
+        end
+        return true
+    end
+    return false
 end
 
 --- Check if a mob is a dragon type (dragons, drakes, wyrms, wyverns)

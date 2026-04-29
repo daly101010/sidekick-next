@@ -21,6 +21,8 @@ local wave2 = {
     'sidekick-next/sk_dps',
     'sidekick-next/sk_buffs',
     'sidekick-next/sk_meditation',
+    'sidekick-next/sk_resurrection',  -- self-gates on rez-class membership
+    'sidekick-next/sk_disciplines',   -- self-gates on class having disciplines
 }
 
 local function startAll()

@@ -203,7 +203,6 @@ local ANCHOR_TARGETS = {
 local function drawUI(settings, themeNames, onChange)
     local controlWidth = 150
 
-    -- DEBUG: Log theme state
     local currentTheme = settings.SideKickTheme or 'Classic'
 
     imgui.Text('Theme')
@@ -211,14 +210,9 @@ local function drawUI(settings, themeNames, onChange)
     imgui.SetNextItemWidth(controlWidth)
     local theme = comboString('##Theme', currentTheme, themeNames)
 
-    -- DEBUG: Log if selection changed
     if theme ~= currentTheme then
-        print(string.format('\ay[Settings] Theme combo changed: %s -> %s\ax', currentTheme, theme))
         if onChange then
-            print('\ag[Settings] Calling onChange callback\ax')
             onChange('SideKickTheme', theme)
-        else
-            print('\ar[Settings] ERROR: onChange is nil!\ax')
         end
     end
 
@@ -1104,6 +1098,35 @@ local function drawAutomation(settings, onChange)
     imgui.TextDisabled('No class-specific settings available.')
 end
 
+-- Cache of the autostart cfg so we don't reopen the file each frame while the
+-- Integration tab is visible. Invalidated on toggle (we rewrite + refresh in
+-- memory) and whenever character/server identity changes.
+local _autostartCache = { key = nil, contents = nil, hasRun = false }
+
+local function _readAutostartCache(autostartPath, cacheKey)
+    if _autostartCache.key == cacheKey and _autostartCache.contents then
+        return
+    end
+    local contents = {}
+    local fh = io.open(autostartPath, 'r')
+    if fh then
+        for line in fh:lines() do
+            contents[#contents + 1] = line
+        end
+        fh:close()
+    end
+    local hasRun = false
+    for _, line in ipairs(contents) do
+        if line:lower():find('/lua run sidekick', 1, true) then
+            hasRun = true
+            break
+        end
+    end
+    _autostartCache.key = cacheKey
+    _autostartCache.contents = contents
+    _autostartCache.hasRun = hasRun
+end
+
 local function drawIntegration(settings, onChange)
     local actors = settings.ActorsEnabled ~= false
     local changed
@@ -1119,57 +1142,43 @@ local function drawIntegration(settings, onChange)
     imgui.Spacing()
 
     do
-        local server = mq.TLO.EverQuest.Server():gsub(" ", "_") or 'Unknown'
-        local charName = mq.TLO.Me.CleanName() or 'Unknown'
+        local rawServer = mq.TLO.EverQuest.Server()
+        local server = (rawServer and rawServer ~= 'NULL' and rawServer ~= '')
+            and rawServer:gsub(" ", "_") or 'Unknown'
+        local rawChar = mq.TLO.Me.CleanName()
+        local charName = (rawChar and rawChar ~= 'NULL' and rawChar ~= '') and rawChar or 'Unknown'
         local autostartPath = string.format('%s/%s_%s.cfg', mq.configDir, server, charName)
 
-        -- Read current autostart file contents
-        local currentContents = {}
-        local fileHandle = io.open(autostartPath, 'r')
-        if fileHandle then
-            for line in fileHandle:lines() do
-                currentContents[#currentContents + 1] = line
-            end
-            fileHandle:close()
-        end
-
-        -- Check if sidekick is in autostart
-        local hasSidekickAutostart = false
-        for _, line in ipairs(currentContents) do
-            if line:lower():find('/lua run sidekick', 1, true) then
-                hasSidekickAutostart = true
-                break
-            end
-        end
+        -- Read (cached) current autostart file contents
+        local cacheKey = autostartPath
+        _readAutostartCache(autostartPath, cacheKey)
+        local currentContents = _autostartCache.contents or {}
+        local hasSidekickAutostart = _autostartCache.hasRun
 
         -- Checkbox to toggle autostart
         local newAutostart = imgui.Checkbox('Autostart SideKick on login##SidekickAutostart', hasSidekickAutostart)
         if newAutostart ~= hasSidekickAutostart then
             -- Build new config contents
             local newLines = {}
-
-            -- Keep existing lines except /lua run sidekick
             for _, line in ipairs(currentContents) do
                 if not line:lower():find('/lua run sidekick', 1, true) then
                     newLines[#newLines + 1] = line
                 end
             end
-
-            -- Add the command if enabling
             if newAutostart then
                 newLines[#newLines + 1] = '/lua run sidekick'
             end
 
-            -- Write the file
             local outFile = io.open(autostartPath, 'w')
             if outFile then
                 for _, line in ipairs(newLines) do
                     outFile:write(line .. '\n')
                 end
                 outFile:close()
-                -- Echo disabled
-            else
-                -- Echo disabled
+                -- Update cache in place so the checkbox reflects the new state
+                -- without re-reading from disk.
+                _autostartCache.contents = newLines
+                _autostartCache.hasRun = newAutostart
             end
         end
         if imgui.IsItemHovered() then
@@ -1911,6 +1920,17 @@ function M.draw(settingsOrCtx, themeNames, onChange)
         if imgui.BeginTabItem('Animations') then
             withTabScrollChild('##sk_settings_animations_scroll', function()
                 drawAnimations(settings, onChange)
+            end)
+            imgui.EndTabItem()
+        end
+        if imgui.BeginTabItem('Claims') then
+            withTabScrollChild('##sk_settings_claims_scroll', function()
+                local ok, Ledger = pcall(require, 'sidekick-next.utils.claim_ledger')
+                if ok and Ledger and Ledger.draw then
+                    Ledger.draw(imgui)
+                else
+                    imgui.TextDisabled('Claim ledger unavailable.')
+                end
             end)
             imgui.EndTabItem()
         end

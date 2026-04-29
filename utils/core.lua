@@ -138,8 +138,13 @@ local _lastSaveAt = 0
 local SAVE_DEBOUNCE_SEC = 1.0  -- Don't write INI more than once per second
 
 function Core.save()
-    local ok, err = pcall(lip.save, iniPath(), Core.Ini)
-    _dirty = false
+    local ok, result = pcall(lip.save, iniPath(), Core.Ini)
+    if ok and result ~= false then
+        _dirty = false
+    else
+        _dirty = true
+        print(string.format('\ar[SideKick]\ax Failed to save settings: %s', tostring(result)))
+    end
     _lastSaveAt = os.clock()
 end
 

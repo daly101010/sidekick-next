@@ -135,6 +135,48 @@ M.aaLines = {
 -- Disc Lines (Enchanters have very few)
 M.discLines = {}
 
+-- Opt ENC into the discipline engine. Without this, sk_disciplines
+-- skips ENC by default (caster classes are off by default).
+M.useDisciplineEngine = true
+
+-- Allow spell-kind picks for ENC. Default is {aa, disc} only — but
+-- ENC's combat rotation is almost entirely spells (mez, tash, slow,
+-- nukes, mana-taps), so we widen the filter for this class.
+M.allowKindsInRotation = { 'aa', 'disc', 'spell' }
+
+-- Per-condition target selector. The default selector ('current_target')
+-- casts on the active EQ target. ENC's mez line predicates fire when
+-- there are 2+ haters but should target the next un-mezzed hater (NOT
+-- the main assist's tank target). Route them through automation/cc.lua's
+-- claim system so two ENC boxes don't double-mez the same mob.
+M.targetSelector = {
+    doSingleMez = 'mez_target',
+    doFastMez   = 'mez_target',
+    doAEMez     = 'mez_target',
+    doPBAEMez   = 'mez_target',
+    doColorStun = 'mez_target',
+}
+
+-- Firing precedence for the engine: emergency runes first, then CC
+-- (mez/stun before debuffs so adds get locked down before we tash/slow
+-- the focus mob), then debuffs, nukes, mana-tap (for mana sustain),
+-- and finally burn AAs which only fire when /sk_burn is on.
+M.conditionOrder = {
+    -- Emergency self-defense
+    'doSelfStasis', 'doDimensionalShield', 'doEldritchRune', 'doReactiveRune',
+    -- Mana sustain (stays high so we can keep casting)
+    'doGatherMana', 'doAzureMindCrystal', 'doManaTap',
+    -- CC: lock down adds first
+    'doColorStun', 'doPBAEMez', 'doAEMez', 'doFastMez', 'doSingleMez',
+    -- Debuffs on focus target
+    'doTash', 'doSlow', 'doCripple',
+    -- DPS
+    'doMindStorm', 'doDoT', 'doMindNuke', 'doChromaticNuke',
+    -- Burn (only fires when ctx.burn is true)
+    'doSilentCasting', 'doIllusionsOfGrandeur', 'doChromaticHaze',
+    'doSpireOfEnchanter', 'doBeguilersSynergy',
+}
+
 -- Default Conditions
 M.defaultConditions = {
     -- Emergency

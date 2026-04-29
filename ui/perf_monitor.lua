@@ -244,14 +244,16 @@ function M.draw()
     if not _visible then return end
 
     imgui.SetNextWindowSize(360, 300, ImGuiCond.FirstUseEver)
-    local open
-    open, _visible = imgui.Begin('SideKick Performance##sk_perf', _visible)
-    if not open then
+    local draw
+    _visible, draw = imgui.Begin('SideKick Performance##sk_perf', _visible)
+    if not _visible then
         imgui.End()
         return
     end
 
-    M.drawContent()
+    if draw then
+        M.drawContent()
+    end
 
     imgui.End()
 end

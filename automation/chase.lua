@@ -56,16 +56,37 @@ local function checkStuck()
     return _navState.stuckCount >= 4
 end
 
+-- Non-blocking stuck recovery: kicks off the back+strafe hold sequence and
+-- schedules releases via module state so the main loop doesn't freeze for
+-- 500ms. Releases are drained in tickStuckRecovery() each tick.
+local _recovery = nil  -- { stage, releaseAt, strafe }
+
 local function doStuckRecovery()
+    if _recovery then return end  -- already in flight
+
     mq.cmd('/keypress back hold')
-    mq.delay(200)
-    mq.cmd('/keypress back')
+    local now = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
     local strafe = (math.random(2) == 1) and 'strafe_left' or 'strafe_right'
-    mq.cmdf('/keypress %s hold', strafe)
-    mq.delay(300)
-    mq.cmdf('/keypress %s', strafe)
+    _recovery = { stage = 'back', releaseAt = now + 200, strafe = strafe }
+
     _navState.stuckCount = 0
     _navState.lastNavAt = 0
+end
+
+local function tickStuckRecovery()
+    if not _recovery then return end
+    local now = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
+    if now < _recovery.releaseAt then return end
+
+    if _recovery.stage == 'back' then
+        mq.cmd('/keypress back')
+        mq.cmdf('/keypress %s hold', _recovery.strafe)
+        _recovery.stage = 'strafe'
+        _recovery.releaseAt = now + 300
+    elseif _recovery.stage == 'strafe' then
+        mq.cmdf('/keypress %s', _recovery.strafe)
+        _recovery = nil
+    end
 end
 
 function M.validateDistance(dist)
@@ -125,12 +146,20 @@ function M.setEnabled(val, opts)
 end
 
 function M.tick()
+    -- Always advance any in-flight stuck-recovery release sequence so the
+    -- back/strafe hold gets cleared even if chase is paused mid-recovery.
+    tickStuckRecovery()
+
     if not M.enabled or M.state.userPaused then return end
     if not mq or not mq.TLO or not mq.TLO.Me or not mq.TLO.Me() then return end
 
     if mq.TLO.Me.Hovering() or mq.TLO.Me.AutoFire() or mq.TLO.Me.Combat() then return end
+    -- me.Casting() returns the spell name when casting OR the literal "NULL"
+    -- when idle — must reject both. Treating "NULL" as truthy (the previous
+    -- behavior) permanently suppressed chase whenever the player wasn't
+    -- actually casting.
     local casting = mq.TLO.Me.Casting()
-    if casting then return end
+    if casting and casting ~= '' and casting ~= 'NULL' then return end
     if mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active() then return end
 
     local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())

@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local Core = require('sidekick-next.utils.core')
 
 local M = {}
@@ -166,8 +166,8 @@ function M.draw()
         local scale = tonumber(iam.TweenFloat('aggro_scale', imgui.GetID('aScale'), targetScale, 0.5, _ezSpringAggro, IamPolicy.Crossfade, dt)) or 1.0
 
         -- Calculate shake offset via native Shake
-        local shakeX = tonumber(iam.Shake('aggro_warning', imgui.GetID('awX'), 15, 0.5, dt)) or 0
-        local shakeY = tonumber(iam.Shake('aggro_warning_y', imgui.GetID('awY'), 10, 0.5, dt)) or 0
+        local shakeX = tonumber(iam.Shake('aggro_warning_x', 15, 30, 0.5, dt)) or 0
+        local shakeY = tonumber(iam.Shake('aggro_warning_y', 10, 30, 0.5, dt)) or 0
 
         -- Calculate pulse for glow via native Oscillate
         local pulse = tonumber(iam.Oscillate('aggro_pulse', imgui.GetID('aPulse'), 0.15, 4.0, 0.0, IamWaveType.Sine, dt)) or 0

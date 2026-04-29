@@ -53,7 +53,10 @@ local _state = {
 }
 
 local _lastUpdate = 0
-local UPDATE_INTERVAL = 0.5
+-- mq.gettime() returns milliseconds, so the throttle threshold must also be
+-- in ms. Previously this was 0.5 (intended as half a second), which made the
+-- guard fire only within 0.5 ms — effectively running tick() every frame.
+local UPDATE_INTERVAL = 500
 local _lastLoggedState = nil
 
 function M.init(config, targetMonitor)
@@ -65,6 +68,13 @@ end
 
 function M.getState()
     return _state
+end
+
+--- Wall-clock ms (mq.gettime) when the current fight started, or 0 if not
+--- in combat. Used by heal_selector to apply opening-burst guards when DPS
+--- history is cold.
+function M.getFightStartTime()
+    return _fightHealing.fightStartTime or 0
 end
 
 -- Record a heal for adaptive throttle tracking
@@ -145,8 +155,11 @@ local function recordMobHP(mobId, mobName, hpPct)
         time = now,
     })
 
-    -- Keep only last 30 seconds of snapshots
-    local cutoff = now - 30
+    -- Keep only last 30 seconds of snapshots. `now = mq.gettime()` returns
+    -- milliseconds, so the cutoff must also be in ms — using a bare `30`
+    -- previously evicted snapshots after 30 *milliseconds*, leaving only one
+    -- sample and breaking TTK estimation entirely.
+    local cutoff = now - (30 * 1000)
     while #data.snapshots > 1 and data.snapshots[1].time < cutoff do
         table.remove(data.snapshots, 1)
     end
@@ -162,7 +175,8 @@ local function getMobTTK(mobId)
 
     local windowSec = (Config and Config.ttkWindowSec) or 5
     local now = mq.gettime()
-    local cutoff = now - windowSec
+    -- mq.gettime() is milliseconds; convert windowSec to ms for the cutoff.
+    local cutoff = now - (windowSec * 1000)
 
     -- Collect samples within the window
     local samples = {}
@@ -176,35 +190,37 @@ local function getMobTTK(mobId)
         return nil
     end
 
-    -- Calculate HP% loss rate, filtering upward jumps (heals/regen)
+    -- Calculate HP% loss rate, filtering upward jumps (heals/regen).
+    -- Convert ms → seconds for the rate math so the returned TTK is in
+    -- seconds (snapshot time is mq.gettime() ms).
     local totalHpLoss = 0
-    local totalTime = 0
+    local totalTimeSec = 0
 
     for i = 2, #samples do
         local prev = samples[i - 1]
         local curr = samples[i]
         local hpDelta = prev.hpPct - curr.hpPct
-        local timeDelta = curr.time - prev.time
+        local timeDeltaSec = (curr.time - prev.time) / 1000
 
         -- Only count HP decreases (ignore heals, regen)
-        if hpDelta > 0 and timeDelta > 0 then
-            -- Clamp outliers: ignore if HP dropped more than 20% in 1 second (likely target swap)
-            local hpLossRate = hpDelta / timeDelta
+        if hpDelta > 0 and timeDeltaSec > 0 then
+            -- Clamp outliers: ignore if HP dropped more than 20% per second (likely target swap)
+            local hpLossRate = hpDelta / timeDeltaSec
             if hpLossRate <= 20 then
                 totalHpLoss = totalHpLoss + hpDelta
-                totalTime = totalTime + timeDelta
+                totalTimeSec = totalTimeSec + timeDeltaSec
             end
         end
     end
 
-    if totalTime <= 0 or totalHpLoss <= 0 then
+    if totalTimeSec <= 0 or totalHpLoss <= 0 then
         return nil
     end
 
-    local hpLossPerSec = totalHpLoss / totalTime
+    local hpLossPerSec = totalHpLoss / totalTimeSec
     local currentHpPct = samples[#samples].hpPct
 
-    -- TTK = remaining HP% / smoothed loss rate
+    -- TTK in seconds = remaining HP% / smoothed loss rate (%/s)
     return currentHpPct / hpLossPerSec
 end
 

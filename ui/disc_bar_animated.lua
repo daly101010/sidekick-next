@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local C = require('sidekick-next.ui.constants')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Core = require('sidekick-next.utils.core')
@@ -31,7 +31,7 @@ local function getGroupTargetBounds()
     end
     local gt = _G.GroupTargetBounds
     if not gt or not gt.loaded then return nil end
-    if gt.timestamp and (os.clock() - gt.timestamp) > 5.0 then return nil end
+    if gt.timestamp and (os.time() - gt.timestamp) > 5.0 then return nil end
     return gt
 end
 
@@ -334,7 +334,8 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 6)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
-    local shown = imgui.Begin('SideKick Discs##SideKickDiscBar', true, flags)
+    local _, shown = imgui.Begin('SideKick Discs##SideKickDiscBar', true, flags)
+    if shown == nil then shown = true end
     if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_disc', imgui)

@@ -91,11 +91,19 @@ function M.resolveAbilitySet(setName, config)
     if not me or not me() then return nil end
 
     -- Iterate through the ability line (ordered best to worst)
-    -- Return the first one found in spellbook/AA/disc list
+    -- Return the first one found in spellbook/AA/disc list. The spellbook
+    -- check uses both an exact match and a SpellGroup lookup so unranked
+    -- config names ("Avowed Light") match scribed ranks ("Avowed Light Rk. II").
     for _, name in ipairs(set) do
-        -- Check spellbook first (most common case for spell lines)
+        -- Check spellbook (exact name)
         local spell = me.Book(name)
         if spell and spell() then
+            return name
+        end
+
+        -- Check spellbook via SpellGroup substring (catches Rk. II / Rk. III)
+        local sgSpell = me.Spell(name)
+        if sgSpell and sgSpell() then
             return name
         end
 

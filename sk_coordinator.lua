@@ -234,19 +234,22 @@ local function expireOwners()
     -- Also don't expire if the owning module still has an active need hint
     -- (covers multi-step operations like gem memorization where castBusy is
     --  still false but the module is actively working toward a cast)
-    if State.castOwner then
-        local expired = isOwnerExpired(State.castOwner)
-        local moduleHasNeed = hasValidNeed(State.castOwner.module)
+    -- Snapshot State.castOwner to a local — defensive against state
+    -- mutations from any handler that runs synchronously below.
+    local castOwner = State.castOwner
+    if castOwner then
+        local expired = isOwnerExpired(castOwner)
+        local moduleHasNeed = hasValidNeed(castOwner.module)
         if expired and not State.castBusy and not moduleHasNeed then
-            lib.log('debug', M.MODULE_NAME, 'Cast owner expired: %s', State.castOwner.module)
+            lib.log('debug', M.MODULE_NAME, 'Cast owner expired: %s', castOwner.module)
             debugLog('EXPIRE: Cast owner %s expired (castBusy=%s, moduleHasNeed=%s)',
-                State.castOwner.module, tostring(State.castBusy), tostring(moduleHasNeed))
+                castOwner.module, tostring(State.castBusy), tostring(moduleHasNeed))
             State.castOwner = nil
             changed = true
         elseif expired and State.castBusy then
-            debugLog('EXPIRE: Cast owner %s expired but castBusy=true, keeping', State.castOwner.module)
+            debugLog('EXPIRE: Cast owner %s expired but castBusy=true, keeping', castOwner.module)
         elseif expired and moduleHasNeed then
-            debugLog('EXPIRE: Cast owner %s expired but module has active need, keeping', State.castOwner.module)
+            debugLog('EXPIRE: Cast owner %s expired but module has active need, keeping', castOwner.module)
         end
     end
     -- Target owner: same logic — extend if owning module has valid need OR castBusy

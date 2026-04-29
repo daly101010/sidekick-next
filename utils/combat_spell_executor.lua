@@ -359,9 +359,10 @@ local function isCastingBusy()
     local me = mq.TLO.Me
     if not me or not me() then return true end
 
-    -- Check if casting
+    -- Check if casting. Casting() can stringify to "NULL" when idle — treating
+    -- that as truthy would permanently busy-lock the executor.
     local casting = me.Casting()
-    if casting and casting ~= '' then
+    if casting and casting ~= '' and casting ~= 'NULL' then
         return true
     end
 
@@ -401,20 +402,29 @@ local function canBeResisted(spellId)
     return true
 end
 
---- Check if a debuff/DoT is already on the target
+--- Check if a debuff/DoT/buff is already on a specific target spawn.
 ---@param spellName string The spell name to check
 ---@param spellId number The spell ID
+---@param targetId number|nil The spawn ID to inspect; falls back to current Target if nil
 ---@return boolean True if the effect is already on target (should skip casting)
-local function isEffectOnTarget(spellName, spellId)
-    local target = mq.TLO.Target
-    if not target or not target() then return false end
+local function isEffectOnTarget(spellName, spellId, targetId)
+    -- Resolve the spawn we actually intend to cast on. The previous version
+    -- always read mq.TLO.Target — but for buff-on-NPC paths the /target id
+    -- swap may not have completed yet, leading to false-positive "already
+    -- has buff" against the old target. Stacking checks have the same race.
+    local spawn = nil
+    if targetId and targetId > 0 then
+        spawn = mq.TLO.Spawn(targetId)
+    end
+    if not spawn or not spawn() then
+        spawn = mq.TLO.Target
+    end
+    if not spawn or not spawn() then return false end
 
-    -- Check if this exact spell is on the target as a buff/debuff
-    -- Note: In EQ, even debuffs show up in Target.Buff()
+    -- Check by name
     if spellName then
-        local buff = target.Buff(spellName)
+        local buff = spawn.Buff(spellName)
         if buff and buff() and buff.ID() then
-            -- Check if it has meaningful duration remaining (more than 3 seconds)
             local duration = buff.Duration()
             if duration and duration > 3000 then
                 return true
@@ -422,9 +432,9 @@ local function isEffectOnTarget(spellName, spellId)
         end
     end
 
-    -- Also check by spell ID
+    -- Check by spell ID
     if spellId and spellId > 0 then
-        local buff = target.Buff(spellId)
+        local buff = spawn.Buff(spellId)
         if buff and buff() and buff.ID() then
             local duration = buff.Duration()
             if duration and duration > 3000 then
@@ -433,14 +443,17 @@ local function isEffectOnTarget(spellName, spellId)
         end
     end
 
-    -- Check if the spell would stack on target (returns false if it won't stack)
-    -- This catches spells that share the same slot/effect
-    if spellName then
+    -- Stacking check: only meaningful when the resolved spawn IS our current
+    -- target, since StacksTarget evaluates against mq.TLO.Target. If we
+    -- haven't switched yet, defer the check rather than report a wrong answer.
+    local current = mq.TLO.Target
+    local currentId = current and current() and current.ID and current.ID() or 0
+    local spawnId = spawn.ID and spawn.ID() or 0
+    if spellName and currentId > 0 and currentId == spawnId then
         local spell = mq.TLO.Spell(spellName)
         if spell and spell() and spell.StacksTarget then
             local stacks = spell.StacksTarget()
             if stacks == false then
-                -- Spell won't stack, meaning something similar is already on target
                 return true
             end
         end
@@ -498,8 +511,8 @@ function M.getNextSpell()
                         -- For NPC targets (beneficial spells on enemies like reverse DS), check stacking
                         if buffTargetType == 'npc' or buffTargetType == 'npc_target' or buffTargetType == 'current_npc' then
                             if targetId then
-                                -- Check if effect already on target
-                                if isEffectOnTarget(entry.spellName, entry.spellId) then
+                                -- Check against the actual intended spawn, not whoever we're targeted on right now.
+                                if isEffectOnTarget(entry.spellName, entry.spellId, targetId) then
                                     shouldSkip = true
                                     targetId = nil
                                 end
@@ -517,12 +530,13 @@ function M.getNextSpell()
                         local targetType = target.Type and target.Type() or ""
                         local targetDead = target.Dead and target.Dead() or false
                         if targetType == "NPC" and not targetDead then
-                            -- Check if this debuff/DoT is already on the target
-                            if isEffectOnTarget(entry.spellName, entry.spellId) then
+                            local liveTargetId = target.ID()
+                            -- Check this debuff/DoT against the spawn we intend to cast on.
+                            if isEffectOnTarget(entry.spellName, entry.spellId, liveTargetId) then
                                 -- Effect already on target, skip this spell
                                 shouldSkip = true
                             else
-                                targetId = target.ID()
+                                targetId = liveTargetId
                             end
                         else
                             -- Skip this spell - no valid target
@@ -595,13 +609,23 @@ local function castSpell(gemSlot, targetId)
     local me = mq.TLO.Me
     if not me or not me() then return false end
 
-    -- Target if needed
+    -- Target if needed. Use a conditional delay (waits for the target to
+    -- actually become ours) and verify before casting — the previous flat
+    -- mq.delay(100) could fire /cast on the wrong mob if /target hadn't
+    -- landed yet (lag, zone load).
     if targetId and targetId > 0 then
         local currentTarget = mq.TLO.Target
         local currentTargetId = currentTarget and currentTarget() and currentTarget.ID() or 0
         if currentTargetId ~= targetId then
             mq.cmdf('/target id %d', targetId)
-            mq.delay(100)
+            mq.delay(500, function()
+                local t = mq.TLO.Target
+                return t and t() and t.ID() == targetId
+            end)
+            local t = mq.TLO.Target
+            if not (t and t() and t.ID() == targetId) then
+                return false
+            end
         end
     end
 

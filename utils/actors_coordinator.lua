@@ -1,5 +1,30 @@
 local mq = require('mq')
 
+-- Lazy-loaded so we don't trigger a circular require during actors init.
+local _ledger = nil
+local function ledger()
+    if _ledger == nil then
+        local ok, mod = pcall(require, 'sidekick-next.utils.claim_ledger')
+        _ledger = ok and mod or false
+    end
+    return _ledger or nil
+end
+
+-- Map an actor message id to a ledger category. Returns nil for messages we
+-- don't track in the ledger (status, bounds, mezlist, etc.).
+local CLAIM_CATEGORIES = {
+    ['cc:claim']        = 'cc_claim',
+    ['debuff:claim']    = 'debuff_claim',
+    ['debuff:landed']   = 'debuff_landed',
+    ['heal:claim']      = 'heal_claim',
+    ['heal:landed']     = 'heal_landed',
+    ['heal:cancelled']  = 'heal_cancelled',
+    ['buff:claim']      = 'buff_claim',
+    ['buff:landed']     = 'buff_landed',
+    ['cure:claim']      = 'cure_claim',
+    ['cure:landed']     = 'cure_landed',
+}
+
 local M = {}
 
 local _actors = nil
@@ -34,6 +59,7 @@ local pruneHealTables
 
 -- Healing message callbacks (registered by healing module to avoid circular require)
 local _healingCallbacks = {}
+local _messageCallbacks = {}
 
 -- Tank coordination state
 local _tankState = {
@@ -74,6 +100,31 @@ local function normalize_sender(sender)
         server = sender.server or sender.Server or '',
         mailbox = sender.mailbox or sender.Mailbox or '',
     }
+end
+
+-- Should we process a cross-zone-sensitive message? True if sender is in our
+-- zone (via content.zone if provided, else via the last known peer status).
+-- Fails open (returns true) when we don't know the sender's zone — dropping
+-- messages from unknown peers would lock out newly-joined peers before their
+-- first status:update lands.
+local function senderInSameZone(content, sender)
+    local myZone = safeZone()
+    if myZone == '' then return true end
+
+    local msgZone = content and content.zone
+    if type(msgZone) == 'string' and msgZone ~= '' then
+        return msgZone == myZone
+    end
+
+    local charName = tostring((content and content.from) or (sender and sender.character) or '')
+    if charName ~= '' then
+        local peer = _remoteCharacters[charName]
+        if peer and peer.zone and peer.zone ~= '' then
+            return peer.zone == myZone
+        end
+    end
+
+    return true
 end
 
 -- Send format: try absolute first, fall back to script+mailbox, cache what works
@@ -137,6 +188,10 @@ function M.init(opts)
     _selfName = safeMeName()
     _selfServer = safeServer()
     _selfZone = safeZone()
+
+    -- Load persisted claim ledger (archives any in-progress session into history).
+    local L = ledger()
+    if L and L.load then pcall(L.load) end
     local _selfNameLower = tostring(_selfName or ''):lower()
     local _selfServerLower = tostring(_selfServer or ''):lower()
 
@@ -158,16 +213,43 @@ function M.init(opts)
             _lastGroupTargetMsgId = id
         end
 
+        -- Tally remote claims into the ledger. Self-fired claims are recorded
+        -- in M.broadcast() instead, so we skip fromMe here to avoid double-counting.
+        if not fromMe then
+            local cat = CLAIM_CATEGORIES[id]
+            if cat then
+                local L = ledger()
+                if L then
+                    local from = tostring(content.from or sender.character or '')
+                    if from ~= '' then L.record(from, cat) end
+                end
+            end
+        end
+
+        local callbacks = _messageCallbacks[id]
+        if callbacks then
+            for _, cb in ipairs(callbacks) do
+                local ok, handled = pcall(cb, content, sender, fromMe)
+                if ok and handled == true then return end
+            end
+        end
+
         -- Respond to GroupTarget pull-style status requests (targeted send).
         -- Note: sender may be our own character (GroupTarget runs on the same client), so do NOT gate on fromMe.
+        -- Always send a reply — even before tick() has populated
+        -- _lastStatusPayload — so GroupTarget can distinguish "alive but quiet"
+        -- from "not responding".
         if id == 'status:req' then
+            local reply = {}
             if type(_lastStatusPayload) == 'table' then
-                local reply = {}
                 for k, v in pairs(_lastStatusPayload) do reply[k] = v end
-                reply.id = 'status:rep'
-                reply.script = 'sidekick'
-                sendToGroupTarget(reply)
             end
+            reply.id = 'status:rep'
+            reply.script = 'sidekick'
+            reply.from = reply.from or _selfName
+            reply.server = reply.server or _selfServer
+            reply.zone = reply.zone or _selfZone
+            sendToGroupTarget(reply)
             return
         end
 
@@ -310,7 +392,7 @@ function M.init(opts)
                 commandBarRight = content.commandBarRight,
                 commandBarBottom = content.commandBarBottom,
                 loaded = true,
-                timestamp = content.timestamp or os.clock(),
+                timestamp = content.timestamp or os.time(),
             }
             return
         end
@@ -339,41 +421,92 @@ function M.init(opts)
             return
         end
 
-        -- Tank coordination: repositioning notification
+        -- Tank coordination: repositioning / settled / taunt events.
+        -- A raw `require` here used to crash the whole actors mailbox handler
+        -- for the session if positioning.lua failed to load; wrap with pcall
+        -- to match the pattern used by other handlers in this file.
+        local function _callPositioning(method)
+            local ok, Positioning = pcall(require, 'sidekick-next.utils.positioning')
+            if not ok or not Positioning or not Positioning[method] then return end
+            Positioning[method]()
+        end
+
+        -- Only accept tank:* from the currently designated tank (the most
+        -- recent `target:primary` sender) or, as a fallback, from a sender
+        -- in our group or raid. Prevents random peers from soft-pausing all
+        -- followers by broadcasting tank:repositioning.
+        local function senderIsAuthorizedTank(content, sender)
+            local fromName = tostring((content and content.from) or (sender and sender.character) or '')
+            if fromName == '' then return false end
+
+            -- Primary gate: currently-known tank (set by target:primary).
+            if _tankState.tankName and _tankState.tankName ~= '' and fromName == _tankState.tankName then
+                return true
+            end
+
+            -- Fallback: sender in our group or raid.
+            local senderSpawn = mq.TLO.Spawn('pc =' .. fromName)
+            local senderId = senderSpawn and senderSpawn() and senderSpawn.ID and senderSpawn.ID() or 0
+            if senderId <= 0 then return false end
+
+            local groupCount = mq.TLO.Group.Members and mq.TLO.Group.Members() or 0
+            for i = 0, groupCount do
+                local member = mq.TLO.Group.Member(i)
+                if member and member() and member.ID and member.ID() == senderId then
+                    return true
+                end
+            end
+
+            local raidCount = mq.TLO.Raid.Members and mq.TLO.Raid.Members() or 0
+            for i = 1, raidCount do
+                local raidMember = mq.TLO.Raid.Member(i)
+                if raidMember and raidMember() then
+                    local raidSpawn = raidMember.Spawn
+                    if raidSpawn and raidSpawn() and raidSpawn.ID and raidSpawn.ID() == senderId then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
         if id == 'tank:repositioning' then
             if fromMe then return end
-            local Positioning = require('sidekick-next.utils.positioning')
-            Positioning.enterSoftPause()
+            if not senderInSameZone(content, sender) then return end
+            if not senderIsAuthorizedTank(content, sender) then return end
+            _callPositioning('enterSoftPause')
             return
         end
 
-        -- Tank coordination: settled after repositioning
         if id == 'tank:settled' then
             if fromMe then return end
-            local Positioning = require('sidekick-next.utils.positioning')
-            Positioning.exitSoftPause()
+            if not senderInSameZone(content, sender) then return end
+            if not senderIsAuthorizedTank(content, sender) then return end
+            _callPositioning('exitSoftPause')
             return
         end
 
-        -- Tank coordination: taunt run started
         if id == 'tank:taunt_run' then
             if fromMe then return end
-            local Positioning = require('sidekick-next.utils.positioning')
-            Positioning.enterSoftPause()
+            if not senderInSameZone(content, sender) then return end
+            if not senderIsAuthorizedTank(content, sender) then return end
+            _callPositioning('enterSoftPause')
             return
         end
 
-        -- Tank coordination: taunt run completed
         if id == 'tank:taunt_done' then
             if fromMe then return end
-            local Positioning = require('sidekick-next.utils.positioning')
-            Positioning.exitSoftPause()
+            if not senderInSameZone(content, sender) then return end
+            if not senderIsAuthorizedTank(content, sender) then return end
+            _callPositioning('exitSoftPause')
             return
         end
 
         -- Tank coordination: mode change notification
         if id == 'tank:mode' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
+            if not senderIsAuthorizedTank(content, sender) then return end
             _tankState.tankMode = content.mode
             return
         end
@@ -381,6 +514,7 @@ function M.init(opts)
         -- CC coordination: receive mez list from mezzer
         if id == 'cc:mezlist' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, CC = pcall(require, 'sidekick-next.automation.cc')
             if ok and CC and CC.receiveMezList then
                 CC.receiveMezList(content)
@@ -391,6 +525,7 @@ function M.init(opts)
         -- CC coordination: receive mez claim from another mezzer
         if id == 'cc:claim' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, CC = pcall(require, 'sidekick-next.automation.cc')
             if ok and CC and CC.receiveClaim then
                 CC.receiveClaim(content)
@@ -401,6 +536,7 @@ function M.init(opts)
         -- Debuff coordination: receive debuff claim from another debuffer
         if id == 'debuff:claim' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Debuff = pcall(require, 'sidekick-next.automation.debuff')
             if ok and Debuff and Debuff.receiveClaim then
                 Debuff.receiveClaim(content)
@@ -411,6 +547,7 @@ function M.init(opts)
         -- Debuff coordination: receive debuff landed notification
         if id == 'debuff:landed' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Debuff = pcall(require, 'sidekick-next.automation.debuff')
             if ok and Debuff and Debuff.receiveDebuffLanded then
                 Debuff.receiveDebuffLanded(content)
@@ -449,28 +586,30 @@ function M.init(opts)
             return
         end
 
-        -- Healing coordination: claim that we're healing a target (prevents multi-healer pile-on)
+        -- Healing coordination: claim that we're healing a target (prevents multi-healer pile-on).
+        -- expiresAt arrives as wall-clock epoch seconds (os.time()) so it's comparable across peers.
         if id == 'heal:claim' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local tid = tonumber(content.targetId) or 0
             if tid <= 0 then return end
             local from = tostring(content.from or sender.character or '')
             if from == '' then return end
             _healClaims[tid] = _healClaims[tid] or {}
-            local now = os.clock()
             _healClaims[tid][from] = {
                 spellName = tostring(content.spellName or ''),
                 tier = tostring(content.tier or ''),
-                expiresAt = tonumber(content.expiresAt) or (now + HEAL_CLAIM_TTL),
-                claimedAt = now,
+                expiresAt = tonumber(content.expiresAt) or (os.time() + HEAL_CLAIM_TTL),
+                claimedAt = os.time(),   -- keep in epoch seconds to match expiresAt
                 from = from,
             }
             return
         end
 
-        -- Healing coordination: HoT presence tracking (cannot be queried cross-client, so share it)
+        -- Healing coordination: HoT presence tracking (cannot be queried cross-client, so share it).
         if id == 'heal:hots' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local tid = tonumber(content.targetId) or 0
             if tid <= 0 then return end
             local from = tostring(content.from or sender.character or '')
@@ -478,9 +617,13 @@ function M.init(opts)
             local spellName = tostring(content.spellName or '')
             if spellName == '' then return end
             _hotStates[tid] = _hotStates[tid] or {}
-            _hotStates[tid][from] = {
+            _hotStates[tid][from] = _hotStates[tid][from] or {}
+            -- Per-spell keying: a single healer can stack multiple HoTs on the
+            -- same target (e.g. Promised + regular HoT). Without this, the
+            -- second cast overwrote the first in tracking.
+            _hotStates[tid][from][spellName] = {
                 spellName = spellName,
-                expiresAt = tonumber(content.expiresAt) or (os.clock() + HOT_DEFAULT_TTL),
+                expiresAt = tonumber(content.expiresAt) or (os.time() + HOT_DEFAULT_TTL),
                 from = from,
             }
             return
@@ -489,6 +632,7 @@ function M.init(opts)
         -- Buff coordination: receive buff list from another buffer
         if id == 'buff:list' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveBuffList then
                 Buff.receiveBuffList(content)
@@ -499,6 +643,7 @@ function M.init(opts)
         -- Buff coordination: receive buff claim from another buffer
         if id == 'buff:claim' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveClaim then
                 Buff.receiveClaim(content)
@@ -508,10 +653,30 @@ function M.init(opts)
 
         -- Buff coordination: receive buff landed notification
         if id == 'buff:landed' then
-            if fromMe then return end
-            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
-            if ok and Buff and Buff.receiveBuffLanded then
-                Buff.receiveBuffLanded(content)
+            if not fromMe then
+                if not senderInSameZone(content, sender) then return end
+                local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
+                if ok and Buff and Buff.receiveBuffLanded then
+                    Buff.receiveBuffLanded(content)
+                end
+            end
+            -- Clear any pending buff request that this landing satisfies (also
+            -- when fromMe — we may have answered our own request).
+            local okR, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
+            if okR and Reqs and Reqs.clearRequest then
+                local tid = tonumber(content.targetId) or 0
+                local cat = tostring(content.buffType or content.category or '')
+                if tid > 0 and cat ~= '' then Reqs.clearRequest(tid, cat) end
+            end
+            return
+        end
+
+        -- Buff request: peer asks the team for a specific buff category
+        if id == 'buff:need' then
+            if not senderInSameZone(content, sender) then return end
+            local okR, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
+            if okR and Reqs and Reqs.receiveNeed then
+                Reqs.receiveNeed(content)
             end
             return
         end
@@ -519,6 +684,7 @@ function M.init(opts)
         -- Buff coordination: receive buff blocks from peer
         if id == 'buff:blocks' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
             if ok and Buff and Buff.receiveBlocks then
                 Buff.receiveBlocks(content)
@@ -529,6 +695,7 @@ function M.init(opts)
         -- Cure coordination: receive cure claim from another curer
         if id == 'cure:claim' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
             if ok and Cures and Cures.receiveClaim then
                 Cures.receiveClaim(content)
@@ -536,9 +703,21 @@ function M.init(opts)
             return
         end
 
+        -- Cure coordination: peer's cure capabilities (for shard splitting).
+        if id == 'cure:capabilities' then
+            if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
+            local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
+            if ok and Cures and Cures.receiveCapabilities then
+                Cures.receiveCapabilities(content)
+            end
+            return
+        end
+
         -- Cure coordination: receive cure landed notification
         if id == 'cure:landed' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
             if ok and Cures and Cures.receiveCureLanded then
                 Cures.receiveCureLanded(content)
@@ -573,11 +752,26 @@ function M.tick(opts)
     opts = opts or {}
     local now = os.clock()
 
+    -- Refresh our cached zone every tick so outbound replies and the
+    -- senderInSameZone fallback never use a stale value across zone-ins.
+    -- Previously _selfZone only updated at init and inside specific
+    -- broadcast helpers, so status:rep / docked broadcasts could carry the
+    -- old zone for several seconds after zoning.
+    _selfZone = safeZone()
+
     -- Periodic heal-claim pruning (every PRUNE_INTERVAL seconds)
     if (now - _lastPruneAt) >= PRUNE_INTERVAL then
         _lastPruneAt = now
         pruneHealTables()
     end
+
+    -- Claim-ledger throttled save.
+    local L = ledger()
+    if L and L.tick then L.tick() end
+
+    -- Buff request queue prune.
+    local okR, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
+    if okR and Reqs and Reqs.tick then Reqs.tick() end
 
     -- If docked, broadcast frequently so GT can hide its control column with staleness check.
     if M._docked then
@@ -629,16 +823,17 @@ function M.getRemoteCharacters()
 end
 
 pruneHealTables = function()
-    local now = os.clock()
+    -- expiresAt values stored in this module are wall-clock epoch seconds
+    -- (os.time()), matching the format senders broadcast. Using os.time()
+    -- here means comparisons are valid across peers despite each Lua
+    -- interpreter having its own os.clock() baseline.
+    local now = os.time()
 
-    -- Remove expired claims + claims from peers no longer seen
+    -- Remove expired claims only (by their own authoritative TTL).
     for tid, perFrom in pairs(_healClaims) do
         local any = false
         for from, c in pairs(perFrom or {}) do
-            local expired = (tonumber(c.expiresAt) or 0) <= now
-            local stalePeer = from ~= _selfName
-                and _remoteCharacters[from] == nil
-            if expired or stalePeer then
+            if (tonumber(c.expiresAt) or 0) <= now then
                 perFrom[from] = nil
             else
                 any = true
@@ -647,19 +842,26 @@ pruneHealTables = function()
         if not any then _healClaims[tid] = nil end
     end
 
+    -- _hotStates is now nested [tid][from][spellName] — prune leaves, then
+    -- collapse empty parent tables.
     for tid, perFrom in pairs(_hotStates) do
-        local any = false
-        for from, h in pairs(perFrom or {}) do
-            local expired = (tonumber(h.expiresAt) or 0) <= now
-            local stalePeer = from ~= _selfName
-                and _remoteCharacters[from] == nil
-            if expired or stalePeer then
+        local anyPeer = false
+        for from, perSpell in pairs(perFrom or {}) do
+            local anySpell = false
+            for spellName, h in pairs(perSpell or {}) do
+                if (tonumber(h.expiresAt) or 0) <= now then
+                    perSpell[spellName] = nil
+                else
+                    anySpell = true
+                end
+            end
+            if not anySpell then
                 perFrom[from] = nil
             else
-                any = true
+                anyPeer = true
             end
         end
-        if not any then _hotStates[tid] = nil end
+        if not anyPeer then _hotStates[tid] = nil end
     end
 end
 
@@ -704,6 +906,15 @@ function M.registerHealingCallback(msgType, callback)
     _healingCallbacks[msgType] = callback
 end
 
+--- Register a callback for a generic Actor message.
+-- Callback receives (content, sender, fromMe). Return true to stop further handling.
+function M.registerMessageCallback(msgType, callback)
+    if not msgType or not callback then return end
+    msgType = tostring(msgType):lower()
+    _messageCallbacks[msgType] = _messageCallbacks[msgType] or {}
+    table.insert(_messageCallbacks[msgType], callback)
+end
+
 --- Generic broadcast to all SideKick instances
 -- @param msgId string Message ID (e.g., 'cc:mezlist')
 -- @param payload table Message payload
@@ -715,6 +926,12 @@ function M.broadcast(msgId, payload)
     pcall(function()
         _dropbox:send({ mailbox = 'sidekick' }, payload)
     end)
+    -- Tally self-fired claims into the ledger.
+    local cat = CLAIM_CATEGORIES[msgId]
+    if cat then
+        local L = ledger()
+        if L then L.record(payload.from, cat) end
+    end
 end
 
 --- Broadcast the primary kill target to assisters
@@ -741,10 +958,12 @@ end
 --- Broadcast that tank is repositioning (assisters enter soft-pause)
 function M.broadcastTankRepositioning()
     if not _dropbox then return end
+    _selfZone = safeZone()
     pcall(function()
         _dropbox:send({ mailbox = 'sidekick' }, {
             id = 'tank:repositioning',
             from = _selfName,
+            zone = _selfZone,
         })
     end)
 end
@@ -752,10 +971,12 @@ end
 --- Broadcast that tank has settled (assisters exit soft-pause)
 function M.broadcastTankSettled()
     if not _dropbox then return end
+    _selfZone = safeZone()
     pcall(function()
         _dropbox:send({ mailbox = 'sidekick' }, {
             id = 'tank:settled',
             from = _selfName,
+            zone = _selfZone,
         })
     end)
 end
@@ -763,10 +984,12 @@ end
 --- Broadcast that tank is doing a taunt run (assisters enter soft-pause)
 function M.broadcastTauntRun()
     if not _dropbox then return end
+    _selfZone = safeZone()
     pcall(function()
         _dropbox:send({ mailbox = 'sidekick' }, {
             id = 'tank:taunt_run',
             from = _selfName,
+            zone = _selfZone,
         })
     end)
 end
@@ -774,10 +997,12 @@ end
 --- Broadcast that tank's taunt run completed (assisters exit soft-pause)
 function M.broadcastTauntDone()
     if not _dropbox then return end
+    _selfZone = safeZone()
     pcall(function()
         _dropbox:send({ mailbox = 'sidekick' }, {
             id = 'tank:taunt_done',
             from = _selfName,
+            zone = _selfZone,
         })
     end)
 end

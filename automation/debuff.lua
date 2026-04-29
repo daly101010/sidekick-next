@@ -224,11 +224,17 @@ function M.broadcastClaim(mobId, debuffType)
     local Actors = getActors()
     if not Actors or not Actors.broadcast then return end
 
+    -- Send zone explicitly so the receiver doesn't have to depend on the
+    -- _remoteCharacters fallback (which can be stale during zone-in).
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+
     Actors.broadcast('debuff:claim', {
         mobId = mobId,
         debuffType = debuffType,
         claimer = _selfName,
         claimedAt = os.clock(),
+        zone = myZone,
     })
 end
 
@@ -294,12 +300,16 @@ function M.broadcastDebuffLanded(mobId, debuffType, spellName, duration)
     local Actors = getActors()
     if not Actors or not Actors.broadcast then return end
 
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+
     Actors.broadcast('debuff:landed', {
         mobId = mobId,
         debuffType = debuffType,
         spellName = spellName or '',
         duration = duration or DEBUFF_DURATION_DEFAULT,
         applier = _selfName,
+        zone = myZone,
     })
 end
 
@@ -360,9 +370,12 @@ function M.broadcastDebuffs()
     end
 
     if #debuffList > 0 then
+        local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+        if myZone == '' or myZone == 'NULL' then myZone = nil end
         Actors.broadcast('debuff:list', {
             debuffs = debuffList,
             sender = _selfName,
+            zone = myZone,
         })
     end
 end
@@ -397,11 +410,16 @@ function M.hasDebuff(mobId, debuffType)
         return true
     end
 
-    -- Fallback: Check TLO for slowed/snared on target
+    -- Fallback: Check TLO for slowed/snared on target. spawn.Slowed is a
+    -- Spell TLO that stringifies to "NULL" when not slowed (truthy in Lua),
+    -- so we have to check the underlying spell ID instead.
     if debuffType == 'slow' then
         local spawn = mq.TLO.Spawn(id)
-        if spawn and spawn() and spawn.Slowed and spawn.Slowed() then
-            return true
+        if spawn and spawn() and spawn.Slowed and spawn.Slowed.ID then
+            local slowedId = tonumber(spawn.Slowed.ID()) or 0
+            if slowedId > 0 then
+                return true
+            end
         end
     end
 

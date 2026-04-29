@@ -12,7 +12,8 @@
 --- @return string|nil err Error message on failure
 local function safeWrite(path, content)
     local tmpPath = path .. '.tmp'
-    -- Write to temp file inside pcall to catch disk errors
+    local bakPath = path .. '.bak'
+
     local ok, writeErr = pcall(function()
         local f, openErr = io.open(tmpPath, 'w')
         if not f then error(openErr or 'failed to open temp file') end
@@ -23,12 +24,36 @@ local function safeWrite(path, content)
         pcall(os.remove, tmpPath)
         return false, tostring(writeErr)
     end
-    -- On Windows, os.rename fails if target exists — remove first
-    os.remove(path)
+
+    pcall(os.remove, bakPath)
+    local hadExisting = false
+    do
+        local existing = io.open(path, 'r')
+        if existing then
+            existing:close()
+            hadExisting = true
+        end
+    end
+
+    if hadExisting then
+        local bakOk, bakErr = os.rename(path, bakPath)
+        if not bakOk then
+            pcall(os.remove, tmpPath)
+            return false, tostring(bakErr)
+        end
+    end
+
     local renameOk, renameErr = os.rename(tmpPath, path)
     if not renameOk then
+        if hadExisting then
+            pcall(os.rename, bakPath, path)
+        end
         pcall(os.remove, tmpPath)
         return false, tostring(renameErr)
+    end
+
+    if hadExisting then
+        pcall(os.remove, bakPath)
     end
     return true
 end

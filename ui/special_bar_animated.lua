@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local C = require('sidekick-next.ui.constants')
 local Colors = require('sidekick-next.ui.colors')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
@@ -59,7 +59,7 @@ local function getGroupTargetBounds()
     end
     local gt = _G.GroupTargetBounds
     if not gt or not gt.loaded then return nil end
-    if gt.timestamp and (os.clock() - gt.timestamp) > 5.0 then return nil end
+    if gt.timestamp and (os.time() - gt.timestamp) > 5.0 then return nil end
     return gt
 end
 
@@ -231,7 +231,8 @@ function M.draw(opts)
     imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 6)
     imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, pad, pad)
 
-    local shown = imgui.Begin('SideKick Specials##SideKickSpecial', true, flags)
+    local _, shown = imgui.Begin('SideKick Specials##SideKickSpecial', true, flags)
+    if shown == nil then shown = true end
     if shown then local _drawOk, _drawErr = pcall(function()
         if Anchor and Anchor.updateWindowBounds then
             Anchor.updateWindowBounds('sidekick_special', imgui)
@@ -363,6 +364,7 @@ function M.draw(opts)
 
             -- Get unique ID for animations
             local uniqueId = def.altName or tostring(def.altID) or tostring(idx)
+            local uniqueIdHash = imgui.GetID(uniqueId)
 
             -- Spring-based button scaling
             local scale = AnimHelpers.getButtonScale(uniqueId, hovered, active)
@@ -387,7 +389,7 @@ function M.draw(opts)
 
             -- Drop shadow (behind everything)
             local shadowAlpha = iam.TweenFloat(
-                uniqueId, imgui.GetID('shadow'),
+                uniqueIdHash, imgui.GetID('shadow'),
                 hovered and C.LAYOUT.SHADOW_ALPHA_HOVER or C.LAYOUT.SHADOW_ALPHA_NORMAL,
                 0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
             local shadowCol = IM_COL32(0, 0, 0, math.floor(shadowAlpha))
@@ -404,7 +406,7 @@ function M.draw(opts)
 
             -- Glow on hover
             local glowAlpha = iam.TweenFloat(
-                uniqueId, imgui.GetID('glow'),
+                uniqueIdHash, imgui.GetID('glow'),
                 hovered and C.LAYOUT.GLOW_ALPHA_MAX or 0,
                 0.15, _ezOutCubic, IamPolicy.Crossfade, dt)
             if glowAlpha > 1 then

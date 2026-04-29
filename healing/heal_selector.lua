@@ -552,6 +552,35 @@ local function joinDetails(primary, extra)
     return primary .. ' | ' .. extra
 end
 
+-- Snapshot the most recent scoring pass for the dashboard. `scores` is a list
+-- of `{ spell|name, score, category?, expected, mana?, castTime? }` rows.
+-- Stored in M._lastScores; read via M.getLastScores(). Always overwrites — we
+-- only ever surface the most recent decision, regardless of pass kind.
+local function stashScores(kind, targetInfo, scores, winnerSpell, winnerScore)
+    if not scores then scores = {} end
+    local out = {}
+    for _, s in ipairs(scores) do
+        table.insert(out, {
+            spell = s.spell or s.name,
+            score = s.score,
+            category = s.category,
+            expected = s.expected,
+            mana = s.mana or 0,
+            castTime = s.castTime or 0,
+        })
+    end
+    table.sort(out, function(a, b) return (a.score or 0) > (b.score or 0) end)
+    M._lastScores = {
+        kind = kind,
+        targetName = (targetInfo and (targetInfo.name or targetInfo.targetName)) or '?',
+        deficit = (targetInfo and targetInfo.deficit) or 0,
+        scores = out,
+        winner = winnerSpell,
+        winnerScore = winnerScore,
+        at = os.time(),
+    }
+end
+
 local function getHighPressure()
     if CombatAssessor and CombatAssessor.isHighPressure then
         local hp, mobs, dps = CombatAssessor.isHighPressure()
@@ -602,6 +631,62 @@ local function calculateSupplementGap(targetInfo, config)
     -- Calculate HoT HPS (healing per second)
     local hotHps = hpPerTick / tickInterval
     local dps = targetInfo.recentDps or 0
+
+    -- ============================================================
+    -- Opening-burst guards (force supplement when HoT/DPS data is cold)
+    -- ============================================================
+    -- Two failure modes were observed at fight start, both of which made
+    -- the downstream "HoT keeping up" / "safety buffer" math return safe
+    -- when the tank was actually about to die:
+    --   (1) A just-cast HoT contributes ZERO real healing for the first
+    --       tickInterval (~6s) — first tick fires after the interval — but
+    --       the math above optimistically credits it with hpPerTick/6s of
+    --       HPS from the moment of cast.
+    --   (2) targetInfo.recentDps is computed from a sliding damage window
+    --       (target_monitor.lua) which is empty for the first ~5s of a
+    --       fresh fight. Reported DPS = 0 → "HoT keeping up" false
+    --       positive. By the time real DPS data arrives the tank is
+    --       already in trouble.
+    -- The downstream "safety buffer" (8s default) compounds both: even
+    -- with degraded inputs, hpAboveDanger / |netHps| typically still
+    -- exceeds 8s while HP is high, so we'd skip supplement anyway. So
+    -- rather than perturb the inputs we short-circuit and return
+    -- "supplement needed" outright.
+    local now = mq.gettime()
+    local hotJustCast = false
+    if hotData.castTime then
+        local hotAgeMs = now - hotData.castTime
+        if hotAgeMs >= 0 and hotAgeMs < TICK_MS then
+            hotJustCast = true
+        end
+    end
+
+    local fightStartTime = (CombatAssessor and CombatAssessor.getFightStartTime
+        and CombatAssessor.getFightStartTime()) or 0
+    local fightAgeMs = (fightStartTime > 0) and (now - fightStartTime) or math.huge
+    local OPENING_BURST_WINDOW_MS = (config.hotOpeningWindowSec or 5) * 1000
+    local fightIsYoung = fightAgeMs < OPENING_BURST_WINDOW_MS
+
+    -- Both guards are gated on "fight is young" so mid-fight HoT refreshes
+    -- and brief DPS lulls don't trigger phantom supplements.
+    local warmupGate = hotJustCast and fightIsYoung
+    local coldStartGate = (dps <= 0) and fightIsYoung
+
+    if warmupGate or coldStartGate then
+        local reason = warmupGate
+            and (coldStartGate and 'opening_burst_hot_warmup_and_dps_cold'
+                or 'opening_burst_hot_warmup')
+            or 'opening_burst_dps_cold'
+        local details = string.format(
+            'hotAge=%.1fs fightAge=%.1fs dps=%.0f hotHps=%.0f hotJustCast=%s dpsZero=%s',
+            (hotData.castTime and (now - hotData.castTime) or 0) / 1000,
+            fightAgeMs / 1000, dps, hotHps, tostring(hotJustCast), tostring(dps <= 0))
+        if log then
+            log.info('supplement', '[%s] OPENING-BURST SUPPLEMENT (%s): %s',
+                targetInfo.name or '?', reason, details)
+        end
+        return true, targetInfo.deficit, reason
+    end
 
     -- Net HPS: positive = gaining HP, negative = losing HP
     local netHps = hotHps - dps
@@ -679,6 +764,10 @@ function M.SelectHeal(targetInfo, situation)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
     local tracker = HealTracker
+    -- Resolve Proactive lazily; earlier code referenced a bare global
+    -- `Proactive` that always resolved to nil, silently disabling the
+    -- promised-heal safety gate, HoT refresh path, and supplement logic.
+    local Proactive = getProactive()
     local deficit = targetInfo.deficit
     local learning = tracker and tracker.IsLearning and tracker.IsLearning()
     local nonSquishy = not targetInfo.isSquishy
@@ -755,7 +844,10 @@ function M.SelectHeal(targetInfo, situation)
     local allowLearnHot = learning and config.hotLearnForce and deficitPct <= learnMaxPct
     local refreshable = true
     if Proactive and Proactive.HasActiveHot and Proactive.HasActiveHot(targetInfo.name) then
-        refreshable = Proactive.ShouldRefreshHot and Proactive.ShouldRefreshHot(targetInfo.name, config) or false
+        -- Pre-selection check: we don't know which HoT we'd cast yet, so ask
+        -- generically via nil spell name — function routes through the
+        -- fallback (_activeHoTs + peer data) to decide refresh eligibility.
+        refreshable = Proactive.ShouldRefreshHot and Proactive.ShouldRefreshHot(targetInfo.name, nil) or false
     end
 
     local isPriorityTarget = targetInfo.role == 'tank'
@@ -962,10 +1054,12 @@ end
 -- Cache for minimum expected heal (refreshed periodically)
 local _minExpectedHealCache = nil
 local _minExpectedHealCacheTime = 0
-local MIN_HEAL_CACHE_TTL = 30  -- seconds
+-- 30s expressed in milliseconds to match mq.gettime(); was previously `30`
+-- which made the cache effectively miss every 30ms.
+local MIN_HEAL_CACHE_TTL = 30 * 1000
 
 function M.GetMinExpectedHeal()
-    local now = mq.gettime and mq.gettime() or os.time()
+    local now = mq.gettime and mq.gettime() or (os.time() * 1000)
     if _minExpectedHealCache and (now - _minExpectedHealCacheTime) < MIN_HEAL_CACHE_TTL then
         return _minExpectedHealCache
     end
@@ -1027,11 +1121,29 @@ function M.FindFastestHeal(deficit, isSelf)
     end
 
     if #candidates == 0 then
+        stashScores('fastest', { name = isSelf and 'self' or 'target', deficit = deficit }, {}, nil, nil)
         return nil
     end
 
     table.sort(candidates, function(a, b) return a.castTimeMs < b.castTimeMs end)
     local fastest = candidates[1]
+
+    -- Surface the candidate list to the dashboard. There's no real score for
+    -- "fastest" — synthesize one as the inverse of cast time so the table
+    -- sorts in the same order the selector evaluated them.
+    local synthScores = {}
+    for _, c in ipairs(candidates) do
+        table.insert(synthScores, {
+            spell = c.spell,
+            score = -((tonumber(c.castTimeMs) or 0) / 1000),
+            category = c.category,
+            expected = c.expected,
+            mana = 0,
+            castTime = c.castTimeMs,
+        })
+    end
+    stashScores('fastest', { name = isSelf and 'self' or 'target', deficit = deficit },
+        synthScores, fastest.spell, -(fastest.castTimeMs / 1000))
 
     return {
         spell = fastest.spell,
@@ -1045,7 +1157,7 @@ function M.FindHealForSquishy(deficit, allowFast)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
     local tracker = HealTracker
-    local minCoverage = deficit * (config.squishyCoveragePct / 100)
+    local minCoverage = deficit * ((config.squishyCoveragePct or 80) / 100)
 
     if allowFast then
         for _, spellName in ipairs(config.spells.fast or {}) do
@@ -1146,20 +1258,11 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
         end
     end
 
+    stashScores('efficient', targetInfo, scores, best and best.spell or nil, bestScore)
+
     local log = getLogger()
     if log and log.logSpellSelection then
-        local spells = {}
-        for _, s in ipairs(scores) do
-            table.insert(spells, {
-                name = s.spell,
-                score = s.score,
-                expected = s.expected,
-                mana = s.mana or 0,
-                castTime = s.castTime or 0,
-            })
-        end
-        table.sort(spells, function(a, b) return a.score > b.score end)
-        log.logSpellSelection(targetInfo, 'single', spells, best and best.spell or nil, bestScore)
+        log.logSpellSelection(targetInfo, 'single', M._lastScores.scores, best and best.spell or nil, bestScore)
     end
 
     return best
@@ -1242,14 +1345,12 @@ function M.ShouldUseGroupHeal(targets)
         end
     end
 
+    stashScores('group', { name = 'group', deficit = 0 },
+        allScores, best and best.spell or nil, bestScore)
+
     local log = getLogger()
     if log and log.logSpellSelection then
-        local spells = {}
-        for _, s in ipairs(allScores) do
-            table.insert(spells, { name = s.name, score = s.score, expected = s.expected, mana = s.mana or 0, castTime = s.castTime or 0 })
-        end
-        table.sort(spells, function(a, b) return a.score > b.score end)
-        log.logSpellSelection({ name = 'group' }, 'group', spells, best and best.spell or nil, bestScore)
+        log.logSpellSelection({ name = 'group' }, 'group', M._lastScores.scores, best and best.spell or nil, bestScore)
     end
 
     return best ~= nil, best
@@ -1298,14 +1399,11 @@ function M.SelectBestHot(targetInfo, useLight, allowFallback)
         end
     end
 
+    stashScores('hot', targetInfo, allScores, best and best.spell or nil, bestScore)
+
     local log = getLogger()
     if log and log.logSpellSelection then
-        local spells = {}
-        for _, s in ipairs(allScores) do
-            table.insert(spells, { name = s.name, score = s.score, expected = s.expected, mana = s.mana or 0, castTime = s.castTime or 0 })
-        end
-        table.sort(spells, function(a, b) return a.score > b.score end)
-        log.logSpellSelection(targetInfo, 'hot', spells, best and best.spell or nil, bestScore)
+        log.logSpellSelection(targetInfo, 'hot', M._lastScores.scores, best and best.spell or nil, bestScore)
     end
 
     return best
@@ -1342,14 +1440,12 @@ function M.SelectBestGroupHot(targets, totalDeficit, hurtCount)
         end
     end
 
+    stashScores('groupHot', { name = 'group', deficit = totalDeficit or 0 },
+        allScores, best and best.spell or nil, bestScore)
+
     local log = getLogger()
     if log and log.logSpellSelection then
-        local spells = {}
-        for _, s in ipairs(allScores) do
-            table.insert(spells, { name = s.name, score = s.score, expected = s.expected, mana = s.mana or 0, castTime = s.castTime or 0 })
-        end
-        table.sort(spells, function(a, b) return a.score > b.score end)
-        log.logSpellSelection({ name = 'group' }, 'groupHot', spells, best and best.spell or nil, bestScore)
+        log.logSpellSelection({ name = 'group' }, 'groupHot', M._lastScores.scores, best and best.spell or nil, bestScore)
     end
 
     return best
@@ -1381,6 +1477,13 @@ end
 
 function M.getLastAction()
     return _lastAction
+end
+
+--- Snapshot of the most recent FindEfficientHeal scoring pass. Used by the
+--- dashboard to surface which alternate spells were considered and why the
+--- winner won. Returns nil if no scoring has happened this session.
+function M.getLastScores()
+    return M._lastScores
 end
 
 return M

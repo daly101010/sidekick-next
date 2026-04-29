@@ -13,6 +13,44 @@ local getActors = lazy('sidekick-next.utils.actors_coordinator')
 -- Lazy-load runtime cache for fallback checks
 local getCache = lazy('sidekick-next.utils.runtime_cache')
 
+-- Lazy-load the per-zone mob immunity DB (existing infra; covers
+-- 'mez' and 'charm' categories among others) and the Core settings
+-- table for the user toggle.
+local getImmuneDB = lazy('sidekick-next.utils.immune_database')
+local getCore = lazy('sidekick-next.utils.core')
+
+local function immunePersistEnabled()
+    local Core = getCore()
+    if not (Core and Core.Settings) then return true end
+    local v = Core.Settings.MezImmunePersistEnabled
+    return v ~= false  -- nil or true => enabled
+end
+
+local function recordImmune(category)
+    if not immunePersistEnabled() then return end
+    local DB = getImmuneDB()
+    if not (DB and DB.addImmune) then return end
+    local target = mq.TLO.Target
+    if not (target and target()) then return end
+    local name = nil
+    pcall(function() name = target.CleanName() or target.Name() end)
+    if not name or name == '' then return end
+    -- The DB scopes by current zone internally; ensure we're indexed
+    -- against the live zone before recording.
+    if DB.loadZone then pcall(DB.loadZone) end
+    DB.addImmune(name, category)
+end
+
+--- Public check used by the target-selection paths. Defaults to
+--- "not immune" if the toggle is off or the DB isn't ready.
+function M.isMobImmuneToCC(mobName, category)
+    if not mobName or mobName == '' then return false end
+    if not immunePersistEnabled() then return false end
+    local DB = getImmuneDB()
+    if not (DB and DB.isImmune) then return false end
+    return DB.isImmune(mobName, category) == true
+end
+
 -- Local mez tracking (mobs we mezzed)
 M.localMezzes = {}  -- { [mobId] = { expires = os.clock(), name = 'mob name' } }
 
@@ -36,6 +74,22 @@ local CLAIM_TIMEOUT = 5.0       -- Claims expire after 5 seconds if mez not land
 local MEZ_DURATION_DEFAULT = 18 -- Default mez duration if unknown
 local _eventsRegistered = false
 local _selfName = ''
+-- Cached integer derived from _selfName, used to shard target selection
+-- across multiple mezzers running in the same group. With two ENC/BRD boxes
+-- both seeing the same XTarget hater list, the previous selection always
+-- picked candidates[1] for everyone — causing both to claim and double-cast
+-- the same mob in the async window before claims propagate. Hash-based
+-- sharding lets each mezzer pick a different index of the sorted list, so
+-- the common case naturally avoids contention even before the claim system
+-- has a chance to broadcast.
+local _shardOffset = 0
+local function _refreshShardOffset()
+    local sum = 0
+    for i = 1, #_selfName do
+        sum = sum + string.byte(_selfName, i)
+    end
+    _shardOffset = sum
+end
 
 local function trim(s)
     s = tostring(s or '')
@@ -73,6 +127,7 @@ function M.init()
     M.remoteClaims = {}
 
     _selfName = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or ''
+    _refreshShardOffset()
 
     -- Best-effort local mez tracking via combat text events (ENC/BRD/NEC).
     if not _eventsRegistered and mq and mq.event and mq.TLO and mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName then
@@ -96,6 +151,26 @@ function M.init()
                 if id then
                     M.removeMez(id)
                 end
+            end)
+
+            -- Mez/charm immunity events. The chat lines are emitted by EQ
+            -- when a mez/charm cast fails because the target is immune.
+            -- We capture the active target's CleanName via mq.TLO.Target —
+            -- the cast just resolved so the target is still locked in.
+            mq.event('sidekick_cc_mez_immune', 'Your target cannot be mesmerized#*#', function()
+                recordImmune('mez')
+            end)
+            mq.event('sidekick_cc_charm_immune', 'Your target cannot be charmed#*#', function()
+                recordImmune('charm')
+            end)
+            mq.event('sidekick_cc_charm_immune_npc', 'This NPC cannot be charmed#*#', function()
+                recordImmune('charm')
+            end)
+            -- Charm spell tier too low — functionally immune for current
+            -- spell, so record charm immunity. User can clear via the DB
+            -- if they upgrade and want to retry.
+            mq.event('sidekick_cc_charm_lvl_high', 'Your target is too high of a level for your charm spell.#*#', function()
+                recordImmune('charm')
             end)
 
             _eventsRegistered = true
@@ -187,10 +262,14 @@ function M.broadcastMezList()
         end
     end
 
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+
     Actors.broadcast('cc:mezlist', {
         mobs = mezList,
         sender = mq.TLO.Me.CleanName(),
         timestamp = now, -- sender-local os.clock (paired with expires for backward compatibility)
+        zone = myZone,
     })
 end
 
@@ -433,11 +512,19 @@ function M.broadcastClaim(mobId, mobName)
     local Actors = getActors()
     if not Actors or not Actors.broadcast then return end
 
+    -- Include zone explicitly so the coordinator's senderInSameZone helper
+    -- doesn't have to fall back to _remoteCharacters[name].zone (which can be
+    -- stale during zone-in transitions). Send only if we have a real zone
+    -- name — "NULL" or empty would defeat the receive-side filter.
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+
     Actors.broadcast('cc:claim', {
         mobId = mobId,
         mobName = mobName or '',
         claimer = _selfName,
         claimedAt = os.clock(),
+        zone = myZone,
     })
 end
 
@@ -485,27 +572,39 @@ function M.getBestMezTarget(maxTargets)
                 -- Skip if claimed by another
                 local claimed, _ = M.isTargetClaimed(id)
                 if not claimed then
-                    table.insert(candidates, {
-                        id = id,
-                        name = hater.name or '',
-                        hp = hater.hp or 100,
-                        distance = hater.distance or 999,
-                    })
+                    -- Skip if the per-zone immune DB has flagged this mob
+                    -- as mez-immune previously.
+                    if not M.isMobImmuneToCC(hater.name or '', 'mez') then
+                        table.insert(candidates, {
+                            id = id,
+                            name = hater.name or '',
+                            hp = hater.hp or 100,
+                            distance = hater.distance or 999,
+                        })
+                    end
                 end
             end
         end
     end
 
-    -- Sort by HP (lowest first - most dangerous), then by distance
+    -- Sort by HP (lowest first), distance, then mobId. The mobId tiebreaker
+    -- guarantees every mezzer in the group sees the same ordering — without
+    -- it, two mezzers iterating an unordered xtarget pairs table can end up
+    -- with different first-element candidates and the sharding below would
+    -- become inconsistent.
     table.sort(candidates, function(a, b)
-        if a.hp ~= b.hp then
-            return a.hp < b.hp
-        end
-        return a.distance < b.distance
+        if a.hp ~= b.hp then return a.hp < b.hp end
+        if a.distance ~= b.distance then return a.distance < b.distance end
+        return a.id < b.id
     end)
 
     if #candidates > 0 then
-        return candidates[1].id, candidates[1].name
+        -- Shard by character-name hash so co-located mezzers naturally pick
+        -- different mobs. Falls back to candidates[1] when only one is
+        -- available (both mezzers will land on it; the claim system + cast
+        -- path is the safety net for that case).
+        local idx = ((_shardOffset - 1) % #candidates) + 1
+        return candidates[idx].id, candidates[idx].name
     end
 
     return nil, nil
@@ -531,16 +630,26 @@ function M.getAvailableMezTargets()
             if not M.isMobMezzed(id) then
                 local claimed, _ = M.isTargetClaimed(id)
                 if not claimed then
-                    table.insert(candidates, {
-                        id = id,
-                        name = hater.name or '',
-                        hp = hater.hp or 100,
-                        distance = hater.distance or 999,
-                    })
+                    if not M.isMobImmuneToCC(hater.name or '', 'mez') then
+                        table.insert(candidates, {
+                            id = id,
+                            name = hater.name or '',
+                            hp = hater.hp or 100,
+                            distance = hater.distance or 999,
+                        })
+                    end
                 end
             end
         end
     end
+
+    -- Same deterministic ordering as getBestMezTarget so callers can sort/
+    -- shard consistently across mezzers.
+    table.sort(candidates, function(a, b)
+        if a.hp ~= b.hp then return a.hp < b.hp end
+        if a.distance ~= b.distance then return a.distance < b.distance end
+        return a.id < b.id
+    end)
 
     return candidates
 end
@@ -577,16 +686,27 @@ local _mezProfiles = {
     -- NEC has fear/charm but not true mez; exclude from active mezzing
 }
 
--- Helper: check if spell is memorized
+-- Helper: strip " Rk. II" / " Rk. III" / etc. so we can compare base names.
+local function stripRank(name)
+    if not name then return '' end
+    return tostring(name):gsub(' Rk%. %u+$', '')
+end
+
+-- Helper: check if any rank of `spellName` is memorized in any gem. Compares
+-- base names so an unranked config entry matches a ranked memorized spell.
 local function spellMemorized(spellName)
     if not spellName or spellName == '' then return false end
     local me = mq.TLO.Me
     if not (me and me()) then return false end
+    local base = stripRank(spellName)
     local gems = tonumber(me.NumGems()) or 13
     for i = 1, gems do
         local gem = me.Gem(i)
-        if gem and gem() and (gem.Name() or '') == spellName then
-            return true
+        if gem and gem() then
+            local gemName = gem.Name() or ''
+            if stripRank(gemName) == base then
+                return true
+            end
         end
     end
     return false
@@ -765,16 +885,36 @@ function M.castMez(mobId, mobName, spellName, opts)
         return false, 'spell_engine_busy'
     end
 
-    -- Check if we're already casting (Casting() returns spell name string, empty if not)
+    -- Check if we're already casting. Casting() returns the spell name when
+    -- active, empty string OR the literal "NULL" when idle — must reject both.
     local me = mq.TLO.Me
     local casting = me and me.Casting() or ''
-    if casting ~= '' then
+    if casting ~= '' and casting ~= 'NULL' then
         return false, 'already_casting'
     end
 
     -- Claim the target before casting
     if not M.claimTarget(mobId, mobName) then
         return false, 'target_claimed'
+    end
+
+    -- Brief confirmation window: another mezzer that claimed simultaneously
+    -- has time to broadcast to us. After the yield, re-check remoteClaims;
+    -- if a peer also claimed this mob, tie-break by lexicographic name —
+    -- the mezzer whose name sorts FIRST wins, the other defers. Without
+    -- the tie-break BOTH mezzers would see each other's claim and BOTH
+    -- abort, leaving the mob un-mezzed.
+    mq.delay(50)
+    local conflicted, otherClaimer = M.isTargetClaimed(mobId)
+    if conflicted and otherClaimer then
+        if _selfName == '' or otherClaimer < _selfName then
+            -- They win the tie. Drop our local claim and abort.
+            M.releaseClaim(mobId)
+            return false, string.format('target_claimed_late_by_%s', tostring(otherClaimer))
+        end
+        -- We win the tie. Clear the stale remote claim so we don't keep
+        -- seeing it as "claimed by someone else" on subsequent checks.
+        M.remoteClaims[mobId] = nil
     end
 
     -- Initiate cast
@@ -824,7 +964,14 @@ function M.mezTick(settings)
     if not (me and me()) then return false end
 
     -- Check if we can cast (not stunned, mezzed, etc.)
-    if me.Stunned() or (me.Mezzed and me.Mezzed()) or (me.Silenced and me.Silenced()) then
+    -- me.Stunned/Silenced are bool TLOs (true/false); me.Mezzed is a Spell
+    -- TLO that stringifies to "NULL" when not mezzed — checking it directly
+    -- would always be truthy and permanently block mezzing.
+    local mezzedNow = false
+    if me.Mezzed and me.Mezzed.ID then
+        mezzedNow = (tonumber(me.Mezzed.ID()) or 0) > 0
+    end
+    if me.Stunned() or mezzedNow or (me.Silenced and me.Silenced()) then
         return false
     end
 

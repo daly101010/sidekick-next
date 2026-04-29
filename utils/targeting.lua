@@ -1,11 +1,37 @@
 local mq = require('mq')
 local Cache = require('sidekick-next.utils.runtime_cache')
 local Actors = require('sidekick-next.utils.actors_coordinator')
+local NamedDetector = require('sidekick-next.utils.named_detector')
 
 local M = {}
 
 -- Settings reference (set via init or passed to functions)
 M.settings = nil
+
+local function _normalizeName(s)
+    if not s or s == '' then return '' end
+    s = tostring(s)
+    s = s:gsub('^%s+', ''):gsub('%s+$', '')
+    return s:lower()
+end
+
+local function _buildIgnoreSet(settings)
+    local raw = settings and settings.TargetingIgnoredTargetNames or ''
+    if not raw or raw == '' then return {} end
+    local set = {}
+    for token in tostring(raw):gmatch('[^,]+') do
+        local name = _normalizeName(token)
+        if name ~= '' then set[name] = true end
+    end
+    return set
+end
+
+local function _isIgnoredSpawn(spawn, ignoreSet)
+    if not spawn or not spawn() then return false end
+    local name = _normalizeName(spawn.CleanName and spawn.CleanName() or spawn.Name())
+    if name == '' then return false end
+    return ignoreSet[name] == true
+end
 
 --- Check if a spawn is a PC's pet
 -- @param spawnId number Spawn ID to check
@@ -29,14 +55,16 @@ end
 -- @param settings table Settings table
 function M.init(settings)
     M.settings = settings
+    if NamedDetector and NamedDetector.init then
+        NamedDetector.init(settings)
+    end
 end
 
 --- Check if spawn is a named mob
 -- @param spawn userdata Spawn TLO
 -- @return boolean
 function M.isNamed(spawn)
-    if not spawn or not spawn() then return false end
-    return spawn.Named() == true or spawn.Body() == 'Giant'
+    return NamedDetector.isNamed(spawn, M.settings)
 end
 
 --- Check if spawn is mezzed
@@ -232,6 +260,11 @@ function M.scoreTarget(spawn, myId, settings)
     if spawn.Type() ~= 'NPC' then return -1, 'not NPC' end
     if spawn.Dead() then return -1, 'dead' end
 
+    local ignoreSet = _buildIgnoreSet(settings or M.settings or {})
+    if _isIgnoredSpawn(spawn, ignoreSet) then
+        return -1, 'ignored'
+    end
+
     -- Check safe targeting (KS prevention)
     local spawnId = spawn.ID() or 0
     local isSafe, reason = M.isSafeTarget(spawnId, settings)
@@ -304,13 +337,35 @@ local SKIP_LOG_COOLDOWN = 5.0  -- Only log once per 5 seconds per target
 -- @return userdata|nil Best target spawn or nil
 function M.selectBestTarget(myId, range, settings)
     settings = settings or M.settings or {}
+    local ignoreSet = _buildIgnoreSet(settings)
     local unmezzed = M.getUnmezzedTargets(range)
     local now = os.clock()
+
+    -- Forced target override (rgmercs-style manual control)
+    local forcedName = _normalizeName(settings.TargetingForcedTargetName)
+    if forcedName ~= '' then
+        local forcedSpawn = mq.TLO.Spawn('npc =' .. settings.TargetingForcedTargetName)
+        if forcedSpawn and forcedSpawn() and forcedSpawn.Type and forcedSpawn.Type() == 'NPC' and not forcedSpawn.Dead() then
+            if not _isIgnoredSpawn(forcedSpawn, ignoreSet) then
+                local forcedId = forcedSpawn.ID() or 0
+                local isSafe = true
+                if forcedId ~= 0 then
+                    isSafe = (M.isSafeTarget(forcedId, settings))
+                end
+                if isSafe then
+                    return forcedSpawn
+                end
+            end
+        end
+    end
 
     if #unmezzed > 0 then
         -- Filter and score targets, logging skipped ones
         local scoredTargets = {}
         for _, spawn in ipairs(unmezzed) do
+            if _isIgnoredSpawn(spawn, ignoreSet) then
+                goto continue
+            end
             local score, reason = M.scoreTarget(spawn, myId, settings)
             if score >= 0 then
                 table.insert(scoredTargets, { spawn = spawn, score = score })
@@ -324,6 +379,7 @@ function M.selectBestTarget(myId, range, settings)
                     -- Echo disabled
                 end
             end
+            ::continue::
         end
 
         -- Sort by score descending
@@ -341,6 +397,9 @@ function M.selectBestTarget(myId, range, settings)
         -- Filter by safe targeting
         local safeTargets = {}
         for _, spawn in ipairs(mezzed) do
+            if _isIgnoredSpawn(spawn, ignoreSet) then
+                goto continue2
+            end
             local spawnId = spawn.ID() or 0
             local isSafe, reason = M.isSafeTarget(spawnId, settings)
             if isSafe then
@@ -354,6 +413,7 @@ function M.selectBestTarget(myId, range, settings)
                     -- Echo disabled
                 end
             end
+            ::continue2::
         end
 
         if #safeTargets > 0 then

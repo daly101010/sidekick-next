@@ -50,15 +50,25 @@ local function normalize_class()
     return c
 end
 
+-- Compare base names: configs use "Avowed Light", gems hold "Avowed Light Rk. II".
+local function strip_rank(name)
+    if not name then return '' end
+    return tostring(name):gsub(' Rk%. %u+$', '')
+end
+
 local function spell_memorized(spellName)
     if not spellName or spellName == '' then return false end
     local me = mq.TLO.Me
     if not (me and me()) then return false end
+    local base = strip_rank(spellName)
     local gems = tonumber(me.NumGems()) or 13
     for i = 1, gems do
         local gem = me.Gem(i)
-        if gem and gem() and (gem.Name() or '') == spellName then
-            return true
+        if gem and gem() then
+            local gemName = gem.Name() or ''
+            if strip_rank(gemName) == base then
+                return true
+            end
         end
     end
     return false
@@ -165,10 +175,14 @@ local function get_hot_remaining(targetId, now)
     local remote = ActorsCoordinator and ActorsCoordinator.getHoTStates and ActorsCoordinator.getHoTStates() or nil
     local perTarget = remote and remote[targetId] or nil
     if perTarget then
-        for _, info in pairs(perTarget) do
-            local exp = tonumber(info.expiresAt) or 0
-            local rem = exp - now
-            if rem > best then best = rem end
+        -- Nested shape: perTarget[from][spellName] = { expiresAt, ... }.
+        -- expiresAt is epoch seconds — matches `now = os.time()` in tick().
+        for _, perSpell in pairs(perTarget) do
+            for _, info in pairs(perSpell) do
+                local exp = tonumber(info.expiresAt) or 0
+                local rem = exp - now
+                if rem > best then best = rem end
+            end
         end
     end
 
@@ -189,8 +203,10 @@ end
 
 local function broadcast_claim(targetId, tier, spellName, castTimeSec)
     if not (ActorsCoordinator and ActorsCoordinator.broadcast) then return end
-    local now = os.clock()
-    local exp = now + (castTimeSec or 2.0) + 1.0
+    -- Use wall-clock epoch seconds (os.time) for any field that crosses the
+    -- wire — os.clock() and mq.gettime() are process-local and disagree
+    -- between peers, which made claim TTL comparisons meaningless.
+    local exp = os.time() + (castTimeSec or 2.0) + 1.0
     ActorsCoordinator.broadcast('heal:claim', {
         targetId = targetId,
         tier = tier,
@@ -273,7 +289,9 @@ function M.tick(settings)
     end
 
     local classShort = normalize_class()
-    local now = os.clock()
+    -- Use epoch seconds so values that round-trip through broadcasts
+    -- (localHots exp, claim TTLs) stay comparable with peer data.
+    local now = os.time()
     prune_map(_state.localHots, now)
     if ActorsCoordinator and ActorsCoordinator.pruneHealState then
         ActorsCoordinator.pruneHealState()

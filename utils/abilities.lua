@@ -170,7 +170,12 @@ function M.hasAbility(def)
         local disc = me.CombatAbility(name)
         return disc and disc() ~= nil
     elseif kind == 'spell' then
-        local spell = me.Book(name)
+        -- me.Book(name) requires exact match and silently misses ranked
+        -- spells ("Avowed Light Rk. II"). Try exact first, then fall back
+        -- to me.Spell which does SpellGroup substring matching.
+        local exact = me.Book(name)
+        if exact and exact() ~= nil then return true end
+        local spell = me.Spell(name)
         return spell and spell() ~= nil
     end
     return false

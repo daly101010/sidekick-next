@@ -91,7 +91,7 @@ end
 
 -- Draw only the bar UI settings (for consolidated UI tab)
 function M.drawBarUI(settings, themeNames, onChange)
-    local themeName = settings.Theme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
 
     -- Enable item bar
     local itemBar = settings.SideKickItemBarEnabled ~= false

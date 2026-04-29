@@ -13,6 +13,14 @@ M._observedTotal = M._observedTotal or {}
 M._debug = false  -- Set to true via /lua run sidekick-next to enable CD debug logging
 M._debugFilter = nil  -- Set to ability name to filter, e.g. "Fists of Wu"
 
+-- Short-TTL cache for raw probe results. probe() gets called once per
+-- rendered button per frame; each miss scans up to 13 gem slots + AA/Disc/
+-- Item TLOs. Gem/AA/item cooldown data changes on ~6s tick granularity, so
+-- a 150ms cache collapses ~60 fps of probing into ~7 real reads/sec per
+-- ability. smooth() still interpolates display between real reads.
+M._probeCache = M._probeCache or {}
+local PROBE_CACHE_MS = 150
+
 local function dbg(...)
   if not M._debug then return end
   local msg = string.format(...)
@@ -89,6 +97,20 @@ function M.probe(row)
   local name = label or key
   local shouldLog = M._debug and (not M._debugFilter or name == M._debugFilter)
 
+  -- Short-TTL cache hit: skip the TLO scan. Still route through smooth() on
+  -- the cached rem/total so the displayed remaining continues to decay
+  -- smoothly between real reads.
+  local cached = M._probeCache[name]
+  if cached and (nowMs() - cached.at) < PROBE_CACHE_MS then
+    return smooth(cached.cacheKey or name, cached.rem, cached.total)
+  end
+
+  -- Helper: record this probe's raw result in the cache and return it.
+  local function _record(cacheKey, rem, total)
+    M._probeCache[name] = { rem = rem, total = total, at = nowMs(), cacheKey = cacheKey }
+    return smooth(cacheKey, rem, total)
+  end
+
   -- Try AA first
   local aa = mq.TLO.Me.AltAbility(name)
   if aa and aa() then
@@ -107,17 +129,17 @@ function M.probe(row)
     end
 
     if ready and total > 0 then
-      return smooth(name, 0, total)
+      return _record(name, 0, total)
     end
 
     if rem > 0 and total > 0 then
-      return smooth(name, rem, total)
+      return _record(name, rem, total)
     end
     -- NOTE: If total=0 here, DON'T use rem as fallback.
     -- AltAbilityTimer can report global AA lockout, not this ability's recast.
     -- Let disc/spell/item sections try instead.
     if total > 0 then
-      return smooth(name, 0, total)
+      return _record(name, 0, total)
     end
   end
 
@@ -149,10 +171,10 @@ function M.probe(row)
           if shouldLog then
             dbg('[DISC] RETURNING: rem=%.3f total=%.3f', rem, total)
           end
-          return smooth(candidate, rem, total)
+          return _record(candidate, rem, total)
         end
         if total > 0 then
-          return smooth(candidate, 0, total)
+          return _record(candidate, 0, total)
         end
       end
     end
@@ -170,8 +192,8 @@ function M.probe(row)
         if shouldLog and rem > 0 then
           dbg('[GEM] %s: gem=%d rem=%.3f total=%.3f', name, gem, rem, total)
         end
-        if rem > 0 and total > 0 then return smooth(name, rem, total) end
-        if total > 0 then return smooth(name, 0, total) end
+        if rem > 0 and total > 0 then return _record(name, rem, total) end
+        if total > 0 then return _record(name, 0, total) end
       end
       break
     end
@@ -210,11 +232,11 @@ function M.probe(row)
 
       if remain > 0 then
         if total <= 0 then total = remain end
-        return smooth(name, remain, total)
+        return _record(name, remain, total)
       end
 
       if total and total > 0 then
-        return smooth(name, 0, total)
+        return _record(name, 0, total)
       end
     end
   end
@@ -222,7 +244,8 @@ function M.probe(row)
   if shouldLog then
     dbg('[MISS] %s: no section matched with active timer', name)
   end
-  return 0, 0
+  -- Record the miss too — otherwise unprobed abilities re-scan every frame.
+  return _record(name, 0, 0)
 end
 
 -- Alias for backwards compatibility

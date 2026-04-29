@@ -22,6 +22,19 @@ local _Core = nil
 local _CombatAssist = nil
 local _Chase = nil
 
+local function stopEngagement()
+    if mq.TLO.Me and mq.TLO.Me.Combat and mq.TLO.Me.Combat() then
+        mq.cmd('/attack off')
+    end
+    local stickActive = false
+    pcall(function()
+        stickActive = mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active()
+    end)
+    if stickActive then
+        mq.cmd('/squelch /stick off')
+    end
+end
+
 function M.init(opts)
     opts = opts or {}
     _Core = opts.Core
@@ -44,6 +57,8 @@ function M.setEnabled(val)
     if not M.enabled then
         if _CombatAssist and _CombatAssist.stop then
             _CombatAssist.stop()
+        else
+            stopEngagement()
         end
         if _Chase then
             _Chase.setEnabled(false, { auto = true })
@@ -151,7 +166,19 @@ function M.engageTarget(targetId, settings)
     local currentId = current and current() and current.ID() or 0
 
     if currentId ~= targetId then
+        -- Wait for the target swap to actually land before sticking/attacking.
+        -- /target id N does not take effect immediately; without the verify,
+        -- /stick attaches to whatever was previously targeted and /attack on
+        -- attacks the wrong mob.
         mq.cmdf('/target id %d', targetId)
+        mq.delay(200, function()
+            local t = mq.TLO.Target
+            return t and t() and t.ID() == targetId
+        end)
+        local t = mq.TLO.Target
+        if not (t and t() and t.ID() == targetId) then
+            return  -- target swap failed; don't stick/attack on the wrong mob
+        end
     end
 
     -- Don't stick if in soft pause (tank repositioning/taunt run)
@@ -197,6 +224,8 @@ function M.runTankBroadcastAssist(settings)
     -- Check engage conditions and engage
     if M.currentTargetId and M.shouldEngage(settings) then
         M.engageTarget(M.currentTargetId, settings)
+    else
+        stopEngagement()
     end
 
     return true

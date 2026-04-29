@@ -5,7 +5,7 @@
 ]]
 
 local mq = require('mq')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local imgui = require('ImGui')
 
 local M = {}

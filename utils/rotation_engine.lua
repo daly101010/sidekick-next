@@ -22,6 +22,32 @@ local getSpellRotation = lazy('sidekick-next.utils.spell_rotation')
 local getConditionContext = lazy('sidekick-next.utils.condition_context')
 local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
 
+-- Per-tick visibility into what each layer did and whether the combat-rotation
+-- pass was deferred. Populated by M.tick(); read by ui/rotation_debug.lua.
+M.lastTickStats = {
+    tickAt = 0,            -- os.clock() when tick ran
+    layers = {},           -- [layerName] = { abilities, executed, spellAttempts, ran }
+    spellRotationRan = false,
+    spellRotationDeferred = false,  -- true when high-priority pending blocked it
+    highPriPendingSpell = false,
+    skipReason = nil,      -- string when whole tick short-circuited
+}
+
+local function _resetTickStats()
+    M.lastTickStats.tickAt = os.clock()
+    M.lastTickStats.layers = {}
+    M.lastTickStats.spellRotationRan = false
+    M.lastTickStats.spellRotationDeferred = false
+    M.lastTickStats.highPriPendingSpell = false
+    M.lastTickStats.skipReason = nil
+end
+
+--- Snapshot of the most recent tick's per-layer activity.
+--- Returns the live table — caller should treat as read-only.
+function M.getLastTickStats()
+    return M.lastTickStats
+end
+
 local _ClassConfigs = {}
 local function getClassConfig(classShort)
     if not classShort or classShort == '' then return nil end
@@ -402,12 +428,20 @@ end
 --- Try to execute an ability through the action executor
 -- @param def table Ability definition
 -- @return boolean True if executed
+-- @return string|nil Failure reason when provided by the executor
 function M.tryExecute(def)
     local Executor = getExecutor()
     if not Executor then return false end
 
     return Executor.executeAbility(def)
 end
+
+local SPELL_DEFER_REASONS = {
+    busy = true,
+    already_casting = true,
+    casting_window_open = true,
+    channel_not_ready = true,
+}
 
 --- Categorize abilities into layers
 -- @param abilities table Array of ability definitions
@@ -494,9 +528,14 @@ end
 function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
     local Abilities = getAbilities()
     local TL = getThrottledLog()
-    if not Abilities then return 0 end
+    if not Abilities then return 0, 0 end
 
     local executed = 0
+    -- Spell-kind dispatches whose gates passed and reached tryExecute
+    -- (succeeded OR rejected by an isBusy engine). Caller uses this to
+    -- detect "this layer had real work this tick" and decide whether the
+    -- combat-rotation tick should defer.
+    local spellAttempts = 0
     local maxSteps = layer.stepsPerTick or 1
 
     -- Log layer execution start
@@ -538,14 +577,39 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
             goto continue
         end
 
+        -- 3b. Adaptive resist filter: skip spells that consistently resist on
+        -- the current target. Only applies to spell-kind abilities in combat
+        -- layers — buffs and self-only utility don't go through resist checks.
+        local isSpellKindGate = tostring(def.kind or ''):lower() == 'spell'
+        if isSpellKindGate and (layer.name == 'combat' or layer.name == 'support' or layer.name == 'aggro' or layer.name == 'burn') and (settings.AdaptiveResistSkip ~= false) then
+            local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
+            if okR and ResistLog and ResistLog.shouldSkip and def.spellName then
+                local target = mq.TLO.Target
+                local targetName = target and target() and target.CleanName and target.CleanName() or ''
+                if targetName ~= '' then
+                    local skip, reason = ResistLog.shouldSkip(def.spellName, targetName)
+                    if skip then
+                        if M.debugLogging and TL then
+                            TL.log('ability_resist_skip_' .. abilityName, 5,
+                                '  %s: SKIP (resist log: %s on %s)', abilityName, reason or '?', targetName)
+                        end
+                        goto continue
+                    end
+                end
+            end
+        end
+
         -- 4. Try to execute
         if M.debugLogging and TL then
             TL.log('ability_exec_' .. abilityName, 5, '  %s: EXECUTING (all gates passed)', abilityName)
         end
+        local isSpellKind = tostring(def.kind or ''):lower() == 'spell'
+        local previousSourceLayer = def.sourceLayer
         if def.sourceLayer ~= layer.name then
             def.sourceLayer = layer.name
         end
-        if layer.name == 'buff' and tostring(def.kind or ''):lower() == 'spell' then
+
+        if layer.name == 'buff' and isSpellKind then
             local log = getBuffLogger()
             if log then
                 log.info('rotation', 'Buff layer cast attempt: ability=%s spell=%s targetId=%d modeKey=%s settingKey=%s',
@@ -553,7 +617,14 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
                     tonumber(def.targetId) or 0, tostring(def.modeKey or ''), tostring(def.settingKey or ''))
             end
         end
-        if M.tryExecute(def) then
+        local didExecute, execReason = M.tryExecute(def)
+        if isSpellKind and (didExecute or SPELL_DEFER_REASONS[tostring(execReason or '')]) then
+            spellAttempts = spellAttempts + 1
+        end
+        if not didExecute then
+            def.sourceLayer = previousSourceLayer
+        end
+        if didExecute then
             executed = executed + 1
             if M.debugLogging and TL then
                 TL.log('ability_success_' .. abilityName, 5, '  %s: SUCCESS', abilityName)
@@ -568,7 +639,7 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
             end
         else
             if M.debugLogging and TL then
-                TL.log('ability_fail_' .. abilityName, 5, '  %s: FAILED (executor returned false)', abilityName)
+                TL.log('ability_fail_' .. abilityName, 5, '  %s: FAILED (executor returned false, reason=%s)', abilityName, tostring(execReason))
             end
             if layer.name == 'buff' and tostring(def.kind or ''):lower() == 'spell' then
                 local log = getBuffLogger()
@@ -583,7 +654,7 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
         ::continue::
     end
 
-    return executed
+    return executed, spellAttempts
 end
 
 --- Run full rotation through all layers
@@ -594,12 +665,15 @@ function M.tick(opts)
     local abilities = opts.abilities or {}
     local settings = opts.settings or {}
 
+    _resetTickStats()
+
     -- Early exit if all ability types are disabled
     if settings.UseSpells == false and settings.UseAAs == false and settings.UseDiscs == false then
         if M.debugLogging and TL then
             TL.log('tick_disabled', 30, 'Rotation SKIP: all ability types disabled (UseSpells=%s, UseAAs=%s, UseDiscs=%s)',
                 tostring(settings.UseSpells), tostring(settings.UseAAs), tostring(settings.UseDiscs))
         end
+        M.lastTickStats.skipReason = 'all_types_disabled'
         return
     end
 
@@ -655,30 +729,75 @@ function M.tick(opts)
         end
     end
 
+    -- Layer names whose pending spell-kind work should defer the combat
+    -- rotation tick. These are the "must run first" layers — if any of them
+    -- had spell-kind abilities reach tryExecute this tick (whether or not the
+    -- engine accepted), starting a fresh combat-rotation cast would just
+    -- compete for the same SpellEngine and risk priority inversion.
+    local HIGH_PRIORITY_LAYERS = {
+        emergency = true,
+        heal      = true,
+        aggro     = true,
+        defenses  = true,
+    }
+
     -- Process each layer in priority order
     local skipLayers = opts.skipLayers or {}
+    local highPriPendingSpell = false
     for _, layer in ipairs(M.LAYERS) do
+        local layerStat = {
+            abilities = #(byLayer[layer.name] or {}),
+            executed = 0,
+            spellAttempts = 0,
+            ran = false,
+            skipReason = nil,
+        }
         if skipLayers[layer.name] then
+            layerStat.skipReason = 'external'
             if M.debugLogging and TL then
                 TL.log('layer_ext_skip_' .. layer.name, 10, 'Layer %s SKIP: owned by external module', layer.name)
             end
-        elseif M.shouldLayerRun(layer, state) then
+        elseif not M.shouldLayerRun(layer, state) then
+            layerStat.skipReason = 'gate'
+        else
             local layerAbilities = byLayer[layer.name] or {}
             if #layerAbilities > 0 then
-                M.runLayer(layer, layerAbilities, settings, state, ctx, classConfig)
+                local executed, spellAttempts = M.runLayer(layer, layerAbilities, settings, state, ctx, classConfig)
+                layerStat.executed = executed or 0
+                layerStat.spellAttempts = spellAttempts or 0
+                layerStat.ran = true
+                if HIGH_PRIORITY_LAYERS[layer.name] and spellAttempts and spellAttempts > 0 then
+                    highPriPendingSpell = true
+                end
+            else
+                layerStat.skipReason = 'no_abilities'
             end
         end
+        M.lastTickStats.layers[layer.name] = layerStat
     end
 
-    -- Run spell rotation after AA/disc rotation
+    M.lastTickStats.highPriPendingSpell = highPriPendingSpell
+
+    -- Run spell rotation after AA/disc rotation. Skip when high-priority
+    -- layers had spell-kind work this tick — let them claim the SpellEngine
+    -- first on the next tick rather than letting combat rotation start a
+    -- fresh long cast that would block emergency / heal / aggro / defenses.
     local SpellRotation = getSpellRotation()
     if SpellRotation then
-        SpellRotation.tick({
-            spells = opts.spells or {},
-            settings = settings,
-            ctx = ctx,
-            classConfig = classConfig,
-        })
+        if highPriPendingSpell then
+            M.lastTickStats.spellRotationDeferred = true
+            if M.debugLogging and TL then
+                TL.log('rotation_defer_highpri', 10, 'SpellRotation deferred: high-priority layer had spell work this tick')
+            end
+        else
+            M.lastTickStats.spellRotationRan = true
+            SpellRotation.tick({
+                spells = opts.spells or {},
+                settings = settings,
+                ctx = ctx,
+                classConfig = classConfig,
+            })
+        end
     end
 end
 

@@ -16,7 +16,7 @@ local imgui = require('ImGui')
 local C = require('sidekick-next.ui.constants')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Colors = require('sidekick-next.ui.colors')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 
 local M = {}
 
@@ -183,7 +183,7 @@ function M.getButtonScale(uniqueId, isHovered, isActive)
                 or isHovered and C.ANIMATION.HOVER_SCALE
                 or 1.0
     local ez = isActive and _ezSpringFast or _ezSpringNormal
-    return iam.TweenFloat(uniqueId, imgui.GetID('scale'), target, 0.5, ez, IamPolicy.Crossfade, dt)
+    return iam.TweenFloat(imgui.GetID(uniqueId), imgui.GetID('scale'), target, 0.5, ez, IamPolicy.Crossfade, dt)
 end
 
 -- ============================================================
@@ -199,7 +199,7 @@ function M.checkCooldownCompletion(uniqueId, onCooldown)
 
     local wasOnCooldown = _lastCooldownState[uniqueId]
     if wasOnCooldown and not onCooldown then
-        iam.TriggerShake(uniqueId)
+        iam.TriggerShake(imgui.GetID(uniqueId))
     end
     _lastCooldownState[uniqueId] = onCooldown
 end
@@ -214,7 +214,7 @@ function M.getCompletionPulse(uniqueId)
         return 0
     end
     local dt = M.get_dt()
-    local ok, val = pcall(iam.Shake, uniqueId, imgui.GetID('pulse'), C.ANIMATION.SHAKE_MAGNITUDE, C.ANIMATION.SHAKE_DECAY, dt)
+    local ok, val = pcall(iam.Shake, uniqueId, C.ANIMATION.SHAKE_MAGNITUDE, 30, C.ANIMATION.SHAKE_DECAY, dt)
     if not ok then return 0 end
     val = tonumber(val) or 0
     -- Clamp to sane range — magnitude is 4, so pulse should never exceed that
@@ -476,13 +476,13 @@ function M.getHpBarShake(uniqueId, currentHp)
     if prev and prev > 0 and currentHp < prev then
         local dropPct = (prev - currentHp) / prev * 100
         if dropPct >= C.RESOURCE.DAMAGE_FLASH_THRESHOLD then
-            iam.TriggerShake(uniqueId .. '_hpshake')
+            iam.TriggerShake(imgui.GetID(uniqueId .. '_hpshake'))
         end
     end
 
     -- Return shake offset (decays naturally)
-    local offsetX = iam.Shake(uniqueId .. '_hpshake', imgui.GetID('sx'), 6, 0.2, dt)
-    local offsetY = iam.Shake(uniqueId .. '_hpshake', imgui.GetID('sy'), 3, 0.2, dt)
+    local offsetX = iam.Shake(uniqueId .. '_hpshake_x', 6, 30, 0.2, dt)
+    local offsetY = iam.Shake(uniqueId .. '_hpshake_y', 3, 30, 0.2, dt)
     return offsetX, offsetY
 end
 
@@ -503,11 +503,11 @@ function M.getToggleScale(uniqueId, isActive)
 
     -- Trigger shake when toggled on
     if prevState ~= nil and prevState ~= isActive and isActive then
-        iam.TriggerShake(uniqueId .. '_toggle')
+        iam.TriggerShake(imgui.GetID(uniqueId .. '_toggle'))
     end
 
     local ez = isActive and _ezSpringFast or _ezSpringSlow
-    return iam.TweenFloat(uniqueId, imgui.GetID('tscale'), 1.0, 0.5, ez, IamPolicy.Crossfade, dt)
+    return iam.TweenFloat(imgui.GetID(uniqueId), imgui.GetID('tscale'), 1.0, 0.5, ez, IamPolicy.Crossfade, dt)
 end
 
 function M.getToggleColor(uniqueId, isActive, onColor, offColor)
@@ -519,7 +519,7 @@ function M.getToggleColor(uniqueId, isActive, onColor, offColor)
     local dt = M.get_dt()
     local target = isActive and onColor or offColor
     local ok, col = pcall(iam.TweenColor,
-        uniqueId, imgui.GetID('tcol'),
+        imgui.GetID(uniqueId), imgui.GetID('tcol'),
         ImVec4(target[1], target[2], target[3], target[4] or 1.0),
         C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade,
         IamColorSpace.SRGB, dt
@@ -536,7 +536,7 @@ end
 function M.getTogglePop(uniqueId)
     if not featureEnabled('TogglePopEnabled') then return 0 end
     local dt = M.get_dt()
-    return iam.Shake(uniqueId .. '_toggle', imgui.GetID('tpop'), C.ANIMATION.SHAKE_MAGNITUDE * 0.5, C.ANIMATION.SHAKE_DECAY, dt)
+    return iam.Shake(uniqueId .. '_toggle', C.ANIMATION.SHAKE_MAGNITUDE * 0.5, 30, C.ANIMATION.SHAKE_DECAY, dt)
 end
 
 -- Theme-aware toggle color helper
@@ -568,7 +568,7 @@ function M.getCooldownColor(uniqueId, pct)
 
     local dt = M.get_dt()
     local ok, col = pcall(iam.TweenColor,
-        uniqueId, imgui.GetID('cdcol'),
+        imgui.GetID(uniqueId), imgui.GetID('cdcol'),
         ImVec4(targetR, targetG, targetB, 1.0),
         C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade,
         IamColorSpace.SRGB, dt
@@ -615,7 +615,7 @@ function M.drawCooldownOverlay(dl, minX, minY, maxX, maxY, rem, total, uniqueId,
     local dt = M.get_dt()
     local fadeTarget = onCooldown and 1.0 or 0.0
     local ok, fadeMul = pcall(iam.TweenFloat,
-        uniqueId, imgui.GetID('cdFade'),
+        imgui.GetID(uniqueId), imgui.GetID('cdFade'),
         fadeTarget,
         C.ANIMATION.TWEEN_FAST, _ezOutCubic, IamPolicy.Crossfade, dt)
     if not ok then fadeMul = fadeTarget end
@@ -712,6 +712,7 @@ local function ensureGridEntryClip()
         :KeyFloat(_SCALE_CH, C.ANIMATION.STAGGER_DURATION, 1.0, IamEaseType.OutBack)
         :KeyFloat(_OFFSET_CH, 0.0, 15.0, IamEaseType.Linear)
         :KeyFloat(_OFFSET_CH, C.ANIMATION.STAGGER_DURATION, 0.0, IamEaseType.OutCubic)
+        :SetStagger(64, C.ANIMATION.STAGGER_DELAY, 0.0)
         :End()
 end
 
@@ -726,7 +727,7 @@ end
 function M.getStaggerAlpha(gridKey, idx, total, delay)
     if not featureEnabled('StaggerAnimationEnabled') then return 1.0 end
     delay = delay or C.ANIMATION.STAGGER_DELAY
-    local staggerOffset = iam.StaggerDelay(idx, total, delay)
+    local staggerOffset = (idx - 1) * delay
     local elapsed = M.getGridEntryElapsed(gridKey)
     if elapsed > C.ANIMATION.STAGGER_DURATION + (total * delay) then return 1.0 end
     local t = math.max(0, math.min(1, (elapsed - staggerOffset) / C.ANIMATION.STAGGER_DURATION))
@@ -783,7 +784,7 @@ function M.getStaggeredEntryTransform(gridKey, idx, total, opts)
 
     ensureGridEntryClip()
     local instId = imgui.GetID(gridKey .. '_' .. idx)
-    local ok, inst = pcall(iam.PlayStagger, _gridEntryClipId, instId, idx, total, C.ANIMATION.STAGGER_DELAY)
+    local ok, inst = pcall(iam.PlayStagger, _gridEntryClipId, instId, idx)
 
     if not ok or not inst or (inst.Valid and not inst:Valid()) then
         return 1.0, 0, 0, 1.0
@@ -840,7 +841,7 @@ function M.drawWindowFocusGlow(dl, x, y, w, h, themeName, isFocused)
         local noiseOpts = IamNoiseOpts()
         noiseOpts.type = IamNoiseType.Perlin
         noiseOpts.octaves = 2
-        drift = iam.SmoothNoiseFloat('focusGlow', 0.3, 0.08, noiseOpts, dt)
+        drift = iam.NoiseChannelFloat('focusGlow', 0.3, 0.08, noiseOpts, dt)
     end)
 
     local intensity = 0.5 + basePulse + drift

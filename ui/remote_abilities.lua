@@ -1,6 +1,6 @@
 local mq = require('mq')
 local imgui = require('ImGui')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 local AnimHelpers = require('sidekick-next.ui.animation_helpers')
 local Core = require('sidekick-next.utils.core')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')

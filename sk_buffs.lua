@@ -551,7 +551,7 @@ local function canBuffNow()
 
     -- Check if already casting
     local casting = me.Casting() or ''
-    if casting ~= '' then return false, 'casting' end
+    if casting ~= '' and casting ~= 'NULL' then return false, 'casting' end
 
     -- Check if hovering (dead)
     if me.Hovering and me.Hovering() then return false, 'dead' end
@@ -611,6 +611,40 @@ local function findBuffNeed()
     local now = os.clock()
     local me = mq.TLO.Me
     local myId = me and me.ID and me.ID() or 0
+
+    -- Pending peer requests jump ahead of normal scan order. Pick the highest
+    -- priority request whose category we can actually cast.
+    local okR, BuffReqs = pcall(require, 'sidekick-next.utils.buff_requests')
+    if okR and BuffReqs and BuffReqs.peekHighestPriority then
+        local req = BuffReqs.peekHighestPriority()
+        if req and req.category and _buffDefinitions[req.category] then
+            local buffDef = _buffDefinitions[req.category]
+            local spellName = buffDef.spellName
+            if spellName and spellName ~= '' then
+                local isSelfOnly = isSelfOnlySpell(spellName)
+                local isGroup = isGroupSpell(spellName)
+                local castableTarget = req.targetId
+                -- Self-only spells can only satisfy a request from us.
+                if isSelfOnly and castableTarget ~= myId then
+                    -- skip self-only request from someone else
+                else
+                    if spellWouldStack(spellName) and hasEnoughMana(spellName) then
+                        debugLog('findBuffNeed: REQUEST priority — %s for %s (category=%s urgency=%s)',
+                            spellName, tostring(req.from), req.category, req.urgency or 'normal')
+                        return {
+                            category = req.category,
+                            spellName = spellName,
+                            targetId = castableTarget,
+                            targetName = req.from,
+                            isSelfOnly = isSelfOnly,
+                            isGroup = isGroup,
+                            fromRequest = true,
+                        }
+                    end
+                end
+            end
+        end
+    end
 
     local sortedBuffs = getSortedBuffDefinitions()
 
@@ -953,10 +987,14 @@ module.executeAction = function(self)
                 debugLog('executeAction: Cast finished, completing')
                 lib.log('info', self.name, 'Buff cast completed: %s on %d', spellName, targetId)
 
-                -- Track the buff
+                -- Track the buff with the caster-specific duration (accounts
+                -- for our level + focus). Passing nil here used to fall through
+                -- to trackLocalBuff's 1200s default, which suppressed rebuff
+                -- for up to 20 min regardless of the real spell duration.
                 if Buff and Buff.trackLocalBuff then
                     local spellId = getSpellId(spellName)
-                    Buff.trackLocalBuff(targetId, category, spellId, spellName, nil)
+                    local duration = Buff.getMySpellDuration and Buff.getMySpellDuration(spellName) or nil
+                    Buff.trackLocalBuff(targetId, category, spellId, spellName, duration)
                 end
 
                 -- Track group cast cooldown

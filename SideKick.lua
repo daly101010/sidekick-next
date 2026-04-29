@@ -93,7 +93,7 @@ local getBar = lazy('sidekick-next.ui.bar_animated')
 local getSpecialBar = lazy('sidekick-next.ui.special_bar_animated')
 local getDiscBar = lazy('sidekick-next.ui.disc_bar_animated')
 local getItemBar = lazy('sidekick-next.ui.item_bar_animated')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 
 -- Cached spring ease descriptors (iam.EaseSpring may be nil in some builds)
 local _ezSpringHover = (function()
@@ -130,6 +130,7 @@ local getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
 local getRotationEngine = lazy('sidekick-next.utils.rotation_engine')
 local getCC = lazy.init('sidekick-next.automation.cc')
 local getBuff = lazy.init('sidekick-next.automation.buff')
+local getTravelBroker = lazy.init('sidekick-next.automation.travel_broker')
 local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
@@ -138,13 +139,13 @@ local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
 local getSpellSetEditor = lazy.init('sidekick-next.ui.spell_set_editor')
 
 local getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
-local getOocBuffExecutor = lazy('sidekick-next.utils.ooc_buff_executor')
 local getCombatSpellExecutor = lazy('sidekick-next.utils.combat_spell_executor')
 local getThrottledLog = lazy('sidekick-next.utils.throttled_log')
 local getHealingMonitor = lazy('sidekick-next.healing.ui.monitor')
 local getHealingSettingsTab = lazy('sidekick-next.ui.settings.tab_healing')
 local getItemsTab = lazy('sidekick-next.ui.settings.tab_items')
 local getBuffsTab = lazy('sidekick-next.ui.settings.tab_buffs')
+local getTravelBrokerUI = lazy.init('sidekick-next.ui.travel_broker')
 
 -- Debug logging flags for main automation loop
 local debugAutomationLogging = false
@@ -429,7 +430,7 @@ local function animatedButton(label, btnScale)
         local springId = 'btn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(imgui.GetID(springId), imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
@@ -506,7 +507,7 @@ local function animatedSmallButton(label, btnScale)
         local springId = 'sbtn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.12 or 1.0
-        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(imgui.GetID(springId), imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment (smaller base padding for SmallButton)
@@ -589,7 +590,7 @@ local function toggleButton(label, enabled, onClick, btnScale)
         -- Check if this button will be hovered (use last frame's state)
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(imgui.GetID(springId), imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
@@ -1140,7 +1141,7 @@ local function draw()
     local manualOptions = Core.Settings.SideKickOptionsManual ~= false
     local heightFactor = openTarget
     if not manualOptions and iam and iam.TweenFloat then
-        heightFactor = iam.TweenFloat('sk_settings_height', imgui.GetID('hfactor'), openTarget, 0.5, _ezSpringSettings, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        heightFactor = iam.TweenFloat(imgui.GetID('sk_settings_height'), imgui.GetID('hfactor'), openTarget, 0.5, _ezSpringSettings, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     if (manualOptions and State.settingsOpen) or (not manualOptions and heightFactor > 0.01) then
@@ -1335,8 +1336,11 @@ local function draw()
                                 if imgui.BeginTabItem('Settings') then
                                     local ok, err = pcall(function()
                                         HealSettingsTab.draw(Core.Settings, Themes.getThemeNames(), function(key, val)
-                                            Core.Settings[key] = val
-                                            Core.save()
+                                            -- Core.set updates Core.Settings AND Core.Ini and
+                                            -- marks dirty; main-loop Core.flush() persists it.
+                                            -- Plain Core.Settings[key]=val + Core.save() did NOT
+                                            -- persist (Core.save writes Ini, which was unchanged).
+                                            Core.set(key, val)
                                         end)
                                     end)
                                     if not ok then
@@ -1373,8 +1377,7 @@ local function draw()
                     if ItemsTab then
                         local ok, err = pcall(function()
                             ItemsTab.draw(Core.Settings, Themes.getThemeNames(), function(key, val)
-                                Core.Settings[key] = val
-                                Core.save()
+                                Core.set(key, val)
                             end)
                         end)
                         if not ok then
@@ -1392,8 +1395,7 @@ local function draw()
                     if BuffsTab then
                         local ok, err = pcall(function()
                             BuffsTab.draw(Core.Settings, Themes.getThemeNames(), function(key, val)
-                                Core.Settings[key] = val
-                                Core.save()
+                                Core.set(key, val)
                             end)
                         end)
                         if not ok then
@@ -1509,6 +1511,10 @@ local function tickAutomation()
     PerfMonitor.begin('Buff')
     do local M = getBuff() if M then M.tick() end end
     PerfMonitor.finish('Buff')
+
+    PerfMonitor.begin('Travel')
+    do local M = getTravelBroker() if M and M.tick then M.tick(Core.Settings) end end
+    PerfMonitor.finish('Travel')
 
     -- Update spell engine state machine (non-blocking cast monitoring)
     PerfMonitor.begin('SpellEngine')
@@ -1713,8 +1719,11 @@ local function drawAutostartPrompt()
         imgui.Separator()
         imgui.Spacing()
 
-        local server = mq.TLO.EverQuest.Server():gsub(" ", "_") or 'Unknown'
-        local charName = mq.TLO.Me.CleanName() or 'Unknown'
+        local rawServer = mq.TLO.EverQuest.Server()
+        local server = (rawServer and rawServer ~= 'NULL' and rawServer ~= '')
+            and rawServer:gsub(" ", "_") or 'Unknown'
+        local rawChar = mq.TLO.Me.CleanName()
+        local charName = (rawChar and rawChar ~= 'NULL' and rawChar ~= '') and rawChar or 'Unknown'
         imgui.TextDisabled(string.format('Config: %s_%s.cfg', server, charName))
         imgui.Spacing()
 
@@ -1821,6 +1830,12 @@ local function main()
     Assist.init({ Core = Core, CombatAssist = CombatAssist, Chase = Chase })
     Tank.init(Core.Settings)
     Cures.init()
+
+    -- Auto-accept rez offers (every character, not just rez classes).
+    do
+        local okR, RezAccept = pcall(require, 'sidekick-next.utils.rez_accept')
+        if okR and RezAccept and RezAccept.init then pcall(RezAccept.init) end
+    end
     -- All other modules init on first access via lazy.init()
 
     -- Launch Group script on startup if enabled (default true)
@@ -1861,6 +1876,8 @@ local function main()
         elseif a1 == 'remoteconfig' then
             -- New command: open remote abilities settings
             local M = getRemoteAbilities() if M then M.toggleSettings() end
+        elseif a1 == 'travel' or a1 == 'ports' then
+            local M = getTravelBrokerUI() if M then M.toggle() end
         elseif a1 == 'debugsettings' then
             -- Toggle settings persistence debugging (/SideKick debugsettings on|off|toggle)
             local a2 = tostring(args[2] or ''):lower()
@@ -1941,12 +1958,6 @@ local function main()
             else
                 log.error('CombatExec is nil')
             end
-        elseif a1 == 'debugooc' then
-            -- Debug OOC buff executor
-            local OocExec = getOocBuffExecutor()
-            if OocExec and OocExec.debugPrint then
-                OocExec.debugPrint()
-            end
         elseif a1 == 'settings' or a1 == 'options' or a1 == 'config' then
             -- Toggle settings panel (also ensures main window is open)
             State.open = true
@@ -1976,6 +1987,9 @@ local function main()
     end)
     _bindCmd('/skactors', function()
         local M = getActorsDebug() if M then M.toggle() end
+    end)
+    _bindCmd('/sktravel', function()
+        local M = getTravelBrokerUI() if M then M.toggle() end
     end)
     _bindCmd('/skspells', function(cmd)
         enqueue(function()
@@ -2017,6 +2031,43 @@ local function main()
         PerfMonitor.toggle()
     end)
 
+    -- Broadcast a buff need request: peers with the matching category will
+    -- jump it to the front of their next buff scan.
+    --   /skreq Symbol            normal urgency (30s TTL)
+    --   /skreq Aego high         high urgency (60s TTL, sorts above normals)
+    _bindCmd('/skreq', function(...)
+        local args = { ... }
+        local category = tostring(args[1] or '')
+        if category == '' then
+            mq.cmd('/echo \ay[SideKick]\ax Usage: /skreq <BuffCategory> [high]')
+            return
+        end
+        local urgency = (tostring(args[2] or '') == 'high') and 'high' or 'normal'
+        local ok, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
+        if ok and Reqs and Reqs.broadcastNeed then
+            Reqs.broadcastNeed(category, { urgency = urgency })
+            mq.cmdf('/echo \ag[SideKick]\ax Requested buff "%s" (urgency=%s)', category, urgency)
+        end
+    end)
+
+    -- Toggle the orchestration dashboard (real-time module status tree).
+    --   /skdash                -- toggle
+    --   /skdash on|off
+    -- /skhealpreview is preserved as an alias for muscle memory.
+    local function _toggleDash(arg)
+        local ok, Dashboard = pcall(require, 'sidekick-next.ui.dashboard')
+        if not ok or not Dashboard then return end
+        Dashboard.register_window()
+        local a = tostring(arg or ''):lower()
+        if a == 'on' then Dashboard.setVisible(true)
+        elseif a == 'off' then Dashboard.setVisible(false)
+        else Dashboard.toggle() end
+        mq.cmdf('/echo \ag[SideKick]\ax Dashboard: %s',
+            Dashboard.isVisible() and 'visible' or 'hidden')
+    end
+    _bindCmd('/skdash', _toggleDash)
+    _bindCmd('/skhealpreview', _toggleDash)
+
     _bindCmd('/skloglevel', function(level)
         level = tonumber(level)
         if level and level >= 1 and level <= 5 then
@@ -2050,6 +2101,44 @@ local function main()
             log.info('Usage: /sklogfile on|off')
         end
     end)
+
+    -- Register the orchestration dashboard window so it can render whenever
+    -- its persisted visibility flag is on. The render itself is gated by the
+    -- flag, so registering it unconditionally has no cost when hidden.
+    do
+        local ok, Dashboard = pcall(require, 'sidekick-next.ui.dashboard')
+        if ok and Dashboard and Dashboard.register_window then
+            pcall(Dashboard.register_window)
+        end
+    end
+
+    -- Resist log: load persisted history and subscribe to spell-cast results
+    -- so the rotation engine can adaptively skip spells that consistently
+    -- resist on a given mob.
+    do
+        local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
+        if okR and ResistLog then
+            pcall(ResistLog.load)
+            local okE, SpellEvents = pcall(require, 'sidekick-next.utils.spell_events')
+            if okE and SpellEvents and SpellEvents.addResultListener and SpellEvents.RESULT then
+                local RESISTED = SpellEvents.RESULT.RESISTED
+                SpellEvents.addResultListener(function(result, extra)
+                    if result == RESISTED and extra then
+                        -- Spell name comes from the event; target may be omitted
+                        -- by some message variants — fall back to current Target.
+                        local spell = extra.spell
+                        local target = extra.target
+                        if (not target or target == '') and mq.TLO.Target and mq.TLO.Target() then
+                            target = mq.TLO.Target.CleanName and mq.TLO.Target.CleanName() or nil
+                        end
+                        if spell and target then
+                            ResistLog.recordResist(spell, target)
+                        end
+                    end
+                end)
+            end
+        end
+    end
 
     mq.imgui.init('SideKick', function()
         -- Apply font scale for high-resolution monitors
@@ -2117,6 +2206,7 @@ local function main()
 
         -- Draw new enhancement UIs (lazy-loaded)
         do local M = getRemoteAbilities() if M then M.draw() end end
+        do local M = getTravelBrokerUI() if M then M.draw() end end
         do local M = getAggroWarning() if M then M.draw() end end
         do local M = getActorsDebug() if M then M.render() end end
         do local M = getCoordinatorDebug() if M then M.render() end end
@@ -2161,12 +2251,6 @@ local function main()
         if CombatSpellExecutor and CombatSpellExecutor.process then
             CombatSpellExecutor.process()
         end
-
-        -- Process OOC buffs - DISABLED: Now handled by sk_buffs.lua coordinator module
-        -- local OocBuffExecutor = getOocBuffExecutor()
-        -- if OocBuffExecutor and OocBuffExecutor.process then
-        --     OocBuffExecutor.process()
-        -- end
 
         -- Check for zone change (immune database)
         do local M = getImmuneDB() if M then M.loadZone() end end
@@ -2213,6 +2297,19 @@ local function main()
         -- Flush pending settings writes (debounced, max once/sec)
         Core.flush()
 
+        -- Resist log throttled save (60s interval) so accumulated learning
+        -- survives a crash or zone-out.
+        do
+            local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
+            if okR and ResistLog and ResistLog.tick then ResistLog.tick() end
+        end
+
+        -- Rez auto-accept tick (drains the rez chat event + 1Hz dialog poll).
+        do
+            local okA, RezAccept = pcall(require, 'sidekick-next.utils.rez_accept')
+            if okA and RezAccept and RezAccept.tick then RezAccept.tick() end
+        end
+
         mq.doevents()
         mq.delay(1)
     end
@@ -2224,6 +2321,11 @@ local function main()
 
     -- Shutdown: save immune database
     do local M = getImmuneDB() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: flush resist log so the last fight's learning isn't lost
+    do local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
+       if okR and ResistLog and ResistLog.save then pcall(ResistLog.save) end
+    end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

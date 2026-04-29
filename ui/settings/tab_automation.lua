@@ -11,7 +11,7 @@ local M = {}
 
 function M.draw(settings, themeNames, onChange)
     local changed
-    local themeName = settings.Theme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
 
     -- ========== COMBAT MODE SECTION ==========
     Components.SettingGroup.section('Combat Mode', themeName)

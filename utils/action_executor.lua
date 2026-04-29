@@ -120,7 +120,7 @@ function M.executeDisc(discName)
     if not me or not me() then return false end
     if not me.CombatAbilityReady(discName)() then return false end
 
-    mq.cmdf('/disc %s', discName)
+    mq.cmdf('/disc "%s"', discName)
     M.markChannelUsed('aa_disc')
     return true
 end
@@ -153,14 +153,14 @@ end
 -- @return boolean True if cast initiated
 function M.executeSpell(spellName, targetId, opts)
     if not spellName or spellName == '' then return false end
-    if not M.isChannelReady('spell') then return false end
+    if not M.isChannelReady('spell') then return false, 'channel_not_ready' end
 
     -- Delegate to spell engine for full state machine handling
     local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
-    if not ok or not SpellEngine then return false end
+    if not ok or not SpellEngine then return false, 'no_spell_engine' end
 
     -- Check if spell engine is already casting
-    if SpellEngine.isBusy() then return false end
+    if SpellEngine.isBusy() then return false, 'busy' end
 
     local buffLog = isBuffSpell(opts) and getBuffLogger() or nil
     if buffLog then
@@ -177,7 +177,7 @@ function M.executeSpell(spellName, targetId, opts)
                 tostring(spellName), tonumber(targetId) or 0, tostring(reason))
         end
     end
-    return success == true
+    return success == true, reason
 end
 
 --- Check if spell engine is busy
@@ -239,7 +239,7 @@ function M.executeMeleeAbility(abilityName)
     if not me or not me() then return false end
     if not me.AbilityReady(abilityName)() then return false end
 
-    mq.cmdf('/doability %s', abilityName)
+    mq.cmdf('/doability "%s"', abilityName)
     M.markChannelUsed('melee')
     return true
 end

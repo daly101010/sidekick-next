@@ -65,59 +65,19 @@ local function clearGem(slot)
     mq.delay(CLEAR_DELAY_MS)
 end
 
---- Wait until a gem slot is empty or timeout
----@param slot number The gem slot to check
----@param timeout number Timeout in milliseconds
----@return boolean True if gem is now empty, false if timed out
-local function waitGemClear(slot, timeout)
+-- Gem state checks (no waiting). The state machine driver polls these once
+-- per tick; `mq.delay`-style wait loops have been removed because they froze
+-- the entire main loop for up to ~16s per gem (~186s across a full swap).
+local function isGemEmpty(slot)
     if not slot or slot < 1 then return false end
-    timeout = timeout or 5000
-
-    local elapsed = 0
-    while elapsed < timeout do
-        local gem = mq.TLO.Me.Gem(slot)
-        if not gem or not gem() or not gem.ID() then
-            return true
-        end
-
-        mq.delay(WAIT_POLL_MS)
-        elapsed = elapsed + WAIT_POLL_MS
-
-        -- Check for combat interrupt
-        if inCombat() then
-            return false
-        end
-    end
-
-    return false
+    local gem = mq.TLO.Me.Gem(slot)
+    return not (gem and gem() and gem.ID())
 end
 
---- Wait until a spell is memorized in a gem slot or timeout
----@param slot number The gem slot to check
----@param spellId number The expected spell ID
----@param timeout number Timeout in milliseconds
----@return boolean True if spell is memorized, false if timed out
-local function waitGemMemorize(slot, spellId, timeout)
+local function isGemMemorized(slot, spellId)
     if not slot or slot < 1 or not spellId then return false end
-    timeout = timeout or MEMORIZE_TIMEOUT_MS
-
-    local elapsed = 0
-    while elapsed < timeout do
-        local gem = mq.TLO.Me.Gem(slot)
-        if gem and gem() and gem.ID() == spellId then
-            return true
-        end
-
-        mq.delay(WAIT_POLL_MS)
-        elapsed = elapsed + WAIT_POLL_MS
-
-        -- Check for combat interrupt
-        if inCombat() then
-            return false
-        end
-    end
-
-    return false
+    local gem = mq.TLO.Me.Gem(slot)
+    return gem and gem() and gem.ID() == spellId or false
 end
 
 --- Get the spell name for a spell ID
@@ -162,14 +122,68 @@ function M.queueApply(setName, saveFirst)
     print(string.format('\ay[SpellSetMemorize]\ax Queued "%s" for memorization', setName or ''))
 end
 
---- Apply a spell set (memorize spells)
---- WARNING: This uses mq.delay and cannot be called from ImGui callbacks!
---- Use queueApply() instead from UI code.
+--------------------------------------------------------------------------------
+-- State Machine for Memorization (Non-Blocking)
+--
+-- Replaces the previous synchronous `M.apply` that ran inline mq.delay loops
+-- on every gem (up to ~16s per gem × ~12 gems = ~186s of frozen main loop).
+-- The state machine advances one step per processPending() tick — same per-
+-- gem timeouts as before, but other automation (healing, mez, defensives)
+-- continues running between steps.
+--
+-- Phases (held in M._memJob.phase):
+--   start       — initial setup, immediately transitions to next_slot
+--   next_slot   — pick the next slot, decide what to do (clear / memspell / skip)
+--   wait_clear  — waiting for a /notify rightmouseup to empty the gem
+--   wait_mem    — waiting for /memspell to land the requested spell
+--   reserved_clear — clear the reserved (last) gem if OOC buffs exist
+--   reserved_wait  — waiting for the reserved-gem clear to complete
+--   done        — finalize (set active, broadcast, clear state)
+--------------------------------------------------------------------------------
+
+M._memJob = nil  -- nil when idle; otherwise see schema below
+
+local function _nowMs()
+    return (mq.gettime and mq.gettime()) or (os.clock() * 1000)
+end
+
+local function _abortMemJob(reason, requeue)
+    if M._memJob and requeue then
+        M.pendingSet = M._memJob.setName
+    end
+    if M._memJob then
+        print(string.format('\ay[SpellSetMemorize]\ax %s "%s" — %s',
+            requeue and 'Interrupted, requeuing' or 'Aborted',
+            tostring(M._memJob.setName or ''),
+            tostring(reason or '')))
+    end
+    M._memJob = nil
+    M.isMemorizing = false
+end
+
+local function _finishMemJob()
+    local job = M._memJob
+    if not job then return end
+
+    local Persistence = getPersistence()
+    if Persistence and Persistence.setActiveSet then
+        Persistence.setActiveSet(job.setName)
+    end
+
+    print(string.format('\ag[SpellSetMemorize]\ax Spell set "%s" applied successfully', job.setName))
+    M._memJob = nil
+    M.isMemorizing = false
+end
+
+--- Apply a spell set (memorize spells) via a non-blocking state machine.
+--- Safe to call from any context — does not yield. The actual memorize
+--- progresses one step per processPending() tick. The function returns
+--- true if a job was successfully queued/started, false if validation failed.
 ---@param setName string The name of the spell set to apply
----@return boolean True if memorization completed, false if failed/queued
+---@return boolean True if a memorize job is in progress, false if rejected
 function M.apply(setName)
     -- Check if already memorizing
-    if M.isMemorizing then
+    if M.isMemorizing or M._memJob then
         print(string.format('\ay[SpellSetMemorize]\ax Already memorizing, queuing "%s"', setName or ''))
         M.pendingSet = setName
         return false
@@ -182,7 +196,6 @@ function M.apply(setName)
         return false
     end
 
-    -- Get the spell set
     local Persistence = getPersistence()
     if not Persistence then
         print('\ar[SpellSetMemorize]\ax Failed to load persistence module')
@@ -195,103 +208,174 @@ function M.apply(setName)
         return false
     end
 
-    -- Get spell set data module for gem count calculation
     local SpellSetData = getSpellSetData()
     if not SpellSetData then
         print('\ar[SpellSetMemorize]\ax Failed to load spellset_data module')
         return false
     end
 
-    -- Start memorization
-    M.isMemorizing = true
-    M.pendingSet = nil
-
-    print(string.format('\ag[SpellSetMemorize]\ax Applying spell set "%s"', setName))
-
-    -- Calculate rotation gems (reserve last gem if OOC buffs exist)
     local hasOocBuffs = SpellSetData.hasOocBuffs(spellSet)
     local rotationGems = SpellSetData.getRotationGemCount(hasOocBuffs)
     local totalGems = SpellSetData.getTotalGemCount()
 
-    -- Process each rotation gem slot
-    for slot = 1, rotationGems do
-        -- Check for combat interrupt
-        if inCombat() then
-            print('\ay[SpellSetMemorize]\ax Interrupted by combat')
-            M.isMemorizing = false
-            M.pendingSet = setName  -- Queue for retry
-            return false
+    M.isMemorizing = true
+    M.pendingSet = nil
+    M._memJob = {
+        setName = setName,
+        spellSet = spellSet,
+        rotationGems = rotationGems,
+        totalGems = totalGems,
+        hasOocBuffs = hasOocBuffs,
+        phase = 'start',
+        slot = 0,                -- incremented by next_slot
+        targetSpellId = 0,
+        deadlineMs = 0,
+        clearAttempted = false,
+    }
+
+    print(string.format('\ag[SpellSetMemorize]\ax Applying spell set "%s"', setName))
+    return true
+end
+
+-- Advance the state machine by one step. Called from processPending each
+-- main-loop tick. Each step does at most one TLO read pass + one issued
+-- command — the heavy lifting is yielding back to the main loop between
+-- ticks rather than blocking inside mq.delay loops.
+local function _stepMemJob()
+    local job = M._memJob
+    if not job then return end
+
+    -- Combat interrupt check at every step.
+    if inCombat() then
+        _abortMemJob('combat detected', true)
+        return
+    end
+
+    local now = _nowMs()
+
+    if job.phase == 'start' then
+        job.phase = 'next_slot'
+        return
+    end
+
+    if job.phase == 'next_slot' then
+        job.slot = job.slot + 1
+        job.clearAttempted = false
+
+        if job.slot > job.rotationGems then
+            -- Done with rotation gems. Handle reserved gem if needed.
+            if job.hasOocBuffs and job.totalGems and job.totalGems > 0 then
+                job.phase = 'reserved_clear'
+            else
+                job.phase = 'done'
+            end
+            return
         end
 
-        local gemConfig = spellSet.gems[slot]
-        local currentSpellId = getCurrentGemSpellId(slot)
+        local gemConfig = job.spellSet.gems[job.slot]
+        local currentSpellId = getCurrentGemSpellId(job.slot)
 
         if gemConfig and gemConfig.spellId then
-            -- Config exists for this slot
-            if currentSpellId ~= gemConfig.spellId then
-                -- Need to change the spell in this slot
-                local spellName = getSpellName(gemConfig.spellId)
-                if spellName then
-                    -- Clear the gem first if it has a spell
-                    if currentSpellId then
-                        clearGem(slot)
-                        if not waitGemClear(slot, 3000) then
-                            print(string.format('\ay[SpellSetMemorize]\ax Failed to clear gem %d', slot))
-                            -- Continue anyway, memspell might work
-                        end
-                    end
-
-                    -- Memorize the new spell
-                    mq.cmdf('/memspell %d "%s"', slot, spellName)
-
-                    -- Wait for memorization
-                    if not waitGemMemorize(slot, gemConfig.spellId, MEMORIZE_TIMEOUT_MS) then
-                        if inCombat() then
-                            print('\ay[SpellSetMemorize]\ax Interrupted by combat during memorization')
-                            M.isMemorizing = false
-                            M.pendingSet = setName
-                            return false
-                        else
-                            print(string.format('\ay[SpellSetMemorize]\ax Timeout memorizing "%s" in gem %d', spellName, slot))
-                        end
-                    end
-                else
-                    print(string.format('\ay[SpellSetMemorize]\ax Spell ID %d not found in spellbook', gemConfig.spellId))
-                end
+            if currentSpellId == gemConfig.spellId then
+                -- Already correct, advance.
+                return
             end
-            -- else: spell already memorized, no action needed
-        elseif currentSpellId then
-            -- No config for this slot, but has a spell - clear it
-            clearGem(slot)
-            waitGemClear(slot, 3000)
+            -- Need to change. Clear (if needed) then memspell.
+            local spellName = getSpellName(gemConfig.spellId)
+            if not spellName then
+                print(string.format('\ay[SpellSetMemorize]\ax Spell ID %d not found in spellbook', gemConfig.spellId))
+                return  -- next_slot stays the phase, slot advances next call
+            end
+            job.targetSpellId = gemConfig.spellId
+            job.targetSpellName = spellName
+            if currentSpellId then
+                clearGem(job.slot)
+                job.deadlineMs = now + 3000
+                job.phase = 'wait_clear'
+            else
+                mq.cmdf('/memspell %d "%s"', job.slot, spellName)
+                job.deadlineMs = now + MEMORIZE_TIMEOUT_MS
+                job.phase = 'wait_mem'
+            end
+            return
         end
-        -- else: no config and no spell, leave empty
-    end
 
-    -- Clear the reserved gem if OOC buffs exist
-    if hasOocBuffs and totalGems > 0 then
-        local reservedSlot = totalGems
-        local currentSpellId = getCurrentGemSpellId(reservedSlot)
         if currentSpellId then
-            -- Check for combat interrupt
-            if inCombat() then
-                print('\ay[SpellSetMemorize]\ax Interrupted by combat')
-                M.isMemorizing = false
-                M.pendingSet = setName
-                return false
-            end
-
-            clearGem(reservedSlot)
-            waitGemClear(reservedSlot, 3000)
+            -- No config but slot has a spell — clear it, no follow-up memspell.
+            clearGem(job.slot)
+            job.deadlineMs = now + 3000
+            job.targetSpellId = 0  -- signal: no memspell after clear
+            job.phase = 'wait_clear'
+            return
         end
+
+        -- No config, no spell — leave empty, advance.
+        return
     end
 
-    -- Set the active set in persistence
-    Persistence.setActiveSet(setName)
+    if job.phase == 'wait_clear' then
+        if isGemEmpty(job.slot) then
+            if job.targetSpellId and job.targetSpellId > 0 then
+                mq.cmdf('/memspell %d "%s"', job.slot, job.targetSpellName)
+                job.deadlineMs = now + MEMORIZE_TIMEOUT_MS
+                job.phase = 'wait_mem'
+            else
+                job.phase = 'next_slot'
+            end
+            return
+        end
+        if now >= job.deadlineMs then
+            print(string.format('\ay[SpellSetMemorize]\ax Failed to clear gem %d (continuing)', job.slot))
+            -- Try memspell anyway if we have a target — otherwise advance.
+            if job.targetSpellId and job.targetSpellId > 0 then
+                mq.cmdf('/memspell %d "%s"', job.slot, job.targetSpellName)
+                job.deadlineMs = now + MEMORIZE_TIMEOUT_MS
+                job.phase = 'wait_mem'
+            else
+                job.phase = 'next_slot'
+            end
+        end
+        return
+    end
 
-    M.isMemorizing = false
-    print(string.format('\ag[SpellSetMemorize]\ax Spell set "%s" applied successfully', setName))
-    return true
+    if job.phase == 'wait_mem' then
+        if isGemMemorized(job.slot, job.targetSpellId) then
+            job.phase = 'next_slot'
+            return
+        end
+        if now >= job.deadlineMs then
+            print(string.format('\ay[SpellSetMemorize]\ax Timeout memorizing "%s" in gem %d',
+                tostring(job.targetSpellName or '?'), job.slot))
+            job.phase = 'next_slot'
+        end
+        return
+    end
+
+    if job.phase == 'reserved_clear' then
+        local reservedSlot = job.totalGems
+        local currentSpellId = getCurrentGemSpellId(reservedSlot)
+        if not currentSpellId then
+            job.phase = 'done'
+            return
+        end
+        clearGem(reservedSlot)
+        job.deadlineMs = now + 3000
+        job.slot = reservedSlot
+        job.phase = 'reserved_wait'
+        return
+    end
+
+    if job.phase == 'reserved_wait' then
+        if isGemEmpty(job.slot) or now >= job.deadlineMs then
+            job.phase = 'done'
+        end
+        return
+    end
+
+    if job.phase == 'done' then
+        _finishMemJob()
+        return
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -339,10 +423,16 @@ local function checkDirtyGems()
     end
 end
 
---- Process pending spell set if out of combat
---- Called from main loop
+--- Process pending spell set / advance active job. Called from main loop.
+--- One state-machine step per tick — never blocks.
 function M.processPending()
-    -- If nothing pending, run the periodic dirty-gem check
+    -- If a job is already running, advance it one step and return.
+    if M._memJob then
+        _stepMemJob()
+        return
+    end
+
+    -- No active job. Run the periodic dirty-gem check if not memorizing.
     if not M.pendingSet then
         if not M.isMemorizing then
             checkDirtyGems()
@@ -368,6 +458,7 @@ function M.processPending()
     end
 
     M.apply(setName)
+    -- M.apply just sets up _memJob; the next tick will start advancing it.
 end
 
 --- Cancel the pending spell set
@@ -378,10 +469,10 @@ function M.cancelPending()
     end
 end
 
---- Check if memorization is in progress
+--- Check if memorization is in progress (active job or legacy flag).
 ---@return boolean True if busy memorizing
 function M.isBusy()
-    return M.isMemorizing
+    return M.isMemorizing or M._memJob ~= nil
 end
 
 --- Get the pending set name (if any)

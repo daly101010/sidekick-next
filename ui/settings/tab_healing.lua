@@ -66,7 +66,7 @@ end
 function M.draw(settings, themeNames, onChange)
     local changed
     local myClass = mq.TLO.Me.Class.ShortName()
-    local themeName = settings.Theme or 'Classic'
+    local themeName = settings.SideKickTheme or 'Classic'
 
     -- Check if this is a healer class
     local isHealer = myClass == 'CLR' or myClass == 'DRU' or myClass == 'SHM' or myClass == 'PAL'
@@ -268,6 +268,31 @@ function M.draw(settings, themeNames, onChange)
             if combatChanged and onChange then onChange('CureInCombat', combatVal) end
         end, { id = 'cure_options', defaultOpen = true })
     end
+
+    -- ========== RESURRECTION ==========
+    -- Group-only auto-rez. CLR/DRU/SHM/PAL render here (healer classes); NEC
+    -- gets the same Core.Settings keys but without a UI surface — they fall
+    -- back to defaults (auto-OOC on, auto-in-combat off, auto-accept on).
+    imgui.Spacing()
+    Components.SettingGroup.section('Resurrection', themeName)
+
+    local autoRezOOC = settings.AutoRezOOC ~= false
+    local oocVal, oocChanged = Components.CheckboxRow.draw('Auto-Rez Out of Combat', 'AutoRezOOC', autoRezOOC, nil, {
+        tooltip = 'After combat ends, automatically rez dead group members. Issues /corpse to drag the corpse before casting.',
+    })
+    if oocChanged and onChange then onChange('AutoRezOOC', oocVal) end
+
+    local autoRezCombat = settings.AutoRezInCombat == true
+    local combatVal2, combatChanged2 = Components.CheckboxRow.draw('Auto Battle-Rez (AA only)', 'AutoRezInCombat', autoRezCombat, nil, {
+        tooltip = 'During combat, fire the class battle-rez AA (e.g. Blessing of Resurrection). The AA has a real cast time (~5s) and will pause the heal rotation for its duration. Never spell-rezzes during a fight.',
+    })
+    if combatChanged2 and onChange then onChange('AutoRezInCombat', combatVal2) end
+
+    local autoAcceptRez = settings.AutoAcceptRez ~= false
+    local accVal, accChanged = Components.CheckboxRow.draw('Auto-Accept Rez Offers', 'AutoAcceptRez', autoAcceptRez, nil, {
+        tooltip = 'When this character receives a rez offer dialog, automatically click Yes.',
+    })
+    if accChanged and onChange then onChange('AutoAcceptRez', accVal) end
 
     -- ========== ADVANCED (Healing Module) ==========
     if _healingSettingsUI and _healingSettingsUI.draw then

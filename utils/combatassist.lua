@@ -197,18 +197,38 @@ local function check_stuck()
   return _stuckCount >= config.stuck_threshold
 end
 
-local function do_stuck_recovery()
-  mq.cmd('/keypress back hold')
-  mq.delay(200)
-  mq.cmd('/keypress back')
+-- Non-blocking stuck recovery: the back+strafe hold sequence is started
+-- here and the releases are drained by tick_stuck_recovery() each tick.
+-- Previously this function blocked the main loop for 500ms per call,
+-- freezing healing, mez, defensives, and every other tick consumer.
+local _recovery = nil  -- { stage, releaseAt, strafe }
 
+local function do_stuck_recovery()
+  if _recovery then return end  -- already in flight
+
+  mq.cmd('/keypress back hold')
+  local now = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
   local strafe = (math.random(2) == 1) and 'strafe_left' or 'strafe_right'
-  mq.cmdf('/keypress %s hold', strafe)
-  mq.delay(300)
-  mq.cmdf('/keypress %s', strafe)
+  _recovery = { stage = 'back', releaseAt = now + 200, strafe = strafe }
 
   _stuckCount = 0
   _lastStickAt = 0
+end
+
+local function tick_stuck_recovery()
+  if not _recovery then return end
+  local now = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
+  if now < _recovery.releaseAt then return end
+
+  if _recovery.stage == 'back' then
+    mq.cmd('/keypress back')
+    mq.cmdf('/keypress %s hold', _recovery.strafe)
+    _recovery.stage = 'strafe'
+    _recovery.releaseAt = now + 300
+  elseif _recovery.stage == 'strafe' then
+    mq.cmdf('/keypress %s', _recovery.strafe)
+    _recovery = nil
+  end
 end
 
 -- ============================================================================
@@ -534,6 +554,10 @@ local function stop()
 end
 
 local function tick()
+  -- Always advance any in-flight stuck-recovery release sequence so the
+  -- back/strafe hold gets cleared even when assist is disabled mid-recovery.
+  tick_stuck_recovery()
+
   if not config.enabled then return end
 
   cleanMezList()

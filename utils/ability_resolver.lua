@@ -33,6 +33,68 @@ function M.clearCache()
     classConfigCache = {}
 end
 
+--------------------------------------------------------------------------------
+-- Rank-aware spell name helpers
+--
+-- Class configs use unranked names ("Avowed Light"). EQ stores spells in the
+-- spellbook and gems with their rank suffix ("Avowed Light Rk. II"). Direct
+-- name comparison via `me.Book(unrankedName)` and `gem.Name() == unrankedName`
+-- silently fails for any rank-only-scribed spell, dropping the entire spell
+-- line on the floor.
+--------------------------------------------------------------------------------
+
+--- Strip the " Rk. II" / " Rk. III" / " Rk. IV" suffix from a spell name.
+---@param name string|nil The spell name (possibly with rank suffix)
+---@return string The base name with rank suffix removed
+function M.stripRank(name)
+    if not name then return '' end
+    return tostring(name):gsub(' Rk%. %u+$', '')
+end
+
+--- Resolve an unranked (or already-ranked) spell name to whatever rank the
+--- character actually has scribed. Returns the actual scribed name (e.g.
+--- "Avowed Light Rk. II") so callers can pass it to `/cast`, compare against
+--- gem entries, etc. Returns nil if no rank of the spell is in the book.
+---
+--- Strategy:
+---   1. Exact-match `me.Book(name)` — fast path when the config name already
+---      matches a scribed name.
+---   2. `me.Spell(name)` — does SpellGroup substring matching against the
+---      spellbook, the proper way to ask "do I have ANY rank of this spell?".
+---      The returned spell's Name() is the actually-scribed ranked name.
+---@param name string Spell name (with or without rank suffix)
+---@return string|nil The actual scribed name, or nil if not in book
+function M.getScribedName(name)
+    if not name or name == '' then return nil end
+    local me = mq.TLO.Me
+    if not me or not me() then return nil end
+
+    -- Fast path: exact match.
+    local book = me.Book(name)
+    if book and book() then
+        return name
+    end
+
+    -- SpellGroup substring match in the spellbook — finds whichever rank is
+    -- actually scribed. spell.Name() gives the ranked name to use downstream.
+    local spell = me.Spell(name)
+    if spell and spell() then
+        local actualName = tostring(spell.Name() or '')
+        if actualName ~= '' and actualName ~= 'NULL' then
+            return actualName
+        end
+    end
+
+    return nil
+end
+
+--- Convenience predicate: is any rank of this spell in our spellbook?
+---@param name string
+---@return boolean
+function M.isSpellScribed(name)
+    return M.getScribedName(name) ~= nil
+end
+
 --- Resolve spell line to best memorized spell
 ---@param classConfig table The class config with spellLines
 ---@param lineName string The spell line name
@@ -49,16 +111,19 @@ function M.resolveSpell(classConfig, lineName)
 
     local numGems = tonumber(me.NumGems()) or 13
 
-    -- Check each spell in the line (ordered newest to oldest)
+    -- Check each spell in the line (ordered newest to oldest). Compare base
+    -- names so a config entry of "Avowed Light" still matches a gem holding
+    -- "Avowed Light Rk. II". Return the actual ranked gem name so callers
+    -- can pass it to /cast unchanged.
     for _, spellName in ipairs(line) do
-        -- Check if memorized in any gem
+        local baseConfig = M.stripRank(spellName)
         for gem = 1, numGems do
             local gemSpell = me.Gem(gem)
             if gemSpell and gemSpell() then
-                local ok, name = pcall(function() return gemSpell.Name() end)
-                if ok and name == spellName then
+                local ok, gemName = pcall(function() return gemSpell.Name() end)
+                if ok and gemName and M.stripRank(gemName) == baseConfig then
                     return {
-                        name = spellName,
+                        name = gemName,  -- ranked name for /cast
                         gem = gem,
                         ready = me.GemTimer(gem)() == 0,
                     }
@@ -84,12 +149,15 @@ function M.resolveSpellFromBook(classConfig, lineName)
     local me = mq.TLO.Me
     if not (me and me()) then return nil end
 
-    -- Check each spell in the line (ordered newest to oldest)
+    -- Check each spell in the line (ordered newest to oldest). Use the rank-
+    -- aware helper so a configured "Avowed Light" matches a scribed
+    -- "Avowed Light Rk. II". Return the ranked name so /cast and other
+    -- consumers receive a name EQ recognizes.
     for _, spellName in ipairs(line) do
-        local ok, inBook = pcall(function() return me.Book(spellName)() end)
-        if ok and inBook then
+        local scribed = M.getScribedName(spellName)
+        if scribed then
             return {
-                name = spellName,
+                name = scribed,
                 inBook = true,
             }
         end
@@ -145,26 +213,26 @@ function M.resolveAA(classConfig, lineName)
     local me = mq.TLO.Me
     if not (me and me()) then return nil end
 
-    -- Check each AA in the line (ordered newest to oldest)
+    -- Check each AA in the line (ordered newest to oldest). The previous
+    -- check required `aa.Spell()` to be truthy, which silently dropped pure-
+    -- effect AAs (Fading Memories, Sanctuary, Divine Aura, Gather Mana, etc.).
+    -- Existence is determined by `aa()` alone.
     for _, aaName in ipairs(line) do
         local aa = me.AltAbility(aaName)
         if aa and aa() then
-            local ok, hasSpell = pcall(function() return aa.Spell() end)
-            if ok and hasSpell then
-                local id = 0
-                local idOk, idVal = pcall(function() return aa.ID() end)
-                if idOk then id = tonumber(idVal) or 0 end
+            local id = 0
+            local idOk, idVal = pcall(function() return aa.ID() end)
+            if idOk then id = tonumber(idVal) or 0 end
 
-                local ready = false
-                local readyOk, readyVal = pcall(function() return me.AltAbilityReady(aaName)() end)
-                if readyOk then ready = readyVal == true end
+            local ready = false
+            local readyOk, readyVal = pcall(function() return me.AltAbilityReady(aaName)() end)
+            if readyOk then ready = readyVal == true end
 
-                return {
-                    name = aaName,
-                    id = id,
-                    ready = ready,
-                }
-            end
+            return {
+                name = aaName,
+                id = id,
+                ready = ready,
+            }
         end
     end
 
@@ -241,15 +309,18 @@ end
 function M.getFallbackSpell(classConfig, spellName, lineName)
     if not classConfig or not classConfig.spellLines then return nil end
 
-    -- Find the line if not provided
+    -- Find the line if not provided. Compare base names so a ranked-suffix
+    -- spellName ("Avowed Light Rk. II") still locates the unranked entry
+    -- ("Avowed Light") in the config line.
     local idx
+    local baseRequested = M.stripRank(spellName)
     if not lineName then
         lineName, idx = M.findSpellLine(classConfig, spellName)
     else
         local line = classConfig.spellLines[lineName]
         if type(line) == 'table' then
             for i, s in ipairs(line) do
-                if s == spellName then
+                if M.stripRank(s) == baseRequested then
                     idx = i
                     break
                 end
@@ -265,14 +336,16 @@ function M.getFallbackSpell(classConfig, spellName, lineName)
     local me = mq.TLO.Me
     if not (me and me()) then return nil end
 
-    -- Start from the spell after the requested one
-    local startIdx = (idx or 0) + 1
+    -- Start from the spell after the requested one. If we couldn't locate
+    -- the original (idx == nil), starting at 1 would re-evaluate the same
+    -- unavailable spell — guard with a sentinel so we always advance.
+    local startIdx = (idx and idx + 1) or 1
 
     for i = startIdx, #line do
         local testSpell = line[i]
-        local ok, inBook = pcall(function() return me.Book(testSpell)() end)
-        if ok and inBook then
-            return testSpell
+        local scribed = M.getScribedName(testSpell)
+        if scribed then
+            return scribed
         end
     end
 
