@@ -38,6 +38,21 @@ local getConditionDefaults = lazy('sidekick-next.utils.condition_defaults')
 local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
 local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
 
+local function saveSpellSets()
+    local okLoad, Persistence = pcall(getPersistence)
+    if not okLoad then
+        print(string.format('\ar[SpellSetCombatTab]\ax Save module load failed: %s', tostring(Persistence)))
+        return false
+    end
+    if not Persistence or not Persistence.save then return false end
+    local ok, saved = pcall(Persistence.save)
+    if not ok then
+        print(string.format('\ar[SpellSetCombatTab]\ax Save failed: %s', tostring(saved)))
+        return false
+    end
+    return saved ~= false
+end
+
 --------------------------------------------------------------------------------
 -- Helper Functions
 --------------------------------------------------------------------------------
@@ -403,11 +418,7 @@ function M.renderConditionEditor(spellSet)
     local uniqueId = "combat_gem_" .. state.selectedGem
     local newCondition = ConditionBuilder.drawInline(uniqueId, gemConfig.condition, function(data)
         gemConfig.condition = data
-        -- Auto-save when condition changes
-        local Persistence = getPersistence()
-        if Persistence then
-            Persistence.save()
-        end
+        saveSpellSets()
     end)
     if newCondition then
         gemConfig.condition = newCondition
@@ -441,9 +452,7 @@ function M.renderConditionEditor(spellSet)
                     if targetTypes[i] == "self" or targetTypes[i] == "group" or targetTypes[i] == "npc" then
                         gemConfig.buffTarget.value = nil
                     end
-                    -- Auto-save
-                    local Persistence = getPersistence()
-                    if Persistence then Persistence.save() end
+                    saveSpellSets()
                 end
             end
             imgui.EndCombo()
@@ -469,9 +478,7 @@ function M.renderConditionEditor(spellSet)
                     if imgui.Selectable(role, roleIdx == i) then
                         gemConfig.buffTarget = gemConfig.buffTarget or {}
                         gemConfig.buffTarget.value = role
-                        -- Auto-save
-                        local Persistence = getPersistence()
-                        if Persistence then Persistence.save() end
+                        saveSpellSets()
                     end
                 end
                 imgui.EndCombo()
@@ -486,9 +493,7 @@ function M.renderConditionEditor(spellSet)
             if newClass ~= classValue then
                 gemConfig.buffTarget = gemConfig.buffTarget or {}
                 gemConfig.buffTarget.value = newClass
-                -- Auto-save
-                local Persistence = getPersistence()
-                if Persistence then Persistence.save() end
+                saveSpellSets()
             end
             imgui.PopItemWidth()
             if imgui.IsItemHovered() then
@@ -503,9 +508,7 @@ function M.renderConditionEditor(spellSet)
             if newName ~= nameValue then
                 gemConfig.buffTarget = gemConfig.buffTarget or {}
                 gemConfig.buffTarget.value = newName
-                -- Auto-save
-                local Persistence = getPersistence()
-                if Persistence then Persistence.save() end
+                saveSpellSets()
             end
             imgui.PopItemWidth()
             if imgui.IsItemHovered() then
@@ -529,9 +532,7 @@ function M.renderConditionEditor(spellSet)
     local newPriority = imgui.SliderInt("##priority", priority, 1, 200)
     if newPriority ~= priority then
         gemConfig.priority = newPriority
-        -- Auto-save
-        local Persistence = getPersistence()
-        if Persistence then Persistence.save() end
+        saveSpellSets()
     end
     imgui.PopItemWidth()
     if imgui.IsItemHovered() then

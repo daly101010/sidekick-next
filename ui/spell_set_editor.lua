@@ -42,6 +42,16 @@ local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
 -- Helper Functions
 --------------------------------------------------------------------------------
 
+local function saveSpellSets(Persistence)
+    if not Persistence or not Persistence.save then return false end
+    local ok, saved = pcall(Persistence.save)
+    if not ok then
+        print(string.format('\ar[SpellSetEditor]\ax Save failed: %s', tostring(saved)))
+        return false
+    end
+    return saved ~= false
+end
+
 --- Get spell name from ID using TLO
 ---@param spellId number The spell ID
 ---@return string name The spell name or "Unknown"
@@ -115,6 +125,7 @@ local function renderHeader()
             if imgui.Selectable(name, isSelected) then
                 state.selectedSet = name
                 Persistence.setActiveSet(name)
+                saveSpellSets(Persistence)
             end
         end
         imgui.EndCombo()
@@ -149,10 +160,10 @@ local function renderHeader()
         if state.selectedSet and Memorize then
             Memorize.queueApply(state.selectedSet, true)  -- true = save first
         else
-            local saveOk = Persistence.save()
+            local saveOk = saveSpellSets(Persistence)
             local Toast = getToast()
             if Toast then
-                if saveOk ~= false then
+                if saveOk then
                     Toast.success('Spell sets saved')
                 else
                     Toast.error('Failed to save spell sets')
@@ -228,7 +239,7 @@ local function renderNewSetPopup()
 
             state.selectedSet = state.newSetName
             Persistence.setActiveSet(state.newSetName)
-            Persistence.save()
+            saveSpellSets(Persistence)
             state.showNewSetPopup = false
             imgui.CloseCurrentPopup()
         end
@@ -267,7 +278,7 @@ local function renderDeletePopup()
                 Persistence.setActiveSet(state.selectedSet)
             end
 
-            Persistence.save()
+            saveSpellSets(Persistence)
             state.showDeletePopup = false
             imgui.CloseCurrentPopup()
         end

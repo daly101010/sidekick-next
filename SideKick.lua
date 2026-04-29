@@ -256,7 +256,10 @@ local function drainQueue()
     local q = State.actionQueue
     State.actionQueue = {}
     for _, fn in ipairs(q) do
-        pcall(fn)
+        local ok, err = pcall(fn)
+        if not ok and mq and mq.cmd then
+            mq.cmd('/echo \\ar[SideKick] Queued action failed: ' .. tostring(err) .. '\\ax')
+        end
     end
 end
 
@@ -1204,8 +1207,9 @@ local function draw()
         imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 6)
         imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, 8, 8)
 
-        local open = imgui.Begin('SideKick Options##SettingsPopup', true, sFlags)
-        if open then
+        local optionsOpen, optionsDraw = imgui.Begin('SideKick Options##SettingsPopup', true, sFlags)
+        if optionsDraw == nil then optionsDraw = optionsOpen end
+        if optionsDraw then
             local closeIcon2 = (Icons and (Icons.FA_TIMES or Icons.MD_CLOSE)) or 'X'
             local availWidth = imgui.GetContentRegionAvail()
             if type(availWidth) ~= 'number' then availWidth = availWidth.x or availWidth[1] or mainW end

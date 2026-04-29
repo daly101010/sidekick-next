@@ -31,6 +31,21 @@ local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
 -- Helper Functions
 --------------------------------------------------------------------------------
 
+local function saveSpellSets()
+    local okLoad, Persistence = pcall(getPersistence)
+    if not okLoad then
+        print(string.format('\ar[SpellSetOocTab]\ax Save module load failed: %s', tostring(Persistence)))
+        return false
+    end
+    if not Persistence or not Persistence.save then return false end
+    local ok, saved = pcall(Persistence.save)
+    if not ok then
+        print(string.format('\ar[SpellSetOocTab]\ax Save failed: %s', tostring(saved)))
+        return false
+    end
+    return saved ~= false
+end
+
 --- Get spell name from ID using TLO
 ---@param spellId number The spell ID
 ---@return string name The spell name or "Unknown"
@@ -121,9 +136,7 @@ function M.renderBuffEntry(spell, spellSet)
             -- Add new buff (enabled by default)
             SpellsetData.addOocBuff(spellSet, spell.id, true, nil, nil)
         end
-        -- Auto-save
-        local Persistence = getPersistence()
-        if Persistence then Persistence.save() end
+        saveSpellSets()
     end
 
     -- Spell name (dimmed if also in combat rotation)
@@ -174,6 +187,7 @@ function M.renderBuffEntry(spell, spellSet)
             -- Ensure buff is in the list before editing conditions
             if not isInList then
                 SpellsetData.addOocBuff(spellSet, spell.id, false, nil, nil)
+                saveSpellSets()
             end
             state.selectedBuff = spell.id
         end
@@ -199,21 +213,25 @@ function M.renderBuffEntry(spell, spellSet)
                 if state.selectedBuff == spell.id then
                     state.selectedBuff = nil
                 end
+                saveSpellSets()
             end
             imgui.Separator()
             if buffIdx and buffIdx > 1 then
                 if imgui.MenuItem("Move Up") then
                     SpellsetData.moveOocBuffUp(spellSet, spell.id)
+                    saveSpellSets()
                 end
             end
             if buffIdx and spellSet.oocBuffs and buffIdx < #spellSet.oocBuffs then
                 if imgui.MenuItem("Move Down") then
                     SpellsetData.moveOocBuffDown(spellSet, spell.id)
+                    saveSpellSets()
                 end
             end
         else
             if imgui.MenuItem("Add to OOC Buffs") then
                 SpellsetData.addOocBuff(spellSet, spell.id, true, nil, nil)
+                saveSpellSets()
             end
         end
         imgui.EndPopup()
@@ -229,14 +247,11 @@ function M.renderBuffEntry(spell, spellSet)
         local uniqueId = "ooc_buff_" .. spell.id
         local newCondition = ConditionBuilder.drawInline(uniqueId, buffConfig.condition, function(data)
             buffConfig.condition = data
-            -- Auto-save when condition changes
-            local Persistence = getPersistence()
-            if Persistence then
-                Persistence.save()
-            end
+            saveSpellSets()
         end)
         if newCondition then
             buffConfig.condition = newCondition
+            saveSpellSets()
         end
 
         -- Target override section (only for single-target buffs)
@@ -266,9 +281,7 @@ function M.renderBuffEntry(spell, spellSet)
                         if targetTypes[i] == "group" then
                             buffConfig.buffTarget.value = nil
                         end
-                        -- Auto-save
-                        local Persistence = getPersistence()
-                        if Persistence then Persistence.save() end
+                        saveSpellSets()
                     end
                 end
                 imgui.EndCombo()
@@ -294,9 +307,7 @@ function M.renderBuffEntry(spell, spellSet)
                         if imgui.Selectable(role, roleIdx == i) then
                             buffConfig.buffTarget = buffConfig.buffTarget or {}
                             buffConfig.buffTarget.value = role
-                            -- Auto-save
-                            local Persistence = getPersistence()
-                            if Persistence then Persistence.save() end
+                            saveSpellSets()
                         end
                     end
                     imgui.EndCombo()
@@ -311,9 +322,7 @@ function M.renderBuffEntry(spell, spellSet)
                 if newClass ~= classValue then
                     buffConfig.buffTarget = buffConfig.buffTarget or {}
                     buffConfig.buffTarget.value = newClass
-                    -- Auto-save
-                    local Persistence = getPersistence()
-                    if Persistence then Persistence.save() end
+                    saveSpellSets()
                 end
                 imgui.PopItemWidth()
 
@@ -325,9 +334,7 @@ function M.renderBuffEntry(spell, spellSet)
                 if newName ~= nameValue then
                     buffConfig.buffTarget = buffConfig.buffTarget or {}
                     buffConfig.buffTarget.value = newName
-                    -- Auto-save
-                    local Persistence = getPersistence()
-                    if Persistence then Persistence.save() end
+                    saveSpellSets()
                 end
                 imgui.PopItemWidth()
             end
