@@ -4,6 +4,7 @@
 
 # Local settings
 .claude/
+**/settings.local.json
 
 # Logs
 *.log
@@ -12,3 +13,12 @@
 .DS_Store
 Thumbs.db
 nul
+
+# Graphify scratch
+.graphify_*
+graphify-out/
+
+# Scratch / temporary
+tmp/
+*.tmp
+_tmp_*
