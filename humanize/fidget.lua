@@ -20,12 +20,14 @@ local Distributions = require('sidekick-next.humanize.distributions')
 local M = {}
 
 -- Configurable EQ keybind names. Edit these to match your layout.
--- Default to standard EQ binds.
+-- Note: EQ doesn't ship with default binds for camera pitch (mouse handles it).
+-- 'pitch' is disabled by default. If you bind keys to look_up / look_down,
+-- set the names below and bump weights.pitch above 0 via M.setKeybind / setWeight.
 local Keybinds = {
     turn_left   = 'left',
     turn_right  = 'right',
-    look_up     = 'lookup',
-    look_down   = 'lookdown',
+    look_up     = nil,    -- intentionally unset; no default EQ keybind
+    look_down   = nil,    -- intentionally unset; no default EQ keybind
 }
 
 local Config = {
@@ -37,10 +39,10 @@ local Config = {
 
     -- Action weights (must sum to <=1; remainder is "no-op this tick").
     weights = {
-        turn       = 0.45,
-        pitch      = 0.15,
-        face_spawn = 0.15,
-        med_cycle  = 0.20,
+        turn       = 0.55,
+        pitch      = 0.00,   -- disabled: EQ has no default look_up/look_down keybind
+        face_spawn = 0.20,
+        med_cycle  = 0.25,
     },
 
     -- Turn/pitch hold duration distribution (ms before the counter-press).
@@ -178,6 +180,8 @@ local function emit(kind)
             releaseKey = releaseKey,
         }
     elseif kind == 'pitch' then
+        -- Skip if no keybinds configured (EQ has no defaults).
+        if not Keybinds.look_up or not Keybinds.look_down then return end
         local up = math.random() < 0.5
         local pressKey = up and Keybinds.look_up or Keybinds.look_down
         local releaseKey = up and Keybinds.look_down or Keybinds.look_up
