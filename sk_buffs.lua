@@ -21,7 +21,7 @@ local BUFF_TICK_INTERVAL = 0.5             -- Casting tick interval (500ms)
 local DEFAULT_REBUFF_WINDOW = 60           -- Default seconds before expiry to rebuff
 local BUFF_CHECK_INTERVAL = 60.0           -- How often to recheck buff status on targets
 local BUFF_DEFS_REFRESH_INTERVAL = 5.0     -- Refresh buff definitions if empty
-local BUFF_DEFS_PERIODIC_REFRESH = 30.0    -- Periodic refresh to pick up spell set changes
+local BUFF_DEFS_PERIODIC_REFRESH = 5.0     -- Periodic refresh to pick up spell set changes
 local BUFF_GEM_HOLD_WINDOW = 8.0           -- Seconds to hold buff gem after mem
 local CLAIM_TIMEOUT = 8.0                  -- Claims expire after 8 seconds
 local PENDING_BUFF_WINDOW = 8.0            -- Seconds to treat a buff as present after cast
@@ -34,11 +34,14 @@ local GROUP_CAST_COOLDOWN = 6.0            -- Cooldown to avoid immediate re-cas
 local _coreLoaded = false
 local _pendingAction = nil
 local _pendingReason = nil
+local _lastBuffScanReason = 'not_scanned'
 local _lastBuffTick = 0
 local _lastBuffDefsRefresh = 0
 local _initialScanComplete = false
 local _lastInitialScanAttempt = 0
 local _selfName = ''
+local _buffDebugEnabled = false
+local _diagThrottle = {}
 
 -- Buff definitions from spell set
 local _buffDefinitions = {}
@@ -73,6 +76,8 @@ local _lastGroupCastAt = {}
 local getCore = lazy('sidekick-next.utils.core')
 local getCache = lazy('sidekick-next.utils.runtime_cache')
 local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
+local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
+local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
 
 local _SpellsetManager = nil
 local function getSpellsetManager()
@@ -93,6 +98,32 @@ local getBuff = lazy('sidekick-next.automation.buff')
 -------------------------------------------------------------------------------
 -- Helper Functions
 -------------------------------------------------------------------------------
+
+local function diagLog(key, intervalSec, fmt, ...)
+    if not _buffDebugEnabled then return end
+
+    local now = os.clock()
+    key = tostring(key or 'diag')
+    intervalSec = tonumber(intervalSec) or 0
+    if intervalSec > 0 and (now - (_diagThrottle[key] or 0)) < intervalSec then return end
+    _diagThrottle[key] = now
+
+    local msg
+    if select('#', ...) > 0 then
+        local ok, formatted = pcall(string.format, fmt, ...)
+        msg = ok and formatted or tostring(fmt)
+    else
+        msg = tostring(fmt)
+    end
+
+    debugLog('[diag] %s', msg)
+
+    local BuffLogger = getBuffLogger()
+    if BuffLogger then
+        if BuffLogger.init then BuffLogger.init({ level = 'debug', enabled = true }) end
+        if BuffLogger.info then BuffLogger.info('diagnostic', '%s', msg) end
+    end
+end
 
 local function ensureCoreLoaded()
     if not _coreLoaded then
@@ -148,6 +179,137 @@ local function getSpellId(spellName)
     return nil
 end
 
+local function buildNameQuery(spellName)
+    if not spellName or spellName == '' then return nil end
+    return string.format('name "%s"', spellName)
+end
+
+local function tloPresent(accessor)
+    local ok, value = pcall(accessor)
+    if not (ok and value) then return false end
+    local okValue, present = pcall(function() return value() end)
+    return okValue and present and true or false
+end
+
+local function actorHasBuffBySpell(actor, spellName, spellId)
+    if not actor then return false end
+
+    if spellId then
+        if tloPresent(function() return actor.FindBuff and actor.FindBuff('id ' .. spellId) end) then return true end
+        if tloPresent(function() return actor.FindSong and actor.FindSong('id ' .. spellId) end) then return true end
+        if tloPresent(function() return actor.Buff and actor.Buff('id ' .. spellId) end) then return true end
+        if tloPresent(function() return actor.Song and actor.Song('id ' .. spellId) end) then return true end
+    end
+
+    local query = buildNameQuery(spellName)
+    if query then
+        if tloPresent(function() return actor.FindBuff and actor.FindBuff(query) end) then return true end
+        if tloPresent(function() return actor.FindSong and actor.FindSong(query) end) then return true end
+    end
+
+    if spellName and spellName ~= '' then
+        if tloPresent(function() return actor.Buff and actor.Buff(spellName) end) then return true end
+        if tloPresent(function() return actor.Song and actor.Song(spellName) end) then return true end
+    end
+
+    return false
+end
+
+local function buffProbe(actor, spellName, spellId)
+    local probe = {
+        findBuffId = false,
+        findSongId = false,
+        buffId = false,
+        songId = false,
+        findBuffName = false,
+        findSongName = false,
+        buffName = false,
+        songName = false,
+    }
+    if not actor then return probe end
+
+    if spellId then
+        probe.findBuffId = tloPresent(function() return actor.FindBuff and actor.FindBuff('id ' .. spellId) end)
+        probe.findSongId = tloPresent(function() return actor.FindSong and actor.FindSong('id ' .. spellId) end)
+        probe.buffId = tloPresent(function() return actor.Buff and actor.Buff('id ' .. spellId) end)
+        probe.songId = tloPresent(function() return actor.Song and actor.Song('id ' .. spellId) end)
+    end
+
+    local query = buildNameQuery(spellName)
+    if query then
+        probe.findBuffName = tloPresent(function() return actor.FindBuff and actor.FindBuff(query) end)
+        probe.findSongName = tloPresent(function() return actor.FindSong and actor.FindSong(query) end)
+    end
+
+    if spellName and spellName ~= '' then
+        probe.buffName = tloPresent(function() return actor.Buff and actor.Buff(spellName) end)
+        probe.songName = tloPresent(function() return actor.Song and actor.Song(spellName) end)
+    end
+
+    return probe
+end
+
+local function probeSummary(probe)
+    return string.format('findBuffId=%s findSongId=%s buffId=%s songId=%s findBuffName=%s findSongName=%s buffName=%s songName=%s',
+        tostring(probe and probe.findBuffId),
+        tostring(probe and probe.findSongId),
+        tostring(probe and probe.buffId),
+        tostring(probe and probe.songId),
+        tostring(probe and probe.findBuffName),
+        tostring(probe and probe.findSongName),
+        tostring(probe and probe.buffName),
+        tostring(probe and probe.songName))
+end
+
+local function actorHasTriggeredEffect(actor, spellName)
+    if not actor or not spellName or spellName == '' then return false end
+    local spell = mq.TLO.Spell(spellName)
+    if not (spell and spell()) then return false end
+
+    local okCount, rawCount = pcall(function()
+        return spell.NumEffects and spell.NumEffects() or 0
+    end)
+    local numEffects = okCount and tonumber(rawCount or 0) or 0
+    for i = 1, numEffects do
+        local okTrigger, trigger = pcall(function()
+            return spell.Trigger and spell.Trigger(i) or nil
+        end)
+        if not okTrigger then trigger = nil end
+        local okPresent, triggerPresent = pcall(function()
+            return trigger and trigger()
+        end)
+        if okPresent and triggerPresent then
+            local okId, rawId = pcall(function()
+                return trigger.ID and trigger.ID() or 0
+            end)
+            local triggerId = okId and tonumber(rawId or 0) or 0
+            local okName, rawName = pcall(function()
+                return trigger.Name and trigger.Name() or ''
+            end)
+            local triggerName = okName and tostring(rawName or '') or ''
+            if triggerId > 0 and actorHasBuffBySpell(actor, triggerName, triggerId) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function getCachedBuffState(targetId, category, rebuffWindow)
+    local id = tonumber(targetId) or 0
+    if id <= 0 or not category then return nil end
+
+    local Cache = getCache()
+    local state = Cache and Cache.buffState and Cache.buffState[id] and Cache.buffState[id][category]
+    if not state then return nil end
+    if state.pending then return state end
+    if state.present and (tonumber(state.remaining) or 0) >= (rebuffWindow or DEFAULT_REBUFF_WINDOW) then
+        return state
+    end
+    return nil
+end
+
 local function getSpellTargetType(spellName)
     if not spellName then return '' end
     local spell = mq.TLO.Spell(spellName)
@@ -192,23 +354,14 @@ local function ensureTarget(id)
     return currentTargetId == id
 end
 
-local function selfHasBuff(spellName)
+local function selfHasBuff(spellName, spellId)
     if not spellName then return false end
 
     local me = mq.TLO.Me
     if not me or not me() then return false end
 
-    -- Check Buff window
-    local buff = me.Buff(spellName)
-    if buff and buff() then
-        return true
-    end
-
-    -- Check Song window (for bard songs)
-    local song = me.Song(spellName)
-    if song and song() then
-        return true
-    end
+    if actorHasBuffBySpell(me, spellName, spellId) then return true end
+    if actorHasTriggeredEffect(me, spellName) then return true end
 
     -- Check Aura slots
     for i = 1, 5 do
@@ -231,6 +384,177 @@ local function selfHasBuff(spellName)
     end
 
     return false
+end
+
+local function getGroupRoleNames()
+    local roles = {}
+    local function readRole(roleName, accessor)
+        local ok, name = pcall(accessor)
+        name = ok and tostring(name or ''):lower() or ''
+        if name ~= '' and name ~= 'null' then
+            roles[name] = roleName
+        end
+    end
+
+    readRole('MainTank', function()
+        local role = mq.TLO.Group.MainTank
+        return role and role.CleanName and role.CleanName() or ''
+    end)
+    readRole('MainAssist', function()
+        local role = mq.TLO.Group.MainAssist
+        return role and role.CleanName and role.CleanName() or ''
+    end)
+    readRole('Puller', function()
+        local role = mq.TLO.Group.Puller
+        return role and role.CleanName and role.CleanName() or ''
+    end)
+
+    return roles
+end
+
+local function groupBuffCandidates(myId)
+    local candidates = {}
+    local roleNames = getGroupRoleNames()
+    local me = mq.TLO.Me
+
+    if me and me() and myId > 0 then
+        local name = me.CleanName and me.CleanName() or _selfName
+        table.insert(candidates, {
+            id = myId,
+            name = name,
+            class = me.Class and me.Class.ShortName and me.Class.ShortName() or '',
+            hp = me.PctHPs and me.PctHPs() or 100,
+            mana = me.PctMana and me.PctMana() or 100,
+            role = roleNames[tostring(name or ''):lower()],
+            isSelf = true,
+            tlo = me,
+        })
+    end
+
+    local memberCount = tonumber(mq.TLO.Group.Members()) or 0
+    for i = 1, memberCount do
+        local member = mq.TLO.Group.Member(i)
+        if member and member() then
+            local id = tonumber(member.ID()) or 0
+            if id > 0 and id ~= myId then
+                local name = member.CleanName and member.CleanName() or ''
+                table.insert(candidates, {
+                    id = id,
+                    name = name,
+                    class = member.Class and member.Class.ShortName and member.Class.ShortName() or '',
+                    hp = member.PctHPs and member.PctHPs() or 100,
+                    mana = member.PctMana and member.PctMana() or 100,
+                    distance = member.Distance and tonumber(member.Distance()) or 999,
+                    role = roleNames[tostring(name or ''):lower()],
+                    isSelf = false,
+                    tlo = member,
+                })
+            end
+        end
+    end
+
+    return candidates
+end
+
+local function targetMatchesBuffTarget(candidate, buffTarget)
+    if not candidate then return false end
+    local targetType = tostring(buffTarget and buffTarget.type or 'group'):lower()
+    local targetValue = tostring(buffTarget and buffTarget.value or ''):lower()
+
+    if targetType == '' or targetType == 'group' then
+        return true
+    elseif targetType == 'role' then
+        return tostring(candidate.role or ''):lower() == targetValue
+    elseif targetType == 'class' then
+        return targetValue == '' or tostring(candidate.class or ''):lower() == targetValue
+    elseif targetType == 'name' then
+        return targetValue == '' or tostring(candidate.name or ''):lower() == targetValue
+    end
+
+    return true
+end
+
+local function conditionPassesForTarget(buffDef, candidate)
+    local condition = buffDef and buffDef.condition
+    if not condition or not condition.conditions or #condition.conditions == 0 then return true end
+
+    local ConditionBuilder = getConditionBuilder()
+    if not (ConditionBuilder and ConditionBuilder.evaluateWithContext) then return true end
+
+    local cls = tostring(candidate.class or '')
+    local ctx = {
+        myHp = mq.TLO.Me.PctHPs() or 100,
+        myMana = mq.TLO.Me.PctMana() or 100,
+        myEndurance = mq.TLO.Me.PctEndurance() or 100,
+        inCombat = lib.inCombat(),
+        isInvis = mq.TLO.Me.Invis() == true,
+        buffTarget = candidate.tlo,
+        buffTargetClass = cls,
+        buffTargetRole = candidate.role,
+        buffTargetHp = candidate.hp or 100,
+        buffTargetMana = candidate.mana or 100,
+        buffTargetIsMe = candidate.isSelf == true,
+        buffTargetIsTank = (cls == 'WAR' or cls == 'PAL' or cls == 'SHD'),
+        buffTargetIsHealer = (cls == 'CLR' or cls == 'DRU' or cls == 'SHM'),
+        buffTargetIsMelee = (cls == 'WAR' or cls == 'PAL' or cls == 'SHD' or cls == 'MNK' or cls == 'ROG' or cls == 'BER' or cls == 'RNG' or cls == 'BST'),
+        buffTargetIsCaster = (cls == 'WIZ' or cls == 'MAG' or cls == 'ENC' or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM'),
+    }
+
+    local ok, result = pcall(ConditionBuilder.evaluateWithContext, condition, ctx)
+    if not ok then
+        debugLog('conditionPassesForTarget: condition failed for %s: %s', tostring(candidate.name), tostring(result))
+        return false
+    end
+    return result == true
+end
+
+local function candidateHasBuff(candidate, spellName, spellId, category, rebuffWindow)
+    if not candidate then return false end
+
+    local cached = getCachedBuffState(candidate.id, category, rebuffWindow)
+    local direct = false
+    local triggered = false
+    local aura = false
+
+    if candidate.isSelf then
+        local me = mq.TLO.Me
+        if me and me() then
+            direct = actorHasBuffBySpell(me, spellName, spellId)
+            triggered = actorHasTriggeredEffect(me, spellName)
+            aura = (not direct and not triggered) and selfHasBuff(spellName, spellId) or false
+        end
+    else
+        direct = actorHasBuffBySpell(candidate.tlo, spellName, spellId)
+        triggered = actorHasTriggeredEffect(candidate.tlo, spellName)
+    end
+
+    if _buffDebugEnabled then
+        local probe = buffProbe(candidate.isSelf and mq.TLO.Me or candidate.tlo, spellName, spellId)
+        local stateText = cached and string.format('present=%s pending=%s remaining=%s spellId=%s',
+            tostring(cached.present), tostring(cached.pending), tostring(cached.remaining), tostring(cached.spellId)) or 'nil'
+        diagLog('candidate_has_' .. tostring(category) .. '_' .. tostring(candidate.id), 0.5,
+            'candidateHasBuff spell="%s" spellId=%s category=%s target=%s(%s) self=%s cached={%s} direct=%s triggered=%s aura=%s probe={%s}',
+            tostring(spellName), tostring(spellId), tostring(category), tostring(candidate.name), tostring(candidate.id),
+            tostring(candidate.isSelf), stateText, tostring(direct), tostring(triggered), tostring(aura), probeSummary(probe))
+    end
+
+    return cached ~= nil or direct or triggered or aura
+end
+
+local function pickBuffTarget(buffDef, spellName, category, rebuffWindow, isGroup, myId)
+    local spellId = buffDef and buffDef.spellId or getSpellId(spellName)
+    for _, candidate in ipairs(groupBuffCandidates(myId)) do
+        if targetMatchesBuffTarget(candidate, buffDef and buffDef.buffTarget)
+            and conditionPassesForTarget(buffDef, candidate) then
+            local hasBuff = candidateHasBuff(candidate, spellName, spellId, category, rebuffWindow)
+            debugLog('pickBuffTarget: %s candidate=%s id=%d hasBuff=%s isGroup=%s',
+                spellName, tostring(candidate.name), tonumber(candidate.id) or 0, tostring(hasBuff), tostring(isGroup))
+            if not hasBuff then
+                return candidate
+            end
+        end
+    end
+    return nil
 end
 
 --- Check if a spell would stack (not blocked by existing buffs)
@@ -286,7 +610,7 @@ end
 local _persistenceLoaded = false
 
 local function loadBuffDefinitions()
-    _buffDefinitions = {}
+    local nextDefinitions = {}
 
     -- Get SpellSetData and Persistence to access oocBuffs
     local SpellSetData = nil
@@ -300,6 +624,7 @@ local function loadBuffDefinitions()
 
     if not SpellSetData or not Persistence then
         debugLog('loadBuffDefinitions: SpellSetData or Persistence not available')
+        _lastBuffScanReason = 'no_spellset_modules'
         return
     end
 
@@ -307,11 +632,13 @@ local function loadBuffDefinitions()
     -- This is only done once per session to avoid repeated disk reads
     if not _persistenceLoaded then
         debugLog('loadBuffDefinitions: Loading spell sets from disk (first time)')
-        local ok, err = pcall(function()
-            Persistence.load()
+        local ok, loadedOrErr = pcall(function()
+            return Persistence.load()
         end)
-        if not ok then
-            debugLog('loadBuffDefinitions: Persistence.load() failed: %s', tostring(err))
+        if not ok or loadedOrErr ~= true then
+            debugLog('loadBuffDefinitions: Persistence.load() failed: %s', tostring(loadedOrErr))
+            _lastBuffScanReason = 'spellset_load_failed'
+            return
         else
             _persistenceLoaded = true
             debugLog('loadBuffDefinitions: Spell sets loaded, activeSetName=%s', tostring(Persistence.activeSetName))
@@ -321,12 +648,16 @@ local function loadBuffDefinitions()
     local spellSet = Persistence.getActiveSet()
     if not spellSet then
         debugLog('loadBuffDefinitions: No active spell set (activeSetName=%s)', tostring(Persistence.activeSetName))
+        _lastBuffScanReason = 'no_active_spell_set'
+        _persistenceLoaded = false
         return
     end
 
     local enabledBuffs = SpellSetData.getEnabledOocBuffs(spellSet)
     if not enabledBuffs or #enabledBuffs == 0 then
         debugLog('loadBuffDefinitions: No enabled OOC buffs in spell set')
+        _buffDefinitions = {}
+        _lastBuffScanReason = 'no_enabled_ooc_buffs'
         return
     end
 
@@ -337,7 +668,7 @@ local function loadBuffDefinitions()
         local spellName = spell and spell.Name() or nil
         if spellName then
             local category = string.format('oocbuff_%d', buffConfig.spellId)
-            _buffDefinitions[category] = {
+            nextDefinitions[category] = {
                 spellId = buffConfig.spellId,
                 spellName = spellName,
                 category = category,
@@ -348,7 +679,16 @@ local function loadBuffDefinitions()
             }
             debugLog('loadBuffDefinitions: Added buff %s (id=%d, priority=%d)',
                 spellName, buffConfig.spellId, buffConfig.priority or 999)
+        else
+            debugLog('loadBuffDefinitions: Spell id %s did not resolve to a spell name', tostring(buffConfig.spellId))
         end
+    end
+
+    _buffDefinitions = nextDefinitions
+    if next(_buffDefinitions) then
+        _lastBuffScanReason = string.format('loaded_%d_ooc_buffs', #enabledBuffs)
+    else
+        _lastBuffScanReason = 'no_resolved_ooc_buffs'
     end
 end
 
@@ -538,16 +878,20 @@ local function canBuffNow()
     -- Check invis
     if me.Invis and me.Invis() then return false, 'invis' end
 
-    -- Check movement plugins
-    if (mq.TLO.MoveTo and mq.TLO.MoveTo.Moving and mq.TLO.MoveTo.Moving())
+    local moving = me.Moving() == true
+
+    -- Check movement plugins. Active stick/nav alone should not suppress
+    -- OOC buffing forever; only block while the character is actually moving.
+    local movementPluginActive = (mq.TLO.MoveTo and mq.TLO.MoveTo.Moving and mq.TLO.MoveTo.Moving())
         or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
         or (mq.TLO.AdvPath and mq.TLO.AdvPath.Following and mq.TLO.AdvPath.Following())
-        or (mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active()) then
+        or (mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active())
+    if movementPluginActive and moving then
         return false, 'movement_plugin'
     end
 
     -- Check if moving
-    if me.Moving() then return false, 'moving' end
+    if moving then return false, 'moving' end
 
     -- Check if already casting
     local casting = me.Casting() or ''
@@ -577,7 +921,7 @@ local function findBuffNeed()
     local Cache = getCache()
     if not Cache then
         debugLog('findBuffNeed: No Cache')
-        return nil
+        return nil, 'no_cache'
     end
 
     local settings = syncSettings()
@@ -586,21 +930,21 @@ local function findBuffNeed()
     local buffingEnabled = settings.BuffingEnabled
     if buffingEnabled == false or buffingEnabled == 0 then
         debugLog('findBuffNeed: Buffing disabled')
-        return nil
+        return nil, 'buffing_disabled'
     end
 
     -- Check if we can buff now
     local canBuff, reason = canBuffNow()
     if not canBuff then
         debugLog('findBuffNeed: Cannot buff now: %s', tostring(reason))
-        return nil
+        return nil, 'blocked_' .. tostring(reason or 'unknown')
     end
 
     refreshBuffDefinitionsIfNeeded()
 
     if not next(_buffDefinitions) then
         debugLog('findBuffNeed: No buff definitions')
-        return nil
+        return nil, _lastBuffScanReason or 'no_buff_definitions'
     end
 
     -- NOTE: Initial scan check removed - we no longer depend on the old buff module
@@ -663,12 +1007,25 @@ local function findBuffNeed()
             if isSelfOnly then
                 -- Self-only buff: check directly if we have the buff
                 if myId > 0 then
-                    local hasBuff = selfHasBuff(spellName)
+                    local spellId = buffDef.spellId or getSpellId(spellName)
+                    local cached = getCachedBuffState(myId, category, rebuffWindow)
+                    local hasSelf = selfHasBuff(spellName, spellId)
+                    local hasBuff = cached ~= nil or hasSelf
+                    if _buffDebugEnabled then
+                        local probe = buffProbe(mq.TLO.Me, spellName, spellId)
+                        local stateText = cached and string.format('present=%s pending=%s remaining=%s spellId=%s',
+                            tostring(cached.present), tostring(cached.pending), tostring(cached.remaining), tostring(cached.spellId)) or 'nil'
+                        diagLog('self_only_' .. tostring(category), 0.5,
+                            'selfOnlyCheck spell="%s" spellId=%s category=%s cached={%s} selfHas=%s probe={%s}',
+                            tostring(spellName), tostring(spellId), tostring(category), stateText, tostring(hasSelf), probeSummary(probe))
+                    end
                     debugLog('findBuffNeed: Self-buff %s hasBuff=%s', spellName, tostring(hasBuff))
 
                     if not hasBuff then
                         -- Check if spell would stack (not blocked by existing buffs)
                         local wouldStack = spellWouldStack(spellName)
+                        diagLog('self_only_stack_' .. tostring(category), 0.5,
+                            'selfOnlyStack spell="%s" spellId=%s stacks=%s', tostring(spellName), tostring(spellId), tostring(wouldStack))
                         if not wouldStack then
                             debugLog('findBuffNeed: Self-buff %s would not stack, skipping', spellName)
                             goto continue_buff
@@ -688,58 +1045,68 @@ local function findBuffNeed()
                             isSelfOnly = true,
                             isGroup = false,
                         }
+                    else
+                        _lastBuffScanReason = 'already_has_self_buff:' .. spellName
                     end
                 end
             else
-                -- Group or single-target buff: check group members directly
                 -- Check group cast cooldown first
                 if isGroup then
                     local lastCast = _lastGroupCastAt[category] or 0
                     if (now - lastCast) < GROUP_CAST_COOLDOWN then
                         debugLog('findBuffNeed: Group buff %s on cooldown', spellName)
+                        _lastBuffScanReason = 'group_cooldown:' .. spellName
                         goto continue_buff
                     end
                 end
 
-                -- Check self first for group buffs
-                local hasSelfBuff = selfHasBuff(spellName)
-                debugLog('findBuffNeed: Group/single buff %s selfHasBuff=%s', spellName, tostring(hasSelfBuff))
-
-                if not hasSelfBuff then
-                    -- Check if spell would stack (not blocked by existing buffs)
-                    local wouldStack = spellWouldStack(spellName)
-                    if not wouldStack then
-                        debugLog('findBuffNeed: Group/single buff %s would not stack, skipping', spellName)
-                        goto continue_buff
-                    end
-
-                    -- Check if we have enough mana
-                    if not hasEnoughMana(spellName) then
-                        debugLog('findBuffNeed: Group/single buff %s not enough mana, skipping', spellName)
-                        goto continue_buff
-                    end
-
-                    debugLog('findBuffNeed: FOUND buff %s on SELF (category=%s, isGroup=%s)',
-                        spellName, category, tostring(isGroup))
-                    return {
-                        category = category,
-                        spellName = spellName,
-                        targetId = myId,
-                        targetName = _selfName,
-                        isSelfOnly = false,
-                        isGroup = isGroup,
-                    }
+                -- Check if we have enough mana
+                if not hasEnoughMana(spellName) then
+                    debugLog('findBuffNeed: Group/single buff %s not enough mana, skipping', spellName)
+                    _lastBuffScanReason = 'not_enough_mana:' .. spellName
+                    goto continue_buff
                 end
 
-                -- TODO: Check group members for single-target buffs
-                -- For now, just handle self-buffing
+                local target = pickBuffTarget(buffDef, spellName, category, rebuffWindow, isGroup, myId)
+                if not target then
+                    debugLog('findBuffNeed: No eligible target needs %s', spellName)
+                    _lastBuffScanReason = 'no_eligible_target:' .. spellName
+                    goto continue_buff
+                end
+
+                -- Only use self Stacks() as a blocker when the selected target
+                -- is self. A self stack failure should not suppress buffing
+                -- another group member who is missing the buff.
+                if target.isSelf and not spellWouldStack(spellName) then
+                    debugLog('findBuffNeed: Group/single buff %s would not stack on self, skipping', spellName)
+                    diagLog('target_stack_' .. tostring(category), 0.5,
+                        'targetStack spell="%s" category=%s target=%s(%s) self=%s stacks=false -> skip',
+                        tostring(spellName), tostring(category), tostring(target.name), tostring(target.id), tostring(target.isSelf))
+                    _lastBuffScanReason = 'would_not_stack:' .. spellName
+                    goto continue_buff
+                end
+
+                diagLog('found_need_' .. tostring(category), 0.5,
+                    'FOUND need spell="%s" category=%s target=%s(%s) isGroup=%s isSelf=%s',
+                    tostring(spellName), tostring(category), tostring(target.name), tostring(target.id),
+                    tostring(isGroup), tostring(target.isSelf))
+                debugLog('findBuffNeed: FOUND buff %s on %s (category=%s, isGroup=%s)',
+                    spellName, tostring(target.name), category, tostring(isGroup))
+                return {
+                    category = category,
+                    spellName = spellName,
+                    targetId = isGroup and myId or target.id,
+                    targetName = isGroup and _selfName or target.name,
+                    isSelfOnly = false,
+                    isGroup = isGroup,
+                }
             end
         end
         ::continue_buff::
     end
 
     debugLog('findBuffNeed: No buffs needed')
-    return nil
+    return nil, _lastBuffScanReason or 'no_buff_needed'
 end
 
 -------------------------------------------------------------------------------
@@ -801,7 +1168,7 @@ module.onTick = function(self)
     _lastBuffTick = now
 
     -- Find if we have buff work to do
-    local need = findBuffNeed()
+    local need, noNeedReason = findBuffNeed()
 
     _pendingAction = need
     _pendingReason = need and 'buff_needed' or nil
@@ -809,7 +1176,7 @@ module.onTick = function(self)
     local needsAction = need ~= nil
     debugLog('onTick: findBuffNeed=%s needsAction=%s',
         need and need.spellName or 'nil', tostring(needsAction))
-    self:sendNeed(needsAction, needsAction and 1500 or nil, needsAction and 'buff_needed' or 'no_buff_needed')
+    self:sendNeed(needsAction, needsAction and 1500 or nil, needsAction and 'buff_needed' or (noNeedReason or 'no_buff_needed'))
 
     -- Handle gem memorization while waiting
     if _buffGemSwap.active and _buffGemSwap.requestedSpell ~= '' then
@@ -994,7 +1361,27 @@ module.executeAction = function(self)
                 if Buff and Buff.trackLocalBuff then
                     local spellId = getSpellId(spellName)
                     local duration = Buff.getMySpellDuration and Buff.getMySpellDuration(spellName) or nil
-                    Buff.trackLocalBuff(targetId, category, spellId, spellName, duration)
+                    if action.isGroup then
+                        local tracked = 0
+                        local myId = lib.safeNum(function() return mq.TLO.Me.ID() end, 0)
+                        for _, candidate in ipairs(groupBuffCandidates(myId)) do
+                            local candidateId = tonumber(candidate.id) or 0
+                            if candidateId > 0 then
+                                Buff.trackLocalBuff(candidateId, category, spellId, spellName, duration)
+                                tracked = tracked + 1
+                            end
+                        end
+                        diagLog('track_local_' .. tostring(category), 0,
+                            'trackLocalBuff group spell="%s" spellId=%s category=%s tracked=%d duration=%s castTargetId=%s',
+                            tostring(spellName), tostring(spellId), tostring(category), tracked,
+                            tostring(duration), tostring(targetId))
+                    else
+                        diagLog('track_local_' .. tostring(category), 0,
+                            'trackLocalBuff spell="%s" spellId=%s category=%s targetId=%s duration=%s isGroup=%s',
+                            tostring(spellName), tostring(spellId), tostring(category), tostring(targetId),
+                            tostring(duration), tostring(action.isGroup))
+                        Buff.trackLocalBuff(targetId, category, spellId, spellName, duration)
+                    end
                 end
 
                 -- Track group cast cooldown
@@ -1102,6 +1489,8 @@ module.requestClaim = function(self, action)
         type = claimType,
         wants = wants,
         module = self.name,
+        ownerName = lib.getMyName(),
+        ownerServer = lib.getMyServer(),
         priority = self.priority,
         claimId = self.currentClaimId,
         epochSeen = self.state.epoch,
@@ -1153,21 +1542,43 @@ end
 -- Command Binding
 -------------------------------------------------------------------------------
 
-mq.bind('/sk_buffs', function(cmd)
+mq.bind('/sk_buffs', function(cmd, arg)
+    cmd = tostring(cmd or '')
+    arg = tostring(arg or '')
+    if arg == '' and cmd:find('%s') then
+        local first, rest = cmd:match('^(%S+)%s+(.+)$')
+        cmd = first or cmd
+        arg = rest or ''
+    end
+    cmd = cmd:lower()
+    arg = arg:lower()
     if cmd == 'stop' then
         module:stop()
         lib.log('info', module.name, 'Stop requested')
     elseif cmd == 'status' then
         local settings = syncSettings()
-        lib.log('info', module.name, 'running=%s, hasState=%s, isMyPriority=%s, ownsCast=%s, buffingEnabled=%s',
+        local defCount = 0
+        for _ in pairs(_buffDefinitions) do defCount = defCount + 1 end
+        lib.log('info', module.name, 'running=%s, hasState=%s, isMyPriority=%s, ownsCast=%s, buffingEnabled=%s, defs=%d, reason=%s',
             tostring(module.running),
             tostring(module:hasValidState()),
             tostring(module:isMyPriority()),
             tostring(module:ownsCast()),
-            tostring(settings.BuffingEnabled))
+            tostring(settings.BuffingEnabled),
+            defCount,
+            tostring(_lastBuffScanReason))
     elseif cmd == 'reload' then
+        _persistenceLoaded = false
         loadBuffDefinitions()
         lib.log('info', module.name, 'Buff definitions reloaded')
+    elseif cmd == 'debug' then
+        _buffDebugEnabled = (arg == 'on' or arg == '1' or arg == 'true')
+        _diagThrottle = {}
+        local BuffLogger = getBuffLogger()
+        if BuffLogger and BuffLogger.init then
+            BuffLogger.init({ level = 'debug', enabled = true })
+        end
+        lib.log('info', module.name, 'Buff diagnostics %s', _buffDebugEnabled and 'enabled' or 'disabled')
     end
 end)
 

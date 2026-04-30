@@ -141,6 +141,8 @@ function M.create(moduleName, priority)
             type = lib.ClaimType.ACTION,
             wants = { 'target', 'cast' },
             module = self.name,
+            ownerName = lib.getMyName(),
+            ownerServer = lib.getMyServer(),
             priority = self.priority,
             claimId = self.currentClaimId,
             epochSeen = self.state.epoch,
@@ -167,6 +169,8 @@ function M.create(moduleName, priority)
             msgType = 'release',
             type = 'action',
             module = self.name,
+            ownerName = lib.getMyName(),
+            ownerServer = lib.getMyServer(),
             claimId = self.currentClaimId,
             epochSeen = self.state and self.state.epoch or 0,
             reason = reason or 'completed',
@@ -187,6 +191,8 @@ function M.create(moduleName, priority)
         local interrupt = {
             msgType = 'interrupt',
             requestingModule = self.name,
+            ownerName = lib.getMyName(),
+            ownerServer = lib.getMyServer(),
             requestingPriority = self.priority,
             reason = reason or 'preempt',
         }
@@ -204,6 +210,8 @@ function M.create(moduleName, priority)
             self.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
                 msgType = 'heartbeat',
                 module = self.name,
+                ownerName = lib.getMyName(),
+                ownerServer = lib.getMyServer(),
                 sentAtMs = lib.getTimeMs(),
                 ready = true,
             })
@@ -226,6 +234,8 @@ function M.create(moduleName, priority)
             self.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
                 msgType = 'need',
                 module = self.name,
+                ownerName = lib.getMyName(),
+                ownerServer = lib.getMyServer(),
                 priority = self.priority,
                 needsAction = value,
                 ttlMs = ttlMs or 250,
@@ -239,6 +249,10 @@ function M.create(moduleName, priority)
     ---------------------------------------------------------------------------
 
     function self:onStateReceived(content)
+        if type(content) ~= 'table' then return end
+        if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
+        if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
+
         self.state = content
         self.stateReceivedAt = lib.getTimeMs()
 
@@ -272,6 +286,18 @@ function M.create(moduleName, priority)
     ---------------------------------------------------------------------------
 
     function self:tick()
+        -- Death/hovering invalidates any local action claim. Continuing to
+        -- advertise need while dead can leave the coordinator stuck on an
+        -- owner that cannot cast after a wipe.
+        if lib.isSelfDeadOrHovering and lib.isSelfDeadOrHovering() then
+            if self.currentClaimId then
+                lib.log('warn', self.name, 'Self dead/hovering, releasing claim')
+                self:releaseClaim('self_dead')
+            end
+            self:sendNeed(false, nil, 'self_dead')
+            return
+        end
+
         -- Safety: stop if no valid state
         if not self:hasValidState() then
             -- Log occasionally to avoid spam

@@ -5,6 +5,7 @@
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
 local Core = require('sidekick-next.utils.core')
+local Helpers = require('sidekick-next.lib.helpers')
 
 local M = {}
 
@@ -118,9 +119,20 @@ function M.executeDisc(discName)
 
     local me = mq.TLO.Me
     if not me or not me() then return false end
-    if not me.CombatAbilityReady(discName)() then return false end
 
-    mq.cmdf('/disc "%s"', discName)
+    local readyName = nil
+    for _, candidate in ipairs(Helpers.discNameCandidates(discName)) do
+        local ok, ready = pcall(function()
+            return me.CombatAbilityReady(candidate)() == true
+        end)
+        if ok and ready then
+            readyName = candidate
+            break
+        end
+    end
+    if not readyName then return false end
+
+    mq.cmd('/disc ' .. readyName)
     M.markChannelUsed('aa_disc')
     return true
 end

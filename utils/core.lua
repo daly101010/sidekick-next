@@ -231,6 +231,11 @@ function Core.ensureSeeded(abilities, MODE)
             else
                 Core.Settings[k] = nil  -- Empty/false, no condition set
             end
+        elseif k:match('Context$') then
+            -- ON_COOLDOWN context is numeric: Combat=1, Out of Combat=2, Anytime=3.
+            -- Treating these as booleans makes saved OOC/Anytime settings reload as false,
+            -- which later falls back to Combat-only behavior.
+            Core.Settings[k] = tonumber(v) or 1
         elseif k:match('Layer$') then
             -- Layer metadata is a string (e.g. auto/emergency/aggro/defenses/burn/combat/utility)
             Core.Settings[k] = tostring(v or '')

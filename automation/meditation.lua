@@ -22,6 +22,7 @@ local function getMedLogger()
 end
 
 local getBuff = lazy('sidekick-next.automation.buff')
+local getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
 
 local M = {}
 
@@ -226,6 +227,21 @@ local function cmd_stand(now)
     _state.lastStateChangeAt = now
 end
 
+local function spell_memorization_active()
+    local Memorize = getSpellSetMemorize()
+    if Memorize and Memorize.isBusy and Memorize.isBusy() then
+        return true, 'spellset_memorize'
+    end
+
+    local bookOpen = safeBool(function()
+        local wnd = mq.TLO.Window and mq.TLO.Window('SpellBookWnd')
+        return wnd and wnd.Open and wnd.Open()
+    end)
+    if bookOpen then return true, 'spellbook_open' end
+
+    return false, nil
+end
+
 function M.tick(settings)
     settings = settings or {}
     local mode = normalize_mode(settings.MeditationMode)
@@ -334,6 +350,17 @@ function M.tick(settings)
 
     if me.moving == true then
         medLog('moving', 2, 'tick skip: moving')
+        return
+    end
+
+    local memActive, memReason = spell_memorization_active()
+    if memActive then
+        if me.sitting ~= true and can_change_state(now, settings) then
+            cmd_sit(now)
+            medLog('sit_memorize', 2, 'sit: spell memorization active (%s)', tostring(memReason))
+        else
+            medLog('hold_memorize', 2, 'hold posture: spell memorization active (%s)', tostring(memReason))
+        end
         return
     end
 

@@ -22,7 +22,6 @@
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
 
-local getConfigLoader = lazy('sidekick-next.utils.class_config_loader')
 local getNamed        = lazy('sidekick-next.utils.named_detector')
 local getCore         = lazy('sidekick-next.utils.core')
 
@@ -194,6 +193,7 @@ function M.buildContext()
         },
         combat = inCombat,
         burn   = burnNow,
+        mode   = settings.CombatMode or 'off',
         target = targetInfo,
         spawn = {
             count = function(query)
@@ -213,14 +213,6 @@ end
 -------------------------------------------------------------------------------
 -- Ability classification & readiness
 -------------------------------------------------------------------------------
-
-local function abilityKind(config, setName)
-    if not (config and setName) then return nil end
-    if config.aaLines and config.aaLines[setName] then return 'aa' end
-    if config.discLines and config.discLines[setName] then return 'disc' end
-    if config.spellLines and config.spellLines[setName] then return 'spell' end
-    return nil
-end
 
 local function isAAReady(name)
     return safeTLO(function() return mq.TLO.Me.AltAbilityReady(name)() end, false) == true
@@ -247,6 +239,72 @@ local function isReady(kind, name)
     return false
 end
 
+local function abilityLineForKind(config, setName, kind)
+    if not (config and setName and kind) then return nil end
+    if kind == 'disc' and config.discLines and config.discLines[setName] then
+        return config.discLines[setName]
+    elseif kind == 'aa' and config.aaLines and config.aaLines[setName] then
+        return config.aaLines[setName]
+    elseif kind == 'spell' and config.spellLines and config.spellLines[setName] then
+        return config.spellLines[setName]
+    end
+
+    -- Legacy configs often keep AAs in AbilitySets with an "AA" suffix
+    -- while the predicate name strips to the unsuffixed line name.
+    if config.AbilitySets then
+        if config.AbilitySets[setName] then
+            return config.AbilitySets[setName]
+        end
+        if kind == 'aa' and config.AbilitySets[setName .. 'AA'] then
+            return config.AbilitySets[setName .. 'AA']
+        end
+    end
+    return nil
+end
+
+local function hasAbilityForKind(kind, name)
+    if kind == 'aa' then
+        local aa = mq.TLO.Me.AltAbility(name)
+        return aa and aa() and true or false
+    elseif kind == 'disc' then
+        local disc = mq.TLO.Me.CombatAbility(name)
+        return disc and disc() and true or false
+    elseif kind == 'spell' then
+        local book = mq.TLO.Me.Book(name)
+        if book and book() then return true end
+        local spell = mq.TLO.Me.Spell(name)
+        return spell and spell() and true or false
+    end
+    return false
+end
+
+local function resolveAbilityForKind(config, setName, kind)
+    local line = abilityLineForKind(config, setName, kind)
+    if type(line) ~= 'table' then return nil end
+    for _, name in ipairs(line) do
+        if hasAbilityForKind(kind, name) then
+            return name
+        end
+    end
+    return nil
+end
+
+local function kindCandidates(config, setName, allowKinds)
+    local candidates = {}
+    local function add(kind)
+        if allowKinds[kind] and abilityLineForKind(config, setName, kind) then
+            table.insert(candidates, kind)
+        end
+    end
+
+    -- Disc first keeps duplicate disc/AA names such as BER Bloodfury from
+    -- being misclassified as an AA before the discipline line is checked.
+    add('disc')
+    add('aa')
+    add('spell')
+    return candidates
+end
+
 -------------------------------------------------------------------------------
 -- Picker
 -------------------------------------------------------------------------------
@@ -268,9 +326,6 @@ function M.pickReadyAbility(classConfig, ctx, opts)
     if not ctx then return nil end
 
     local allowKinds = (opts and opts.allowKinds) or { aa = true, disc = true, spell = true }
-
-    local CL = getConfigLoader()
-    if not (CL and CL.resolveAbilitySet) then return nil end
 
     -- Honor an explicit ordering on the class config when supplied. This
     -- lets a config author choose firing priority (e.g. defensive discs
@@ -310,9 +365,8 @@ function M.pickReadyAbility(classConfig, ctx, opts)
                 -- Strip the leading "do" prefix to get the ability-set name
                 -- ("doFortitude" -> "Fortitude", "doStandDisc" -> "StandDisc").
                 local setName = condKey:gsub('^do', '')
-                local kind = abilityKind(classConfig, setName)
-                if kind and allowKinds[kind] then
-                    local resolved = CL.resolveAbilitySet(setName, classConfig)
+                for _, kind in ipairs(kindCandidates(classConfig, setName, allowKinds)) do
+                    local resolved = resolveAbilityForKind(classConfig, setName, kind)
                     if resolved and isReady(kind, resolved) then
                         return {
                             name    = resolved,
@@ -342,7 +396,7 @@ function M.fireAbility(action)
         mq.cmdf('/alt activate %d', id)
         return true
     elseif action.kind == 'disc' then
-        mq.cmdf('/disc "%s"', action.name)
+        mq.cmd('/disc ' .. action.name)
         return true
     elseif action.kind == 'spell' then
         mq.cmdf('/cast "%s"', action.name)

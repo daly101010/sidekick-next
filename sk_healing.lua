@@ -102,6 +102,12 @@ module.onTick = function(self)
     Healing.tickSensors()
 
     if self:ownsCast() then
+        if not self:ownsAction() then
+            _pendingAction = nil
+            self:releaseClaim('partial_ownership')
+            self:sendNeed(false, nil, 'partial_ownership')
+            return
+        end
         _pendingAction = nil
         local ttlMs = 1000
         local ownerAction = self.state and self.state.castOwner and self.state.castOwner.action

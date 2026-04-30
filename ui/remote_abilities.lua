@@ -105,7 +105,7 @@ local function executeRemoteAbility(charName, ability)
     if kind == 'aa' and ability.altID then
         mq.cmdf('/dex %s /alt activate %d', charName, ability.altID)
     elseif kind == 'disc' and ability.discName then
-        mq.cmdf('/dex %s /disc "%s"', charName, ability.discName)
+        mq.cmdf('/dex %s /disc %s', charName, ability.discName)
     elseif kind == 'ability' and ability.altName then
         mq.cmdf('/dex %s /doability "%s"', charName, ability.altName)
     elseif kind == 'item' and ability.itemName then

@@ -14,6 +14,9 @@ local M = {}
 
 M.spellSets = {}       -- Dictionary of spell sets by name {[name] = SpellSet}
 M.activeSetName = nil  -- Currently active set name
+M.loaded = false       -- True after a load attempt for the current character path
+M.loadError = nil      -- Non-nil when the on-disk file exists but failed to load
+M.pathError = nil      -- Non-nil when character/server identity is not ready
 
 --------------------------------------------------------------------------------
 -- Lazy-loaded dependencies
@@ -23,6 +26,23 @@ local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
 local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
 local getPaths = lazy('sidekick-next.utils.paths')
 
+local _lastConfigPath = nil
+
+local function fileExists(path)
+    local f = io.open(path, 'r')
+    if f then
+        f:close()
+        return true
+    end
+    return false
+end
+
+local function countSets(t)
+    local n = 0
+    for _ in pairs(t or {}) do n = n + 1 end
+    return n
+end
+
 --------------------------------------------------------------------------------
 -- Path Helpers
 --------------------------------------------------------------------------------
@@ -31,19 +51,22 @@ local getPaths = lazy('sidekick-next.utils.paths')
 --- Path: mq.configDir/SideKick/Server_CharName_spellsets.lua
 ---@return string The full path to the spell sets config file
 function M.getConfigPath()
-    local server = 'Server'
-    local charName = 'Character'
+    M.pathError = nil
 
     -- Get server name
     local ok, s = pcall(function() return mq.TLO.EverQuest.Server() end)
-    if ok and s then
-        server = tostring(s):gsub(' ', '_')
+    local server = ok and tostring(s or ''):gsub(' ', '_') or ''
+    if server == '' or server:lower() == 'null' then
+        M.pathError = 'server_not_ready'
+        return _lastConfigPath
     end
 
     -- Get character name
     ok, s = pcall(function() return mq.TLO.Me.CleanName() end)
-    if ok and s then
-        charName = tostring(s)
+    local charName = ok and tostring(s or '') or ''
+    if charName == '' or charName:lower() == 'null' then
+        M.pathError = 'character_not_ready'
+        return _lastConfigPath
     end
 
     -- Ensure SideKick directory exists
@@ -56,7 +79,8 @@ function M.getConfigPath()
         os.execute('mkdir "' .. baseDir .. '" 2>nul')
     end
 
-    return string.format('%s/%s_%s_spellsets.lua', baseDir, server, charName)
+    _lastConfigPath = string.format('%s/%s_%s_spellsets.lua', baseDir, server, charName)
+    return _lastConfigPath
 end
 
 --------------------------------------------------------------------------------
@@ -182,12 +206,32 @@ end
 --- Uses mq.pickle(path, data) to write
 function M.save()
     local path = M.getConfigPath()
+    if not path or M.pathError then
+        print(string.format('\ar[SpellSetPersistence]\ax Refusing to save: %s', tostring(M.pathError or 'no_config_path')))
+        return false
+    end
+
+    -- Several UI/module paths can reach Persistence.save() lazily. If that
+    -- happens before Persistence.load(), the module still contains its initial
+    -- empty tables and saving would overwrite the user's spell-set file with a
+    -- blank/default set. Force load first, and refuse to save over a file that
+    -- failed to parse.
+    if not M.loaded then
+        if countSets(M.spellSets) == 0 then
+            M.load()
+        else
+            print('\ar[SpellSetPersistence]\ax Refusing to save spell sets before loading existing data')
+            return false
+        end
+    end
+
+    if M.loadError then
+        print(string.format('\ar[SpellSetPersistence]\ax Refusing to save because load failed: %s', tostring(M.loadError)))
+        return false
+    end
 
     -- Count sets for debug output
-    local setCount = 0
-    for _ in pairs(M.spellSets) do
-        setCount = setCount + 1
-    end
+    local setCount = countSets(M.spellSets)
     -- print(string.format('\\ay[SpellSetPersistence]\\ax Saving %d spell set(s) to: %s', setCount, path))
 
     -- Build data structure for persistence
@@ -234,6 +278,21 @@ function M.save()
         data.sets[name] = setData
     end
 
+    -- Keep a last-known-good backup before overwriting. This is intentionally
+    -- best-effort; failure to copy the backup should not block normal saves.
+    if fileExists(path) then
+        pcall(function()
+            local src = io.open(path, 'r')
+            if not src then return end
+            local content = src:read('*all')
+            src:close()
+            local dst = io.open(path .. '.bak', 'w')
+            if not dst then return end
+            dst:write(content or '')
+            dst:close()
+        end)
+    end
+
     -- Write to file using mq.pickle
     local ok, err = pcall(function()
         mq.pickle(path, data)
@@ -261,7 +320,14 @@ end
 --- Ensures activeSetName points to valid set
 function M.load()
     local path = M.getConfigPath()
+    if not path or M.pathError then
+        M.loaded = false
+        M.loadError = tostring(M.pathError or 'no_config_path')
+        return false
+    end
     -- print(string.format('\\ay[SpellSetPersistence]\\ax Loading spell sets from: %s', path))
+    M.loaded = false
+    M.loadError = nil
 
     -- Probe for file existence before dofile so the normal "first-run, no
     -- saved sets" case stays silent. A red error should only fire for actual
@@ -290,12 +356,34 @@ function M.load()
         else
             -- File exists but failed to parse — this IS an error worth surfacing.
             print(string.format('\\ar[SpellSetPersistence]\\ax Failed to load: %s', tostring(err)))
+            M.loadError = tostring(err or 'unknown error')
+            if fileExists(path .. '.bak') then
+                local backupContent
+                local bf = io.open(path .. '.bak', 'r')
+                if bf then
+                    backupContent = bf:read('*all')
+                    bf:close()
+                end
+                local backupResult, backupErr = SafeLoad.tableLiteral(backupContent, path .. '.bak')
+                if type(backupResult) == 'table' then
+                    print('\\ay[SpellSetPersistence]\\ax Loaded spell sets from backup file')
+                    data = backupResult
+                    M.loadError = nil
+                else
+                    print(string.format('\\ar[SpellSetPersistence]\\ax Backup load failed: %s', tostring(backupErr)))
+                end
+            end
         end
     end
 
     -- Reset state
     M.spellSets = {}
     M.activeSetName = nil
+
+    if M.loadError then
+        M.loaded = true
+        return false
+    end
 
     -- Process loaded data
     if data and data.version and data.sets then
@@ -382,6 +470,7 @@ function M.load()
         M.activeSetName = 'Default'
     end
 
+    M.loaded = true
     return true
 end
 

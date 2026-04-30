@@ -134,11 +134,37 @@ function M.isMeValid()
     return mq.TLO.Me and mq.TLO.Me() ~= nil
 end
 
+--- Check whether the local character cannot act because they are dead/hovering.
+-- @return boolean
+function M.isSelfDeadOrHovering()
+    if not M.isMeValid() then return true end
+    if M.safeTLO(function() return mq.TLO.Me.Hovering() end, false) == true then
+        return true
+    end
+    return M.safeTLO(function() return mq.TLO.Me.Dead() end, false) == true
+end
+
 --- Get my character name
 -- @return string
 function M.getMyName()
     if not M.isMeValid() then return '' end
     return M.safeTLO(function() return mq.TLO.Me.CleanName() end, '') or ''
+end
+
+--- Get current server name normalized the same way config paths do.
+-- @return string
+function M.getMyServer()
+    return M.safeTLO(function() return mq.TLO.EverQuest.Server() end, '') or ''
+end
+
+--- Build identity fields for local module/coordinator messages.
+-- These are intentionally simple strings so older receivers can ignore them.
+-- @return table
+function M.getMessageIdentity()
+    return {
+        ownerName = M.getMyName(),
+        ownerServer = M.getMyServer(),
+    }
 end
 
 --- Get current zone short name
@@ -152,7 +178,19 @@ end
 function M.isCasting()
     if not M.isMeValid() then return false end
     local casting = M.safeTLO(function() return mq.TLO.Me.Casting() end, nil)
-    return casting ~= nil
+    local castText = tostring(casting or '')
+    if castText ~= '' and castText:upper() ~= 'NULL' then
+        return true
+    end
+
+    if M.safeNum(function() return mq.TLO.Me.CastTimeLeft() end, 0) > 0 then
+        return true
+    end
+
+    return M.safeTLO(function()
+        local wnd = mq.TLO.Window and mq.TLO.Window('CastingWindow')
+        return wnd and wnd.Open and wnd.Open()
+    end, false) == true
 end
 
 --- Get remaining cast time in seconds

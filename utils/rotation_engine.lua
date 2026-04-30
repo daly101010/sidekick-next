@@ -164,6 +164,14 @@ function M.getAbilityLayer(def, settings, classConfig)
         if mapped then return mapped end
     end
 
+    -- Generated AA data uses `type` for this classification
+    -- (for example CLR AAs have type="offensive"). Treat it as a category
+    -- fallback so those abilities don't all fall through to combat.
+    if def.type then
+        local mapped = CATEGORY_TO_LAYER[tostring(def.type):lower()]
+        if mapped then return mapped end
+    end
+
     -- Check Category from class config Settings metadata (e.g., Settings.DoHaste.Category = "Buff")
     if classConfig and classConfig.Settings and def.settingKey then
         local settingMeta = classConfig.Settings[def.settingKey]
@@ -902,6 +910,13 @@ function M.processMashQueue(opts)
             goto continue
         end
         -- ANYTIME passes regardless of combat state
+
+        -- For auto-mashed buffs/auras, don't re-fire while the effect is
+        -- already present in buff, song, or aura windows. Manual clicks bypass
+        -- this path and still force the ability.
+        if Abilities.hasActiveBuffSongOrAura and Abilities.hasActiveBuffSongOrAura(def) then
+            goto continue
+        end
 
         -- Try to execute (instant abilities, no GCD contention)
         if M.tryExecute(def) then

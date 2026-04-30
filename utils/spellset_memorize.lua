@@ -4,6 +4,8 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local actors = require('actors')
+local lib = require('sidekick-next.sk_lib')
 
 local M = {}
 
@@ -30,6 +32,7 @@ local CLEAR_DELAY_MS = 500          -- Delay after right-click to clear gem
 local MEMORIZE_TIMEOUT_MS = 12000   -- Max time to wait for memorization
 local WAIT_POLL_MS = 100            -- Poll interval for wait functions
 local DIRTY_CHECK_INTERVAL = 30     -- Seconds between automatic dirty-gem checks
+local STATUS_MODULE = 'spell_memorize'
 
 --------------------------------------------------------------------------------
 -- Internal Helpers
@@ -147,6 +150,63 @@ local function _nowMs()
     return (mq.gettime and mq.gettime()) or (os.clock() * 1000)
 end
 
+local _statusActor = nil
+local _lastStatusNeed = nil
+local _lastStatusReason = nil
+local _lastStatusSentAt = 0
+local _lastHeartbeatAt = 0
+
+local function getStatusActor()
+    if _statusActor ~= nil then return _statusActor end
+    local ok, actor = pcall(function()
+        return actors.register(STATUS_MODULE, function() end)
+    end)
+    _statusActor = ok and actor or false
+    return _statusActor
+end
+
+local function publishStatus(needsAction, reason)
+    local actor = getStatusActor()
+    if not actor then return end
+
+    local now = lib.getTimeMs()
+    if (now - (_lastHeartbeatAt or 0)) >= lib.Timing.MODULE_HEARTBEAT_MS then
+        _lastHeartbeatAt = now
+        pcall(function()
+            actor:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
+                msgType = 'heartbeat',
+                module = STATUS_MODULE,
+                ownerName = lib.getMyName(),
+                ownerServer = lib.getMyServer(),
+                sentAtMs = now,
+                ready = true,
+            })
+        end)
+    end
+
+    local need = needsAction == true
+    reason = tostring(reason or (need and 'memorizing' or 'idle'))
+    if need == _lastStatusNeed and reason == _lastStatusReason and (now - (_lastStatusSentAt or 0)) < 100 then
+        return
+    end
+
+    _lastStatusNeed = need
+    _lastStatusReason = reason
+    _lastStatusSentAt = now
+    pcall(function()
+        actor:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
+            msgType = 'need',
+            module = STATUS_MODULE,
+            ownerName = lib.getMyName(),
+            ownerServer = lib.getMyServer(),
+            priority = lib.Priority.BUFF,
+            needsAction = need,
+            ttlMs = need and 1000 or 250,
+            reason = reason,
+        })
+    end)
+end
+
 local function _abortMemJob(reason, requeue)
     if M._memJob and requeue then
         M.pendingSet = M._memJob.setName
@@ -159,6 +219,7 @@ local function _abortMemJob(reason, requeue)
     end
     M._memJob = nil
     M.isMemorizing = false
+    publishStatus(false, reason or 'aborted')
 end
 
 local function _finishMemJob()
@@ -173,6 +234,7 @@ local function _finishMemJob()
     print(string.format('\ag[SpellSetMemorize]\ax Spell set "%s" applied successfully', job.setName))
     M._memJob = nil
     M.isMemorizing = false
+    publishStatus(false, 'done')
 end
 
 --- Apply a spell set (memorize spells) via a non-blocking state machine.
@@ -234,6 +296,7 @@ function M.apply(setName)
     }
 
     print(string.format('\ag[SpellSetMemorize]\ax Applying spell set "%s"', setName))
+    publishStatus(true, 'starting:' .. tostring(setName or ''))
     return true
 end
 
@@ -428,9 +491,15 @@ end
 function M.processPending()
     -- If a job is already running, advance it one step and return.
     if M._memJob then
+        publishStatus(true, 'phase:' .. tostring(M._memJob.phase or 'active'))
         _stepMemJob()
+        if not M._memJob then
+            publishStatus(false, 'idle')
+        end
         return
     end
+
+    publishStatus(false, 'idle')
 
     -- No active job. Run the periodic dirty-gem check if not memorizing.
     if not M.pendingSet then
@@ -452,8 +521,14 @@ function M.processPending()
     if shouldSave then
         local Persistence = getPersistence()
         if Persistence then
-            Persistence.save()
-            print('\ag[SpellSetMemorize]\ax Spell sets saved')
+            local ok = Persistence.save()
+            if ok ~= false then
+                print('\ag[SpellSetMemorize]\ax Spell sets saved')
+            else
+                print('\ar[SpellSetMemorize]\ax Spell sets save failed')
+                M.pendingSet = setName
+                return
+            end
         end
     end
 

@@ -29,7 +29,9 @@ function M.tableLiteral(content, chunkName)
     if type(content) ~= 'string' or content == '' then
         return nil, 'empty content'
     end
-    local fn, err = compile('return ' .. content, chunkName)
+    local trimmed = content:match('^%s*(.-)%s*$') or content
+    local src = trimmed:match('^return%s+') and trimmed or ('return ' .. trimmed)
+    local fn, err = compile(src, chunkName)
     if not fn then return nil, err end
     local ok, data = pcall(fn)
     if not ok then return nil, data end

@@ -110,6 +110,18 @@ local priorityNames = {
     [lib.Priority.MEDITATION] = 'Meditation',
 }
 
+local moduleOrder = {
+    healing_emergency = 10,
+    emergency = 20,
+    healing = 30,
+    resurrection = 40,
+    disciplines = 50,
+    dps = 60,
+    buffs = 70,
+    spell_memorize = 80,
+    meditation = 90,
+}
+
 local function formatBool(v)
     if v == true then return 'true' end
     if v == false then return 'false' end
@@ -214,14 +226,15 @@ local function renderModuleDiagnostics(moduleDiag)
         return
     end
 
-    -- Sort modules by priority for display
+    -- Sort modules by stable module order. Sorting by current need priority
+    -- makes rows jump whenever needs expire or reappear.
     local sorted = {}
     for name, diag in pairs(moduleDiag) do
         table.insert(sorted, { name = name, diag = diag })
     end
     table.sort(sorted, function(a, b)
-        local pa = a.diag.needPriority or 999
-        local pb = b.diag.needPriority or 999
+        local pa = moduleOrder[a.name] or 999
+        local pb = moduleOrder[b.name] or 999
         if pa ~= pb then return pa < pb end
         return a.name < b.name
     end)
@@ -264,7 +277,9 @@ local function renderModuleDiagnostics(moduleDiag)
             -- Heartbeat age
             imgui.TableNextColumn()
             local hbAge = diag.heartbeatAge or 0
-            if hbAge < 500 then
+            if diag.stale then
+                imgui.TextColored(0.6, 0.6, 0.6, 1, 'stale')
+            elseif hbAge < 500 then
                 imgui.TextColored(0.3, 1.0, 0.3, 1, string.format('%dms', hbAge))
             elseif hbAge < 2000 then
                 imgui.TextColored(1.0, 1.0, 0.3, 1, string.format('%dms', hbAge))
@@ -573,6 +588,8 @@ function M.init()
     M._stateDropbox = actors.register(lib.Mailbox.STATE, function(message)
         local content = message()
         if type(content) ~= 'table' then return end
+        if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
+        if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
         if content.tickId and content.epoch then
             State.last = content
             State.receivedAtMs = mq.gettime()

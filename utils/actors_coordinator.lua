@@ -195,6 +195,13 @@ function M.init(opts)
     local _selfNameLower = tostring(_selfName or ''):lower()
     local _selfServerLower = tostring(_selfServer or ''):lower()
 
+    local function sameLocalCharacter(name, server)
+        name = tostring(name or ''):lower()
+        server = tostring(server or ''):lower()
+        if name == '' or _selfNameLower == '' or name ~= _selfNameLower then return false end
+        return _selfServerLower == '' or server == '' or server == _selfServerLower
+    end
+
     _dropbox = _actors.register('sidekick', function(message)
         local content = message()
         if type(content) ~= 'table' then return end
@@ -240,6 +247,11 @@ function M.init(opts)
         -- _lastStatusPayload — so GroupTarget can distinguish "alive but quiet"
         -- from "not responding".
         if id == 'status:req' then
+            if tostring(content.script or '') == 'grouptarget'
+                and not sameLocalCharacter(content.from, content.server)
+                and not fromMe then
+                return
+            end
             local reply = {}
             if type(_lastStatusPayload) == 'table' then
                 for k, v in pairs(_lastStatusPayload) do reply[k] = v end
@@ -255,7 +267,7 @@ function M.init(opts)
 
         -- GroupTarget broadcasting its settings panel state (used to hide Exit Both button, etc.)
         if id == 'gt:settings_open' then
-            if not fromMe and not fromGroupTargetMailbox then return end
+            if not sameLocalCharacter(content.from, content.server) and not fromMe then return end
             _G.GroupTargetBounds = _G.GroupTargetBounds or {}
             _G.GroupTargetBounds.settingsOpen = content.open == true
             _G.GroupTargetBounds.settingsOpenAt = os.clock()

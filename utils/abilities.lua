@@ -199,6 +199,129 @@ local function isNamedTarget()
     return t and t() and t.Named and t.Named() == true
 end
 
+local function normEffectName(s)
+    s = Helpers.normSpellName(s)
+    s = s:gsub('%s+', ' ')
+    s = s:gsub('^%s+', ''):gsub('%s+$', '')
+    return s
+end
+
+local function effectNameCandidates(def)
+    local name = tostring((def and (def.discName or def.altName or def.name)) or '')
+
+    local out, seen = {}, {}
+    local function add(v)
+        v = tostring(v or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        if v == '' or seen[v] then return end
+        seen[v] = true
+        table.insert(out, v)
+    end
+
+    add(def and def.buffName)
+    add(def and def.effectName)
+    add(def and def.auraName)
+    add(def and def.songName)
+    add(name)
+    if name == '' then return out end
+
+    local base = name:gsub('%s+[Rr][Kk]%.[^%s]+$', '')
+    add(base)
+    local noDisc = base:gsub('%s+[Dd]iscipline$', '')
+    add(noDisc)
+    if noDisc ~= base then
+        add(noDisc .. ' Effect')
+        add(noDisc .. ' Discipline Effect')
+    end
+    return out
+end
+
+local function activeWindowExactMatch(getEntryName, candidates)
+    local wanted = {}
+    for _, c in ipairs(candidates or {}) do
+        wanted[normEffectName(c)] = true
+    end
+    if not next(wanted) then return false end
+
+    for i = 1, 60 do
+        local ok, name = pcall(getEntryName, i)
+        name = ok and tostring(name or '') or ''
+        if name ~= '' then
+            local n = normEffectName(name)
+            if wanted[n] then return true end
+        end
+    end
+    return false
+end
+
+local function auraActiveByName(candidates)
+    local me = mq.TLO.Me
+    if not (me and me()) then return false end
+
+    local wanted = {}
+    for _, c in ipairs(candidates or {}) do
+        local n = tostring(c or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        if n ~= '' then
+            table.insert(wanted, n:lower())
+            table.insert(wanted, n:gsub("'", ''):lower())
+        end
+    end
+
+    for i = 1, 2 do
+        local ok, auraName = pcall(function()
+            local aura = me.Aura(i)
+            return aura and aura() and aura.Name and aura.Name() or ''
+        end)
+        auraName = ok and tostring(auraName or ''):lower() or ''
+        local auraNoApostrophe = auraName:gsub("'", '')
+        if auraName ~= '' then
+            for _, wantedName in ipairs(wanted) do
+                if auraName:find(wantedName, 1, true) or auraNoApostrophe:find(wantedName, 1, true) then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+function M.hasActiveBuffSongOrAura(def)
+    local me = mq.TLO.Me
+    if not (me and me()) then return false end
+    local candidates = effectNameCandidates(def)
+    if #candidates == 0 then return false end
+
+    for _, name in ipairs(candidates) do
+        local okBuff, hasBuff = pcall(function()
+            local b = me.Buff(name)
+            return b and b() and true or false
+        end)
+        if okBuff and hasBuff then return true end
+
+        local okSong, hasSong = pcall(function()
+            local s = me.Song(name)
+            return s and s() and true or false
+        end)
+        if okSong and hasSong then return true end
+    end
+
+    if activeWindowExactMatch(function(i)
+        local b = me.Buff(i)
+        return b and b() and b.Name and b.Name() or ''
+    end, candidates) then
+        return true
+    end
+
+    if activeWindowExactMatch(function(i)
+        local s = me.Song(i)
+        return s and s() and s.Name and s.Name() or ''
+    end, candidates) then
+        return true
+    end
+
+    return auraActiveByName(candidates)
+end
+
 function M.activate(def)
     if not def then return end
     local kind = tostring(def.kind or 'aa')

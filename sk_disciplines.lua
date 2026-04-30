@@ -29,6 +29,8 @@ local lazy = require('sidekick-next.utils.lazy_require')
 local Engine = require('sidekick-next.utils.discipline_engine')
 local getConfigLoader = lazy('sidekick-next.utils.class_config_loader')
 local getCore         = lazy('sidekick-next.utils.core')
+local getAbilityLoader = lazy('sidekick-next.abilities.loader')
+local getAbilities     = lazy('sidekick-next.utils.abilities')
 
 local module = ModuleBase.create('disciplines', lib.Priority.DPS)
 
@@ -36,10 +38,28 @@ local module = ModuleBase.create('disciplines', lib.Priority.DPS)
 -- Settings access
 -------------------------------------------------------------------------------
 
-local function disciplinesEnabled()
+local _coreLoaded = false
+local _lastCoreLoadAt = 0
+local loadDynamicAbilities
+
+local function getSettings()
     local Core = getCore()
-    if not (Core and Core.Settings) then return true end
-    local v = Core.Settings.DisciplinesEnabled
+    local now = lib.getTimeMs()
+    if Core and Core.load and (not _coreLoaded or (now - _lastCoreLoadAt) > 1000) then
+        Core.load()
+        local Abilities = getAbilities()
+        if Core.ensureSeeded and Abilities and Abilities.MODE then
+            Core.ensureSeeded(loadDynamicAbilities(), Abilities.MODE)
+        end
+        _coreLoaded = true
+        _lastCoreLoadAt = now
+    end
+    return Core and Core.Settings or {}
+end
+
+local function disciplinesEnabled()
+    local settings = getSettings()
+    local v = settings.DisciplinesEnabled
     return v ~= false  -- default true
 end
 
@@ -55,8 +75,8 @@ local function setBurn(value)
 end
 
 local function getBurn()
-    local Core = getCore()
-    return Core and Core.Settings and Core.Settings.BurnNow == true or false
+    local settings = getSettings()
+    return settings.BurnNow == true or false
 end
 
 -------------------------------------------------------------------------------
@@ -112,6 +132,8 @@ end
 -------------------------------------------------------------------------------
 
 local _classConfig = nil
+local _dynamicAbilities = nil
+local _dynamicClass = nil
 local _pendingAction = nil
 local _pendingComputedAt = 0
 local PENDING_TTL_MS = 250  -- accept a freshly-picked action for this long
@@ -132,13 +154,111 @@ local function classAllowKinds(cfg)
     return set
 end
 
+function loadDynamicAbilities()
+    local cls = myClassShort()
+    if cls == '' then return {} end
+    if _dynamicAbilities and _dynamicClass == cls then return _dynamicAbilities end
+
+    local Loader = getAbilityLoader()
+    local Abilities = getAbilities()
+    local list = (Loader and Loader.loadForClass and Loader.loadForClass(cls)) or {}
+    if Abilities and Abilities.filterAvailable then
+        list = Abilities.filterAvailable(list)
+    end
+    _dynamicClass = cls
+    _dynamicAbilities = list or {}
+    return _dynamicAbilities
+end
+
+local function hasDynamicDisciplines()
+    for _, def in ipairs(loadDynamicAbilities()) do
+        if type(def) == 'table' then
+            local kind = tostring(def.kind or ''):lower()
+            if kind == 'disc' or kind == 'aa' then return true end
+        end
+    end
+    return false
+end
+
+local function dynamicAbilityReady(def)
+    if type(def) ~= 'table' then return nil end
+    local me = mq.TLO.Me
+    if not (me and me()) then return nil end
+
+    local kind = tostring(def.kind or 'aa'):lower()
+    if kind == 'aa' then
+        if def.altID and me.AltAbilityReady then
+            local ok, ready = pcall(function() return me.AltAbilityReady(tonumber(def.altID))() == true end)
+            if ok and ready then return def.altName, 'aa' end
+        end
+        if def.altName and me.AltAbilityReady then
+            local ok, ready = pcall(function() return me.AltAbilityReady(def.altName)() == true end)
+            if ok and ready then return def.altName, 'aa' end
+        end
+    elseif kind == 'disc' then
+        local Helpers = require('sidekick-next.lib.helpers')
+        local discName = tostring(def.discName or def.altName or '')
+        for _, candidate in ipairs(Helpers.discNameCandidates(discName)) do
+            local ok, ready = pcall(function() return me.CombatAbilityReady(candidate)() == true end)
+            if ok and ready then return candidate, 'disc' end
+        end
+    end
+
+    return nil
+end
+
+local function pickDynamicCooldownAction(ctx)
+    local settings = getSettings()
+    local Abilities = getAbilities()
+    if not (Abilities and Abilities.MODE and Abilities.CONTEXT) then return nil end
+
+    local inCombat = ctx and ctx.combat == true
+    for _, def in ipairs(loadDynamicAbilities()) do
+        if type(def) == 'table' then
+            local kind = tostring(def.kind or ''):lower()
+            if kind == 'disc' or kind == 'aa' then
+                local mode = def.modeKey and tonumber(settings[def.modeKey]) or Abilities.MODE.ON_DEMAND
+                local enabled = def.settingKey and settings[def.settingKey] == true
+                if enabled and mode == Abilities.MODE.ON_COOLDOWN then
+                    local contextKey = tostring(def.settingKey) .. 'Context'
+                    local context = tonumber(settings[contextKey]) or Abilities.CONTEXT.COMBAT
+                    local contextOk = context == Abilities.CONTEXT.ANYTIME
+                        or (context == Abilities.CONTEXT.COMBAT and inCombat)
+                        or (context == Abilities.CONTEXT.OUT_OF_COMBAT and not inCombat)
+                    if contextOk then
+                        if Abilities.hasActiveBuffSongOrAura and Abilities.hasActiveBuffSongOrAura(def) then
+                            goto dynamic_continue
+                        end
+                        local name, resolvedKind = dynamicAbilityReady(def)
+                        if name then
+                            return {
+                                name = name,
+                                kind = resolvedKind,
+                                setName = def.settingKey or name,
+                                condKey = def.modeKey or def.settingKey,
+                                targetId = lib.safeNum(function() return mq.TLO.Me.ID() end, 0),
+                                dynamic = true,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+        ::dynamic_continue::
+    end
+    return nil
+end
+
 local function pickPendingAction()
     if not disciplinesEnabled() then return nil end
-    if not _classConfig then return nil end
     local ctx = Engine.buildContext()
     if not ctx then return nil end
-    return Engine.pickReadyAbility(_classConfig, ctx,
-        { allowKinds = classAllowKinds(_classConfig) })
+
+    local dynamic = pickDynamicCooldownAction(ctx)
+    if dynamic then return dynamic end
+
+    if not _classConfig then return nil end
+    return Engine.pickReadyAbility(_classConfig, ctx, { allowKinds = classAllowKinds(_classConfig) })
 end
 
 local function refreshPending(self)
@@ -192,6 +312,9 @@ end
 --- `claimed` indicates we placed a CC claim that should be released on
 --- failure paths. nil targetId means "skip this action — no valid target".
 local function acquireTargetFor(action)
+    if action and action.targetId and action.targetId > 0 then
+        return action.targetId, false
+    end
     local sel = selectorFor(action.condKey)
     if sel == 'mez_target' then
         local CC = getCC()
@@ -365,7 +488,7 @@ if not shouldRunForClass(_classConfig, myClassShort()) then
     return module
 end
 
-if not configHasDisciplines(_classConfig) then
+if not configHasDisciplines(_classConfig) and not hasDynamicDisciplines() then
     -- Class is opted in but the class config has no disciplines/AAs/
     -- conditions defined yet. Bind /sk_burn for consistency, exit run.
     registerBurnBind()

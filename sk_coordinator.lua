@@ -32,6 +32,7 @@ local State = {
     -- World snapshot
     worldState = {
         inCombat = false,
+        selfDead = false,
         myHpPct = 100,
         myManaPct = 100,
         groupNeedsHealing = false,
@@ -42,6 +43,7 @@ local State = {
 
     -- Module heartbeats
     moduleHeartbeats = {}, -- [module] = { sentAtMs, ready, script, mailbox }
+    knownModules = {},     -- [module] = true once seen locally
 
     -- Need hints from modules
     moduleNeeds = {}, -- [module] = { priority, needsAction, ttlMs, receivedAtMs }
@@ -71,14 +73,39 @@ local function parseSenderScript(senderMailbox)
     return senderMailbox:match('^(.-):')
 end
 
+local function isLocalModuleMessage(content)
+    if type(content) ~= 'table' then return false end
+    local ownerName = tostring(content.ownerName or '')
+    local ownerServer = tostring(content.ownerServer or '')
+    -- Module-control mailboxes are shared across all running characters.
+    -- Untagged legacy messages cannot be safely attributed, so reject them
+    -- rather than letting another character's module state leak into this
+    -- coordinator's dashboard or priority decisions.
+    if ownerName == '' or ownerServer == '' then
+        return false
+    end
+    if ownerName ~= '' and ownerName ~= tostring(lib.getMyName() or '') then
+        return false
+    end
+    if ownerServer ~= '' and ownerServer ~= tostring(lib.getMyServer() or '') then
+        return false
+    end
+    return true
+end
+
 -------------------------------------------------------------------------------
 -- World State Evaluation
 -------------------------------------------------------------------------------
 
 local function updateWorldState()
     local me = mq.TLO.Me
-    if not (me and me()) then return end
+    if not (me and me()) then
+        State.worldState.selfDead = true
+        State.castBusy = false
+        return
+    end
 
+    State.worldState.selfDead = lib.isSelfDeadOrHovering and lib.isSelfDeadOrHovering() or false
     State.worldState.inCombat = lib.inCombat()
     State.worldState.myHpPct = lib.safeNum(function() return me.PctHPs() end, 100)
     State.worldState.myManaPct = lib.safeNum(function() return me.PctMana() end, 100)
@@ -128,6 +155,12 @@ local function updateWorldState()
     State.castBusy = lib.isCasting()
 end
 
+local function hasFreshHeartbeat(moduleName)
+    local hb = State.moduleHeartbeats[moduleName]
+    if not hb or not hb.receivedAtMs then return false end
+    return (lib.getTimeMs() - hb.receivedAtMs) <= lib.Timing.MODULE_CRASH_MS
+end
+
 -------------------------------------------------------------------------------
 -- Priority Evaluation
 -------------------------------------------------------------------------------
@@ -135,6 +168,10 @@ end
 local function computeActivePriority()
     local ws = State.worldState
     local now = lib.getTimeMs()
+
+    if ws.selfDead then
+        return lib.Priority.IDLE
+    end
 
     -- Emergency takes precedence
     if ws.emergencyActive then
@@ -149,7 +186,7 @@ local function computeActivePriority()
             local ttl = need.ttlMs or 250
             local receivedAt = need.receivedAtMs or 0
             local age = now - receivedAt
-            local isValid = age <= ttl
+            local isValid = age <= ttl and hasFreshHeartbeat(moduleName)
             table.insert(validNeeds, string.format('%s:p%d:%s(age=%dms,ttl=%dms)',
                 moduleName, need.priority or -1, isValid and 'VALID' or 'EXPIRED',
                 age, ttl))
@@ -221,6 +258,7 @@ end
 
 --- Check if a module has a valid (non-expired) need hint requesting action
 local function hasValidNeed(moduleName)
+    if not hasFreshHeartbeat(moduleName) then return false end
     local need = State.moduleNeeds[moduleName]
     if not need or not need.needsAction then return false end
     local ttl = need.ttlMs or 250
@@ -271,6 +309,23 @@ local function expireOwners()
             debugLog('EXPIRE: Target owner %s expired but module has active need, keeping', State.targetOwner.module)
         end
     end
+    return changed
+end
+
+local function clearOwnersForSelfDead()
+    if not State.worldState.selfDead then return false end
+    local changed = false
+    if State.castOwner then
+        debugLog('SELF_DEAD: Clearing cast owner %s', tostring(State.castOwner.module))
+        State.castOwner = nil
+        changed = true
+    end
+    if State.targetOwner then
+        debugLog('SELF_DEAD: Clearing target owner %s', tostring(State.targetOwner.module))
+        State.targetOwner = nil
+        changed = true
+    end
+    State.castBusy = false
     return changed
 end
 
@@ -515,17 +570,27 @@ local function buildStatePayload()
     -- Build lightweight module diagnostics for UI consumption
     local now = lib.getTimeMs()
     local moduleDiag = {}
-    for moduleName, hb in pairs(State.moduleHeartbeats) do
+    local names = {}
+    for moduleName in pairs(State.knownModules) do names[moduleName] = true end
+    for moduleName in pairs(State.moduleHeartbeats) do names[moduleName] = true end
+    for moduleName in pairs(State.moduleNeeds) do names[moduleName] = true end
+
+    for moduleName in pairs(names) do
+        local hb = State.moduleHeartbeats[moduleName]
         local need = State.moduleNeeds[moduleName]
+        local heartbeatAge = hb and (now - (hb.receivedAtMs or 0)) or 0
+        local heartbeatFresh = hb ~= nil and heartbeatAge <= lib.Timing.MODULE_CRASH_MS
         local needValid = false
         local needAge = 0
         if need then
             needAge = now - (need.receivedAtMs or 0)
-            needValid = need.needsAction == true and needAge <= (need.ttlMs or 250)
+            needValid = need.needsAction == true and needAge <= (need.ttlMs or 250) and heartbeatFresh
         end
+        local ready = hb and hb.ready ~= false or false
         moduleDiag[moduleName] = {
-            heartbeatAge = now - (hb.receivedAtMs or 0),
-            ready = hb.ready ~= false,
+            heartbeatAge = heartbeatAge,
+            ready = ready,
+            stale = not heartbeatFresh,
             needsAction = need and need.needsAction or false,
             needValid = needValid,
             needPriority = need and need.priority or nil,
@@ -538,6 +603,8 @@ local function buildStatePayload()
     return {
         tickId = State.tickId,
         epoch = State.epoch,
+        ownerName = lib.getMyName(),
+        ownerServer = lib.getMyServer(),
         sentAtMs = lib.getTimeMs(),
         ttlMs = lib.Timing.STATE_TTL_MS,
         activePriority = State.activePriority,
@@ -647,14 +714,19 @@ local function onMessage(message)
 
     -- Route by mailbox
     if msgType == 'claim' then
+        if not isLocalModuleMessage(content) then return end
         processClaim(content, sender)
     elseif msgType == 'release' then
+        if not isLocalModuleMessage(content) then return end
         processRelease(content)
     elseif msgType == 'interrupt' then
+        if not isLocalModuleMessage(content) then return end
         processInterrupt(content)
     elseif msgType == 'heartbeat' then
+        if not isLocalModuleMessage(content) then return end
         -- Track module heartbeat
         if content.module then
+            State.knownModules[content.module] = true
             debugLog('HEARTBEAT received: module=%s script=%s mailbox=%s',
                 tostring(content.module), tostring(senderScript), tostring(mailbox))
             State.moduleHeartbeats[content.module] = {
@@ -668,8 +740,10 @@ local function onMessage(message)
             onModuleHeartbeatReceived(senderScript)
         end
     elseif msgType == 'need' then
+        if not isLocalModuleMessage(content) then return end
         -- Track module need hints
         if content.module then
+            State.knownModules[content.module] = true
             State.moduleNeeds[content.module] = {
                 priority = content.priority,
                 needsAction = content.needsAction,
@@ -842,6 +916,11 @@ local function tick()
 
     -- Update world state
     updateWorldState()
+
+    if clearOwnersForSelfDead() then
+        State.epoch = State.epoch + 1
+        State.pendingBroadcast = true
+    end
 
     -- Compute active priority
     local newPriority = computeActivePriority()

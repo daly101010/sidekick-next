@@ -323,6 +323,8 @@ local function sendNeed(needsAction, ttlMs, reason)
         State.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
             msgType = 'need',
             module = M.MODULE_NAME,
+            ownerName = lib.getMyName(),
+            ownerServer = lib.getMyServer(),
             priority = lib.Priority.MEDITATION,
             needsAction = value,
             ttlMs = ttlMs or 500,
@@ -337,6 +339,8 @@ local function sendHeartbeat()
         State.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
             msgType = 'heartbeat',
             module = M.MODULE_NAME,
+            ownerName = lib.getMyName(),
+            ownerServer = lib.getMyServer(),
             sentAtMs = lib.getTimeMs(),
             ready = true,
         })
@@ -378,6 +382,26 @@ local function shouldBlockForOtherActivity()
     return false
 end
 
+local function spellMemorizationActive()
+    if hasValidState() then
+        local diag = State.coordState.moduleDiag or {}
+        local mem = diag.spell_memorize
+        if mem and mem.needValid == true and mem.needsAction == true then
+            return true, mem.reason or 'spell_memorize'
+        end
+    end
+
+    -- Local runtime fallback. /memspell uses the spellbook UI while changing
+    -- gems; if the coordinator signal is between broadcasts, this still keeps
+    -- meditation from issuing a /stand that aborts the memorize operation.
+    local bookOpen = safeBool(function()
+        local wnd = mq.TLO.Window and mq.TLO.Window('SpellBookWnd')
+        return wnd and wnd.Open and wnd.Open()
+    end)
+    if bookOpen then return true, 'spellbook_open' end
+
+    return false, nil
+end
 
 -------------------------------------------------------------------------------
 -- Main Tick Logic
@@ -525,6 +549,16 @@ local function tick()
         return
     end
 
+    local memActive, memReason = spellMemorizationActive()
+    if memActive then
+        if shouldLog then debugLog('tick: spell memorization active (%s)', tostring(memReason)) end
+        sendNeed(me.sitting ~= true, nil, 'spell_memorize:' .. tostring(memReason or 'active'))
+        if me.sitting ~= true and canChangeState(now, settings) then
+            cmdSit(now)
+        end
+        return
+    end
+
     -- Determine if we should sit
     local wantSit, sitReason = shouldSit(me, settings)
 
@@ -597,6 +631,10 @@ end
 -------------------------------------------------------------------------------
 
 local function onStateReceived(content)
+    if type(content) ~= 'table' then return end
+    if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
+    if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
+
     State.coordState = content
     State.stateReceivedAt = lib.getTimeMs()
 
