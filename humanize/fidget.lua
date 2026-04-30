@@ -174,8 +174,18 @@ local function manaPct()
     return (me and me.PctMana and me.PctMana()) or 100
 end
 
+local function isSitting()
+    local me = mq.TLO.Me
+    return me and me.Sitting and me.Sitting() == true
+end
+
 local function emit(kind)
     local now = State.now()
+    -- Movement actions (turn/jump/strafe) will stand you up if you're medding.
+    -- Capture pre-fidget sit state so we can restore it after the action chain
+    -- finishes. Stored on the pending entry; final-release in tick() handles it.
+    local wasSitting = isSitting()
+
     if kind == 'turn' then
         local left = math.random() < 0.5
         local pressKey = left and Keybinds.turn_left or Keybinds.turn_right
@@ -186,6 +196,7 @@ local function emit(kind)
             kind = 'turn',
             releaseAt = now + hold,
             releaseKey = releaseKey,
+            resitAfter = wasSitting,
         }
     elseif kind == 'pitch' then
         -- Skip if no keybinds configured (EQ has no defaults).
@@ -199,11 +210,21 @@ local function emit(kind)
             kind = 'pitch',
             releaseAt = now + hold,
             releaseKey = releaseKey,
+            resitAfter = wasSitting,
         }
     elseif kind == 'jump' then
         if not Keybinds.jump then return end
-        -- Single tap; jump is instantaneous, no hold/release pair needed.
+        -- Single tap; jump is instantaneous. If we were sitting, sit back down
+        -- after a brief beat so the jump animation can play.
         mq.cmdf('/keypress %s', Keybinds.jump)
+        if wasSitting then
+            Fidget.pending = {
+                kind = 'jump_resit',
+                releaseAt = now + 600,  -- give the jump animation room
+                releaseKey = nil,
+                resitAfter = true,
+            }
+        end
     elseif kind == 'strafe' then
         if not Keybinds.strafe_left or not Keybinds.strafe_right then return end
         -- Always start with left, then chain right via the pending-release path.
@@ -216,6 +237,7 @@ local function emit(kind)
             releaseKey  = Keybinds.strafe_left,
             chainPress  = Keybinds.strafe_right,  -- press this after releasing left
             chainHoldMs = math.floor(Distributions.sample(Config.strafeHoldMs)),
+            resitAfter  = wasSitting,             -- carried through to final release
         }
     elseif kind == 'face_spawn' then
         local id = nearbyFriendlyId()
@@ -256,17 +278,32 @@ function M.tick()
             if not blocked then
                 mq.cmd('/stand')
             end
+        elseif p.kind == 'jump_resit' then
+            -- Post-jump resit: the jump itself already fired; this step is a
+            -- timer to let the animation play, then sit back down.
+            local blocked = select(1, blockedByGameState())
+            if not blocked and p.resitAfter and not isSitting() then
+                mq.cmd('/sit')
+            end
         elseif p.releaseKey then
             mq.cmdf('/keypress %s', p.releaseKey)
             -- If this step has a chained second leg (e.g. strafe left -> right),
             -- press the chain key and re-arm pending so tick releases it next.
+            -- Carry resitAfter through so the final release re-sits if needed.
             if p.chainPress then
                 mq.cmdf('/keypress %s hold', p.chainPress)
                 Fidget.pending = {
                     kind       = p.kind,
                     releaseAt  = now + (p.chainHoldMs or 1200),
                     releaseKey = p.chainPress,
+                    resitAfter = p.resitAfter,
                 }
+            elseif p.resitAfter then
+                -- Final leg: re-sit if we were medding before fidgeting.
+                local blocked = select(1, blockedByGameState())
+                if not blocked and not isSitting() then
+                    mq.cmd('/sit')
+                end
             end
         end
         return
