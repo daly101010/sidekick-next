@@ -23,6 +23,7 @@ local _navState = {
 -- Per-chase-episode jitter so the trigger distance varies between catches
 -- without oscillating mid-chase. Cleared whenever we're in range.
 local _chaseRoll = nil
+local _chaseJitterPct = 0.20  -- ±20% default
 
 local function humanizeOn()
     local cfg = _G.SIDEKICK_NEXT_CONFIG
@@ -34,19 +35,28 @@ local function humanizeOn()
     return true
 end
 
--- Effective trigger distance: configured value with ±20% jitter, fixed for
--- the duration of one chase episode. Clears when caller calls clearChaseRoll().
+-- Effective trigger distance: configured value with ±_chaseJitterPct jitter,
+-- fixed for the duration of one chase episode.
 local function effectiveMaxDist(base)
-    if not humanizeOn() then return base end
+    if not humanizeOn() or _chaseJitterPct <= 0 then return base end
     if not _chaseRoll then
-        local lo = base * 0.8
-        local hi = base * 1.2
+        local lo = base * (1 - _chaseJitterPct)
+        local hi = base * (1 + _chaseJitterPct)
         _chaseRoll = lo + math.random() * (hi - lo)
     end
     return _chaseRoll
 end
 
 local function clearChaseRoll() _chaseRoll = nil end
+
+function M.getChaseJitterPct() return _chaseJitterPct end
+function M.setChaseJitterPct(v)
+    v = tonumber(v) or 0.20
+    if v < 0 then v = 0 end
+    if v > 0.5 then v = 0.5 end
+    _chaseJitterPct = v
+    _chaseRoll = nil
+end
 
 local _Core = nil
 

@@ -373,12 +373,40 @@ function M.tick()
     emit(kind)
 end
 
--- Expose tunables for the UI tab to read/edit later.
+-- Expose tunables for the UI tab to read/edit.
 function M.getKeybinds() return Keybinds end
 function M.setKeybind(name, value)
-    if Keybinds[name] ~= nil and type(value) == 'string' and value ~= '' then
-        Keybinds[name] = value
-    end
+    if Keybinds[name] == nil and not (name == 'look_up' or name == 'look_down') then return end
+    if value == '' then value = nil end
+    Keybinds[name] = value
+end
+
+function M.getWindowKeys() return WindowKeys end
+function M.setWindowKey(name, value)
+    if WindowKeys[name] == nil then return end
+    if value == '' then value = nil end
+    WindowKeys[name] = value
+end
+
+function M.getConfig() return Config end
+function M.setWeight(action, value)
+    if not Config.weights or Config.weights[action] == nil then return end
+    value = tonumber(value) or 0
+    if value < 0 then value = 0 end
+    if value > 1 then value = 1 end
+    Config.weights[action] = value
+end
+function M.setMinIntervalMs(ms)
+    ms = tonumber(ms) or 8000
+    if ms < 1000 then ms = 1000 end
+    if ms > 60000 then ms = 60000 end
+    Config.minIntervalMs = ms
+end
+function M.setFidgetPerSec(v)
+    v = tonumber(v) or 1.0
+    if v < 0.05 then v = 0.05 end
+    if v > 5.0 then v = 5.0 end
+    Config.fidgetPerSec = v
 end
 
 return M

@@ -90,10 +90,15 @@ function M.pickStickVariant(role, settings, targetId)
     return cmd
 end
 
--- If the current target has been engaged for >= reStickAfterMs, force a re-roll
+-- Tunables exposed to UI.
+local Tunables = {
+    engageMinPct   = 88,      -- floor of engage HP% sample range
+    restickAfterMs = 60000,   -- restick once per minute on long fights
+}
+
+-- If the current target has been engaged for >= restickAfterMs, force a re-roll
 -- of the stick variant. Returns nil if no re-stick is due, otherwise returns
 -- the new stick command (and updates the cache).
-local RESTICK_AFTER_MS = 60000  -- ~1× per minute on long fights
 function M.maybeReStick(role, settings, targetId)
     if not flagOn() then return nil end
     if not Profiles.subsystemEnabled('engagement') then return nil end
@@ -101,7 +106,7 @@ function M.maybeReStick(role, settings, targetId)
     if not targetId or targetId == 0 then return nil end
     local roll = State.getTargetRoll(targetId)
     if not roll or not roll.stickAt then return nil end
-    if (State.now() - roll.stickAt) < RESTICK_AFTER_MS then return nil end
+    if (State.now() - roll.stickAt) < Tunables.restickAfterMs then return nil end
     -- Roll a new variant; ~50% chance per check after the threshold.
     if not Distributions.chance(0.5) then return nil end
 
@@ -134,7 +139,7 @@ function M.pickEngageThreshold(role, settings, targetId)
     if profileName == 'emergency' or profileName == 'named' then
         if thresh < 95 then thresh = 95 end
     end
-    if thresh < 88 then thresh = 88 end
+    if thresh < Tunables.engageMinPct then thresh = Tunables.engageMinPct end
     if thresh > 100 then thresh = 100 end
 
     if targetId and targetId > 0 then
@@ -149,6 +154,22 @@ end
 -- Clear cached rolls for a target (call on death/target change).
 function M.clearTarget(targetId)
     State.clearTargetRoll(targetId)
+end
+
+function M.getTunables() return Tunables end
+
+function M.setEngageMinPct(v)
+    v = tonumber(v) or 88
+    if v < 50 then v = 50 end
+    if v > 100 then v = 100 end
+    Tunables.engageMinPct = v
+end
+
+function M.setRestickAfterMs(ms)
+    ms = tonumber(ms) or 60000
+    if ms < 5000 then ms = 5000 end
+    if ms > 600000 then ms = 600000 end
+    Tunables.restickAfterMs = ms
 end
 
 return M
