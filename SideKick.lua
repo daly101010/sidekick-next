@@ -2251,6 +2251,12 @@ local function main()
             if okF and F and F.tick then F.tick() end
         end
 
+        -- Pull module: drive its state machine.
+        do
+            local ok, P = pcall(require, 'sidekick-next.automation.pull')
+            if ok and P and P.tick then P.tick() end
+        end
+
         -- Process pending spell set memorization (must be in main loop, not ImGui)
 
         local Memorize = getSpellSetMemorize()
