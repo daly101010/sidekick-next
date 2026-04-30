@@ -1265,6 +1265,33 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
         log.logSpellSelection(targetInfo, 'single', M._lastScores.scores, best and best.spell or nil, bestScore)
     end
 
+    -- Humanize: occasionally pick rank-2 from this tier when the score gap is small.
+    -- Suppressed during emergency situations and when target HP is critical (caller passes situation.urgency).
+    if best and #scores >= 2 then
+        local sorted = {}
+        for _, s in ipairs(scores) do table.insert(sorted, s) end
+        table.sort(sorted, function(a, b) return a.score > b.score end)
+        local r1, r2 = sorted[1], sorted[2]
+        local gap = math.abs(r1.score) > 0.001 and ((r1.score - r2.score) / math.abs(r1.score)) or 1.0
+        -- Only consider rank-2 swap if rank-2 is within 30% of rank-1's score.
+        if gap >= 0 and gap < 0.30 then
+            local ok, H = pcall(require, 'sidekick-next.humanize')
+            if ok and H and H.perturbChoice then
+                local urgency = (situation and situation.urgency) or nil
+                local picked = H.perturbChoice(
+                    {
+                        { spell = r1.spell, expected = r1.expected, category = r1.category, details = formatScoreDetails('efficient', 'single', r1.components) },
+                        { spell = r2.spell, expected = r2.expected, category = r2.category, details = formatScoreDetails('efficient', 'single', r2.components) },
+                    },
+                    { kind = 'heal', urgency = urgency }
+                )
+                if picked and picked.spell ~= best.spell then
+                    best = picked
+                end
+            end
+        end
+    end
+
     return best
 end
 

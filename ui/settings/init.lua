@@ -100,6 +100,7 @@ local function loadTabs()
         { name = 'Automation', module = 'sidekick-next.ui.settings.tab_automation' },
         { name = 'Integration', module = 'sidekick-next.ui.settings.tab_integration' },
         { name = 'Animations', module = 'sidekick-next.ui.settings.tab_animations' },
+        { name = 'Humanize', module = 'sidekick-next.ui.settings.tab_humanize' },
         { name = 'Remote', module = 'sidekick-next.ui.settings.tab_remote' },
     }
 
