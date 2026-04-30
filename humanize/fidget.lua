@@ -19,15 +19,15 @@ local Distributions = require('sidekick-next.humanize.distributions')
 
 local M = {}
 
--- Configurable EQ keybind names. Edit these to match your layout.
--- Note: EQ doesn't ship with default binds for camera pitch (mouse handles it).
--- 'pitch' is disabled by default. If you bind keys to look_up / look_down,
--- set the names below and bump weights.pitch above 0 via M.setKeybind / setWeight.
+-- Literal keyboard key names for /keypress. Edit to match your bindings.
+-- /keypress takes raw key names (e.g. 'space', 'left', 'page_up'), NOT MQ
+-- mappable command names ('forward', 'jump').
 local Keybinds = {
-    turn_left   = 'left',
-    turn_right  = 'right',
-    look_up     = nil,    -- intentionally unset; no default EQ keybind
-    look_down   = nil,    -- intentionally unset; no default EQ keybind
+    turn_left   = 'left',       -- arrow key
+    turn_right  = 'right',      -- arrow key
+    jump        = 'space',      -- common default
+    look_up     = nil,          -- set if you have a key bound to camera pitch up
+    look_down   = nil,          -- set if you have a key bound to camera pitch down
 }
 
 local Config = {
@@ -39,10 +39,11 @@ local Config = {
 
     -- Action weights (must sum to <=1; remainder is "no-op this tick").
     weights = {
-        turn       = 0.55,
-        pitch      = 0.00,   -- disabled: EQ has no default look_up/look_down keybind
-        face_spawn = 0.20,
-        med_cycle  = 0.25,
+        turn       = 0.45,
+        jump       = 0.15,
+        pitch      = 0.00,   -- disabled by default: pitch keys are usually unbound
+        face_spawn = 0.18,
+        med_cycle  = 0.22,
     },
 
     -- Turn/pitch hold duration distribution (ms before the counter-press).
@@ -192,6 +193,10 @@ local function emit(kind)
             releaseAt = now + hold,
             releaseKey = releaseKey,
         }
+    elseif kind == 'jump' then
+        if not Keybinds.jump then return end
+        -- Single tap; jump is instantaneous, no hold/release pair needed.
+        mq.cmdf('/keypress %s', Keybinds.jump)
     elseif kind == 'face_spawn' then
         local id = nearbyFriendlyId()
         if id > 0 then
