@@ -23,11 +23,13 @@ local M = {}
 -- /keypress takes raw key names (e.g. 'space', 'left', 'page_up'), NOT MQ
 -- mappable command names ('forward', 'jump').
 local Keybinds = {
-    turn_left   = 'left',       -- arrow key
-    turn_right  = 'right',      -- arrow key
-    jump        = 'space',      -- common default
-    look_up     = nil,          -- set if you have a key bound to camera pitch up
-    look_down   = nil,          -- set if you have a key bound to camera pitch down
+    turn_left    = 'left',         -- arrow key
+    turn_right   = 'right',        -- arrow key
+    jump         = 'space',        -- common default
+    strafe_left  = 'strafe_left',  -- mappable cmd name (default Q in EQ)
+    strafe_right = 'strafe_right', -- mappable cmd name (default E in EQ)
+    look_up      = nil,            -- set if you have a key bound to camera pitch up
+    look_down    = nil,            -- set if you have a key bound to camera pitch down
 }
 
 local Config = {
@@ -39,15 +41,19 @@ local Config = {
 
     -- Action weights (must sum to <=1; remainder is "no-op this tick").
     weights = {
-        turn       = 0.45,
-        jump       = 0.15,
+        turn       = 0.35,
+        jump       = 0.12,
+        strafe     = 0.15,
         pitch      = 0.00,   -- disabled by default: pitch keys are usually unbound
         face_spawn = 0.18,
-        med_cycle  = 0.22,
+        med_cycle  = 0.20,
     },
 
     -- Turn/pitch hold duration distribution (ms before the counter-press).
     holdMs = { dist = 'lognormal', median_ms = 140, sigma = 0.40, min = 80, max = 280 },
+
+    -- Strafe hold: shorter than turn so you don't shuffle a long distance.
+    strafeHoldMs = { dist = 'lognormal', median_ms = 110, sigma = 0.35, min = 60, max = 220 },
 
     -- Med cycle hold duration (ms).
     medHoldMs = { dist = 'lognormal', median_ms = 35000, sigma = 0.45, min = 20000, max = 60000 },
@@ -197,6 +203,18 @@ local function emit(kind)
         if not Keybinds.jump then return end
         -- Single tap; jump is instantaneous, no hold/release pair needed.
         mq.cmdf('/keypress %s', Keybinds.jump)
+    elseif kind == 'strafe' then
+        if not Keybinds.strafe_left or not Keybinds.strafe_right then return end
+        local left = math.random() < 0.5
+        local pressKey = left and Keybinds.strafe_left or Keybinds.strafe_right
+        local releaseKey = left and Keybinds.strafe_right or Keybinds.strafe_left
+        local hold = math.floor(Distributions.sample(Config.strafeHoldMs))
+        mq.cmdf('/keypress %s hold', pressKey)
+        Fidget.pending = {
+            kind = 'strafe',
+            releaseAt = now + hold,
+            releaseKey = releaseKey,
+        }
     elseif kind == 'face_spawn' then
         local id = nearbyFriendlyId()
         if id > 0 then
