@@ -39,7 +39,7 @@ local WindowKeys = {
     inventory = 'i',  -- inventory
     character = 'c',  -- character/stats
     map       = 'm',  -- map
-    group     = 'g',  -- group window
+    group     = 'v',  -- group window
 }
 
 local Config = {
