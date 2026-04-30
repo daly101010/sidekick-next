@@ -2,34 +2,35 @@
 -- SideKick Settings - Humanize Tab
 -- ============================================================
 -- Status, override controls, per-subsystem toggles, and live tunables
--- for the behavioral humanization layer.
+-- for the behavioral humanization layer. All knob changes route through
+-- humanize/persistence.lua so they survive script restart.
 
 local imgui = require('ImGui')
 
 local M = {}
 
 local function getH()
-    local ok, H = pcall(require, 'sidekick-next.humanize')
-    if ok then return H end
-    return nil
+    local ok, H = pcall(require, 'sidekick-next.humanize'); return ok and H or nil
 end
-
 local function getFidget()
-    local ok, F = pcall(require, 'sidekick-next.humanize.fidget')
-    if ok then return F end
-    return nil
+    local ok, F = pcall(require, 'sidekick-next.humanize.fidget'); return ok and F or nil
 end
-
 local function getEngagement()
-    local ok, E = pcall(require, 'sidekick-next.humanize.engagement')
-    if ok then return E end
-    return nil
+    local ok, E = pcall(require, 'sidekick-next.humanize.engagement'); return ok and E or nil
+end
+local function getChase()
+    local ok, C = pcall(require, 'sidekick-next.automation.chase'); return ok and C or nil
+end
+local function getProfiles()
+    local ok, P = pcall(require, 'sidekick-next.humanize.profiles'); return ok and P or nil
+end
+local function getPersistence()
+    local ok, P = pcall(require, 'sidekick-next.humanize.persistence'); return ok and P or nil
 end
 
-local function getChase()
-    local ok, C = pcall(require, 'sidekick-next.automation.chase')
-    if ok then return C end
-    return nil
+local function persist(kind, args, value)
+    local P = getPersistence()
+    if P and P.persist then P.persist(kind, args, value) end
 end
 
 local function badge(label, color)
@@ -48,11 +49,18 @@ local function colorForProfile(name)
     return {0.85, 0.85, 0.85, 1}
 end
 
--- Ordered key lists so iteration is stable in the UI (pairs() order isn't).
 local FIDGET_ACTIONS    = { 'turn', 'jump', 'strafe', 'window', 'pitch', 'face_spawn', 'med_cycle' }
 local FIDGET_KEYBINDS   = { 'turn_left', 'turn_right', 'jump', 'strafe_left', 'strafe_right', 'look_up', 'look_down' }
 local WINDOW_KEY_NAMES  = { 'inventory', 'character', 'map', 'group' }
 local SUBSYSTEMS        = { 'combat', 'targeting', 'buffs', 'heals', 'engagement', 'fidget' }
+local PROFILE_NAMES     = { 'idle', 'farming', 'combat', 'emergency', 'named' }
+local DIST_NAMES        = { 'reaction', 'precast', 'target_lock' }
+local NOISE_KEYS        = { 'second_best_p', 'skip_global_p', 'retarget_hesit', 'double_press_p' }
+
+-- Per-tab UI state (kept across draws via the closure of M).
+local UIState = {
+    selectedProfile = 'combat',
+}
 
 function M.draw(settings, themeNames, onChange)
     local H = getH()
@@ -61,19 +69,16 @@ function M.draw(settings, themeNames, onChange)
         return
     end
 
+    -- Lazy-apply persisted settings on first draw.
+    if H.applySettings then pcall(H.applySettings) end
+
     -- Master flag ---------------------------------------------------------
     local cfg = _G.SIDEKICK_NEXT_CONFIG or {}
     local enabled = cfg.HUMANIZE_BEHAVIOR == true
     local newEnabled, changed = imgui.Checkbox('Humanize layer enabled', enabled)
-    if changed then
-        cfg.HUMANIZE_BEHAVIOR = newEnabled and true or false
-        _G.SIDEKICK_NEXT_CONFIG = cfg
-    end
+    if changed then persist('master', nil, newEnabled) end
     if imgui.IsItemHovered() then
-        imgui.SetTooltip(
-            'Master switch for the humanization layer. When off, all gates and ' ..
-            'choice perturbations are no-ops (byte-identical to baseline).'
-        )
+        imgui.SetTooltip('Master switch. When off, gates and perturbations are no-ops (byte-identical to baseline).')
     end
 
     imgui.Separator()
@@ -82,12 +87,9 @@ function M.draw(settings, themeNames, onChange)
     local profile = H.activeProfile() or 'off'
     local override = H.getOverride() or 'auto'
 
-    imgui.Text('Active profile:')
-    imgui.SameLine()
+    imgui.Text('Active profile:'); imgui.SameLine()
     badge(profile, colorForProfile(profile))
-
-    imgui.Text('Override:      ')
-    imgui.SameLine()
+    imgui.Text('Override:      '); imgui.SameLine()
     if override == 'boss' then
         badge('BOSS (force named profile)', {0.95, 0.55, 0.95, 1})
     elseif override == 'off' then
@@ -109,7 +111,7 @@ function M.draw(settings, themeNames, onChange)
     for _, name in ipairs(SUBSYSTEMS) do
         local cur = H.subsystemEnabled(name)
         local v, ch = imgui.Checkbox(name .. '##sub_' .. name, cur)
-        if ch then H.setSubsystem(name, v) end
+        if ch then persist('subsystem', { name = name }, v) end
         if name ~= SUBSYSTEMS[#SUBSYSTEMS] then imgui.SameLine() end
     end
 
@@ -123,28 +125,20 @@ function M.draw(settings, themeNames, onChange)
         else
             local Cfg = F.getConfig()
 
-            -- Min interval
             local mi = Cfg.minIntervalMs or 8000
             local newMi, miCh = imgui.SliderInt('Min interval (ms)##fidget_min', mi, 1000, 60000)
-            if miCh then F.setMinIntervalMs(newMi) end
-            if imgui.IsItemHovered() then
-                imgui.SetTooltip('Minimum gap between fidgets. Default 8000.')
-            end
+            if miCh then persist('fidget_minInterval', nil, newMi) end
 
-            -- Per-second probability
             local fps = Cfg.fidgetPerSec or 1.0
             local newFps, fpsCh = imgui.SliderFloat('Avg per second##fidget_persec', fps, 0.05, 5.0, '%.2f')
-            if fpsCh then F.setFidgetPerSec(newFps) end
-            if imgui.IsItemHovered() then
-                imgui.SetTooltip('Average fidget attempts per idle second. Default 1.0.')
-            end
+            if fpsCh then persist('fidget_perSec', nil, newFps) end
 
             imgui.Separator()
-            imgui.TextDisabled('Action weights (sum > 0; remainder = no-op tick)')
+            imgui.TextDisabled('Action weights')
             for _, action in ipairs(FIDGET_ACTIONS) do
                 local cur = (Cfg.weights and Cfg.weights[action]) or 0
                 local newW, ch = imgui.SliderFloat(action .. '##w_' .. action, cur, 0.0, 1.0, '%.2f')
-                if ch then F.setWeight(action, newW) end
+                if ch then persist('fidget_weight', { action = action }, newW) end
             end
 
             imgui.Separator()
@@ -153,16 +147,16 @@ function M.draw(settings, themeNames, onChange)
             for _, name in ipairs(FIDGET_KEYBINDS) do
                 local cur = kbs[name] or ''
                 local newV, ch = imgui.InputText(name .. '##kb_' .. name, cur, 32)
-                if ch then F.setKeybind(name, newV) end
+                if ch then persist('fidget_keybind', { name = name }, newV) end
             end
 
             imgui.Separator()
-            imgui.TextDisabled('Window peek hotkeys (toggle keys)')
+            imgui.TextDisabled('Window peek hotkeys')
             local wks = F.getWindowKeys()
             for _, name in ipairs(WINDOW_KEY_NAMES) do
                 local cur = wks[name] or ''
                 local newV, ch = imgui.InputText(name .. '##wk_' .. name, cur, 16)
-                if ch then F.setWindowKey(name, newV) end
+                if ch then persist('window_key', { name = name }, newV) end
             end
         end
     end
@@ -176,20 +170,11 @@ function M.draw(settings, themeNames, onChange)
             local T = E.getTunables()
             local minPct = T.engageMinPct or 88
             local newMin, ch = imgui.SliderInt('Engage HP% floor##eng_min', minPct, 50, 100)
-            if ch then E.setEngageMinPct(newMin) end
-            if imgui.IsItemHovered() then
-                imgui.SetTooltip(
-                    'Lowest mob HP% non-tank DPS will hold for before engaging. Default 88.\n' ..
-                    'emergency/named profiles clamp to 95.'
-                )
-            end
+            if ch then persist('engage_min', nil, newMin) end
 
             local restick = T.restickAfterMs or 60000
             local newRs, rsCh = imgui.SliderInt('Re-stick after (ms)##eng_restick', restick, 5000, 600000)
-            if rsCh then E.setRestickAfterMs(newRs) end
-            if imgui.IsItemHovered() then
-                imgui.SetTooltip('How long an engagement runs before a re-stick is considered. Default 60000 (1 min).')
-            end
+            if rsCh then persist('restick_ms', nil, newRs) end
         end
     end
 
@@ -202,37 +187,75 @@ function M.draw(settings, themeNames, onChange)
             local cur = C.getChaseJitterPct() or 0.20
             local pct = math.floor(cur * 100 + 0.5)
             local newPct, ch = imgui.SliderInt('±jitter %##chase_jit', pct, 0, 50)
-            if ch then C.setChaseJitterPct(newPct / 100.0) end
-            if imgui.IsItemHovered() then
-                imgui.SetTooltip(
-                    'Per-episode jitter on the chase trigger distance.\n' ..
-                    'At base=30 with 20%, you catch up between ~24 and ~36 across pulls.'
-                )
-            end
+            if ch then persist('chase_jitter', nil, newPct / 100.0) end
         end
     end
 
-    -- Profile snapshot ----------------------------------------------------
-    if imgui.CollapsingHeader('Active profile snapshot') then
-        local ok, Profiles = pcall(require, 'sidekick-next.humanize.profiles')
-        local p = ok and Profiles.get and Profiles.get(profile)
-        if not p then
-            imgui.TextDisabled('profile not found')
+    -- Profile editor ------------------------------------------------------
+    if imgui.CollapsingHeader('Profile timings (per profile)') then
+        local Profiles = getProfiles()
+        if not Profiles then
+            imgui.TextDisabled('profiles module not loaded')
         else
-            local function fmtDist(d)
-                if not d then return '(none)' end
-                return string.format('median=%d sigma=%.2f min=%d max=%d',
-                    d.median_ms or 0, d.sigma or 0, d.min or 0, d.max or 0)
+            -- Profile picker
+            imgui.Text('Edit profile:')
+            for _, pname in ipairs(PROFILE_NAMES) do
+                imgui.SameLine()
+                local pressed = false
+                if pname == UIState.selectedProfile then
+                    imgui.PushStyleColor(ImGuiCol.Button, 0.30, 0.55, 0.85, 1.0)
+                    pressed = imgui.Button(pname .. '##pick_' .. pname)
+                    imgui.PopStyleColor()
+                else
+                    pressed = imgui.Button(pname .. '##pick_' .. pname)
+                end
+                if pressed then UIState.selectedProfile = pname end
             end
-            imgui.Text('reaction:    ' .. fmtDist(p.reaction))
-            imgui.Text('precast:     ' .. fmtDist(p.precast))
-            imgui.Text('target_lock: ' .. fmtDist(p.target_lock))
-            imgui.Text(string.format('buff jitter: %.2f', p.buff_refresh_pct_jitter or 0))
-            local n = p.noise or {}
-            imgui.Text(string.format('noise: 2nd_best=%.0f%%  skip=%.0f%%  retarget=%.0f%%  double=%.1f%%',
-                (n.second_best_p or 0)*100, (n.skip_global_p or 0)*100,
-                (n.retarget_hesit or 0)*100, (n.double_press_p or 0)*100))
-            imgui.TextDisabled('Edit humanize/profiles.lua to change distributions.')
+
+            local sel = UIState.selectedProfile
+            local p = Profiles.get(sel)
+            if not p then
+                imgui.TextDisabled('profile not found')
+            else
+                imgui.Separator()
+                imgui.TextDisabled(string.format('Editing profile: %s', sel))
+
+                for _, dname in ipairs(DIST_NAMES) do
+                    local d = p[dname]
+                    if d then
+                        imgui.Text(dname .. ':')
+                        local med = d.median_ms or 200
+                        local newMed, c1 = imgui.SliderInt('median ms##' .. sel .. dname, med, 30, 2000)
+                        if c1 then persist('profile_dist', { profile = sel, dist = dname, field = 'median_ms' }, newMed) end
+
+                        local sig = d.sigma or 0.4
+                        local newSig, c2 = imgui.SliderFloat('sigma##' .. sel .. dname, sig, 0.05, 1.0, '%.2f')
+                        if c2 then persist('profile_dist', { profile = sel, dist = dname, field = 'sigma' }, newSig) end
+
+                        local mn = d.min or 50
+                        local newMn, c3 = imgui.SliderInt('min ms##' .. sel .. dname, mn, 0, 1000)
+                        if c3 then persist('profile_dist', { profile = sel, dist = dname, field = 'min' }, newMn) end
+
+                        local mx = d.max or 1500
+                        local newMx, c4 = imgui.SliderInt('max ms##' .. sel .. dname, mx, 100, 5000)
+                        if c4 then persist('profile_dist', { profile = sel, dist = dname, field = 'max' }, newMx) end
+                        imgui.Separator()
+                    end
+                end
+
+                local bj = p.buff_refresh_pct_jitter or 0
+                local newBj, bjCh = imgui.SliderFloat('buff_refresh_pct_jitter##' .. sel, bj, 0.0, 0.5, '%.2f')
+                if bjCh then persist('profile_buff', { profile = sel }, newBj) end
+
+                imgui.Separator()
+                imgui.TextDisabled('Decision noise')
+                local noise = p.noise or {}
+                for _, nk in ipairs(NOISE_KEYS) do
+                    local cur = noise[nk] or 0
+                    local newN, c = imgui.SliderFloat(nk .. '##' .. sel .. nk, cur, 0.0, 0.5, '%.3f')
+                    if c then persist('profile_noise', { profile = sel, key = nk }, newN) end
+                end
+            end
         end
     end
 

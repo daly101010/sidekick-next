@@ -25,6 +25,26 @@ M.SKIP = -1
 
 State.init()
 
+-- Lazy-apply persisted settings on first call. Core.Settings may not be
+-- populated when humanize is first required, so we defer until any of
+-- gate()/perturbChoice()/tick() is invoked.
+local _settingsApplied = false
+local function ensureSettingsApplied()
+    if _settingsApplied then return end
+    local okC, Core = pcall(require, 'sidekick-next.utils.core')
+    if not (okC and Core and Core.Settings) then return end
+    local okP, P = pcall(require, 'sidekick-next.humanize.persistence')
+    if okP and P and P.applyFromSettings then
+        pcall(P.applyFromSettings, Core.Settings)
+        _settingsApplied = true
+    end
+end
+
+function M.applySettings()
+    _settingsApplied = false
+    ensureSettingsApplied()
+end
+
 local function flagOn()
     local cfg = _G.SIDEKICK_NEXT_CONFIG
     return cfg and cfg.HUMANIZE_BEHAVIOR == true
@@ -153,7 +173,10 @@ end
 
 -- Tick called from any main loop that wants to drive selector cadence.
 -- Optional: gate()/perturbChoice() also lazy-refresh, so wiring this is not required for P1.
-function M.tick() Selector.resolve() end
+function M.tick()
+    ensureSettingsApplied()
+    Selector.resolve()
+end
 
 -- Profile control --------------------------------------------------------------
 

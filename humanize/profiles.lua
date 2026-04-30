@@ -100,4 +100,56 @@ function M.setSubsystem(name, enabled)
     end
 end
 
+-- Editable profile names (excludes 'off' which is hard-coded no-op).
+M.EDITABLE = { 'idle', 'farming', 'combat', 'emergency', 'named' }
+
+local function clampNum(v, lo, hi)
+    v = tonumber(v); if not v then return nil end
+    if lo and v < lo then v = lo end
+    if hi and v > hi then v = hi end
+    return v
+end
+
+-- Set a single distribution field on a profile.
+-- profileName: 'idle' | 'farming' | 'combat' | 'emergency' | 'named'
+-- distName: 'reaction' | 'precast' | 'target_lock'
+-- field: 'median_ms' | 'sigma' | 'min' | 'max'
+function M.setDistField(profileName, distName, field, value)
+    local p = M[profileName]
+    if not p or profileName == 'off' then return end
+    if not p[distName] then return end
+    if field == 'median_ms' then
+        value = clampNum(value, 10, 5000)
+    elseif field == 'sigma' then
+        value = clampNum(value, 0.05, 1.5)
+    elseif field == 'min' then
+        value = clampNum(value, 0, 5000)
+    elseif field == 'max' then
+        value = clampNum(value, 10, 10000)
+    else
+        return
+    end
+    if value == nil then return end
+    p[distName][field] = value
+end
+
+function M.setBuffJitter(profileName, value)
+    local p = M[profileName]
+    if not p or profileName == 'off' then return end
+    value = clampNum(value, 0, 0.5)
+    if value == nil then return end
+    p.buff_refresh_pct_jitter = value
+end
+
+function M.setNoise(profileName, key, value)
+    local p = M[profileName]
+    if not p or profileName == 'off' then return end
+    p.noise = p.noise or {}
+    if key ~= 'second_best_p' and key ~= 'skip_global_p'
+       and key ~= 'retarget_hesit' and key ~= 'double_press_p' then return end
+    value = clampNum(value, 0, 1)
+    if value == nil then return end
+    p.noise[key] = value
+end
+
 return M
