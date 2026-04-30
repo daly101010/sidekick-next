@@ -20,6 +20,34 @@ local _navState = {
     initiatedNav = false,
 }
 
+-- Per-chase-episode jitter so the trigger distance varies between catches
+-- without oscillating mid-chase. Cleared whenever we're in range.
+local _chaseRoll = nil
+
+local function humanizeOn()
+    local cfg = _G.SIDEKICK_NEXT_CONFIG
+    if not (cfg and cfg.HUMANIZE_BEHAVIOR) then return false end
+    local ok, Profiles = pcall(require, 'sidekick-next.humanize.profiles')
+    if ok and Profiles and Profiles.subsystemEnabled then
+        return Profiles.subsystemEnabled('engagement')
+    end
+    return true
+end
+
+-- Effective trigger distance: configured value with ±20% jitter, fixed for
+-- the duration of one chase episode. Clears when caller calls clearChaseRoll().
+local function effectiveMaxDist(base)
+    if not humanizeOn() then return base end
+    if not _chaseRoll then
+        local lo = base * 0.8
+        local hi = base * 1.2
+        _chaseRoll = lo + math.random() * (hi - lo)
+    end
+    return _chaseRoll
+end
+
+local function clearChaseRoll() _chaseRoll = nil end
+
 local _Core = nil
 
 function M.init(opts)
@@ -136,6 +164,7 @@ function M.setEnabled(val, opts)
 
     if not M.enabled then
         M.stopNav()
+        clearChaseRoll()
     end
 
     if opts.user then
@@ -181,10 +210,12 @@ function M.tick()
 
     local dist = M.distanceTo(spawn)
     if not dist then return end
-    local maxDist = tonumber(M.state.distance) or 30
+    local baseDist = tonumber(M.state.distance) or 30
+    local maxDist = effectiveMaxDist(baseDist)
     if dist <= maxDist then
         if navActive then M.stopNav() end
         _navState.stuckCount = 0
+        clearChaseRoll()
         return
     end
 
