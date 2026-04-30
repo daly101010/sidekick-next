@@ -93,7 +93,7 @@ end
 -- Tunables exposed to UI.
 local Tunables = {
     engageMinPct   = 88,      -- floor of engage HP% sample range
-    restickAfterMs = 60000,   -- restick once per minute on long fights
+    restickAfterMs = 20000,   -- consider a stick-variant swap after 20s in combat
 }
 
 -- If the current target has been engaged for >= restickAfterMs, force a re-roll

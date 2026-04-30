@@ -244,6 +244,31 @@ function M.runTankBroadcastAssist(settings)
     return true
 end
 
+-- Per-engagement re-stick check: occasionally swap stick variants mid-fight
+-- so the script doesn't lock to one stick command for the whole encounter.
+-- Cached on a per-target basis in humanize state; throttled internally by
+-- the engagement module's restickAfterMs window.
+local _lastRestickCheckMs = 0
+local function maybeReStickCurrent(settings)
+    if (mq.gettime() - _lastRestickCheckMs) < 5000 then return end
+    _lastRestickCheckMs = mq.gettime()
+
+    -- Only when stick is actually active.
+    if not (mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active()) then return end
+
+    local tid = mq.TLO.Target and mq.TLO.Target.ID and mq.TLO.Target.ID() or 0
+    if tid == 0 then return end
+
+    local Engagement = getEngagement()
+    if not Engagement or not Engagement.maybeReStick then return end
+    local newCmd = Engagement.maybeReStick(nil, settings, tid)
+    if not newCmd then return end
+
+    mq.cmd('/squelch /stick off')
+    mq.delay(50)
+    mq.cmd(newCmd)
+end
+
 function M.tick(settings)
     settings = settings or (_Core and _Core.Settings) or M.settings
     if not M.enabled then return end
@@ -254,6 +279,9 @@ function M.tick(settings)
         CasterAssist.tick(settings)
         return
     end
+
+    -- Periodic re-stick variant swap (humanize-driven).
+    maybeReStickCurrent(settings)
 
     local combatMode = settings and settings.CombatMode or 'off'
 
