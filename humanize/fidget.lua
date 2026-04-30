@@ -1,6 +1,10 @@
 -- humanize/fidget.lua
--- Idle-time movement emitter. Adds turn-key presses, occasional /face, and
--- sit/stand med cycles when the active profile is 'idle'.
+-- Idle-time movement emitter. Adds turn-key presses, jumps, strafes, window
+-- peeks, and sit/stand med cycles when the active profile is 'idle'.
+--
+-- /face is intentionally avoided — it produces pixel-perfect heading snaps
+-- that are an obvious bot tell. All rotation goes through /keypress instead,
+-- which mimics real keyboard input.
 --
 -- Hard-gated off whenever in combat, following, navigating, looting, mezzed
 -- mobs nearby, or any group member in combat. Min-interval between fidgets
@@ -51,13 +55,12 @@ local Config = {
 
     -- Action weights (must sum to <=1; remainder is "no-op this tick").
     weights = {
-        turn       = 0.30,
-        jump       = 0.10,
-        strafe     = 0.13,
-        window     = 0.12,
+        turn       = 0.40,
+        jump       = 0.12,
+        strafe     = 0.15,
+        window     = 0.13,
         pitch      = 0.00,   -- disabled by default: pitch keys are usually unbound
-        face_spawn = 0.17,
-        med_cycle  = 0.18,
+        med_cycle  = 0.20,
     },
 
     -- Turn/pitch hold duration distribution (ms before the counter-press).
@@ -164,25 +167,6 @@ local function rollAction()
     return nil
 end
 
-local function nearbyFriendlyId()
-    -- Prefer a group member spawn id; fall back to nearest PC.
-    local groupSize = mq.TLO.Group.Members() or 0
-    if groupSize > 0 then
-        local idx = math.random(1, groupSize)
-        local member = mq.TLO.Group.Member(idx)
-        if member and member() then
-            local id = member.ID and member.ID() or 0
-            if id > 0 then return id end
-        end
-    end
-    local nearest = mq.TLO.NearestSpawn(1, 'pc')
-    if nearest and nearest() then
-        local id = nearest.ID and nearest.ID() or 0
-        if id > 0 then return id end
-    end
-    return 0
-end
-
 local function manaPct()
     local me = mq.TLO.Me
     return (me and me.PctMana and me.PctMana()) or 100
@@ -274,11 +258,6 @@ local function emit(kind)
             releaseKey = key,   -- same key toggles the window closed
             -- no resitAfter: opening a window doesn't stand the character
         }
-    elseif kind == 'face_spawn' then
-        local id = nearbyFriendlyId()
-        if id > 0 then
-            mq.cmdf('/face fast id %d', id)
-        end
     elseif kind == 'med_cycle' then
         if manaPct() >= Config.medMaxManaPct then return end
         local me = mq.TLO.Me

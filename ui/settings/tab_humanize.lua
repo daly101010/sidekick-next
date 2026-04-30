@@ -49,7 +49,7 @@ local function colorForProfile(name)
     return {0.85, 0.85, 0.85, 1}
 end
 
-local FIDGET_ACTIONS    = { 'turn', 'jump', 'strafe', 'window', 'pitch', 'face_spawn', 'med_cycle' }
+local FIDGET_ACTIONS    = { 'turn', 'jump', 'strafe', 'window', 'pitch', 'med_cycle' }
 local FIDGET_KEYBINDS   = { 'turn_left', 'turn_right', 'jump', 'strafe_left', 'strafe_right', 'look_up', 'look_down' }
 local WINDOW_KEY_NAMES  = { 'inventory', 'character', 'map', 'group' }
 local SUBSYSTEMS        = { 'combat', 'targeting', 'buffs', 'heals', 'engagement', 'fidget' }
