@@ -7,6 +7,8 @@ local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local Core = require('sidekick-next.utils.core')
 local Healing = require('sidekick-next.healing')
+local lazy = require('sidekick-next.utils.lazy_require')
+local getHumanize = lazy.once('sidekick-next.humanize')
 
 -- Create module instance
 local module = ModuleBase.create('healing_emergency', lib.Priority.EMERGENCY)
@@ -222,6 +224,12 @@ module.executeAction = function(self)
     end
 
     lib.log('info', self.name, 'Casting %s on %d', spellName, targetIdVal)
+    -- Humanize gate: emergency urgency forces 'emergency' profile (fast tail, no SKIP).
+    local H = getHumanize()
+    if H and H.gate then
+        local d = H.gate('cast', { spell = spellName, target = targetIdVal, urgency = 'emergency' })
+        if d ~= H.SKIP and d and d > 0 then mq.delay(d) end
+    end
     mq.cmdf('/cast "%s"', spellName)
     mq.delay(100)
 

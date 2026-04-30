@@ -2149,6 +2149,14 @@ local function main()
         syncModulesFromSettings()
         tickAutomation()
 
+        -- Humanize: drive selector + fidget state machine.
+        do
+            local ok, H = pcall(require, 'sidekick-next.humanize')
+            if ok and H and H.tick then H.tick() end
+            local okF, F = pcall(require, 'sidekick-next.humanize.fidget')
+            if okF and F and F.tick then F.tick() end
+        end
+
         -- Process pending spell set memorization (must be in main loop, not ImGui)
 
         local Memorize = getSpellSetMemorize()

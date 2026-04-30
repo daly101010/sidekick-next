@@ -14,6 +14,7 @@ local getSpellEvents = lazy('sidekick-next.utils.spell_events')
 local getCache = lazy('sidekick-next.utils.runtime_cache')
 local getCore = lazy('sidekick-next.utils.core')
 local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
+local getHumanize = lazy.once('sidekick-next.humanize')
 
 -- Cast states
 M.STATE = {
@@ -318,6 +319,25 @@ function M.cast(spellName, targetId, opts)
                 return t and t.ID() == targetId
             end)
         end
+    end
+
+    -- Humanize gate: reaction + precast delay before issuing /cast.
+    -- urgency='emergency' is set by emergency healers; runs through 'emergency' profile (fast tail).
+    -- SKIP drops the cast attempt for this tick.
+    local Humanize = getHumanize()
+    if Humanize and Humanize.gate then
+        local urgency = opts.urgency
+        if not urgency and (opts.spellCategory == 'emergency' or opts.priority == 0) then
+            urgency = 'emergency'
+        end
+        local d = Humanize.gate('cast', { target = targetId, spell = spellName, urgency = urgency })
+        if d == Humanize.SKIP then
+            if buffLog then
+                buffLog.info('spell_engine', 'Cast humanize-skipped: spell=%s', tostring(spellName))
+            end
+            return false, 'humanize_skip'
+        end
+        if d and d > 0 then mq.delay(d) end
     end
 
     -- Issue cast command

@@ -10,6 +10,19 @@ local M = {}
 
 -- Optional buff logger for tracing executor-level spell casts
 local getBuffLogger = lazy('sidekick-next.automation.buff_logger')
+local getHumanize = lazy.once('sidekick-next.humanize')
+
+-- Humanize gate for ability-channel actions. Returns:
+--   true  -> caller should proceed (after any delay applied here)
+--   false -> caller should bail (SKIP rolled or layer told us to drop)
+local function humanizeAbilityGate(ctx)
+    local H = getHumanize()
+    if not H or not H.gate then return true end
+    local d = H.gate('ability', ctx or {})
+    if d == H.SKIP then return false end
+    if d and d > 0 then mq.delay(d) end
+    return true
+end
 
 local function isBuffSpell(opts)
     if not opts then return false end
@@ -104,6 +117,8 @@ function M.executeAA(altId)
     if not me or not me() then return false end
     if not me.AltAbilityReady(altId)() then return false end
 
+    if not humanizeAbilityGate({ kind = 'aa', altId = altId }) then return false end
+
     mq.cmdf('/alt activate %d', altId)
     M.markChannelUsed('aa_disc')
     return true
@@ -119,6 +134,8 @@ function M.executeDisc(discName)
     local me = mq.TLO.Me
     if not me or not me() then return false end
     if not me.CombatAbilityReady(discName)() then return false end
+
+    if not humanizeAbilityGate({ kind = 'disc', name = discName }) then return false end
 
     mq.cmdf('/disc %s', discName)
     M.markChannelUsed('aa_disc')
@@ -204,6 +221,8 @@ function M.executeItem(itemName)
     if not item or not item() then return false end
     if item.TimerReady() ~= 0 then return false end  -- 0 means ready
 
+    if not humanizeAbilityGate({ kind = 'item', name = itemName }) then return false end
+
     mq.cmdf('/useitem "%s"', itemName)
     M.markChannelUsed('item')
     return true
@@ -220,6 +239,8 @@ function M.executeItemSlot(slotName)
     local item = mq.TLO.InvSlot(slotName).Item
     if not item or not item() then return false end
     if item.TimerReady() ~= 0 then return false end
+
+    if not humanizeAbilityGate({ kind = 'itemslot', slot = slotName }) then return false end
 
     mq.cmdf('/itemnotify %s rightmouseup', slotName)
     M.markChannelUsed('item')
@@ -238,6 +259,8 @@ function M.executeMeleeAbility(abilityName)
     local me = mq.TLO.Me
     if not me or not me() then return false end
     if not me.AbilityReady(abilityName)() then return false end
+
+    if not humanizeAbilityGate({ kind = 'melee', name = abilityName }) then return false end
 
     mq.cmdf('/doability %s', abilityName)
     M.markChannelUsed('melee')

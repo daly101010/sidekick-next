@@ -15,6 +15,7 @@ _G.SIDEKICK_NEXT_CONFIG = {
     USE_NEW_SETTINGS = true,     -- Use ui/settings/ modular tab system
     VISUAL_REDESIGN = false,     -- Placeholder for C experiments
     DEBUG_SETTINGS = false,      -- Log ImGui setting interactions (dev)
+    HUMANIZE_BEHAVIOR = true,   -- Behavioral humanization layer (humanize/). Off = byte-identical to baseline.
 }
 
 -- Helper for require with base path (optional, modules can use relative requires)

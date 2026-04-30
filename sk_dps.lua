@@ -153,6 +153,16 @@ module.shouldAct = function(self)
     if not target then return false end
     if target.hp < Config.minTargetHpPct then return false end
 
+    -- Humanize: jittered engage threshold. Real DPS players hesitate variably;
+    -- wait for tank to settle aggro instead of firing at 100% mob HP.
+    do
+        local ok, Engagement = pcall(require, 'sidekick-next.humanize.engagement')
+        if ok and Engagement and Engagement.pickEngageThreshold then
+            local engageAt = Engagement.pickEngageThreshold(nil, nil, target.id)
+            if target.hp > engageAt then return false end
+        end
+    end
+
     -- Check if we have a spell ready
     local nuke = resolveSpell('nuke')
     local stun = resolveSpell('stun')
@@ -222,6 +232,17 @@ module.executeAction = function(self)
 
     -- Cast
     lib.log('info', self.name, 'Casting %s on %d', spellName, targetId)
+    do
+        local ok, H = pcall(require, 'sidekick-next.humanize')
+        if ok and H and H.gate then
+            local d = H.gate('cast', { spell = spellName, target = targetId })
+            if d == H.SKIP then
+                lib.log('info', self.name, 'humanize-skipped: %s', spellName)
+                return false, 'humanize_skip'
+            end
+            if d and d > 0 then mq.delay(d) end
+        end
+    end
     mq.cmdf('/cast "%s"', spellName)
     mq.delay(100)
 

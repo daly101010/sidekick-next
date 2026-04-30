@@ -3,6 +3,9 @@ local Actors = require('sidekick-next.utils.actors_coordinator')
 local Positioning = require('sidekick-next.utils.positioning')
 local Targeting = require('sidekick-next.utils.targeting')
 local CasterAssist = require('sidekick-next.automation.caster_assist')
+local lazy = require('sidekick-next.utils.lazy_require')
+local getHumanize = lazy.once('sidekick-next.humanize')
+local getEngagement = lazy.once('sidekick-next.humanize.engagement')
 
 local M = {}
 
@@ -151,12 +154,22 @@ function M.engageTarget(targetId, settings)
     local currentId = current and current() and current.ID() or 0
 
     if currentId ~= targetId then
+        local H = getHumanize()
+        if H and H.gate then
+            local d = H.gate('target', { target = targetId })
+            if d == H.SKIP then return end
+            if d and d > 0 then mq.delay(d) end
+        end
         mq.cmdf('/target id %d', targetId)
     end
 
     -- Don't stick if in soft pause (tank repositioning/taunt run)
     if not Positioning.isInSoftPause() then
         local stickCmd = settings and settings.StickCommand or '/stick snaproll behind 10 moveback uw'
+        local Engagement = getEngagement()
+        if Engagement and Engagement.pickStickVariant then
+            stickCmd = Engagement.pickStickVariant(nil, settings, targetId) or stickCmd
+        end
         mq.cmd(stickCmd)
     end
 
