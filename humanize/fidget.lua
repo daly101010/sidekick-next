@@ -32,6 +32,16 @@ local Keybinds = {
     look_down    = nil,            -- set if you have a key bound to camera pitch down
 }
 
+-- Hotkeys that toggle windows. Real players poke at these idly. Same key
+-- press opens and closes (EQ window keys are toggles). Edit to match your
+-- bindings; entries set to nil are skipped at pick time.
+local WindowKeys = {
+    inventory = 'i',  -- inventory
+    character = 'c',  -- character/stats
+    map       = 'm',  -- map
+    group     = 'g',  -- group window
+}
+
 local Config = {
     -- Average per-second probability of emitting a fidget when idle.
     fidgetPerSec = 1.0,
@@ -41,12 +51,13 @@ local Config = {
 
     -- Action weights (must sum to <=1; remainder is "no-op this tick").
     weights = {
-        turn       = 0.35,
-        jump       = 0.12,
-        strafe     = 0.15,
+        turn       = 0.30,
+        jump       = 0.10,
+        strafe     = 0.13,
+        window     = 0.12,
         pitch      = 0.00,   -- disabled by default: pitch keys are usually unbound
-        face_spawn = 0.18,
-        med_cycle  = 0.20,
+        face_spawn = 0.17,
+        med_cycle  = 0.18,
     },
 
     -- Turn/pitch hold duration distribution (ms before the counter-press).
@@ -55,6 +66,9 @@ local Config = {
     -- Strafe hold per leg (left, then right). Two legs = ~2-4s total.
     -- Net position change is ~zero since you go out and back.
     strafeHoldMs = { dist = 'lognormal', median_ms = 1300, sigma = 0.30, min = 800, max = 2200 },
+
+    -- How long a peeked window stays open before the close keypress fires.
+    windowPeekMs = { dist = 'lognormal', median_ms = 2200, sigma = 0.40, min = 900, max = 5500 },
 
     -- Med cycle hold duration (ms).
     medHoldMs = { dist = 'lognormal', median_ms = 35000, sigma = 0.45, min = 20000, max = 60000 },
@@ -179,6 +193,16 @@ local function isSitting()
     return me and me.Sitting and me.Sitting() == true
 end
 
+local function pickWindowKey()
+    -- Collect configured (non-nil) window keys; pick uniformly.
+    local keys = {}
+    for _, k in pairs(WindowKeys) do
+        if type(k) == 'string' and k ~= '' then table.insert(keys, k) end
+    end
+    if #keys == 0 then return nil end
+    return keys[math.random(1, #keys)]
+end
+
 local function emit(kind)
     local now = State.now()
     -- Movement actions (turn/jump/strafe) will stand you up if you're medding.
@@ -238,6 +262,17 @@ local function emit(kind)
             chainPress  = Keybinds.strafe_right,  -- press this after releasing left
             chainHoldMs = math.floor(Distributions.sample(Config.strafeHoldMs)),
             resitAfter  = wasSitting,             -- carried through to final release
+        }
+    elseif kind == 'window' then
+        local key = pickWindowKey()
+        if not key then return end
+        local hold = math.floor(Distributions.sample(Config.windowPeekMs))
+        mq.cmdf('/keypress %s', key)
+        Fidget.pending = {
+            kind = 'window',
+            releaseAt = now + hold,
+            releaseKey = key,   -- same key toggles the window closed
+            -- no resitAfter: opening a window doesn't stand the character
         }
     elseif kind == 'face_spawn' then
         local id = nearbyFriendlyId()
