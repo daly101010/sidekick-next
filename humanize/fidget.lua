@@ -52,8 +52,9 @@ local Config = {
     -- Turn/pitch hold duration distribution (ms before the counter-press).
     holdMs = { dist = 'lognormal', median_ms = 140, sigma = 0.40, min = 80, max = 280 },
 
-    -- Strafe hold: shorter than turn so you don't shuffle a long distance.
-    strafeHoldMs = { dist = 'lognormal', median_ms = 110, sigma = 0.35, min = 60, max = 220 },
+    -- Strafe hold per leg (left, then right). Two legs = ~2-4s total.
+    -- Net position change is ~zero since you go out and back.
+    strafeHoldMs = { dist = 'lognormal', median_ms = 1300, sigma = 0.30, min = 800, max = 2200 },
 
     -- Med cycle hold duration (ms).
     medHoldMs = { dist = 'lognormal', median_ms = 35000, sigma = 0.45, min = 20000, max = 60000 },
@@ -205,15 +206,16 @@ local function emit(kind)
         mq.cmdf('/keypress %s', Keybinds.jump)
     elseif kind == 'strafe' then
         if not Keybinds.strafe_left or not Keybinds.strafe_right then return end
-        local left = math.random() < 0.5
-        local pressKey = left and Keybinds.strafe_left or Keybinds.strafe_right
-        local releaseKey = left and Keybinds.strafe_right or Keybinds.strafe_left
+        -- Always start with left, then chain right via the pending-release path.
+        -- Net displacement ~zero.
         local hold = math.floor(Distributions.sample(Config.strafeHoldMs))
-        mq.cmdf('/keypress %s hold', pressKey)
+        mq.cmdf('/keypress %s hold', Keybinds.strafe_left)
         Fidget.pending = {
-            kind = 'strafe',
-            releaseAt = now + hold,
-            releaseKey = releaseKey,
+            kind        = 'strafe',
+            releaseAt   = now + hold,
+            releaseKey  = Keybinds.strafe_left,
+            chainPress  = Keybinds.strafe_right,  -- press this after releasing left
+            chainHoldMs = math.floor(Distributions.sample(Config.strafeHoldMs)),
         }
     elseif kind == 'face_spawn' then
         local id = nearbyFriendlyId()
@@ -256,6 +258,16 @@ function M.tick()
             end
         elseif p.releaseKey then
             mq.cmdf('/keypress %s', p.releaseKey)
+            -- If this step has a chained second leg (e.g. strafe left -> right),
+            -- press the chain key and re-arm pending so tick releases it next.
+            if p.chainPress then
+                mq.cmdf('/keypress %s hold', p.chainPress)
+                Fidget.pending = {
+                    kind       = p.kind,
+                    releaseAt  = now + (p.chainHoldMs or 1200),
+                    releaseKey = p.chainPress,
+                }
+            end
         end
         return
     end
