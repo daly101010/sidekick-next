@@ -23,7 +23,6 @@ M.lastTankBroadcast = 0    -- Track when we last received tank data
 
 local _Core = nil
 local _CombatAssist = nil
-local _Chase = nil
 
 local function stopEngagement()
     if mq.TLO.Me and mq.TLO.Me.Combat and mq.TLO.Me.Combat() then
@@ -42,7 +41,6 @@ function M.init(opts)
     opts = opts or {}
     _Core = opts.Core
     _CombatAssist = opts.CombatAssist
-    _Chase = opts.Chase
     M.settings = opts.settings
     CasterAssist.init(opts)
 end
@@ -51,27 +49,14 @@ function M.setEnabled(val)
     M.enabled = val and true or false
     CasterAssist.setEnabled(val)
 
-    if _Core and _Core.set then
-        _Core.set('AssistEnabled', M.enabled)
-    elseif _Core and _Core.Settings then
-        _Core.Settings.AssistEnabled = M.enabled
-    end
-
     if not M.enabled then
         if _CombatAssist and _CombatAssist.stop then
             _CombatAssist.stop()
         else
             stopEngagement()
         end
-        if _Chase then
-            _Chase.setEnabled(false, { auto = true })
-        end
         -- Clear target tracking when disabled
         M.currentTargetId = nil
-    else
-        if _Chase and not _Chase.state.userPaused then
-            _Chase.setEnabled(true, { auto = true })
-        end
     end
 end
 
@@ -124,7 +109,7 @@ function M.shouldEngage(settings)
 
     if condition == 'hp' then
         local hp = spawn.PctHPs and spawn.PctHPs() or 100
-        local threshold = settings and settings.AssistEngageHpThreshold or 97
+        local threshold = settings and settings.AssistAt or 97
         return hp <= threshold
     elseif condition == 'tank_aggro' then
         -- Engage only when the target is actually targeting the tank.
@@ -268,10 +253,8 @@ function M.tick(settings)
         end
     end
 
-    -- Legacy mode: delegate to CombatAssist for traditional MA-following
-    -- This runs when:
-    -- 1. CombatMode is 'off' or 'tank' (not 'assist')
-    -- 2. Or CombatMode is 'assist' but no tank broadcast data available
+    -- Fall back to traditional MA-following when no fresh tank broadcast is
+    -- available. CombatMode already gates this module before tick runs.
     if _CombatAssist and _CombatAssist.tick then
         _CombatAssist.tick()
     end

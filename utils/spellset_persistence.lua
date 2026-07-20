@@ -201,8 +201,8 @@ end
 --------------------------------------------------------------------------------
 
 --- Save all spell sets to disk
---- Creates data table with version=2, activeSet, sets
---- For each spell set, serializes gems and oocBuffs
+--- Creates data table with version=3, activeSet, sets
+--- For each spell set, serializes gems, oocBuffs, and per-spell profiles
 --- Uses mq.pickle(path, data) to write
 function M.save()
     local path = M.getConfigPath()
@@ -236,7 +236,7 @@ function M.save()
 
     -- Build data structure for persistence
     local data = {
-        version = 2,
+        version = 3,
         activeSet = M.activeSetName,
         sets = {},
     }
@@ -248,16 +248,39 @@ function M.save()
             name = spellSet.name,
             gems = {},
             oocBuffs = {},
+            spellProfiles = {},
         }
 
         -- Serialize gems
         if spellSet.gems then
+            local SpellSetData = getSpellSetData()
             for slot, gemConfig in pairs(spellSet.gems) do
+                -- Direct UI condition edits mutate the live GemConfig. Refresh
+                -- its saved profile immediately before writing so the archive
+                -- always reflects the latest user configuration.
+                if SpellSetData and SpellSetData.rememberGemProfile then
+                    SpellSetData.rememberGemProfile(spellSet, gemConfig)
+                end
                 setData.gems[slot] = {
                     spellId = gemConfig.spellId,
                     condition = serializeCondition(gemConfig.condition),
                     priority = gemConfig.priority,
                     buffTarget = gemConfig.buffTarget,
+                    utility = gemConfig.utility,
+                }
+            end
+        end
+
+        -- Profiles survive removal from a gem and are restored when the same
+        -- spell is later manually memorized or dragged back into the set.
+        if spellSet.spellProfiles then
+            for spellId, profile in pairs(spellSet.spellProfiles) do
+                setData.spellProfiles[spellId] = {
+                    spellId = tonumber(profile.spellId) or tonumber(spellId),
+                    condition = serializeCondition(profile.condition),
+                    priority = profile.priority,
+                    buffTarget = profile.buffTarget,
+                    utility = profile.utility,
                 }
             end
         end
@@ -350,6 +373,7 @@ function M.load()
                 f:close()
             end
         end
+
         local result, err = SafeLoad.tableLiteral(content, path)
         if type(result) == 'table' then
             data = result
@@ -387,8 +411,8 @@ function M.load()
 
     -- Process loaded data
     if data and data.version and data.sets then
-        -- Handle version differences if needed in the future
-        -- Currently version=2 is the only version
+        -- Version 2 files are migrated in memory by seeding spellProfiles from
+        -- their currently configured gems. Version 3 persists those profiles.
 
         -- Count sets in data
         local loadedSetCount = 0
@@ -411,6 +435,7 @@ function M.load()
                     name = name,
                     gems = {},
                     oocBuffs = {},
+                    spellProfiles = {},
                 }
             end
 
@@ -425,8 +450,36 @@ function M.load()
                                 condition = deserializeCondition(gemData.condition),
                                 priority = gemData.priority,
                                 buffTarget = gemData.buffTarget,
+                                utility = gemData.utility,
                             }
                         end
+                    end
+                end
+
+                -- Load archived per-spell metadata before seeding from live
+                -- gems. Numeric conversion handles serializers that stringify
+                -- table keys.
+                spellSet.spellProfiles = spellSet.spellProfiles or {}
+                if setData.spellProfiles then
+                    for profileKey, profileData in pairs(setData.spellProfiles) do
+                        local spellId = tonumber(profileData.spellId) or tonumber(profileKey)
+                        if spellId then
+                            spellSet.spellProfiles[spellId] = {
+                                spellId = spellId,
+                                condition = deserializeCondition(profileData.condition),
+                                priority = profileData.priority,
+                                buffTarget = profileData.buffTarget,
+                                utility = profileData.utility,
+                            }
+                        end
+                    end
+                end
+
+                -- The currently configured gem is authoritative for its spell.
+                -- This also performs the version 2 -> 3 in-memory migration.
+                if SpellSetData and SpellSetData.rememberGemProfile then
+                    for _, gemConfig in pairs(spellSet.gems or {}) do
+                        SpellSetData.rememberGemProfile(spellSet, gemConfig)
                     end
                 end
 
@@ -503,6 +556,7 @@ function M.createSet(name)
             name = name,
             gems = {},
             oocBuffs = {},
+            spellProfiles = {},
         }
     end
 

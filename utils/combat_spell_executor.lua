@@ -56,6 +56,9 @@ function M.getSortedCastList(spellSet)
     if not spellSet then
         local Persistence = getSpellsetPersistence()
         if Persistence then
+            if not Persistence.loaded and Persistence.load then
+                pcall(Persistence.load)
+            end
             spellSet = Persistence.getActiveSet()
         end
     end
@@ -476,6 +479,9 @@ function M.getNextSpell()
     if not Persistence then
         return nil, nil
     end
+    if not Persistence.loaded and Persistence.load then
+        pcall(Persistence.load)
+    end
 
     local spellSet = Persistence.getActiveSet()
     if not spellSet then
@@ -674,6 +680,9 @@ end
 function M.getSpellInfo(slot)
     local Persistence = getSpellsetPersistence()
     if not Persistence then return nil end
+    if not Persistence.loaded and Persistence.load then
+        pcall(Persistence.load)
+    end
 
     local spellSet = Persistence.getActiveSet()
     if not spellSet or not spellSet.gems or not spellSet.gems[slot] then
@@ -753,6 +762,9 @@ function M.debugPrintAllGems()
     if not Persistence then
         print('\ar[CombatSpellExecutor]\ax Failed to load persistence')
         return
+    end
+    if not Persistence.loaded and Persistence.load then
+        pcall(Persistence.load)
     end
 
     local spellSet = Persistence.getActiveSet()

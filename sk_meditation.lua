@@ -6,14 +6,15 @@
 local mq = require('mq')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
-local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
 local debugLog = require('sidekick-next.utils.debug_log').module('sk_meditation', 'SK_MEDITATION')
 
 -- Module identity
-M.MODULE_NAME = 'meditation'
+-- Keep the actor/coordinator identity distinct from production SideKick's
+-- `meditation` worker. Both trees can be installed or running concurrently.
+M.MODULE_NAME = 'next_meditation'
 
 -- Internal state
 local State = {
@@ -48,8 +49,8 @@ local State = {
 
 -- Load settings directly from INI (we run as separate script)
 local _settings = nil
-local _settingsLoadedAt = 0
-local SETTINGS_REFRESH_INTERVAL = 5.0  -- Refresh settings every 5 seconds
+local _settingsRevision = nil
+local _settingsPath = nil
 
 local function toBool(v, default)
     if v == nil then return default end
@@ -71,19 +72,35 @@ local function loadSettingsFromIni()
     pcall(function() Paths = require('sidekick-next.utils.paths') end)
     if not Paths then return settings end
 
-    local iniPath = Paths.getMainConfigPath()
-    local lip = nil
-    pcall(function() lip = require('LIP') end)
-    if not lip then return settings end
+    local iniPath = Paths.getModuleConfigPath('meditation')
+    _settingsPath = iniPath
+    local section = {}
+    local okAtomic, AtomicIni = pcall(require, 'sidekick-next.utils.atomic_ini')
+    if okAtomic and AtomicIni then
+        local ini = AtomicIni.load(iniPath)
+        section = type(ini) == 'table' and (ini.Settings or {}) or {}
+    end
 
-    local ok, ini = pcall(lip.load, iniPath)
-    if not ok or type(ini) ~= 'table' then return settings end
+    -- During first-run migration the UI may not have created the module file
+    -- yet. Fall back to the combined legacy source without ever writing it.
+    if next(section) == nil then
+        local okLip, lip = pcall(require, 'LIP')
+        if okLip and lip then
+            local okLegacy, legacy = pcall(lip.load, Paths.getMainConfigPath())
+            if okLegacy and type(legacy) == 'table' then
+                section = legacy.SideKick or legacy['SideKick'] or {}
+            end
+        end
+    end
 
-    -- Read meditation settings from [SideKick] section
-    local section = ini['SideKick'] or {}
-
-    -- Meditation settings
-    settings.MeditationMode = section['MeditationMode'] or 'inout'
+    -- Meditation settings. Prefer the SideKick mode field, but honor legacy
+    -- MedOn if present so imported configs cannot report mode_off while the
+    -- character was configured to med.
+    local legacyMedOn = toBool(section['MedOn'], nil)
+    settings.MeditationMode = section['MeditationMode'] or (legacyMedOn == true and 'ooc' or 'inout')
+    if tostring(settings.MeditationMode):lower() == 'off' and legacyMedOn == true then
+        settings.MeditationMode = 'ooc'
+    end
     settings.MeditationHPStartPct = tonumber(section['MeditationHPStartPct']) or 70
     settings.MeditationHPStopPct = tonumber(section['MeditationHPStopPct']) or 95
     settings.MeditationManaStartPct = tonumber(section['MeditationManaStartPct']) or 50
@@ -96,24 +113,22 @@ local function loadSettingsFromIni()
     settings.MeditationAfterCombatDelay = tonumber(section['MeditationAfterCombatDelay']) or 2.0
     settings.MeditationMinStateSeconds = tonumber(section['MeditationMinStateSeconds']) or 1.0
 
-    debugLog('loadSettingsFromIni: MeditationStandWhenDone raw=%s parsed=%s',
+    debugLog('loadSettingsFromIni: MeditationMode raw=%s MedOn=%s parsed=%s StandWhenDone raw=%s parsed=%s',
+        tostring(section['MeditationMode']), tostring(section['MedOn']), tostring(settings.MeditationMode),
         tostring(section['MeditationStandWhenDone']), tostring(settings.MeditationStandWhenDone))
 
     return settings
 end
 
 local function getSettings()
-    local now = os.clock()
-    if not _settings or (now - _settingsLoadedAt) >= SETTINGS_REFRESH_INTERVAL then
+    local revision = tonumber(State.coordState and State.coordState.settingsRevision) or 0
+    if not _settings or revision ~= _settingsRevision then
         _settings = loadSettingsFromIni()
-        _settingsLoadedAt = now
+        _settingsRevision = revision
         debugLog('getSettings: Loaded from INI, MeditationMode=%s', tostring(_settings.MeditationMode))
     end
     return _settings
 end
-
--- Keep Core for backwards compatibility but don't rely on it
-local getCore = lazy('sidekick-next.utils.core')
 
 -- Build me data directly from TLO (since we run as separate script)
 local function getMeData()
@@ -130,7 +145,6 @@ local function getMeData()
     pcall(function() data.moving = me.Moving() end)
     pcall(function() data.casting = me.Casting() and me.Casting.ID() and me.Casting.ID() > 0 end)
     pcall(function() data.combat = me.Combat() end)
-    pcall(function() data.stunned = me.Stunned() end)
     pcall(function() data.pctAggro = me.PctAggro() end)
 
     return data
@@ -217,7 +231,7 @@ local function iHaveAggro(me, settings)
 end
 
 local function updateResourceFlags(now)
-    if (now - (State.lastMaxProbeAt or 0)) < 5.0 then return end
+    if (now - (State.lastMaxProbeAt or 0)) < 5000 then return end
     State.lastMaxProbeAt = now
 
     local me = mq.TLO.Me
@@ -285,8 +299,8 @@ local function shouldSit(me, settings)
 end
 
 local function canChangeState(now, settings)
-    local minHold = tonumber(settings.MeditationMinStateSeconds) or 1.0
-    local minCmd = 0.5
+    local minHold = (tonumber(settings.MeditationMinStateSeconds) or 1.0) * 1000
+    local minCmd = 500
     if (now - (State.lastCmdAt or 0)) < minCmd then return false end
     if (now - (State.lastStateChangeAt or 0)) < minHold then return false end
     return true
@@ -391,12 +405,9 @@ local function spellMemorizationActive()
         end
     end
 
-    -- Local runtime fallback. /memspell uses the spellbook UI while changing
-    -- gems; if the coordinator signal is between broadcasts, this still keeps
-    -- meditation from issuing a /stand that aborts the memorize operation.
     local bookOpen = safeBool(function()
         local wnd = mq.TLO.Window and mq.TLO.Window('SpellBookWnd')
-        return wnd and wnd.Open and wnd.Open()
+        return wnd and wnd.Open and wnd.Open() == true
     end)
     if bookOpen then return true, 'spellbook_open' end
 
@@ -410,6 +421,20 @@ end
 local _lastTickLog = 0
 
 local function tick()
+    -- Remain loaded through zoning, but do not sit/stand or inspect character
+    -- state until MacroQuest reports that the character is fully in game.
+    if not lib.isInGame() then
+        sendNeed(false, nil, 'not_ingame')
+        return
+    end
+
+    local paused = State.coordState and State.coordState.automationPaused
+    if paused == nil and lib.isAutomationPaused then paused = lib.isAutomationPaused() end
+    if paused == true then
+        sendNeed(false, nil, 'automation_paused')
+        return
+    end
+
     -- Safety: stop if no valid state
     if not hasValidState() then
         sendNeed(false, nil, 'no_state')
@@ -424,9 +449,9 @@ local function tick()
     local settings = getSettings()
     local mode = normalizeMode(settings.MeditationMode)
 
-    -- Log periodically (every 2 seconds)
-    local now = os.clock()
-    local shouldLog = (now - _lastTickLog) >= 2.0
+    -- Log periodically (every 2 seconds of wall-clock time)
+    local now = lib.getTimeMs()
+    local shouldLog = (now - _lastTickLog) >= 2000
     if shouldLog then
         _lastTickLog = now
         debugLog('tick: rawMode=%s normalizedMode=%s', tostring(settings.MeditationMode), mode)
@@ -446,8 +471,15 @@ local function tick()
         return
     end
 
-    local now = os.clock()
+    local now = lib.getTimeMs()
     updateResourceFlags(now)
+
+    local incapacitated, incapReason = lib.isIncapacitated()
+    if incapacitated then
+        if shouldLog then debugLog('tick: blocked by %s', tostring(incapReason)) end
+        sendNeed(false, nil, 'incapacitated:' .. tostring(incapReason or 'unknown'))
+        return
+    end
 
     -- Track movement
     if me.moving == true then
@@ -461,7 +493,7 @@ local function tick()
         State.combatEndedAt = 0
     elseif State.wasInCombat == true then
         State.combatEndedAt = now
-        State.postCombatJitter = math.random() * 0.75
+        State.postCombatJitter = math.random() * 750
     end
     State.wasInCombat = inCombat == true
 
@@ -521,22 +553,12 @@ local function tick()
         return
     end
 
-    -- Stunned check
-    if me.stunned == true then
-        if me.sitting == true and canChangeState(now, settings) then
-            if shouldLog then debugLog('tick: standing due to stunned') end
-            cmdStand(now)
-        end
-        sendNeed(false, nil, 'stunned')
-        return
-    end
-
     -- Post-combat delay before sitting
     if (mode == 'ooc' or mode == 'inout') and State.combatEndedAt and State.combatEndedAt > 0 then
-        local delay = tonumber(settings.MeditationAfterCombatDelay) or 2.0
+        local delay = (tonumber(settings.MeditationAfterCombatDelay) or 2.0) * 1000
         local readyAt = State.combatEndedAt + delay + (State.postCombatJitter or 0)
         if now < readyAt then
-            if shouldLog then debugLog('tick: post-combat delay (%.1fs remaining)', readyAt - now) end
+            if shouldLog then debugLog('tick: post-combat delay (%.1fs remaining)', (readyAt - now) / 1000) end
             sendNeed(false, nil, 'post_combat_delay')
             return
         end
@@ -677,13 +699,23 @@ end
 
 --- Check if coordinator has been absent too long
 local function isCoordinatorAbsent()
+    if not lib.isInGame() then return false end
     -- Not initialized yet or never received state
     if not State.initialized then return false end
     if State.stateReceivedAt == 0 then return false end
 
     local now = lib.getTimeMs()
     local absence = now - State.stateReceivedAt
-    return absence > lib.Timing.COORDINATOR_ABSENCE_MS
+    if absence <= lib.Timing.COORDINATOR_ABSENCE_MS then return false end
+
+    local status = lib.getLuaScriptStatus(lib.Scripts.COORDINATOR)
+    if status ~= 'EXITED' then
+        State.stateReceivedAt = now
+        debugLog('WATCHDOG: coordinator actor state stale but Lua status=%s; keeping worker',
+            status ~= '' and status or 'UNKNOWN')
+        return false
+    end
+    return true
 end
 
 local function mainLoop()
@@ -692,12 +724,20 @@ local function mainLoop()
     local lastHeartbeat = 0
     local tickDelayMs = 100  -- Meditation can tick slower
     local _coordinatorAbsentLogged = false
+    local wasInGame = lib.isInGame()
 
     while State.running do
         tick()
 
         -- Send heartbeat periodically
         local now = lib.getTimeMs()
+        local inGame = lib.isInGame()
+        if inGame and not wasInGame then
+            -- Give the coordinator's first post-zone state broadcast time to
+            -- arrive before applying the absence watchdog.
+            State.stateReceivedAt = now
+        end
+        wasInGame = inGame
         if (now - lastHeartbeat) >= lib.Timing.MODULE_HEARTBEAT_MS then
             sendHeartbeat()
             lastHeartbeat = now
@@ -712,6 +752,8 @@ local function mainLoop()
                 --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
                 --     M.MODULE_NAME, absence / 1000))
                 debugLog('WATCHDOG: Coordinator absent for %dms, shutting down', now - State.stateReceivedAt)
+                lib.log('warn', M.MODULE_NAME,
+                    'Stopping worker: coordinator Lua process is EXITED')
             end
             -- Meditation does not use claims, so no releaseClaim needed
             State.running = false
@@ -729,20 +771,110 @@ end
 -- Command Binding
 -------------------------------------------------------------------------------
 
-mq.bind('/sk_meditation', function(cmd)
-    if cmd == 'stop' then
+local function commandEcho(fmt, ...)
+    local ok, message = pcall(string.format, tostring(fmt or ''), ...)
+    if not ok then message = tostring(fmt or '') end
+    if mq and mq.cmd then
+        -- MQ chat parsing treats backslash sequences as formatting codes.
+        message = message:gsub('\\', '/')
+        mq.cmd('/echo \\ag[SK-Next Meditation]\\ax ' .. message)
+    else
+        print('[SK-Next Meditation] ' .. message)
+    end
+end
+
+local function echoLastSettingsAudit()
+    local Paths = require('sidekick-next.utils.paths')
+    local path = Paths.getModuleConfigDir() .. '/settings-audit.log'
+    local file = io.open(path, 'r')
+    if not file then
+        commandEcho('No settings audit entries at %s', path)
+        return
+    end
+    local last = nil
+    for line in file:lines() do
+        if line ~= '' then last = line end
+    end
+    file:close()
+    commandEcho('Last settings write: %s', tostring(last or 'none'))
+end
+
+local function handleCommand(cmd)
+    cmd = tostring(cmd or ''):lower():match('^%s*(.-)%s*$')
+    if cmd == 'on' then cmd = 'ooc' end
+
+    if cmd == 'off' or cmd == 'ooc' or cmd == 'always' or cmd == 'in combat' or cmd == 'incombat' then
+        local mode = cmd
+        if mode == 'incombat' then mode = 'in combat' end
+        -- The worker is read-only for the shared character INI. Route the
+        -- change to the UI process, which is the sole settings writer.
+        mq.cmdf('/sk_next_set_meditation %s', mode)
+        _settings = nil
+        _settingsRevision = nil
+        commandEcho('Requested mode=%s through the primary settings writer', mode)
+    elseif cmd == 'audit' then
+        echoLastSettingsAudit()
+    elseif cmd == 'stop' then
         State.running = false
         lib.log('info', M.MODULE_NAME, 'Stop requested')
+        commandEcho('Stop requested')
+    elseif cmd == 'reload' then
+        _settings = nil
+        _settingsRevision = nil
+        local settings = getSettings()
+        lib.log('info', M.MODULE_NAME, 'Reloaded settings: mode=%s manaStart=%s manaStop=%s',
+            tostring(normalizeMode(settings.MeditationMode)),
+            tostring(settings.MeditationManaStartPct),
+            tostring(settings.MeditationManaStopPct))
+        commandEcho('Reloaded config=%s rawMode=%s normalized=%s',
+            tostring(_settingsPath or 'unknown'), tostring(settings.MeditationMode),
+            tostring(normalizeMode(settings.MeditationMode)))
     elseif cmd == 'status' then
-        local Core = getCore()
-        local settings = Core and Core.Settings or {}
-        lib.log('info', M.MODULE_NAME, 'running=%s, hasState=%s, isMyPriority=%s, mode=%s',
+        local settings = getSettings()
+        local me = getMeData() or {}
+        lib.log('info', M.MODULE_NAME, 'script=sidekick-next/sk_meditation config=%s rawMode=%s',
+            tostring(_settingsPath or 'unknown'), tostring(settings.MeditationMode))
+        lib.log('info', M.MODULE_NAME, 'running=%s, hasState=%s, isMyPriority=%s, mode=%s, mana=%s, sitting=%s, lastReason=%s',
             tostring(State.running),
             tostring(hasValidState()),
             tostring(isMyPriority()),
-            tostring(normalizeMode(settings.MeditationMode)))
+            tostring(normalizeMode(settings.MeditationMode)),
+            tostring(me.mana),
+            tostring(me.sitting),
+            tostring(State.lastNeedReason))
+        lib.log('info', M.MODULE_NAME,
+            'combat=%s moving=%s movePlugin=%s casting=%s castBusy=%s aggroUnsafe=%s hp=%s end=%s postCombatMs=%s',
+            tostring(lib.inCombat()),
+            tostring(me.moving == true),
+            tostring(movementPluginsActive()),
+            tostring(me.casting == true),
+            tostring(State.coordState and State.coordState.castBusy == true),
+            tostring(iHaveAggro(me, settings)),
+            tostring(me.hp),
+            tostring(me.endur),
+            State.combatEndedAt > 0 and tostring(math.max(0, lib.getTimeMs() - State.combatEndedAt)) or 'none')
+        commandEcho('script=sidekick-next/sk_meditation config=%s rawMode=%s normalized=%s reason=%s',
+            tostring(_settingsPath or 'unknown'), tostring(settings.MeditationMode),
+            tostring(normalizeMode(settings.MeditationMode)), tostring(State.lastNeedReason))
+        commandEcho('state=%s priority=%s mana=%s sitting=%s combat=%s moving=%s casting=%s castBusy=%s aggro=%s',
+            tostring(hasValidState()), tostring(isMyPriority()), tostring(me.mana), tostring(me.sitting),
+            tostring(lib.inCombat()), tostring(me.moving == true), tostring(me.casting == true),
+            tostring(State.coordState and State.coordState.castBusy == true),
+            tostring(iHaveAggro(me, settings)))
+        commandEcho('thresholds mana=%s/%s hp=%s/%s end=%s/%s',
+            tostring(settings.MeditationManaStartPct), tostring(settings.MeditationManaStopPct),
+            tostring(settings.MeditationHPStartPct), tostring(settings.MeditationHPStopPct),
+            tostring(settings.MeditationEndStartPct), tostring(settings.MeditationEndStopPct))
+    else
+        lib.log('info', M.MODULE_NAME, 'Usage: /sk_next_meditation off|ooc|always|status|reload|audit|stop')
+        commandEcho('Usage: /sk_next_meditation off|ooc|always|status|reload|audit|stop')
     end
-end)
+end
+
+-- Next-only command. The legacy alias remains for compatibility, but may be
+-- shadowed when production SideKick is also running.
+mq.bind('/sk_next_meditation', handleCommand)
+mq.bind('/sk_meditation', handleCommand)
 
 -------------------------------------------------------------------------------
 -- Run

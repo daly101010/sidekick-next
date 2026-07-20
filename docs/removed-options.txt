@@ -1,9 +1,11 @@
 Removed options (sidekick-next)
 Date: 2026-01-22
 
-These settings were removed because they existed in the Settings UI but had no functional implementation (no references outside settings UI/registry), so changing them could not affect runtime behavior.
+These settings were removed either because they had no functional implementation or because their behavior was consolidated into the canonical setting noted in the implementation history. Do not restore them as independent controls.
 
 Removed setting keys:
+- AssistEnabled
+- AssistEngageHpThreshold
 - AuraSelection
 - AutoStandFD
 - BuffAllowInCombat
@@ -19,6 +21,27 @@ Removed setting keys:
 - EmergencyHealPct
 - LowResourceThreshold
 - MAScanZRange
+- ResourceAllowCombat
+- ResourceHpAbovePctCombat
+- ResourceHpAbovePctOOC
+- ResourceManaBelowPct
+- SpecialEnabled
+- BuffPetsEnabled
+- CCEnabled
+- CCCoordinateActors
+- CCMaxMezTargets
+- CCPrioritizeSelfHeal
+- CCSelfHealHpThreshold
+- CureCoordinateActors
+- DebuffAutoCripple
+- DebuffAutoMalo
+- DebuffAutoSlow
+- DebuffCoordinateActors
+- DebuffGroupHealHpThreshold
+- DebuffPrioritizeSelfHeal
+- DebuffSelfHealHpThreshold
+- DoCharm
+- TravelBrokerEnabled
 
 Files updated to remove the UI/registry surfaces:
 - sidekick-next/ui/settings.lua

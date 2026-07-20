@@ -5,6 +5,7 @@
 local mq = require('mq')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
+local ActionExecutor = require('sidekick-next.utils.action_executor')
 
 local M = {}
 
@@ -15,6 +16,7 @@ local debugLogToFile = require('sidekick-next.utils.debug_log').moduleTagged('sk
 -- @param priority number Module's priority tier
 -- @return table Module instance
 function M.create(moduleName, priority)
+    ActionExecutor.init()
     local self = {
         name = moduleName,
         priority = priority,
@@ -26,8 +28,12 @@ function M.create(moduleName, priority)
         -- Claim tracking
         claimCounter = 0,
         currentClaimId = nil,
+        currentClaimType = nil,
         claimPending = false,
         claimRequestedAt = 0,
+        claimEpochAtRequest = nil,
+        lastReleasedClaimId = nil,
+        lastReleasedAtMs = 0,
         lastNeedSentAt = 0,
         lastNeedValue = nil,
         lastNeedReason = nil,
@@ -40,6 +46,14 @@ function M.create(moduleName, priority)
         -- Actor dropbox
         dropbox = nil,
         stateDropbox = nil,
+        peerActorsEnabled = false,
+        peerActors = nil,
+        settingsRevision = nil,
+
+        -- Unified action executor (opt-in during compatibility migration)
+        unifiedExecutorEnabled = false,
+        actionHandlers = nil,
+        lastActionResult = nil,
 
         -- Callbacks (override these)
         onTick = nil,          -- Called each tick when active
@@ -75,6 +89,10 @@ function M.create(moduleName, priority)
         local owner = self.state.castOwner
         if not owner then return false end
         if owner.module ~= self.name then return false end
+        -- Actor state is asynchronous. Never resurrect a claim we have already
+        -- released merely because one older coordinator snapshot is still in
+        -- self.state.
+        if owner.claimId == self.lastReleasedClaimId then return false end
 
         -- If we own by module name but claimId doesn't match, adopt the coordinator's claimId
         -- This handles the case where we sent multiple claims and an earlier one was granted
@@ -83,6 +101,7 @@ function M.create(moduleName, priority)
                 tostring(owner.claimId), tostring(self.currentClaimId))
             self.currentClaimId = owner.claimId
             self.claimPending = false
+            self.claimEpochAtRequest = nil
         end
 
         -- The coordinator includes this module as owner in the state broadcast,
@@ -95,6 +114,7 @@ function M.create(moduleName, priority)
         local owner = self.state.targetOwner
         if not owner then return false end
         if owner.module ~= self.name then return false end
+        if owner.claimId == self.lastReleasedClaimId then return false end
 
         -- If we own by module name but claimId doesn't match, adopt the coordinator's claimId
         if owner.claimId ~= self.currentClaimId then
@@ -102,6 +122,7 @@ function M.create(moduleName, priority)
                 tostring(owner.claimId), tostring(self.currentClaimId))
             self.currentClaimId = owner.claimId
             self.claimPending = false
+            self.claimEpochAtRequest = nil
         end
 
         -- The coordinator includes this module as owner in the state broadcast,
@@ -111,6 +132,16 @@ function M.create(moduleName, priority)
 
     function self:ownsAction()
         return self:ownsCast() and self:ownsTarget()
+    end
+
+    function self:ownsClaim()
+        local claimType = self.currentClaimType or lib.ClaimType.ACTION
+        if claimType == lib.ClaimType.CAST then
+            return self:ownsCast()
+        elseif claimType == lib.ClaimType.TARGET then
+            return self:ownsTarget()
+        end
+        return self:ownsAction()
     end
 
     ---------------------------------------------------------------------------
@@ -135,24 +166,44 @@ function M.create(moduleName, priority)
 
         self.claimCounter = self.claimCounter + 1
         self.currentClaimId = lib.generateClaimId(self.name, self.claimCounter)
+        self.currentClaimType = action.type or lib.ClaimType.ACTION
+
+        local wants = action.wants
+        if type(wants) ~= 'table' then
+            if self.currentClaimType == lib.ClaimType.CAST then
+                wants = { 'cast' }
+            elseif self.currentClaimType == lib.ClaimType.TARGET then
+                wants = { 'target' }
+            else
+                wants = { 'target', 'cast' }
+            end
+        end
 
         local claim = {
             msgType = 'claim',
-            type = lib.ClaimType.ACTION,
-            wants = { 'target', 'cast' },
+            type = self.currentClaimType,
+            wants = wants,
             module = self.name,
             ownerName = lib.getMyName(),
             ownerServer = lib.getMyServer(),
             priority = self.priority,
             claimId = self.currentClaimId,
             epochSeen = self.state.epoch,
-            ttlMs = lib.Timing.CLAIM_DEFAULT_TTL_MS,
+            -- Pre-cast workflows such as memorization or navigation can ask
+            -- for a longer bounded lease. The coordinator still revokes it on
+            -- heartbeat loss, incapacitation, or explicit release.
+            ttlMs = tonumber(action.claimTtlMs) or lib.Timing.CLAIM_DEFAULT_TTL_MS,
+            expectsCastStart = action.expectsCastStart ~= false
+                and action.kind == lib.ActionKind.CAST_SPELL,
+            castStartTimeoutMs = tonumber(action.castStartTimeoutMs)
+                or lib.Timing.CLAIM_CAST_START_MS,
             reason = action.reason or 'action',
             action = action,
         }
 
         self.claimPending = true
         self.claimRequestedAt = lib.getTimeMs()
+        self.claimEpochAtRequest = self.state.epoch
 
         pcall(function()
             self.dropbox:send({ mailbox = lib.Mailbox.CLAIM, script = lib.Scripts.COORDINATOR }, claim)
@@ -165,9 +216,11 @@ function M.create(moduleName, priority)
     function self:releaseClaim(reason)
         if not self.currentClaimId then return end
 
+        local releasedClaimId = self.currentClaimId
+
         local release = {
             msgType = 'release',
-            type = 'action',
+            type = self.currentClaimType or lib.ClaimType.ACTION,
             module = self.name,
             ownerName = lib.getMyName(),
             ownerServer = lib.getMyServer(),
@@ -181,8 +234,12 @@ function M.create(moduleName, priority)
         end)
 
         lib.log('debug', self.name, 'Release sent: %s (%s)', self.currentClaimId, reason)
+        self.lastReleasedClaimId = releasedClaimId
+        self.lastReleasedAtMs = lib.getTimeMs()
         self.currentClaimId = nil
+        self.currentClaimType = nil
         self.claimPending = false
+        self.claimEpochAtRequest = nil
     end
 
     function self:requestInterrupt(reason)
@@ -214,8 +271,74 @@ function M.create(moduleName, priority)
                 ownerServer = lib.getMyServer(),
                 sentAtMs = lib.getTimeMs(),
                 ready = true,
+                action = self.unifiedExecutorEnabled and ActionExecutor.getStatus() or nil,
             })
         end)
+    end
+
+    ---------------------------------------------------------------------------
+    -- Unified Action Executor
+    ---------------------------------------------------------------------------
+
+    function self:enableUnifiedExecutor(handlers)
+        self.unifiedExecutorEnabled = true
+        self.actionHandlers = handlers or {}
+    end
+
+    function self:getClaimAction()
+        local claimType = self.currentClaimType or lib.ClaimType.ACTION
+        if claimType == lib.ClaimType.TARGET then
+            return self.state and self.state.targetOwner and self.state.targetOwner.action
+        end
+        return self.state and self.state.castOwner and self.state.castOwner.action
+    end
+
+    function self:cancelUnifiedAction(reason)
+        if self.unifiedExecutorEnabled and ActionExecutor.hasActiveJob() then
+            ActionExecutor.cancel(reason or 'cancelled')
+        end
+    end
+
+    function self:driveUnifiedAction()
+        if not self.unifiedExecutorEnabled then return false end
+
+        if not ActionExecutor.hasJob() then
+            local action = self:getClaimAction()
+            if not action then
+                self:releaseClaim('executor:no_action')
+                return true
+            end
+            action.claimId = action.claimId or self.currentClaimId
+            local accepted, reason = ActionExecutor.submit(action, {
+                handlers = self.actionHandlers,
+                context = self,
+            })
+            if not accepted then
+                self.lastActionResult = { phase = 'failed', reason = reason or 'submit_failed' }
+                self:releaseClaim('executor:' .. tostring(reason or 'submit_failed'))
+                return true
+            end
+        end
+
+        ActionExecutor.tick({
+            -- Every unified action owns the cast resource. Target ownership
+            -- may be released while an already-started cast is deliberately
+            -- allowed to finish, so the executor follows the cast lease after
+            -- its initial full-claim admission check.
+            ownsAction = function() return self:ownsCast() end,
+        })
+        local result = ActionExecutor.consumeResult()
+        if result then
+            self.lastActionResult = result
+            local reason = string.format('executor:%s:%s',
+                tostring(result.phase or 'unknown'), tostring(result.reason or 'unknown'))
+            lib.log(result.phase == 'completed' and 'debug' or 'warn', self.name,
+                'Action %s: kind=%s name=%s reason=%s elapsed=%dms',
+                tostring(result.phase), tostring(result.kind), tostring(result.name),
+                tostring(result.reason), tonumber(result.elapsedMs) or 0)
+            self:releaseClaim(reason)
+        end
+        return true
     end
 
     function self:sendNeed(needsAction, ttlMs, reason)
@@ -266,16 +389,19 @@ function M.create(moduleName, priority)
 
         -- Check if our claim was granted or rejected
         if self.claimPending then
-            if self:ownsAction() then
+            if self:ownsClaim() then
                 lib.log('debug', self.name, 'Claim granted: %s', self.currentClaimId)
                 self.claimPending = false
-            elseif self.state.epoch > (self.claimRequestedAt and self.state.epoch or 0) then
+                self.claimEpochAtRequest = nil
+            elseif self.claimEpochAtRequest and self.state.epoch > self.claimEpochAtRequest then
                 -- Epoch changed but we don't own - claim was rejected or someone else got it
                 local elapsed = lib.getTimeMs() - self.claimRequestedAt
                 if elapsed > 100 then
                     lib.log('debug', self.name, 'Claim likely rejected (epoch changed): %s', self.currentClaimId)
                     self.claimPending = false
                     self.currentClaimId = nil
+                    self.currentClaimType = nil
+                    self.claimEpochAtRequest = nil
                 end
             end
         end
@@ -286,15 +412,70 @@ function M.create(moduleName, priority)
     ---------------------------------------------------------------------------
 
     function self:tick()
+        -- Zoning is a suspended state, not a module shutdown. Keep Actors
+        -- heartbeats alive but advertise no work and never touch character
+        -- TLOs until MacroQuest reports INGAME again.
+        if not lib.isInGame() then
+            self:cancelUnifiedAction('not_ingame')
+            if self.currentClaimId then
+                self:releaseClaim('not_ingame')
+            end
+            self:sendNeed(false, nil, 'not_ingame')
+            return
+        end
+
+        -- Reload shared settings only when the UI-published revision changes.
+        -- This replaces the former 500ms all-INI polling in every worker.
+        local revision = tonumber(self.state and self.state.settingsRevision)
+        if revision and revision ~= self.settingsRevision then
+            lib.refreshSettings(revision)
+            self.settingsRevision = revision
+            if self.onSettingsReload then pcall(self.onSettingsReload, self, revision) end
+        end
+
+        -- Global automation pause. Keep the worker alive and heartbeating, but
+        -- advertise no work and release any claim so the coordinator is not
+        -- pinned to a paused module.
+        local paused = self.state and self.state.automationPaused
+        if paused == nil and lib.isAutomationPaused then paused = lib.isAutomationPaused() end
+        if paused == true then
+            self:cancelUnifiedAction('automation_paused')
+            if self.currentClaimId then
+                self:releaseClaim('automation_paused')
+            end
+            self.claimPending = false
+            self.claimEpochAtRequest = nil
+            self:sendNeed(false, nil, 'automation_paused')
+            return
+        end
+
         -- Death/hovering invalidates any local action claim. Continuing to
         -- advertise need while dead can leave the coordinator stuck on an
         -- owner that cannot cast after a wipe.
         if lib.isSelfDeadOrHovering and lib.isSelfDeadOrHovering() then
+            self:cancelUnifiedAction('self_dead')
             if self.currentClaimId then
                 lib.log('warn', self.name, 'Self dead/hovering, releasing claim')
                 self:releaseClaim('self_dead')
             end
             self:sendNeed(false, nil, 'self_dead')
+            return
+        end
+
+        -- Revalidate local control state in the worker's normal tick. This is
+        -- intentionally independent of the coordinator snapshot so a stun/mez
+        -- cannot leave a granted claim waiting for the next Actor broadcast.
+        local incapacitated, incapReason = lib.isIncapacitated()
+        if incapacitated then
+            local reason = 'incapacitated:' .. tostring(incapReason or 'unknown')
+            self:cancelUnifiedAction(reason)
+            if self.currentClaimId then
+                lib.log('warn', self.name, 'Unable to act (%s), releasing claim', tostring(incapReason))
+                self:releaseClaim(reason)
+            end
+            self.claimPending = false
+            self.claimEpochAtRequest = nil
+            self:sendNeed(false, nil, reason)
             return
         end
 
@@ -305,6 +486,7 @@ function M.create(moduleName, priority)
                 self._lastNoStateLog = lib.getTimeMs()
                 debugLogToFile(self.name, 'tick: No valid state (state=%s)', self.state and 'exists' or 'nil')
             end
+            self:cancelUnifiedAction('state_stale')
             if self.currentClaimId then
                 lib.log('warn', self.name, 'State stale, releasing claim')
                 self:releaseClaim('state_stale')
@@ -322,15 +504,33 @@ function M.create(moduleName, priority)
             self.onTick(self)
         end
 
+        -- Once submitted, an action continues to be monitored even if the
+        -- scheduler's active priority changes. The coordinator may preserve a
+        -- live cast while revoking target ownership; the executor finishes the
+        -- observed cast and releases the original claim when it ends.
+        if self.unifiedExecutorEnabled and (ActionExecutor.hasJob() or self:ownsClaim()) then
+            self:driveUnifiedAction()
+            return
+        end
+
         -- Check if we should act
         if not self:isMyPriority() then
             return
         end
 
         -- If we already own the action, execute
-        local ownsIt = self:ownsAction()
+        local ownsIt = self:ownsClaim()
         if ownsIt then
             if self.executeAction then
+                -- A control effect can land after the priority/ownership checks
+                -- above. Sample once more immediately before side effects.
+                local blocked, blockedReason = lib.isIncapacitated()
+                if blocked then
+                    local reason = 'incapacitated:' .. tostring(blockedReason or 'unknown')
+                    self:releaseClaim(reason)
+                    self:sendNeed(false, nil, reason)
+                    return
+                end
                 local success, reason = self.executeAction(self)
                 lib.log('debug', self.name, 'executeAction returned: success=%s reason=%s', tostring(success), tostring(reason))
                 if success or reason == 'completed' then
@@ -356,6 +556,10 @@ function M.create(moduleName, priority)
     -- Initialization
     ---------------------------------------------------------------------------
 
+    function self:enablePeerActors()
+        self.peerActorsEnabled = true
+    end
+
     function self:initialize()
         debugLogToFile(self.name, 'Initializing module (priority=%d)', self.priority)
         lib.log('info', self.name, 'Initializing module (priority=%d)', self.priority)
@@ -379,12 +583,23 @@ function M.create(moduleName, priority)
             end
         end)
 
+        if self.peerActorsEnabled then
+            local ok, coordinator = pcall(require, 'sidekick-next.utils.actors_coordinator')
+            if ok and coordinator then
+                coordinator.init()
+                self.peerActors = coordinator
+            end
+        end
+
         lib.log('info', self.name, 'Module ready, waiting for Coordinator state...')
     end
 
     --- Check if coordinator has been absent too long
     ---@return boolean True if coordinator is presumed crashed
     function self:isCoordinatorAbsent()
+        -- Coordinator state broadcasts may pause during a zone transition.
+        -- Do not convert that expected pause into a worker self-shutdown.
+        if not lib.isInGame() then return false end
         -- Not initialized yet = still waiting, not absent
         if not self.initialized then return false end
         -- Never received state = still in startup
@@ -392,7 +607,21 @@ function M.create(moduleName, priority)
 
         local now = lib.getTimeMs()
         local absence = now - self.stateReceivedAt
-        return absence > lib.Timing.COORDINATOR_ABSENCE_MS
+        if absence <= lib.Timing.COORDINATOR_ABSENCE_MS then return false end
+
+        -- Actor state delivery is not authoritative for local process
+        -- liveness. If MQ2Lua still has the coordinator process, preserve this
+        -- worker and start a fresh absence window. Unknown status is handled
+        -- non-destructively as well.
+        local status = lib.getLuaScriptStatus(lib.Scripts.COORDINATOR)
+        if status ~= 'EXITED' then
+            self.stateReceivedAt = now
+            debugLogToFile(self.name,
+                'WATCHDOG: coordinator actor state stale but Lua status=%s; keeping worker',
+                status ~= '' and status or 'UNKNOWN')
+            return false
+        end
+        return true
     end
 
     function self:run(tickDelayMs)
@@ -402,12 +631,28 @@ function M.create(moduleName, priority)
 
         local lastHeartbeat = 0
         local _coordinatorAbsentLogged = false
+        local wasInGame = lib.isInGame()
 
         while self.running do
+            if self.peerActors and self.peerActors.tick then
+                self.peerActors.tick()
+            end
+            -- Spell/cast result events belong to the worker process that
+            -- issued the action. Drain them from the yieldable main loop so
+            -- the unified executor can advance without module-specific event
+            -- plumbing.
+            if mq.doevents then pcall(mq.doevents) end
             self:tick()
 
             -- Send heartbeat periodically
             local now = lib.getTimeMs()
+            local inGame = lib.isInGame()
+            if inGame and not wasInGame then
+                -- Coordinator state delivery and worker ticks race on the
+                -- first frame after zoning. Start a fresh absence window.
+                self.stateReceivedAt = now
+            end
+            wasInGame = inGame
             if (now - lastHeartbeat) >= lib.Timing.MODULE_HEARTBEAT_MS then
                 self:sendHeartbeat()
                 lastHeartbeat = now
@@ -422,6 +667,8 @@ function M.create(moduleName, priority)
                     --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
                     --     self.name, absence / 1000))
                     debugLogToFile(self.name, 'WATCHDOG: Coordinator absent for %dms, shutting down', now - self.stateReceivedAt)
+                    lib.log('warn', self.name,
+                        'Stopping worker: coordinator Lua process is EXITED')
                 end
                 self:stop()
             else
@@ -436,6 +683,7 @@ function M.create(moduleName, priority)
 
     function self:stop()
         self.running = false
+        self:cancelUnifiedAction('shutdown')
         if self.currentClaimId then
             self:releaseClaim('shutdown')
         end

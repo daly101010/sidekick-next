@@ -168,6 +168,8 @@ function M.buildStatusPayload(opts)
     if not me or not me() then return nil end
 
     local hp = safeNum(function() return me.PctHPs() end, 0)
+    local currentHP = safeNum(function() return me.CurrentHPs() end, 0)
+    local maxHP = safeNum(function() return me.MaxHPs() end, 0)
     local mana = safeNum(function() return me.PctMana() end, 0)
     local endur = safeNum(function() return me.PctEndurance() end, 0)
     local level = safeNum(function() return me.Level() end, 0)
@@ -185,6 +187,11 @@ function M.buildStatusPayload(opts)
         id = 'status:update',
         zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
         hp = hp,
+        currentHP = currentHP,
+        maxHP = maxHP,
+        characterId = safeNum(function() return me.ID() end, 0),
+        dead = safeBool(function() return me.Dead() end, false) or hp <= 0,
+        hovering = safeBool(function() return me.Hovering() end, false),
         mana = mana,
         endur = endur,
         level = level,
@@ -193,6 +200,7 @@ function M.buildStatusPayload(opts)
         follow = following,
         chase = opts.chase == true,
         assistEnabled = opts.assistEnabled == true,
+        automationPaused = opts.automationPaused == true,
         burnActive = opts.burnActive == true,
         settingsOpen = opts.settingsOpen == true,
         abilities = buildAbilityStatus(opts.abilities, opts.cooldownProbe),

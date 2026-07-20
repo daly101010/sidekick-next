@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local Paths = require('sidekick-next.utils.paths')
 
 -- Lazy-load Logger to avoid circular requires
 local getLogger = lazy.once('sidekick-next.healing.logger')
@@ -57,18 +58,7 @@ M.data = {
 -------------------------------------------------------------------------------
 
 local function getDataPath()
-    local server = 'Server'
-    local charName = 'Character'
-
-    if mq.TLO.EverQuest and mq.TLO.EverQuest.Server then
-        server = mq.TLO.EverQuest.Server() or 'Server'
-        server = server:gsub(" ", "_")  -- Normalize server name (matches config.lua)
-    end
-    if mq.TLO.Me and mq.TLO.Me.CleanName then
-        charName = mq.TLO.Me.CleanName() or 'Character'
-    end
-
-    return string.format('%s/SideKick_HealData_%s_%s.lua', mq.configDir, server, charName)
+    return Paths.getHealingDataPath()
 end
 
 -------------------------------------------------------------------------------

@@ -31,6 +31,7 @@ M.RESULT = {
     DISTRACTED  = 20,  -- Silenced/distracted
     COLLAPSE    = 21,  -- Gate collapsed
     OVERWRITTEN = 22,  -- Buff overwritten
+    LEVELTOOLOW  = 23,  -- Character level is below the spell requirement
 }
 
 -- Result name lookup
@@ -66,6 +67,7 @@ M.FAILED = {
     [M.RESULT.STUNNED] = true,
     [M.RESULT.DISTRACTED] = true,
     [M.RESULT.CANNOTSEE] = true,
+    [M.RESULT.LEVELTOOLOW] = true,
 }
 
 -- Current result state
@@ -412,6 +414,10 @@ function M.registerEvents()
         setResult(M.RESULT.NOTREADY)
     end)
 
+    mq.event('sk_leveltoolow1', "You are not high enough level to cast this spell#*#", function()
+        setResult(M.RESULT.LEVELTOOLOW)
+    end)
+
     mq.event('sk_fdfail1', "#1# has fallen to the ground.#*#", function()
         setResult(M.RESULT.FDFAIL)
     end)
@@ -520,6 +526,7 @@ function M.unregisterEvents()
     mq.unevent('sk_recover1')
     mq.unevent('sk_recover2')
     mq.unevent('sk_notready1')
+    mq.unevent('sk_leveltoolow1')
     mq.unevent('sk_fdfail1')
 
     -- Memorization events

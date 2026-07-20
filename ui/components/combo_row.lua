@@ -13,6 +13,14 @@ local C = require('sidekick-next.ui.constants')
 
 local M = {}
 
+local function selectableClicked(label, selected)
+    local first, clicked = imgui.Selectable(label, selected)
+    -- Current MQ binding returns (selected, clicked). Retain compatibility
+    -- with bindings that expose only the traditional clicked boolean.
+    if clicked == nil then clicked = first end
+    return clicked == true
+end
+
 -- ============================================================
 -- STANDARD COMBO ROW (index-based)
 -- ============================================================
@@ -39,12 +47,7 @@ function M.draw(label, settingKey, currentIndex, items, onChange, opts)
     if imgui.BeginCombo('##' .. settingKey, previewValue) then
         for i, item in ipairs(items) do
             local isSelected = (i - 1) == currentIndex
-            -- MQ's Selectable returns true when isSelected=true (every frame)
-            -- So we need to detect actual clicks differently:
-            -- Pass isSelected for visual highlighting, but only count as changed
-            -- if user clicks a NON-selected item
-            local result = imgui.Selectable(item, isSelected)
-            if result and not isSelected then
+            if selectableClicked(item, isSelected) and not isSelected then
                 -- User clicked on a different item (not currently selected)
                 newIndex = i - 1
                 changed = true
@@ -130,10 +133,7 @@ function M.keyValue(label, settingKey, currentKey, items, onChange, opts)
     if imgui.BeginCombo('##' .. settingKey, previewValue) then
         for i, item in ipairs(items) do
             local isSelected = item.key == currentKey
-            -- MQ's Selectable returns true when isSelected=true (every frame)
-            -- Only count as changed if clicking a non-selected item
-            local result = imgui.Selectable(labels[i], isSelected)
-            if result and not isSelected then
+            if selectableClicked(labels[i], isSelected) and not isSelected then
                 newKey = item.key
                 changed = true
             end

@@ -6,6 +6,7 @@ local Logger = require('sidekick-next.utils.logger')
 local log = Logger.new('Main')
 
 local Core = require('sidekick-next.utils.core')
+local SettingsRegistry = require('sidekick-next.registry')
 local Themes = require('sidekick-next.themes')
 local Helpers = require('sidekick-next.lib.helpers')
 local Draw = require('sidekick-next.ui.draw_helpers')
@@ -18,10 +19,12 @@ local Chase = require('sidekick-next.automation.chase')
 local Assist = require('sidekick-next.automation.assist')
 local Burn = require('sidekick-next.automation.burn')
 local Tank = require('sidekick-next.automation.tank')
-local LegacyHealing = require('sidekick-next.automation.healing')
-local NewHealing = nil  -- Lazy-loaded for CLR
+local HealerClasses = require('sidekick-next.utils.healer_classes')
+local RezData = require('sidekick-next.utils.rez_data')
+local getLegacyHealing = lazy.once('sidekick-next.automation.healing')
+local NewHealing = nil  -- Lazy-loaded for supported healer classes
 
--- Phased healing module loader: spreads the ~6 second CLR healing module load
+-- Phased healing module loader: spreads the healing module load
 -- across multiple main loop ticks to avoid blocking MQ frames.
 -- Phase 0: warmup (3s, legacy healing covers)
 -- Phase 1: require module (fast since submodule requires are deferred)
@@ -35,10 +38,10 @@ local HEALING_WARMUP_SEC = 3.0  -- Seconds before starting phased load
 
 local function getHealingModule()
     local me = mq.TLO.Me
-    if not me or not me() then return LegacyHealing end
+    if not me or not me() then return getLegacyHealing() end
     local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
     local upper = classShort:upper()
-    if upper ~= 'CLR' and upper ~= 'PAL' then return LegacyHealing end
+    if not HealerClasses.isSupported(upper) then return getLegacyHealing() end
 
     -- Advance one phase per call until complete
     if not _healLoadComplete then
@@ -79,21 +82,24 @@ local function getHealingModule()
         end
     end
 
-    return NewHealing or LegacyHealing
+    return NewHealing or getLegacyHealing()
 end
 
 local Healing = nil  -- Will be set dynamically by getHealingModule()
 
-local Cures = require('sidekick-next.automation.cures')
+local getCures = lazy.init('sidekick-next.automation.cures')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
+local Supervisor = require('sidekick-next.utils.supervisor')
+local SkLib = require('sidekick-next.sk_lib')
 local SharedData = require('sidekick-next.actors.shareddata')
 local getGrids = lazy('sidekick-next.ui.grids')
-local SettingsUI = require('sidekick-next.ui.settings')
+local SettingsUI = require('sidekick-next.ui.settings.init')
 local getBar = lazy('sidekick-next.ui.bar_animated')
 local getSpecialBar = lazy('sidekick-next.ui.special_bar_animated')
 local getDiscBar = lazy('sidekick-next.ui.disc_bar_animated')
 local getItemBar = lazy('sidekick-next.ui.item_bar_animated')
-local iam = require('sidekick-next.utils.imanim')
+local getSkillBar = lazy('sidekick-next.ui.skill_bar_animated')
+local iam = require('ImAnim')
 
 -- Cached spring ease descriptors (iam.EaseSpring may be nil in some builds)
 local _ezSpringHover = (function()
@@ -130,9 +136,9 @@ local getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
 local getRotationEngine = lazy('sidekick-next.utils.rotation_engine')
 local getCC = lazy.init('sidekick-next.automation.cc')
 local getBuff = lazy.init('sidekick-next.automation.buff')
-local getTravelBroker = lazy.init('sidekick-next.automation.travel_broker')
 local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
+local getRezAccept = lazy.init('sidekick-next.utils.rez_accept')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -145,7 +151,6 @@ local getHealingMonitor = lazy('sidekick-next.healing.ui.monitor')
 local getHealingSettingsTab = lazy('sidekick-next.ui.settings.tab_healing')
 local getItemsTab = lazy('sidekick-next.ui.settings.tab_items')
 local getBuffsTab = lazy('sidekick-next.ui.settings.tab_buffs')
-local getTravelBrokerUI = lazy.init('sidekick-next.ui.travel_broker')
 
 -- Debug logging flags for main automation loop
 local debugAutomationLogging = false
@@ -256,10 +261,7 @@ local function drainQueue()
     local q = State.actionQueue
     State.actionQueue = {}
     for _, fn in ipairs(q) do
-        local ok, err = pcall(fn)
-        if not ok and mq and mq.cmd then
-            mq.cmd('/echo \\ar[SideKick] Queued action failed: ' .. tostring(err) .. '\\ax')
-        end
+        pcall(fn)
     end
 end
 
@@ -284,7 +286,7 @@ local function applyBerDiscDefaultsOnce(abilities, isFirstDiscSeed)
     if tostring(State.classShort or '') ~= 'BER' then return end
     local me = mq.TLO.Me
     if not me or not me() then return end
-    if iniFlagIsTrue('SideKick', 'SideKickBERDiscDefaultsApplied') then return end
+    if Core.Settings.SideKickBERDiscDefaultsApplied == true then return end
     if isFirstDiscSeed ~= true then return end
 
     local bestByTimer = {}
@@ -324,7 +326,7 @@ local function applyBerDiscDefaultsOnce(abilities, isFirstDiscSeed)
     end
 
     if changed then
-        Core.Ini['SideKick']['SideKickBERDiscDefaultsApplied'] = '1'
+        Core.set('SideKickBERDiscDefaultsApplied', true, { source = 'ber_disc_defaults' })
         Core.save()
     end
 end
@@ -433,7 +435,7 @@ local function animatedButton(label, btnScale)
         local springId = 'btn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = iam.TweenFloat(imgui.GetID(springId), imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
@@ -510,7 +512,7 @@ local function animatedSmallButton(label, btnScale)
         local springId = 'sbtn_hover_' .. label
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.12 or 1.0
-        hoverScale = iam.TweenFloat(imgui.GetID(springId), imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment (smaller base padding for SmallButton)
@@ -593,7 +595,7 @@ local function toggleButton(label, enabled, onClick, btnScale)
         -- Check if this button will be hovered (use last frame's state)
         local isHovered = _buttonHoverState[label] or false
         local targetScale = isHovered and 1.08 or 1.0
-        hoverScale = iam.TweenFloat(imgui.GetID(springId), imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        hoverScale = iam.TweenFloat(springId, imgui.GetID('hscale'), targetScale, 0.5, _ezSpringHover, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     -- Apply scale via padding adjustment
@@ -850,7 +852,7 @@ local function draw()
             pushedBtnScale = true
         end
 
-        local assistOn = Core.Settings.AssistEnabled == true
+        local assistOn = (Core.Settings.CombatMode or 'off') == 'assist'
         local chaseOn = Core.Settings.ChaseEnabled == true
         local burnOn = Core.Settings.BurnActive == true
 
@@ -953,19 +955,28 @@ local function draw()
 
         local pausedOn = Core.Settings.AutomationPaused == true
         toggleButton('Pause##sk', pausedOn, function()
-            enqueue(function() Core.set('AutomationPaused', not pausedOn) end)
+            enqueue(function()
+                Core.set('AutomationPaused', not pausedOn)
+                Core.forceSave()
+            end)
         end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Pause all automation') end
 
         imgui.SameLine()
         toggleButton('Assist##sk', assistOn, function()
-            enqueue(function() Core.set('AssistEnabled', not assistOn) end)
+            enqueue(function()
+                Core.set('CombatMode', assistOn and 'off' or 'assist')
+                Core.forceSave()
+            end)
         end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Toggle Assist') end
 
         imgui.SameLine()
         toggleButton('Chase##sk', chaseOn, function()
-            enqueue(function() Core.set('ChaseEnabled', not chaseOn) end)
+            enqueue(function()
+                Core.set('ChaseEnabled', not chaseOn)
+                Core.forceSave()
+            end)
         end, btnScale)
         if imgui.IsItemHovered() then imgui.SetTooltip('Toggle Chase') end
 
@@ -1144,7 +1155,7 @@ local function draw()
     local manualOptions = Core.Settings.SideKickOptionsManual ~= false
     local heightFactor = openTarget
     if not manualOptions and iam and iam.TweenFloat then
-        heightFactor = iam.TweenFloat(imgui.GetID('sk_settings_height'), imgui.GetID('hfactor'), openTarget, 0.5, _ezSpringSettings, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
+        heightFactor = iam.TweenFloat('sk_settings_height', imgui.GetID('hfactor'), openTarget, 0.5, _ezSpringSettings, IamPolicy.Crossfade, imgui.GetIO().DeltaTime)
     end
 
     if (manualOptions and State.settingsOpen) or (not manualOptions and heightFactor > 0.01) then
@@ -1207,9 +1218,9 @@ local function draw()
         imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 6)
         imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, 8, 8)
 
-        local optionsOpen, optionsDraw = imgui.Begin('SideKick Options##SettingsPopup', true, sFlags)
-        if optionsDraw == nil then optionsDraw = optionsOpen end
-        if optionsDraw then
+        local open = imgui.Begin('SideKick Options##SettingsPopup', true, sFlags)
+        local _popupOk, _popupErr = true, nil
+        if open then _popupOk, _popupErr = pcall(function()
             local closeIcon2 = (Icons and (Icons.FA_TIMES or Icons.MD_CLOSE)) or 'X'
             local availWidth = imgui.GetContentRegionAvail()
             if type(availWidth) ~= 'number' then availWidth = availWidth.x or availWidth[1] or mainW end
@@ -1223,18 +1234,127 @@ local function draw()
             imgui.PopStyleColor(3)
 
             if imgui.BeginTabBar('##sidekick_popup_tabs') then
-                if imgui.BeginTabItem("AA's") then
-                    local Grids = getGrids()
-                    if Grids then Grids.drawAbilities({
-                        abilities = State.abilities,
-                        settings = Core.Settings,
-                        modeLabels = Abilities.MODE_LABELS,
-                        onToggle = function(key, value) Core.set(key, value) end,
-                        onMode = function(key, value) Core.set(key, value) end,
-                        onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
-                        cooldownProbe = function(row) return Cooldowns.probe(row) end,
-                        helpers = Helpers,
-                    }) end
+                if imgui.BeginTabItem('Buttons') then
+                    -- Sub-section selector via radio buttons (avoids nested
+                    -- ImGui TabBars which conflict with the inner TabBar that
+                    -- Grids.drawAbilities creates for AAs/Discs).
+                    local sub = tostring(Core.Settings.SideKickButtonsSubtab or 'aas')
+                    if sub ~= 'aas' and sub ~= 'discs' and sub ~= 'skills' then sub = 'aas' end
+                    do
+                        local function radio(label, value)
+                            if imgui.RadioButton(label .. '##sub_' .. value, sub == value) then
+                                Core.set('SideKickButtonsSubtab', value)
+                                sub = value
+                            end
+                        end
+                        radio("AA's", 'aas')
+                        imgui.SameLine()
+                        radio('Discs', 'discs')
+                        imgui.SameLine()
+                        radio('Skills', 'skills')
+                        imgui.Separator()
+                    end
+
+                    if sub == 'aas' then
+                        local ok, err = pcall(function()
+                            local Grids = getGrids()
+                            local aas = {}
+                            for _, def in ipairs(State.abilities or {}) do
+                                if tostring(def.kind or 'aa') ~= 'disc' then table.insert(aas, def) end
+                            end
+                            if Grids then Grids.drawAbilities({
+                                abilities = aas,
+                                settings = Core.Settings,
+                                modeLabels = Abilities.MODE_LABELS,
+                                onToggle = function(key, value) Core.set(key, value) end,
+                                onMode = function(key, value) Core.set(key, value) end,
+                                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                                cooldownProbe = function(row) return Cooldowns.probe(row) end,
+                                helpers = Helpers,
+                            }) end
+                        end)
+                        if not ok then imgui.TextColored(1, 0.3, 0.3, 1, 'AA section error: ' .. tostring(err)) end
+                    elseif sub == 'discs' then
+                        local ok, err = pcall(function()
+                            local Grids = getGrids()
+                            local discs = {}
+                            for _, def in ipairs(State.abilities or {}) do
+                                if tostring(def.kind or '') == 'disc' then table.insert(discs, def) end
+                            end
+                            if Grids then Grids.drawAbilities({
+                                abilities = discs,
+                                settings = Core.Settings,
+                                modeLabels = Abilities.MODE_LABELS,
+                                onToggle = function(key, value) Core.set(key, value) end,
+                                onMode = function(key, value) Core.set(key, value) end,
+                                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                                cooldownProbe = function(row) return Cooldowns.probe(row) end,
+                                helpers = Helpers,
+                            }) end
+                        end)
+                        if not ok then imgui.TextColored(1, 0.3, 0.3, 1, 'Disc section error: ' .. tostring(err)) end
+                    elseif sub == 'skills' then
+                        do
+                            local skTabOk, skTabErr = pcall(function()
+                            local Skills = require('sidekick-next.utils.skills')
+                            local function _truthy(v)
+                                if v == true then return true end
+                                if v == false or v == nil then return false end
+                                if type(v) == 'number' then return v ~= 0 end
+                                if type(v) == 'string' then
+                                    local s = v:lower()
+                                    return s == '1' or s == 'true' or s == 'yes' or s == 'on'
+                                end
+                                return false
+                            end
+                            local barEnabled = _truthy(Core.Settings.SideKickSkillBarEnabled)
+                            local newBarEnabled, barChanged = imgui.Checkbox('Show Skill Bar', barEnabled)
+                            if barChanged then Core.set('SideKickSkillBarEnabled', newBarEnabled) end
+
+                            imgui.Separator()
+                            imgui.Text('Bar layout')
+
+                            local cell = tonumber(Core.Settings.SideKickSkillBarCell) or 48
+                            local newCell, cellChanged = imgui.SliderInt('Cell size##sk_cell', cell, 24, 96)
+                            if cellChanged then Core.set('SideKickSkillBarCell', newCell) end
+
+                            local rows = tonumber(Core.Settings.SideKickSkillBarRows) or 2
+                            local newRows, rowsChanged = imgui.SliderInt('Rows##sk_rows', rows, 1, 8)
+                            if rowsChanged then Core.set('SideKickSkillBarRows', newRows) end
+
+                            local gap = tonumber(Core.Settings.SideKickSkillBarGap) or 4
+                            local newGap, gapChanged = imgui.SliderInt('Gap##sk_gap', gap, 0, 16)
+                            if gapChanged then Core.set('SideKickSkillBarGap', newGap) end
+
+                            local pad = tonumber(Core.Settings.SideKickSkillBarPad) or 6
+                            local newPad, padChanged = imgui.SliderInt('Padding##sk_pad', pad, 0, 16)
+                            if padChanged then Core.set('SideKickSkillBarPad', newPad) end
+
+                            local bg = tonumber(Core.Settings.SideKickSkillBarBgAlpha) or 0.85
+                            local newBg, bgChanged = imgui.SliderFloat('Background alpha##sk_bg', bg, 0.0, 1.0)
+                            if bgChanged then Core.set('SideKickSkillBarBgAlpha', newBg) end
+
+                            imgui.Separator()
+                            imgui.Text('Visible skills')
+                            imgui.SameLine()
+                            if imgui.Button('Refresh##SideKickSkillsRefresh') then
+                                Skills.refresh()
+                            end
+                            local list = Skills.discover()
+                            if #list == 0 then
+                                imgui.TextDisabled('No activated skills detected for this character.')
+                            else
+                                for _, sk in ipairs(list) do
+                                    local key = 'SideKickSkill_' .. tostring(sk.index)
+                                    local cur = _truthy(Core.Settings[key])
+                                    local newVal, changed = imgui.Checkbox(string.format('%s##%s', sk.name, key), cur)
+                                    if changed then Core.set(key, newVal) end
+                                end
+                            end
+                            end)
+                            if not skTabOk then imgui.TextColored(1, 0.3, 0.3, 1, 'Skills section error: ' .. tostring(skTabErr)) end
+                        end
+                    end
                     imgui.EndTabItem()
                 end
 
@@ -1285,6 +1405,12 @@ local function draw()
                                 log.debug('Theme change, holdUntil=%.2f', State._themeLocalSetAt + 5.0)
                             end
                             Core.set(key, value)
+                            local settingKey = tostring(key)
+                            if settingKey:match('^Meditation') or settingKey:match('^Chase')
+                                or settingKey:match('^Rez') or settingKey:match('^AutoRez')
+                                or settingKey == 'AutoAcceptRez' or settingKey == 'CombatMode' then
+                                enqueue(function() Core.forceSave() end)
+                            end
                             log.debug('Core.set done, new=%s', tostring(Core.Settings[tostring(key)]))
                         end
                     )
@@ -1327,11 +1453,12 @@ local function draw()
                     imgui.EndTabItem()
                 end
 
-                -- Healing tab (healer classes only)
-                local isHealerClass = State.classShort == 'CLR' or State.classShort == 'DRU' or
-                                      State.classShort == 'SHM' or State.classShort == 'PAL'
-                if isHealerClass then
-                    if imgui.BeginTabItem('Healing') then
+                -- Healing/rez settings. Rez-capable utility classes such as
+                -- NEC get the rez surface without loading Healing Intelligence.
+                local isHealerClass = HealerClasses.isSupported(State.classShort)
+                local isRezClass = RezData.isRezClass(State.classShort)
+                if isHealerClass or isRezClass then
+                    if imgui.BeginTabItem(isHealerClass and 'Healing' or 'Resurrection') then
                         -- Sub-tabs within Healing
                         if imgui.BeginTabBar('HealingSubTabs') then
                             -- Settings sub-tab
@@ -1340,11 +1467,12 @@ local function draw()
                                 if imgui.BeginTabItem('Settings') then
                                     local ok, err = pcall(function()
                                         HealSettingsTab.draw(Core.Settings, Themes.getThemeNames(), function(key, val)
-                                            -- Core.set updates Core.Settings AND Core.Ini and
-                                            -- marks dirty; main-loop Core.flush() persists it.
-                                            -- Plain Core.Settings[key]=val + Core.save() did NOT
-                                            -- persist (Core.save writes Ini, which was unchanged).
                                             Core.set(key, val)
+                                            local settingKey = tostring(key)
+                                            if settingKey:match('^Rez') or settingKey:match('^AutoRez')
+                                                or settingKey == 'AutoAcceptRez' then
+                                                enqueue(function() Core.forceSave() end)
+                                            end
                                         end)
                                     end)
                                     if not ok then
@@ -1354,18 +1482,20 @@ local function draw()
                                 end
                             end
 
-                            -- Monitor sub-tab (CLR only with healing intelligence)
-                            local HealMonitor = getHealingMonitor()
-                            if HealMonitor and HealMonitor.isInitialized and HealMonitor.isInitialized() then
-                                if imgui.BeginTabItem('Monitor') then
-                                    HealMonitor.drawContent()
-                                    imgui.EndTabItem()
-                                end
-                            elseif State.classShort == 'CLR' or State.classShort == 'PAL' then
-                                if imgui.BeginTabItem('Monitor') then
-                                    imgui.TextDisabled('Healing monitor initializing...')
-                                    imgui.TextDisabled('Enter combat to activate')
-                                    imgui.EndTabItem()
+                            -- Monitor sub-tab for supported Healing Intelligence classes
+                            if isHealerClass then
+                                local HealMonitor = getHealingMonitor()
+                                if HealMonitor and HealMonitor.isInitialized and HealMonitor.isInitialized() then
+                                    if imgui.BeginTabItem('Monitor') then
+                                        HealMonitor.drawContent()
+                                        imgui.EndTabItem()
+                                    end
+                                else
+                                    if imgui.BeginTabItem('Monitor') then
+                                        imgui.TextDisabled('Healing monitor initializing...')
+                                        imgui.TextDisabled('Enter combat to activate')
+                                        imgui.EndTabItem()
+                                    end
                                 end
                             end
 
@@ -1414,40 +1544,11 @@ local function draw()
                 imgui.EndTabBar()
             end
 
-            -- MQ's ImGui integration can hide EQ's cursor-drawn item icon when hovering an ImGui window.
-            -- Mirror the cursor item icon inside this window so drag/drop feels consistent.
-            do
-                if animItems and mq and mq.TLO and mq.TLO.Cursor and mq.TLO.Cursor() and imgui.DrawTextureAnimation then
-                    local mp = imgui.GetMousePos and imgui.GetMousePos() or nil
-                    local mx, my = vec2xy(mp)
-                    local wp = imgui.GetWindowPos and imgui.GetWindowPos() or nil
-                    local ws = imgui.GetWindowSize and imgui.GetWindowSize() or nil
-                    local wx, wy = vec2xy(wp)
-                    local ww, wh = vec2xy(ws)
-
-                    local inside = (mx >= wx and my >= wy and mx <= (wx + ww) and my <= (wy + wh))
-                    if inside then
-                        local iconId = 0
-                        if mq.TLO.Cursor.Icon then
-                            local okIcon, vIcon = pcall(function() return mq.TLO.Cursor.Icon() end)
-                            if okIcon then iconId = tonumber(vIcon) or 0 end
-                        end
-                        if iconId > 0 then
-                            local cell0 = iconId - 500
-                            if cell0 < 0 then cell0 = 0 end
-                            pcall(function() animItems:SetTextureCell(cell0) end)
-
-                            local size = 34
-                            local restoreX, restoreY = vec2xy(imgui.GetCursorScreenPos())
-                            -- Draw slightly offset from the actual mouse position so this overlay does not
-                            -- block interaction with underlying ImGui widgets (checkboxes/sliders/etc).
-                            imgui.SetCursorScreenPos(mx + 16, my + 16)
-                            pcall(imgui.DrawTextureAnimation, animItems, size, size)
-                            imgui.SetCursorScreenPos(restoreX, restoreY)
-                        end
-                    end
-                end
-            end
+            -- Cursor item icon mirror — drawing imgui content while an EQ item
+            -- is on the cursor was previously triggering "Missing End()" crashes
+            -- via DrawTextureAnimation. Disabled until we can audit the binding.
+            -- (When enabled, gate the entire block in a single pcall so any
+            -- failure can't leak imgui state.)
 
             if manualOptions then
                 local winX, winY = vec2xy(imgui.GetWindowPos())
@@ -1466,6 +1567,14 @@ local function draw()
                     end
                 end
             end
+        end) end
+        if not _popupOk then
+            -- Surface the error in chat so it doesn't silently fail.
+            pcall(function()
+                if mq and mq.cmd then
+                    mq.cmdf('/echo \\ar[SideKick popup]\\ax %s', tostring(_popupErr))
+                end
+            end)
         end
         imgui.End()
         imgui.PopStyleVar(2)
@@ -1501,36 +1610,59 @@ local function tickAutomation()
     do local M = getRuntimeCache() if M then M.tick() end end
     PerfMonitor.finish('RuntimeCache')
 
-    -- Update CC tracking (mez broadcasts/receives)
-    PerfMonitor.begin('CC')
-    local CC = getCC()
-    if CC then CC.tick() end
-    -- Mez casting tick (ENC/BRD only, checks isMezClass internally)
-    if allowAbilityAutomation and CC then
-        CC.mezTick(Core.Settings)
+    local monolithicMode = _G.SIDEKICK_NEXT_CONFIG
+        and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false
+    if monolithicMode then
+        -- These modules own event handlers and cast state. In coordinated mode
+        -- their dedicated workers are the only instances allowed to initialize.
+        PerfMonitor.begin('CC')
+        local CC = getCC()
+        if CC then
+            CC.tick()
+            if allowAbilityAutomation then CC.mezTick(Core.Settings) end
+        end
+        PerfMonitor.finish('CC')
+
+        PerfMonitor.begin('Buff')
+        do local M = getBuff() if M then M.tick() end end
+        PerfMonitor.finish('Buff')
+
+        PerfMonitor.begin('SpellEngine')
+        do local M = getSpellEngine() if M then M.tick() end end
+        PerfMonitor.finish('SpellEngine')
+
+        PerfMonitor.begin('SpellsetMgr')
+        do local M = getSpellsetManager() if M then M.tick() end end
+        PerfMonitor.finish('SpellsetMgr')
+    else
+        -- Manual UI/test casts may explicitly load a UI-local SpellEngine.
+        -- Advance it if present, but do not instantiate it during normal
+        -- coordinated automation.
+        local loadedSpellEngine = package.loaded['sidekick-next.utils.spell_engine']
+        if loadedSpellEngine and loadedSpellEngine.tick then loadedSpellEngine.tick() end
     end
-    PerfMonitor.finish('CC')
-
-    -- Update buff tracking (buff broadcasts/receives)
-    PerfMonitor.begin('Buff')
-    do local M = getBuff() if M then M.tick() end end
-    PerfMonitor.finish('Buff')
-
-    PerfMonitor.begin('Travel')
-    do local M = getTravelBroker() if M and M.tick then M.tick(Core.Settings) end end
-    PerfMonitor.finish('Travel')
-
-    -- Update spell engine state machine (non-blocking cast monitoring)
-    PerfMonitor.begin('SpellEngine')
-    do local M = getSpellEngine() if M then M.tick() end end
-    PerfMonitor.finish('SpellEngine')
-
-    PerfMonitor.begin('SpellsetMgr')
-    do local M = getSpellsetManager() if M then M.tick() end end
-    PerfMonitor.finish('SpellsetMgr')
 
     -- Process events for cast result detection
     mq.doevents()
+
+    -- Chase is local movement controlled by the UI host. It must run in both
+    -- coordinated and monolithic modes; worker scripts handle casts/claims but
+    -- do not own follower movement.
+    PerfMonitor.begin('Chase')
+    if allowMovementAutomation then
+        Chase.tick()
+    elseif Chase and Chase.stopNav then
+        Chase.stopNav()
+    end
+    PerfMonitor.finish('Chase')
+
+    -- In canonical coordinated mode this script is the UI/state host only.
+    -- Automatic combat/cast actions are executed exclusively by claimed worker
+    -- modules. Local follower movement remains above this return.
+    if not monolithicMode then
+        PerfMonitor.finishFrame()
+        return
+    end
 
     local priorityHealingActive = false
     if playStyle ~= 'manual' then
@@ -1548,6 +1680,7 @@ local function tickAutomation()
 
     -- Cure tick (after healing, before rotation engine)
     PerfMonitor.begin('Cures')
+    local Cures = getCures()
     if allowAbilityAutomation and not priorityHealingActive and Cures and Cures.tick then
         Cures.tick(Core.Settings)
     end
@@ -1592,14 +1725,6 @@ local function tickAutomation()
     PerfMonitor.begin('Burn')
     Burn.tick()
     PerfMonitor.finish('Burn')
-
-    PerfMonitor.begin('Chase')
-    if allowMovementAutomation then
-        Chase.tick()
-    elseif Chase and Chase.stopNav then
-        Chase.stopNav()
-    end
-    PerfMonitor.finish('Chase')
 
     PerfMonitor.begin('Tank')
     local CombatMode = Core.Settings.CombatMode or 'off'
@@ -1666,16 +1791,17 @@ local function syncModulesFromSettings()
         Chase.setEnabled(Core.Settings.ChaseEnabled == true, { auto = true })
     end
 
+    local assistEnabled = (Core.Settings.CombatMode or 'off') == 'assist'
     CombatAssist.apply_config({
-        enabled = Core.Settings.AssistEnabled == true,
+        enabled = assistEnabled,
         assist_at = Core.Settings.AssistAt,
         assist_rng = Core.Settings.AssistRange,
         assist_mode = Core.Settings.AssistMode,
         assist_name = Core.Settings.AssistName,
         stick_cmd = Core.Settings.StickCommand,
     })
-    if (Core.Settings.AssistEnabled == true) ~= (Assist.enabled == true) then
-        Assist.setEnabled(Core.Settings.AssistEnabled == true)
+    if assistEnabled ~= (Assist.enabled == true) then
+        Assist.setEnabled(assistEnabled)
     end
 
     if (Core.Settings.BurnActive == true) ~= (Burn.active == true) then
@@ -1723,11 +1849,8 @@ local function drawAutostartPrompt()
         imgui.Separator()
         imgui.Spacing()
 
-        local rawServer = mq.TLO.EverQuest.Server()
-        local server = (rawServer and rawServer ~= 'NULL' and rawServer ~= '')
-            and rawServer:gsub(" ", "_") or 'Unknown'
-        local rawChar = mq.TLO.Me.CleanName()
-        local charName = (rawChar and rawChar ~= 'NULL' and rawChar ~= '') and rawChar or 'Unknown'
+        local server = mq.TLO.EverQuest.Server():gsub(" ", "_") or 'Unknown'
+        local charName = mq.TLO.Me.CleanName() or 'Unknown'
         imgui.TextDisabled(string.format('Config: %s_%s.cfg', server, charName))
         imgui.Spacing()
 
@@ -1764,7 +1887,7 @@ local function drawAutostartPrompt()
                     newLines[#newLines + 1] = line
                 end
             end
-            newLines[#newLines + 1] = '/lua run sidekick'
+            newLines[#newLines + 1] = '/lua run sidekick-next'
 
             local outFile = io.open(autostartPath, 'w')
             if outFile then
@@ -1775,9 +1898,7 @@ local function drawAutostartPrompt()
             end
 
             -- Mark prompt as shown
-            Core.Ini['SideKick'] = Core.Ini['SideKick'] or {}
-            Core.Ini['SideKick']['AutostartPromptShown'] = '1'
-            Core.save()
+            Core.set('AutostartPromptShown', true, { source = 'autostart_prompt' })
             State.showAutostartPrompt = false
             imgui.CloseCurrentPopup()
         end
@@ -1791,9 +1912,7 @@ local function drawAutostartPrompt()
         imgui.PushStyleColor(ImGuiCol.ButtonActive, 0.4, 0.15, 0.15, 1.0)
         if imgui.Button('No', buttonWidth, 0) then
             -- Mark prompt as shown without enabling autostart
-            Core.Ini['SideKick'] = Core.Ini['SideKick'] or {}
-            Core.Ini['SideKick']['AutostartPromptShown'] = '1'
-            Core.save()
+            Core.set('AutostartPromptShown', true, { source = 'autostart_prompt' })
             State.showAutostartPrompt = false
             imgui.CloseCurrentPopup()
         end
@@ -1813,41 +1932,129 @@ local function main()
     -- First-run autostart prompt check
     if not State.autostartPromptChecked then
         State.autostartPromptChecked = true
-        local promptShown = Core.Ini['SideKick'] and Core.Ini['SideKick']['AutostartPromptShown']
-        if not promptShown or promptShown == '0' or promptShown == '' then
+        local promptShown = Core.Settings.AutostartPromptShown
+        if promptShown ~= true then
             State.showAutostartPrompt = true
         end
     end
 
     ActorsCoordinator.init()
+    getRezAccept()
+    do
+        local monitor = getHealingMonitor()
+        if monitor and ActorsCoordinator.registerMessageCallback then
+            ActorsCoordinator.registerMessageCallback('heal:telemetry', function(content)
+                monitor.setTelemetry(content)
+                return true
+            end)
+        end
+    end
+    if ActorsCoordinator.registerMessageCallback then
+        ActorsCoordinator.registerMessageCallback('rez:telemetry', function(content)
+            local debugUi = getCoordinatorDebug()
+            if debugUi and debugUi.setRezTelemetry then
+                debugUi.setRezTelemetry(content)
+            end
+            return true
+        end)
+    end
 
     Chase.init({ Core = Core })
     Burn.init({ Core = Core })
     CombatAssist.apply_config({
-        enabled = Core.Settings.AssistEnabled == true,
+        enabled = (Core.Settings.CombatMode or 'off') == 'assist',
         assist_at = Core.Settings.AssistAt,
         assist_rng = Core.Settings.AssistRange,
         assist_mode = Core.Settings.AssistMode,
         assist_name = Core.Settings.AssistName,
         stick_cmd = Core.Settings.StickCommand,
     })
-    Assist.init({ Core = Core, CombatAssist = CombatAssist, Chase = Chase })
+    Assist.init({ Core = Core, CombatAssist = CombatAssist })
     Tank.init(Core.Settings)
-    Cures.init()
+    -- Cures are owned and initialized by sk_cures in coordinated mode. The
+    -- feature-flagged monolithic path initializes them lazily inside its tick.
+    -- All other modules init on first access via lazy.init().
 
-    -- Auto-accept rez offers (every character, not just rez classes).
-    do
-        local okR, RezAccept = pcall(require, 'sidekick-next.utils.rez_accept')
-        if okR and RezAccept and RezAccept.init then pcall(RezAccept.init) end
+    local function queueMuleAssistImport(importArgs)
+        local options = { preview = false, importSpellSet = true, activateSpellSet = true }
+        local pathParts = {}
+        for _, value in ipairs(importArgs or {}) do
+            local token = tostring(value or '')
+            local lower = token:lower()
+            if lower == 'preview' or lower == '--preview' then
+                options.preview = true
+            elseif lower == 'activate' or lower == '--activate' then
+                options.activateSpellSet = true
+            elseif lower == 'staged' or lower == '--staged' or lower == 'noactivate' or lower == '--noactivate' then
+                options.activateSpellSet = false
+            elseif lower == 'settings-only' or lower == '--settings-only' then
+                options.importSpellSet = false
+            elseif token ~= '' then
+                pathParts[#pathParts + 1] = token
+            end
+        end
+        local path = #pathParts > 0 and table.concat(pathParts, ' ') or nil
+
+        enqueue(function()
+            local ok, Importer = pcall(require, 'sidekick-next.utils.ini_importer')
+            if not ok or not Importer then
+                log.error('Unable to load MuleAssist importer: %s', tostring(Importer))
+                return
+            end
+            local result = Importer.run(path, Core, options)
+            local lines = Importer.summaryLines(result)
+            for i, line in ipairs(lines) do
+                if result.ok then log.info('%s', line) else log.error('%s', line) end
+            end
+            if result.ok and result.plan then
+                for _, warning in ipairs(result.plan.warnings or {}) do
+                    log.warn('MuleAssist import: %s', warning)
+                end
+            end
+            if result.ok and options.preview and result.plan then
+                for _, setting in ipairs(result.plan.settings or {}) do
+                    log.info('  %s=%s  <= %s', setting.key, tostring(setting.value), setting.source)
+                end
+                for _, reason in ipairs(result.plan.ignored or {}) do
+                    log.info('  Not imported: %s', reason)
+                end
+            end
+            if result.ok and not options.preview then
+                if result.spellSet and result.spellSet.activated then
+                    log.info('Imported spell set "%s" is now active. Use /SideKick spellset to review it.',
+                        tostring(result.spellSet.name))
+                    local Memorize = getSpellSetMemorize()
+                    if Memorize and Memorize.queueApply then
+                        Memorize.queueApply(result.spellSet.name, false)
+                    end
+                elseif result.spellSet then
+                    log.info('Use /SideKick spellset to review the staged import before activating it.')
+                end
+            end
+        end)
     end
-    -- All other modules init on first access via lazy.init()
 
     -- Launch Group script on startup if enabled (default true)
     if Core.Settings.SideKickLaunchGroup ~= false then
         mq.cmd('/lua run group')
     end
 
-    _bindCmd('/SideKick', function(...)
+    local function setAutomationPaused(paused, source)
+        paused = paused == true
+        Core.set('AutomationPaused', paused)
+        Core.forceSave()
+        pcall(function()
+            mq.cmdf('/echo \\ag[SideKick]\\ax automation %s%s',
+                paused and 'paused' or 'resumed',
+                source and source ~= '' and (' (' .. tostring(source) .. ')') or '')
+        end)
+    end
+
+    local function toggleAutomationPaused(source)
+        setAutomationPaused(not (Core.Settings.AutomationPaused == true), source or 'toggle')
+    end
+
+    local function handleSideKickCommand(...)
         local args = { ... }
         local a1 = tostring(args[1] or ''):lower()
         if a1 == 'burn' then
@@ -1869,19 +2076,40 @@ local function main()
         elseif a1 == 'chase' then
             enqueue(function()
                 Core.set('ChaseEnabled', not (Core.Settings.ChaseEnabled == true))
+                Core.forceSave()
             end)
         elseif a1 == 'assist' then
             enqueue(function()
-                Core.set('AssistEnabled', not (Core.Settings.AssistEnabled == true))
+                local assistOn = (Core.Settings.CombatMode or 'off') == 'assist'
+                Core.set('CombatMode', assistOn and 'off' or 'assist')
+                Core.forceSave()
             end)
+        elseif a1 == 'pause' or a1 == 'paused' then
+            enqueue(function() setAutomationPaused(true, 'command') end)
+        elseif a1 == 'resume' or a1 == 'unpause' then
+            enqueue(function() setAutomationPaused(false, 'command') end)
+        elseif a1 == 'togglepause' or a1 == 'pausetoggle' then
+            enqueue(function() toggleAutomationPaused('command') end)
+        elseif a1 == 'status' then
+            pcall(function()
+                mq.cmdf('/echo \\ag[SideKick]\\ax paused=%s assist=%s chase=%s buffs=%s heals=%s dps=%s',
+                    tostring(Core.Settings.AutomationPaused == true),
+                    tostring((Core.Settings.CombatMode or 'off') == 'assist'),
+                    tostring(Core.Settings.ChaseEnabled == true),
+                    tostring(Core.Settings.BuffingEnabled ~= false),
+                    tostring(Core.Settings.DoHeals == true),
+                    tostring(Core.Settings.SpellRotationEnabled == true))
+            end)
+        elseif a1 == 'import' or a1 == 'importini' then
+            local importArgs = {}
+            for i = 2, #args do importArgs[#importArgs + 1] = args[i] end
+            queueMuleAssistImport(importArgs)
         elseif a1 == 'remote' then
             -- New command: toggle remote ability bar
             local M = getRemoteAbilities() if M then M.toggle() end
         elseif a1 == 'remoteconfig' then
             -- New command: open remote abilities settings
             local M = getRemoteAbilities() if M then M.toggleSettings() end
-        elseif a1 == 'travel' or a1 == 'ports' then
-            local M = getTravelBrokerUI() if M then M.toggle() end
         elseif a1 == 'debugsettings' then
             -- Toggle settings persistence debugging (/SideKick debugsettings on|off|toggle)
             local a2 = tostring(args[2] or ''):lower()
@@ -1920,9 +2148,13 @@ local function main()
                 if SE then SE.cast(spellName, targetId) end
             end
         elseif a1 == 'healmonitor' then
-            local mod = getHealingModule()
-            if mod and mod.toggleMonitor then
-                mod.toggleMonitor()
+            if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
+                do local M = getHealingMonitor() if M then M.toggle() end end
+            else
+                local mod = getHealingModule()
+                if mod and mod.toggleMonitor then
+                    mod.toggleMonitor()
+                end
             end
         elseif a1 == 'assistme' then
             -- Broadcast assist me to all peers in same zone
@@ -1962,26 +2194,148 @@ local function main()
             else
                 log.error('CombatExec is nil')
             end
+        elseif a1 == 'debugooc' then
+            mq.cmd('/echo \\ay[SideKick]\\ax debugooc is retired; use /sk coordinator to inspect the buffs worker.')
         elseif a1 == 'settings' or a1 == 'options' or a1 == 'config' then
-            -- Toggle settings panel (also ensures main window is open)
-            State.open = true
-            State.settingsOpen = not State.settingsOpen
+            local a2 = tostring(args[2] or ''):lower()
+            if a2 == 'audit' or a2 == 'validate' or a2 == 'status' then
+                local diag = Core.getRegistryDiagnostics and Core.getRegistryDiagnostics() or {}
+                local audit = diag.registry or {}
+                mq.cmdf('/echo \\ag[SK Settings]\\ax registry=%s registered=%d owned=%d namespaces=%d unregistered=%d invalid=%d',
+                    audit.ok == true and 'ok' or 'ERROR', tonumber(audit.registered) or 0,
+                    tonumber(audit.owned) or 0, tonumber(audit.namespaces) or 0,
+                    #(diag.unregistered or {}), #(diag.invalid or {}))
+                for i = 1, math.min(5, #(audit.errors or {})) do
+                    mq.cmdf('/echo \\ar[SK Settings]\\ax %s', tostring(audit.errors[i]))
+                end
+                for i = 1, math.min(5, #(diag.invalid or {})) do
+                    local entry = diag.invalid[i]
+                    mq.cmdf('/echo \\ar[SK Settings]\\ax invalid %s: %s',
+                        tostring(entry.key), tostring(entry.reason))
+                end
+                for i = 1, math.min(5, #(diag.unregistered or {})) do
+                    local entry = diag.unregistered[i]
+                    mq.cmdf('/echo \\ay[SK Settings]\\ax unregistered %s (section=%s)',
+                        tostring(entry.key), tostring(entry.section))
+                end
+            elseif a2 == 'get' then
+                local key = SettingsRegistry.resolveKey(tostring(args[3] or ''))
+                local owner, kind = SettingsRegistry.owner(key)
+                if key == '' then
+                    mq.cmd('/echo \\ay[SK Settings]\\ax Usage: /sk config get <key>')
+                else
+                    local configPath = owner and Core.getModuleConfigPath(owner) or 'compatibility routing'
+                    configPath = tostring(configPath):gsub('\\', '/')
+                    mq.cmdf('/echo \\ag[SK Settings]\\ax %s=%s owner=%s registration=%s file=%s',
+                        key, tostring(Core.Settings[key]), tostring(owner or 'unregistered'), tostring(kind),
+                        configPath)
+                end
+            elseif a2 == 'set' then
+                local key = SettingsRegistry.resolveKey(tostring(args[3] or ''))
+                local valueParts = {}
+                for i = 4, #args do valueParts[#valueParts + 1] = tostring(args[i]) end
+                local rawValue = table.concat(valueParts, ' ')
+                if key == '' or #valueParts == 0 then
+                    mq.cmd('/echo \\ay[SK Settings]\\ax Usage: /sk config set <key> <value>')
+                else
+                    enqueue(function()
+                        local ok, err = Core.set(key, rawValue, { save = true, source = 'command' })
+                        if ok then
+                            local owner = select(1, SettingsRegistry.owner(key))
+                            mq.cmdf('/echo \\ag[SK Settings]\\ax saved %s=%s owner=%s',
+                                key, tostring(Core.Settings[key]), tostring(owner or 'unregistered'))
+                        else
+                            mq.cmdf('/echo \\ar[SK Settings]\\ax rejected %s: %s', key, tostring(err))
+                        end
+                    end)
+                end
+            else
+                -- No registry subcommand: preserve the existing options toggle.
+                State.open = true
+                State.settingsOpen = not State.settingsOpen
+            end
         else
             State.open = not State.open
         end
+    end
+
+    _bindCmd('/SideKick', handleSideKickCommand)
+    _bindCmd('/sk', handleSideKickCommand)
+
+    -- Internal single-writer endpoint used by the standalone meditation
+    -- worker. All main INI writes must execute in this UI Lua state.
+    _bindCmd('/sk_next_set_meditation', function(rawMode)
+        local mode = tostring(rawMode or ''):lower():match('^%s*(.-)%s*$')
+        if mode == 'on' then mode = 'ooc' end
+        if mode == 'incombat' then mode = 'in combat' end
+        if mode ~= 'off' and mode ~= 'ooc' and mode ~= 'always' and mode ~= 'in combat' then
+            mq.cmd('/echo \\ar[SK-Next]\\ax Invalid meditation mode. Use off, ooc, or always.')
+            return
+        end
+        Core.set('MeditationMode', mode)
+        local saved, err = Core.forceSave()
+        if saved == false then
+            mq.cmdf('/echo \\ar[SK-Next]\\ax MeditationMode save failed: %s', tostring(err))
+        else
+            mq.cmdf('/echo \\ag[SK-Next]\\ax MeditationMode saved as %s by the primary settings writer.', mode)
+        end
+    end)
+
+    -- Internal single-writer endpoint used by sk_disciplines. Worker Lua
+    -- states may request a burn change but never write settings themselves.
+    _bindCmd('/sk_next_set_burn', function(rawValue)
+        local value = tostring(rawValue or ''):lower()
+        local enabled = value == 'on' or value == '1' or value == 'true'
+        Core.set('BurnNow', enabled)
+        Core.forceSave()
     end)
 
     -- Group-control friendly binds (for /dgge, /dgre broadcasts)
     _bindCmd('/skchaseon', function()
         enqueue(function()
             Core.set('ChaseEnabled', true)
+            Core.forceSave()
             Chase.setEnabled(true, { user = true })
         end)
     end)
     _bindCmd('/skchaseoff', function()
         enqueue(function()
             Core.set('ChaseEnabled', false)
+            Core.forceSave()
             Chase.setEnabled(false, { user = true })
+        end)
+    end)
+    _bindCmd('/skchase', function(...)
+        local args = { ... }
+        local a1 = tostring(args[1] or ''):lower()
+        enqueue(function()
+            if a1 == 'on' then
+                Core.set('ChaseEnabled', true)
+                Core.forceSave()
+                Chase.setEnabled(true, { user = true })
+            elseif a1 == 'off' then
+                Core.set('ChaseEnabled', false)
+                Core.forceSave()
+                Chase.setEnabled(false, { user = true })
+            end
+
+            local s = Chase.status and Chase.status() or {}
+            local playStyle = tostring(Core.Settings.AutomationLevel or 'auto')
+            pcall(function()
+                mq.cmdf('/echo \\ag[SK Chase]\\ax enabled=%s paused=%s automation=%s role=%s target=%s dist=%s resolved=%s(%s) resolvedDist=%s nav=%s ownNav=%s reason=%s',
+                    tostring(s.enabled),
+                    tostring(s.userPaused),
+                    playStyle,
+                    tostring(s.role),
+                    tostring(s.target),
+                    tostring(s.distance),
+                    tostring(s.resolvedName),
+                    tostring(s.resolvedId),
+                    s.resolvedDistance and string.format('%.1f', s.resolvedDistance) or 'nil',
+                    tostring(s.navActive),
+                    tostring(s.initiatedNav),
+                    tostring(s.reason))
+            end)
         end)
     end)
     _bindCmd('/skassistme', function()
@@ -1989,11 +2343,34 @@ local function main()
             ActorsCoordinator.broadcastAssistMe()
         end)
     end)
+    _bindCmd('/skpause', function()
+        enqueue(function() setAutomationPaused(true, 'skpause') end)
+    end)
+    _bindCmd('/skresume', function()
+        enqueue(function() setAutomationPaused(false, 'skresume') end)
+    end)
+    _bindCmd('/skunpause', function()
+        enqueue(function() setAutomationPaused(false, 'skunpause') end)
+    end)
+    _bindCmd('/sktogglepause', function()
+        enqueue(function() toggleAutomationPaused('sktogglepause') end)
+    end)
+    _bindCmd('/skstatus', function()
+        pcall(function()
+            mq.cmdf('/echo \\ag[SideKick]\\ax paused=%s assist=%s chase=%s buffs=%s heals=%s dps=%s',
+                tostring(Core.Settings.AutomationPaused == true),
+                tostring((Core.Settings.CombatMode or 'off') == 'assist'),
+                tostring(Core.Settings.ChaseEnabled == true),
+                tostring(Core.Settings.BuffingEnabled ~= false),
+                tostring(Core.Settings.DoHeals == true),
+                tostring(Core.Settings.SpellRotationEnabled == true))
+        end)
+    end)
     _bindCmd('/skactors', function()
         local M = getActorsDebug() if M then M.toggle() end
     end)
-    _bindCmd('/sktravel', function()
-        local M = getTravelBrokerUI() if M then M.toggle() end
+    _bindCmd('/skimport', function(...)
+        queueMuleAssistImport({ ... })
     end)
     _bindCmd('/skspells', function(cmd)
         enqueue(function()
@@ -2035,43 +2412,6 @@ local function main()
         PerfMonitor.toggle()
     end)
 
-    -- Broadcast a buff need request: peers with the matching category will
-    -- jump it to the front of their next buff scan.
-    --   /skreq Symbol            normal urgency (30s TTL)
-    --   /skreq Aego high         high urgency (60s TTL, sorts above normals)
-    _bindCmd('/skreq', function(...)
-        local args = { ... }
-        local category = tostring(args[1] or '')
-        if category == '' then
-            mq.cmd('/echo \ay[SideKick]\ax Usage: /skreq <BuffCategory> [high]')
-            return
-        end
-        local urgency = (tostring(args[2] or '') == 'high') and 'high' or 'normal'
-        local ok, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
-        if ok and Reqs and Reqs.broadcastNeed then
-            Reqs.broadcastNeed(category, { urgency = urgency })
-            mq.cmdf('/echo \ag[SideKick]\ax Requested buff "%s" (urgency=%s)', category, urgency)
-        end
-    end)
-
-    -- Toggle the orchestration dashboard (real-time module status tree).
-    --   /skdash                -- toggle
-    --   /skdash on|off
-    -- /skhealpreview is preserved as an alias for muscle memory.
-    local function _toggleDash(arg)
-        local ok, Dashboard = pcall(require, 'sidekick-next.ui.dashboard')
-        if not ok or not Dashboard then return end
-        Dashboard.register_window()
-        local a = tostring(arg or ''):lower()
-        if a == 'on' then Dashboard.setVisible(true)
-        elseif a == 'off' then Dashboard.setVisible(false)
-        else Dashboard.toggle() end
-        mq.cmdf('/echo \ag[SideKick]\ax Dashboard: %s',
-            Dashboard.isVisible() and 'visible' or 'hidden')
-    end
-    _bindCmd('/skdash', _toggleDash)
-    _bindCmd('/skhealpreview', _toggleDash)
-
     _bindCmd('/skloglevel', function(level)
         level = tonumber(level)
         if level and level >= 1 and level <= 5 then
@@ -2105,44 +2445,6 @@ local function main()
             log.info('Usage: /sklogfile on|off')
         end
     end)
-
-    -- Register the orchestration dashboard window so it can render whenever
-    -- its persisted visibility flag is on. The render itself is gated by the
-    -- flag, so registering it unconditionally has no cost when hidden.
-    do
-        local ok, Dashboard = pcall(require, 'sidekick-next.ui.dashboard')
-        if ok and Dashboard and Dashboard.register_window then
-            pcall(Dashboard.register_window)
-        end
-    end
-
-    -- Resist log: load persisted history and subscribe to spell-cast results
-    -- so the rotation engine can adaptively skip spells that consistently
-    -- resist on a given mob.
-    do
-        local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
-        if okR and ResistLog then
-            pcall(ResistLog.load)
-            local okE, SpellEvents = pcall(require, 'sidekick-next.utils.spell_events')
-            if okE and SpellEvents and SpellEvents.addResultListener and SpellEvents.RESULT then
-                local RESISTED = SpellEvents.RESULT.RESISTED
-                SpellEvents.addResultListener(function(result, extra)
-                    if result == RESISTED and extra then
-                        -- Spell name comes from the event; target may be omitted
-                        -- by some message variants — fall back to current Target.
-                        local spell = extra.spell
-                        local target = extra.target
-                        if (not target or target == '') and mq.TLO.Target and mq.TLO.Target() then
-                            target = mq.TLO.Target.CleanName and mq.TLO.Target.CleanName() or nil
-                        end
-                        if spell and target then
-                            ResistLog.recordResist(spell, target)
-                        end
-                    end
-                end)
-            end
-        end
-    end
 
     mq.imgui.init('SideKick', function()
         -- Apply font scale for high-resolution monitors
@@ -2208,17 +2510,35 @@ local function main()
             }) end
         end
 
+        do
+            local v = Core.Settings.SideKickSkillBarEnabled
+            local skillBarEnabled = (v == true) or (v == 1) or (v == '1') or (v == 'true')
+            if skillBarEnabled then
+                local SkillBar = getSkillBar()
+                if SkillBar then SkillBar.draw({
+                    settings = Core.Settings,
+                    onActivate = function(sk)
+                        enqueue(function()
+                            Abilities.activate({ kind = 'skill', skillName = sk.name })
+                        end)
+                    end,
+                }) end
+            end
+        end
+
         -- Draw new enhancement UIs (lazy-loaded)
         do local M = getRemoteAbilities() if M then M.draw() end end
-        do local M = getTravelBrokerUI() if M then M.draw() end end
         do local M = getAggroWarning() if M then M.draw() end end
         do local M = getActorsDebug() if M then M.render() end end
         do local M = getCoordinatorDebug() if M then M.render() end end
         do local M = getSpellSetEditor() if M then M.render() end end
         PerfMonitor.draw()
 
-        -- Healing monitor (new healing intelligence module)
-        if NewHealing and NewHealing.drawMonitor then
+        -- Healing monitor: coordinated mode renders worker telemetry only;
+        -- monolithic mode renders the locally-owned Healing Intelligence UI.
+        if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
+            do local M = getHealingMonitor() if M and M.draw then M.draw() end end
+        elseif NewHealing and NewHealing.drawMonitor then
             NewHealing.drawMonitor()
         end
 
@@ -2237,37 +2557,49 @@ local function main()
 
     _healingWarmupStart = os.clock()  -- Start warmup timer (defers heavy CLR healing load)
 
-    while State.isRunning and mq.TLO.MacroQuest.GameState() == 'INGAME' do
+    while State.isRunning do
+        Supervisor.tick({
+            automationPaused = Core.Settings.AutomationPaused == true,
+            settingsRevision = Core.getRevision and Core.getRevision() or 0,
+        })
+
+        local gameState = SkLib.getGameState()
+        if gameState ~= 'INGAME' then
+            -- Zoning/loading: keep the supervisor heartbeat alive while all
+            -- UI-host automation remains suspended. Do not tear workers down.
+            -- MacroQuest can briefly report character-select-like states while
+            -- changing zones, so GameState is never used to terminate SideKick.
+            mq.doevents()
+            mq.delay(100)
+        else
         refreshClassAbilitiesIfNeeded()
         drainQueue()
         syncModulesFromSettings()
+        do local M = getRezAccept() if M and M.tick then M.tick() end end
         tickAutomation()
 
         -- Humanize: drive selector + fidget state machine.
-        do
+        if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false then
             local ok, H = pcall(require, 'sidekick-next.humanize')
             if ok and H and H.tick then H.tick() end
             local okF, F = pcall(require, 'sidekick-next.humanize.fidget')
             if okF and F and F.tick then F.tick() end
         end
 
-        -- Pull module: drive its state machine.
-        do
-            local ok, P = pcall(require, 'sidekick-next.automation.pull')
-            if ok and P and P.tick then P.tick() end
-        end
-
-        -- Process pending spell set memorization (must be in main loop, not ImGui)
-
+        -- Process pending spell set memorization (must be in main loop, not ImGui).
+        -- This must run in both monolithic and coordinated modes; worker scripts
+        -- read the active spell set but the UI script owns safe /memspell driving.
         local Memorize = getSpellSetMemorize()
         if Memorize and Memorize.processPending then
             Memorize.processPending()
         end
 
-        -- Process combat spells (must be in main loop for mq.delay)
-        local CombatSpellExecutor = getCombatSpellExecutor()
-        if CombatSpellExecutor and CombatSpellExecutor.process then
-            CombatSpellExecutor.process()
+        if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false then
+            -- Process combat spells (must be in main loop for mq.delay)
+            local CombatSpellExecutor = getCombatSpellExecutor()
+            if CombatSpellExecutor and CombatSpellExecutor.process then
+                CombatSpellExecutor.process()
+            end
         end
 
         -- Check for zone change (immune database)
@@ -2300,7 +2632,8 @@ local function main()
                 abilities = State.abilities,
                 cooldownProbe = cooldownRemaining,
                 chase = Core.Settings.ChaseEnabled == true,
-                assistEnabled = Core.Settings.AssistEnabled == true,
+                assistEnabled = (Core.Settings.CombatMode or 'off') == 'assist',
+                automationPaused = Core.Settings.AutomationPaused == true,
                 burnActive = Core.Settings.BurnActive == true,
                 settingsOpen = State.settingsOpen == true,
             })
@@ -2315,21 +2648,9 @@ local function main()
         -- Flush pending settings writes (debounced, max once/sec)
         Core.flush()
 
-        -- Resist log throttled save (60s interval) so accumulated learning
-        -- survives a crash or zone-out.
-        do
-            local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
-            if okR and ResistLog and ResistLog.tick then ResistLog.tick() end
-        end
-
-        -- Rez auto-accept tick (drains the rez chat event + 1Hz dialog poll).
-        do
-            local okA, RezAccept = pcall(require, 'sidekick-next.utils.rez_accept')
-            if okA and RezAccept and RezAccept.tick then RezAccept.tick() end
-        end
-
         mq.doevents()
         mq.delay(1)
+        end
     end
 
     -- Shutdown: healing module (new healing intelligence)
@@ -2339,11 +2660,6 @@ local function main()
 
     -- Shutdown: save immune database
     do local M = getImmuneDB() if M and M.shutdown then M.shutdown() end end
-
-    -- Shutdown: flush resist log so the last fight's learning isn't lost
-    do local okR, ResistLog = pcall(require, 'sidekick-next.utils.resist_log')
-       if okR and ResistLog and ResistLog.save then pcall(ResistLog.save) end
-    end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

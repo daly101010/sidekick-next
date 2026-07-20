@@ -1,6 +1,7 @@
 -- healing/config.lua
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local Paths = require('sidekick-next.utils.paths')
 
 -- Lazy-load Logger to avoid circular requires
 local getLogger = lazy.once('sidekick-next.healing.logger')
@@ -30,7 +31,6 @@ local M = {
     lowPressureMinDeficitPct = 20,    -- During low pressure, wait for 20% deficit before direct heals
     lowPressureHotMinDeficitPct = 25, -- During low pressure, wait for 25% deficit before HoTs (more conservative)
     lowPressureMobCount = 1,
-
     -- Scoring weights
     -- Overheal penalty increased to properly penalize heals that are too big for the deficit
     -- ManaEff reduced in normal mode - right-sizing heals matters more than raw efficiency
@@ -54,6 +54,11 @@ local M = {
     duckEmergencyThreshold = 70,
     duckHotThreshold = 92,
     duckBufferPct = 0.5,
+    duckHysteresisPct = 5,
+    duckHotHysteresisPct = 3,
+    duckEmergencyHysteresisPct = 8,
+    duckMinCastAgeMs = 600,
+    duckIncomingGraceMs = 900,
     considerIncomingHot = true,
     hotIncomingCoveragePct = 100,
 
@@ -135,6 +140,7 @@ local M = {
 
     -- Pet healing
     healPetsEnabled = false,     -- Whether to include pets in healing targets
+    breakInvisOOC = false,       -- Allow an OOC heal to break invisibility
     petHealMinPct = 40,          -- Minimum HP% to heal pets
 
     -- Self-healing (PAL off-tank use case)
@@ -147,6 +153,7 @@ local M = {
 
     -- Coordination
     incomingHealTimeoutSec = 3,  -- Reduced from 10 - heals should land within cast time
+    defaultRemoteMaxHP = 100000, -- Estimate only; heal sizing treats this as unknown until Actor/DanNet reports a real value
     broadcastEnabled = true,
 
     -- Logging (file logging enabled by default for troubleshooting)
@@ -218,6 +225,22 @@ local function getSpell(spellName)
     return nil
 end
 
+local function isKnownSpell(spellName)
+    local me = mq.TLO.Me
+    if not (me and me() and me.Book) then
+        return true
+    end
+
+    local ok, known = pcall(function()
+        local bookSpell = me.Book(spellName)
+        return bookSpell and bookSpell() and true or false
+    end)
+    if not ok then
+        return true
+    end
+    return known == true
+end
+
 local function normalizeText(value)
     if not value then
         return ''
@@ -259,36 +282,103 @@ local function getCastTimeMs(spell)
     return nil
 end
 
+-- Get spell level for sorting and merge placement.
+local function getSpellLevel(spell)
+    if not spell then return 0 end
+    local level = spell.Level and spell.Level()
+    return tonumber(level) or 0
+end
+
+local function hasSpellSPA(spell, spaId)
+    if not spell or not spell.HasSPA then return false end
+    local ok, value = pcall(function()
+        local result = spell.HasSPA(spaId)
+        return result and result() == true
+    end)
+    return ok and value == true
+end
+
+-- Older/TLP spell data does not consistently expose the newer textual
+-- subcategories ("Quick Heal", "Duration Heals", etc.). Infer healing shape
+-- from the actual HP SPAs and duration so classic spells such as Remedy and
+-- Celestial Elixir are still discovered safely.
+local function inferHealCategoryFromEffects(spell)
+    if not spell then return nil end
+
+    local spellType = normalizeText(spell.SpellType and spell.SpellType() or '')
+    local beneficial = spellType ~= 'detrimental'
+    if spell.Beneficial then
+        local ok, value = pcall(function() return spell.Beneficial() end)
+        if ok then beneficial = value == true end
+    end
+    if not beneficial then return nil end
+
+    local hasDirectHP = hasSpellSPA(spell, 0)
+    local hasHPOverTime = hasSpellSPA(spell, 79)
+    if not hasDirectHP and not hasHPOverTime then return nil end
+
+    local targetType = normalizeText(spell.TargetType and spell.TargetType() or '')
+    local duration = tonumber(spell.Duration and spell.Duration() or 0) or 0
+    local isDurationHeal = hasHPOverTime or duration > 0
+
+    if isGroupV1(targetType) then
+        return isDurationHeal and 'groupHot' or 'group'
+    elseif isSelfTarget(targetType) then
+        return 'selfHeal', getSpellLevel(spell)
+    elseif isSingleTarget(targetType) then
+        if isDurationHeal then
+            return 'hot_single', tonumber(spell.Mana and spell.Mana() or 0) or 0
+        end
+        local castTimeMs = getCastTimeMs(spell)
+        if castTimeMs and castTimeMs <= 2000 then
+            return 'fast', getSpellLevel(spell)
+        end
+        return 'direct_single', getSpellLevel(spell)
+    end
+
+    return nil
+end
+
 function M.IsValidSpellForCategory(category, spellName)
     local spell = getSpell(spellName)
     if not spell then
         return false
     end
+    if not isKnownSpell(spellName) then
+        return false
+    end
 
     local subcategory = normalizeText(spell.Subcategory())
     local targetType = normalizeText(spell.TargetType())
+    local inferredCategory = inferHealCategoryFromEffects(spell)
 
     if category == 'selfHeal' then
-        return (subcategory == 'heals' or subcategory == 'quick heal') and isSelfTarget(targetType)
+        return ((subcategory == 'heals' or subcategory == 'quick heal') and isSelfTarget(targetType))
+            or inferredCategory == 'selfHeal'
     elseif category == 'hot' or category == 'hotLight' then
-        return subcategory == 'duration heals' and isSingleTarget(targetType)
+        return (subcategory == 'duration heals' and isSingleTarget(targetType))
+            or inferredCategory == 'hot_single'
     elseif category == 'groupHot' then
-        return subcategory == 'duration heals' and isGroupV1(targetType)
+        return (subcategory == 'duration heals' and isGroupV1(targetType))
+            or inferredCategory == 'groupHot'
     elseif category == 'group' then
-        return subcategory == 'heals' and isGroupV1(targetType)
+        return (subcategory == 'heals' and isGroupV1(targetType))
+            or inferredCategory == 'group'
     elseif category == 'promised' then
         return subcategory == 'delayed' and isSingleTarget(targetType)
     elseif category == 'fast' or category == 'small' or category == 'medium' or category == 'large' then
         if category == 'fast' then
-            return subcategory == 'quick heal' and isSingleTarget(targetType)
+            return (subcategory == 'quick heal' and isSingleTarget(targetType))
+                or inferredCategory == 'fast'
         end
         if not isSingleTarget(targetType) then
             return false
         end
         if category == 'small' or category == 'medium' then
             return subcategory == 'heals' or subcategory == 'quick heal'
+                or inferredCategory == 'direct_single' or inferredCategory == 'fast'
         end
-        if subcategory ~= 'heals' then
+        if subcategory ~= 'heals' and inferredCategory ~= 'direct_single' then
             return false
         end
         local castTimeMs = getCastTimeMs(spell)
@@ -328,16 +418,16 @@ function M.IsConfiguredSpell(spellName)
     return false
 end
 
+function M.HasConfiguredSpells()
+    for _, spells in pairs(M.spells or {}) do
+        if type(spells) == 'table' and #spells > 0 then return true end
+    end
+    return false
+end
+
 -- Auto-assignment tracking
 M.lastSpellBarScan = 0
 M.spellBarScanInterval = 2.0  -- Rescan every 2 seconds
-
--- Get spell level for sorting
-local function getSpellLevel(spell)
-    if not spell then return 0 end
-    local level = spell.Level and spell.Level()
-    return tonumber(level) or 0
-end
 
 -- Categorize a healing spell (returns category or nil, plus level for sorting)
 local function categorizeHealSpell(spellName)
@@ -393,7 +483,140 @@ local function categorizeHealSpell(spellName)
         return 'direct_single', getSpellLevel(spell)
     end
 
+    return inferHealCategoryFromEffects(spell)
+end
+
+local function newEmptySpellAssignments()
+    return {
+        fast = {},
+        small = {},
+        medium = {},
+        large = {},
+        group = {},
+        hot = {},
+        hotLight = {},
+        groupHot = {},
+        promised = {},
+        selfHeal = {},
+    }
+end
+
+local function assignCollectedHealingSpells(directHeals, hotHeals)
+    table.sort(directHeals, function(a, b) return a.level < b.level end)
+    if #directHeals == 1 then
+        table.insert(M.spells.medium, directHeals[1].name)
+    elseif #directHeals == 2 then
+        table.insert(M.spells.small, directHeals[1].name)
+        table.insert(M.spells.large, directHeals[2].name)
+    elseif #directHeals > 2 then
+        table.insert(M.spells.small, directHeals[1].name)
+        table.insert(M.spells.large, directHeals[#directHeals].name)
+        for i = 2, #directHeals - 1 do
+            table.insert(M.spells.medium, directHeals[i].name)
+        end
+    end
+
+    table.sort(hotHeals, function(a, b) return a.manaCost < b.manaCost end)
+    if #hotHeals == 1 then
+        table.insert(M.spells.hot, hotHeals[1].name)
+    elseif #hotHeals > 1 then
+        table.insert(M.spells.hotLight, hotHeals[1].name)
+        table.insert(M.spells.hot, hotHeals[#hotHeals].name)
+        for i = 2, #hotHeals - 1 do
+            table.insert(M.spells.hot, hotHeals[i].name)
+        end
+    end
+end
+
+local function collectHealingSpell(spellName, assigned, directHeals, hotHeals, sourceLabel)
+    if not spellName or spellName == '' or assigned[spellName] then return false end
+
+    local category, value = categorizeHealSpell(spellName)
+    local log = getLogger()
+    if log then
+        log.debug('autoAssign', '%s: %s -> category=%s value=%s',
+            tostring(sourceLabel or 'spell'), spellName, tostring(category), tostring(value))
+    end
+
+    if category == 'direct_single' then
+        table.insert(directHeals, { name = spellName, level = value or 0 })
+        assigned[spellName] = true
+        return true
+    elseif category == 'hot_single' then
+        table.insert(hotHeals, { name = spellName, manaCost = value or 0 })
+        assigned[spellName] = true
+        return true
+    elseif category and M.spells[category] then
+        table.insert(M.spells[category], spellName)
+        assigned[spellName] = category
+        return true
+    end
+
+    return false
+end
+
+local function spellNameFromId(spellId)
+    spellId = tonumber(spellId) or 0
+    if spellId <= 0 then return nil end
+    local spell = mq.TLO.Spell(spellId)
+    if spell and spell() then
+        return spell.Name and spell.Name() or nil
+    end
     return nil
+end
+
+function M.autoAssignFromActiveSpellSet()
+    local ok, Persistence = pcall(require, 'sidekick-next.utils.spellset_persistence')
+    if not ok or not Persistence then return false end
+
+    if not Persistence.loaded and Persistence.load then
+        Persistence.load()
+    end
+
+    local activeName = Persistence.activeSetName
+    local spellSet = activeName and Persistence.spellSets and Persistence.spellSets[activeName] or nil
+    if not spellSet or not spellSet.gems then return false end
+
+    M.spells = newEmptySpellAssignments()
+
+    local assigned = {}
+    local directHeals = {}
+    local hotHeals = {}
+    local found = 0
+    local slots = {}
+
+    for slot in pairs(spellSet.gems) do
+        table.insert(slots, tonumber(slot) or slot)
+    end
+    table.sort(slots, function(a, b)
+        local na = tonumber(a)
+        local nb = tonumber(b)
+        if na and nb then return na < nb end
+        return tostring(a) < tostring(b)
+    end)
+
+    for _, slot in ipairs(slots) do
+        local gemConfig = spellSet.gems[slot]
+        local spellName = gemConfig and spellNameFromId(gemConfig.spellId) or nil
+        if collectHealingSpell(spellName, assigned, directHeals, hotHeals, 'Active spell set gem ' .. tostring(slot)) then
+            found = found + 1
+        end
+    end
+
+    assignCollectedHealingSpells(directHeals, hotHeals)
+    M.FilterSpells()
+
+    if not M.HasConfiguredSpells() then
+        M.spells = newEmptySpellAssignments()
+        return false
+    end
+
+    local log = getLogger()
+    if log then
+        log.info('config', 'Assigned healing spells from active spell set "%s" (%d candidate heal spell(s))',
+            tostring(activeName), found)
+    end
+    return true
 end
 
 -- Scan spell bar and auto-assign healing spells to categories
@@ -558,6 +781,89 @@ function M.autoAssignFromSpellBar()
     return true  -- Scan completed
 end
 
+--- Merge valid healing spells from the current spell bar into the persisted
+--- assignments without moving or removing anything already configured.
+--- This is intentionally separate from autoAssignFromSpellBar(), whose
+--- first-run behavior clears all categories before rebuilding them.
+--- @return number added Number of newly configured spells.
+--- @return table additions Array of { name = string, category = string }.
+--- @return number scanned Number of occupied gem slots inspected.
+--- @return boolean persisted Whether additions were saved successfully.
+--- @return table observed Classification result for each occupied gem.
+function M.mergeFromSpellBar()
+    local me = mq.TLO.Me
+    if not me or not me() then return 0, {}, 0, true, {} end
+
+    M.spells = M.spells or newEmptySpellAssignments()
+    for category in pairs(newEmptySpellAssignments()) do
+        if type(M.spells[category]) ~= 'table' then
+            M.spells[category] = {}
+        end
+    end
+
+    -- A spell already assigned in any category is authoritative. Keep that
+    -- category and only add names that do not exist anywhere in the profile.
+    local assigned = {}
+    for _, spells in pairs(M.spells) do
+        if type(spells) == 'table' then
+            for _, spellName in ipairs(spells) do
+                assigned[normalizeText(spellName)] = true
+            end
+        end
+    end
+
+    local additions = {}
+    local observed = {}
+    local scanned = 0
+    local numGems = tonumber(me.NumGems()) or 13
+
+    for gem = 1, numGems do
+        local gemSpell = me.Gem(gem)
+        if gemSpell and gemSpell() then
+            scanned = scanned + 1
+            local spellName = gemSpell.Name and gemSpell.Name() or nil
+            local key = normalizeText(spellName)
+            if spellName and spellName ~= '' and assigned[key] then
+                table.insert(observed, { name = spellName, status = 'configured' })
+            elseif spellName and spellName ~= '' then
+                local category = categorizeHealSpell(spellName)
+                -- Dynamic markers are useful when building an empty profile.
+                -- During a merge, conservative destinations avoid reshuffling
+                -- the user's existing heal-size and HoT tier choices.
+                if category == 'direct_single' then
+                    category = 'medium'
+                elseif category == 'hot_single' then
+                    category = 'hot'
+                end
+
+                if category and M.spells[category]
+                    and M.IsValidSpellForCategory(category, spellName) then
+                    table.insert(M.spells[category], spellName)
+                    assigned[key] = true
+                    table.insert(additions, { name = spellName, category = category })
+                    table.insert(observed, { name = spellName, status = 'added', category = category })
+                else
+                    table.insert(observed, { name = spellName, status = 'not_heal' })
+                end
+            end
+        end
+    end
+
+    local persisted = true
+    if #additions > 0 then
+        persisted = M.save() == true
+        local log = getLogger()
+        if log then
+            for _, addition in ipairs(additions) do
+                log.info('config', 'Merged memorized heal: %s -> %s',
+                    addition.name, addition.category)
+            end
+        end
+    end
+
+    return #additions, additions, scanned, persisted, observed
+end
+
 -- Get a summary of auto-assigned spells (for UI display)
 function M.getAssignmentSummary()
     local summary = {}
@@ -589,23 +895,8 @@ function M.getAssignmentSummary()
     return summary
 end
 
-local _charName = nil
-local _serverName = nil
-
-local function getCharInfo()
-    if not _charName then
-        _charName = mq.TLO.Me.CleanName() or 'Unknown'
-    end
-    if not _serverName then
-        local server = mq.TLO.EverQuest.Server() or 'Unknown'
-        _serverName = server:gsub(" ", "_")
-    end
-    return _charName, _serverName
-end
-
 local function getConfigPath()
-    local char, server = getCharInfo()
-    return string.format('%s/SideKick_Healing_%s_%s.lua', mq.configDir, server, char)
+    return Paths.getHealingConfigPath()
 end
 
 local function serializeValue(v, indent)
@@ -655,7 +946,21 @@ function M.save()
         return false
     end
     if log then log.info('config', 'Config saved to %s', path) end
+    -- Notify coordinated workers that their in-memory copy is stale. The
+    -- receiver reloads from disk in its normal tick, never in an Actor callback.
+    local ac = package.loaded['sidekick-next.utils.actors_coordinator']
+    if ac and ac.sendToScript then
+        pcall(ac.sendToScript, 'sidekick-next/sk_healing', 'heal:config', {
+            revision = os.time(),
+            character = mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName() or '',
+            zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
+        })
+    end
     return true
+end
+
+function M.GetConfigPath()
+    return getConfigPath()
 end
 
 -- Class-specific default overrides (applied before user config)
@@ -717,6 +1022,28 @@ function M.load()
     for k, v in pairs(data) do
         if k ~= '_version' and M[k] ~= nil then
             M[k] = v
+        end
+    end
+
+    local beforeFilter = 0
+    for _, spells in pairs(M.spells or {}) do
+        beforeFilter = beforeFilter + #spells
+    end
+    M.FilterSpells()
+    local afterFilter = 0
+    for _, spells in pairs(M.spells or {}) do
+        afterFilter = afterFilter + #spells
+    end
+    if afterFilter < beforeFilter and log then
+        log.warn('config', 'Removed %d unavailable/invalid healing spell(s) from config',
+            beforeFilter - afterFilter)
+    end
+    if afterFilter == 0 and M.autoAssignFromActiveSpellSet then
+        local assignedFromSpellSet = M.autoAssignFromActiveSpellSet()
+        if assignedFromSpellSet then
+            M.save()
+        elseif log then
+            log.info('config', 'No configured heals and no valid healing spells found in active spell set')
         end
     end
 

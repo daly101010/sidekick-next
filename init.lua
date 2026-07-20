@@ -7,6 +7,7 @@
 -- Run with: /lua run sidekick-next
 
 local BASE = 'sidekick-next.'
+local Supervisor = require(BASE .. 'utils.supervisor')
 
 -- Feature flags for experimental features
 _G.SIDEKICK_NEXT_CONFIG = {
@@ -16,6 +17,7 @@ _G.SIDEKICK_NEXT_CONFIG = {
     VISUAL_REDESIGN = false,     -- Placeholder for C experiments
     DEBUG_SETTINGS = false,      -- Log ImGui setting interactions (dev)
     HUMANIZE_BEHAVIOR = true,   -- Behavioral humanization layer (humanize/). Off = byte-identical to baseline.
+    COORDINATED_MODE = true,    -- Workers own all automatic game actions.
 }
 
 -- Helper for require with base path (optional, modules can use relative requires)
@@ -27,6 +29,11 @@ end
 local main = require(BASE .. 'SideKick')
 
 if type(main) == 'function' then
-    main()
+    local ok, err = xpcall(function()
+        Supervisor.start()
+        main()
+    end, debug.traceback)
+    pcall(Supervisor.stop)
+    if not ok then error(err, 0) end
 end
 return main

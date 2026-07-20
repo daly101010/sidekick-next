@@ -1,6 +1,8 @@
 -- utils/paths.lua
 -- Centralized path management for SideKick
--- All config and log paths are consolidated under mq.configDir/SideKick/
+-- All config and log paths are consolidated under mq.configDir/SideKick-Next/.
+-- The production sidekick tree uses mq.configDir/SideKick; keeping a separate
+-- root prevents the two scripts from overwriting each other's runtime snapshot.
 
 local mq = require('mq')
 
@@ -9,6 +11,9 @@ local M = {}
 -- Cache for character info (computed once per session)
 local _charName = nil
 local _serverName = nil
+
+local ROOT_NAME = 'SideKick-Next'
+local LEGACY_ROOT_NAME = 'SideKick'
 
 --- Get character and server info (cached)
 local function getCharInfo()
@@ -25,12 +30,31 @@ end
 
 --- Get the root SideKick directory
 function M.getRootDir()
-    return mq.configDir .. '/SideKick'
+    return mq.configDir .. '/' .. ROOT_NAME
+end
+
+--- Get the production/legacy root used to seed a new sidekick-next install.
+function M.getLegacyRootDir()
+    return mq.configDir .. '/' .. LEGACY_ROOT_NAME
 end
 
 --- Get the config directory
 function M.getConfigDir()
     return M.getRootDir() .. '/config'
+end
+
+--- Get the per-character module config directory.
+function M.getModuleConfigDir()
+    local char, server = getCharInfo()
+    local path = string.format('%s/%s_%s', M.getConfigDir(), server, char)
+    M.ensureDir(path)
+    return path
+end
+
+--- Get one module's independently owned INI path.
+function M.getModuleConfigPath(moduleName)
+    moduleName = tostring(moduleName or 'main'):lower():gsub('[^%w_%-]', '_')
+    return string.format('%s/%s.ini', M.getModuleConfigDir(), moduleName)
 end
 
 --- Get the healing subdirectory
@@ -82,6 +106,49 @@ function M.ensureDir(path)
     end
 end
 
+local function fileExists(path)
+    local f = io.open(path, 'r')
+    if not f then return false end
+    f:close()
+    return true
+end
+
+local function fileHasContent(path)
+    local f = io.open(path, 'rb')
+    if not f then return false end
+    local size = f:seek('end') or 0
+    f:close()
+    return size > 0
+end
+
+--- Copy an existing production config into the isolated next root once.
+--- Existing next files always win and are never refreshed from production.
+local function seedFromLegacy(destination, legacyPath)
+    -- A zero-byte destination is a failed/truncated save, not a valid config.
+    -- Recover it from the last production seed on the next launch.
+    if fileHasContent(destination) then return end
+
+    local candidates = type(legacyPath) == 'table' and legacyPath or { legacyPath }
+    local sourcePath = nil
+    for _, candidate in ipairs(candidates) do
+        if candidate and fileExists(candidate) then
+            sourcePath = candidate
+            break
+        end
+    end
+    if not sourcePath then return end
+
+    local source = io.open(sourcePath, 'r')
+    if not source then return end
+    local content = source:read('*a')
+    source:close()
+
+    local ok, safeWrite = pcall(require, 'sidekick-next.utils.safe_write')
+    if ok and safeWrite then
+        safeWrite(destination, content)
+    end
+end
+
 -------------------------------------------------------------------------------
 -- Config File Paths
 -------------------------------------------------------------------------------
@@ -91,7 +158,10 @@ end
 function M.getMainConfigPath()
     local char, server = getCharInfo()
     M.ensureDir(M.getConfigDir())
-    return string.format('%s/%s_%s.ini', M.getConfigDir(), server, char)
+    local path = string.format('%s/%s_%s.ini', M.getConfigDir(), server, char)
+    local legacyPath = string.format('%s/config/%s_%s.ini', M.getLegacyRootDir(), server, char)
+    seedFromLegacy(path, legacyPath)
+    return path
 end
 
 --- Get the healing config path
@@ -99,7 +169,15 @@ end
 function M.getHealingConfigPath()
     local char, server = getCharInfo()
     M.ensureDir(M.getHealingDir())
-    return string.format('%s/config_%s_%s.lua', M.getHealingDir(), server, char)
+    local path = string.format('%s/config_%s_%s.lua', M.getHealingDir(), server, char)
+    seedFromLegacy(path, {
+        -- Healing Intelligence originally wrote these files directly under
+        -- mq.configDir. Prefer that character's most recent local settings.
+        string.format('%s/SideKick_Healing_%s_%s.lua', mq.configDir, server, char),
+        string.format('%s/SideKick_Healing_%s_%s.lua', M.getRootDir(), server, char),
+        string.format('%s/healing/config_%s_%s.lua', M.getLegacyRootDir(), server, char),
+    })
+    return path
 end
 
 --- Get the healing learned data path
@@ -107,14 +185,22 @@ end
 function M.getHealingDataPath()
     local char, server = getCharInfo()
     M.ensureDir(M.getHealingDir())
-    return string.format('%s/data_%s_%s.lua', M.getHealingDir(), server, char)
+    local path = string.format('%s/data_%s_%s.lua', M.getHealingDir(), server, char)
+    seedFromLegacy(path, {
+        string.format('%s/SideKick_HealData_%s_%s.lua', mq.configDir, server, char),
+        string.format('%s/SideKick_HealData_%s_%s.lua', M.getRootDir(), server, char),
+        string.format('%s/healing/data_%s_%s.lua', M.getLegacyRootDir(), server, char),
+    })
+    return path
 end
 
 --- Get the immune database path
 -- Path: SideKick/data/immune_database.lua
 function M.getImmuneDatabasePath()
     M.ensureDir(M.getDataDir())
-    return M.getDataDir() .. '/immune_database.lua'
+    local path = M.getDataDir() .. '/immune_database.lua'
+    seedFromLegacy(path, M.getLegacyRootDir() .. '/data/immune_database.lua')
+    return path
 end
 
 -------------------------------------------------------------------------------
@@ -199,7 +285,7 @@ function M.checkMigrationNeeded()
     end
 
     -- Old immune database path
-    local oldImmune = mq.configDir .. '/SideKick/immune_database.lua'
+    local oldImmune = M.getLegacyRootDir() .. '/immune_database.lua'
     local newImmune = M.getImmuneDatabasePath()
     f = io.open(oldImmune, 'r')
     if f then

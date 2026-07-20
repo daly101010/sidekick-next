@@ -28,7 +28,6 @@ local lazy = require('sidekick-next.utils.lazy_require')
 
 local Engine = require('sidekick-next.utils.discipline_engine')
 local getConfigLoader = lazy('sidekick-next.utils.class_config_loader')
-local getCore         = lazy('sidekick-next.utils.core')
 local getAbilityLoader = lazy('sidekick-next.abilities.loader')
 local getAbilities     = lazy('sidekick-next.utils.abilities')
 
@@ -38,23 +37,10 @@ local module = ModuleBase.create('disciplines', lib.Priority.DPS)
 -- Settings access
 -------------------------------------------------------------------------------
 
-local _coreLoaded = false
-local _lastCoreLoadAt = 0
 local loadDynamicAbilities
 
 local function getSettings()
-    local Core = getCore()
-    local now = lib.getTimeMs()
-    if Core and Core.load and (not _coreLoaded or (now - _lastCoreLoadAt) > 1000) then
-        Core.load()
-        local Abilities = getAbilities()
-        if Core.ensureSeeded and Abilities and Abilities.MODE then
-            Core.ensureSeeded(loadDynamicAbilities(), Abilities.MODE)
-        end
-        _coreLoaded = true
-        _lastCoreLoadAt = now
-    end
-    return Core and Core.Settings or {}
+    return lib.getSettings and lib.getSettings() or {}
 end
 
 local function disciplinesEnabled()
@@ -64,14 +50,7 @@ local function disciplinesEnabled()
 end
 
 local function setBurn(value)
-    local Core = getCore()
-    if not Core then return end
-    if Core.set then
-        Core.set('BurnNow', value == true)
-    elseif Core.Settings then
-        Core.Settings.BurnNow = value == true
-        if Core.save then pcall(Core.save) end
-    end
+    mq.cmdf('/sk_next_set_burn %s', value == true and 'on' or 'off')
 end
 
 local function getBurn()
@@ -145,6 +124,15 @@ local PENDING_TTL_MS = 250  -- accept a freshly-picked action for this long
 -- predominantly spells (mez/tash/slow/nukes) and there is no
 -- competing ENC nuke module.
 local DEFAULT_ALLOW_KINDS = { aa = true, disc = true }
+
+-- Mez spell ownership belongs exclusively to sk_cc. ENC's discipline engine
+-- still handles stun/debuff/DPS conditions, but can never select these casts.
+local COORDINATOR_OWNED_CONDITIONS = {
+    doSingleMez = true,
+    doFastMez = true,
+    doAEMez = true,
+    doPBAEMez = true,
+}
 
 local function classAllowKinds(cfg)
     if not (cfg and cfg.allowKindsInRotation) then return DEFAULT_ALLOW_KINDS end
@@ -258,7 +246,10 @@ local function pickPendingAction()
     if dynamic then return dynamic end
 
     if not _classConfig then return nil end
-    return Engine.pickReadyAbility(_classConfig, ctx, { allowKinds = classAllowKinds(_classConfig) })
+    return Engine.pickReadyAbility(_classConfig, ctx, {
+        allowKinds = classAllowKinds(_classConfig),
+        excludeConditions = COORDINATOR_OWNED_CONDITIONS,
+    })
 end
 
 local function refreshPending(self)
@@ -445,6 +436,39 @@ module.executeAction = function(self)
 
     return true, 'completed'
 end
+
+
+module:enableUnifiedExecutor({
+    preflight = function(action)
+        _pendingAction = nil
+        _pendingComputedAt = 0
+        if ensureTarget(tonumber(action.targetId) or 0) then return true end
+        if action.claimedTarget then
+            local CC = getCC()
+            if CC and CC.releaseClaim then CC.releaseClaim(action.targetId) end
+        end
+        return false, 'target_lost'
+    end,
+    dispatch = function(action)
+        local fired = Engine.fireAbility({ kind = action.engineKind, name = action.name })
+        if not fired then return false, 'fire_refused' end
+        if action.engineKind == 'spell' then return true, nil, 'cast' end
+        if action.engineKind == 'aa' then return true, nil, 'cast_or_settle' end
+        return true, nil, 'settle'
+    end,
+    onFailure = function(action)
+        if action and action.claimedTarget then
+            local CC = getCC()
+            if CC and CC.releaseClaim then CC.releaseClaim(action.targetId) end
+        end
+    end,
+    onCancel = function(action)
+        if action and action.claimedTarget then
+            local CC = getCC()
+            if CC and CC.releaseClaim then CC.releaseClaim(action.targetId) end
+        end
+    end,
+})
 
 -------------------------------------------------------------------------------
 -- /sk_burn slash command — toggles BurnNow.

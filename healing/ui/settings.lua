@@ -76,6 +76,18 @@ function M.draw()
             duckBuffer, changed = imgui.SliderFloat('Duck Buffer %', duckBuffer, 0.0, 5.0, '%.1f')
             if changed then Config.duckBufferPct = duckBuffer end
 
+            local duckHysteresis = (Config.duckHysteresisPct ~= nil) and Config.duckHysteresisPct or 5
+            duckHysteresis, changed = imgui.SliderInt('Direct Heal Duck Hysteresis %', duckHysteresis, 0, 15)
+            if changed then Config.duckHysteresisPct = duckHysteresis end
+
+            local duckHotHysteresis = (Config.duckHotHysteresisPct ~= nil) and Config.duckHotHysteresisPct or 3
+            duckHotHysteresis, changed = imgui.SliderInt('HoT Duck Hysteresis %', duckHotHysteresis, 0, 15)
+            if changed then Config.duckHotHysteresisPct = duckHotHysteresis end
+
+            local duckMinAge = (Config.duckMinCastAgeMs ~= nil) and Config.duckMinCastAgeMs or 600
+            duckMinAge, changed = imgui.SliderInt('Min Cast Age Before Duck (ms)', duckMinAge, 0, 2000)
+            if changed then Config.duckMinCastAgeMs = duckMinAge end
+
             local considerHot = Config.considerIncomingHot ~= false
             considerHot, changed = imgui.Checkbox('Consider Incoming HoTs', considerHot)
             if changed then Config.considerIncomingHot = considerHot end

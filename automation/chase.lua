@@ -59,6 +59,7 @@ function M.setChaseJitterPct(v)
 end
 
 local _Core = nil
+local _lastReason = 'init'
 
 function M.init(opts)
     opts = opts or {}
@@ -189,22 +190,26 @@ function M.tick()
     -- back/strafe hold gets cleared even if chase is paused mid-recovery.
     tickStuckRecovery()
 
-    if not M.enabled or M.state.userPaused then return end
-    if not mq or not mq.TLO or not mq.TLO.Me or not mq.TLO.Me() then return end
+    if not M.enabled then _lastReason = 'disabled'; return end
+    if M.state.userPaused then _lastReason = 'user_paused'; return end
+    if not mq or not mq.TLO or not mq.TLO.Me or not mq.TLO.Me() then _lastReason = 'no_character'; return end
 
-    if mq.TLO.Me.Hovering() or mq.TLO.Me.AutoFire() or mq.TLO.Me.Combat() then return end
+    if mq.TLO.Me.Hovering() then _lastReason = 'hovering'; return end
+    if mq.TLO.Me.AutoFire() then _lastReason = 'autofire'; return end
+    if mq.TLO.Me.Combat() then _lastReason = 'melee_combat'; return end
     -- me.Casting() returns the spell name when casting OR the literal "NULL"
     -- when idle — must reject both. Treating "NULL" as truthy (the previous
     -- behavior) permanently suppressed chase whenever the player wasn't
     -- actually casting.
     local casting = mq.TLO.Me.Casting()
-    if casting and casting ~= '' and casting ~= 'NULL' then return end
-    if mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active() then return end
+    if casting and casting ~= '' and casting ~= 'NULL' then _lastReason = 'casting'; return end
+    if mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active() then _lastReason = 'stick_active'; return end
 
     local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
         or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
 
     if navActive and not _navState.initiatedNav then
+        _lastReason = 'external_nav_active'
         return
     end
     if not navActive then
@@ -214,30 +219,35 @@ function M.tick()
     local spawn = M.resolveSpawn()
     if not (spawn and spawn()) then
         _navState.stuckCount = 0
+        _lastReason = 'no_chase_target'
         return
     end
-    if spawn.Type and spawn.Type() ~= 'PC' then return end
+    if spawn.Type and spawn.Type() ~= 'PC' then _lastReason = 'target_not_pc'; return end
 
     local dist = M.distanceTo(spawn)
-    if not dist then return end
+    if not dist then _lastReason = 'no_distance'; return end
     local baseDist = tonumber(M.state.distance) or 30
     local maxDist = effectiveMaxDist(baseDist)
     if dist <= maxDist then
         if navActive then M.stopNav() end
         _navState.stuckCount = 0
         clearChaseRoll()
+        _lastReason = string.format('in_range:%.1f<=%.1f', dist, maxDist)
         return
     end
 
     if navActive then
         if checkStuck() then
             doStuckRecovery()
+            _lastReason = 'stuck_recovery'
+        else
+            _lastReason = string.format('nav_active:%.1f>%.1f', dist, maxDist)
         end
         return
     end
 
     local cleanName = spawn.CleanName and spawn.CleanName() or ''
-    if cleanName == '' then return end
+    if cleanName == '' then _lastReason = 'empty_target_name'; return end
 
     local now = os.clock()
     if isUnderwater() then
@@ -245,11 +255,12 @@ function M.tick()
         if id and id > 0 then
             mq.cmdf('/stick 15 id %d uw moveback', id)
             _navState.lastNavAt = now
+            _lastReason = string.format('stick_underwater:%s', cleanName)
         end
         return
     end
 
-    if (now - _navState.lastNavAt) < 2.0 then return end
+    if (now - _navState.lastNavAt) < 2.0 then _lastReason = 'nav_cooldown'; return end
 
     local pathOk = navMeshLoaded() and mq.TLO.Navigation and mq.TLO.Navigation.PathExists
         and mq.TLO.Navigation.PathExists(string.format('spawn pc =%s', cleanName))
@@ -257,6 +268,7 @@ function M.tick()
         mq.cmdf('/nav spawn pc =%s | dist=10 log=off', cleanName)
         _navState.initiatedNav = true
         _navState.lastNavAt = now
+        _lastReason = string.format('nav_to:%s dist=%.1f', cleanName, dist)
         return
     end
 
@@ -267,6 +279,7 @@ function M.tick()
             mq.cmdf('/moveto id %d uw mdist 10', id)
             _navState.initiatedNav = true
             _navState.lastNavAt = now
+            _lastReason = string.format('moveto:%s dist=%.1f', cleanName, dist)
         end
         return
     end
@@ -275,8 +288,35 @@ function M.tick()
     if id and id > 0 then
         mq.cmdf('/stick 20 id %d uw moveback', id)
         _navState.lastNavAt = now
+        _lastReason = string.format('stick:%s dist=%.1f', cleanName, dist)
     end
 end
 
-return M
+function M.status()
+    local spawn = M.resolveSpawn()
+    local name = nil
+    local id = 0
+    local dist = nil
+    if spawn and spawn() then
+        name = spawn.CleanName and spawn.CleanName() or tostring(spawn.Name and spawn.Name() or '')
+        id = spawn.ID and spawn.ID() or 0
+        dist = M.distanceTo(spawn)
+    end
+    local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
+        or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
+    return {
+        enabled = M.enabled == true,
+        userPaused = M.state.userPaused == true,
+        role = M.state.role,
+        target = M.state.target,
+        distance = M.state.distance,
+        resolvedName = name,
+        resolvedId = id,
+        resolvedDistance = dist,
+        navActive = navActive == true,
+        initiatedNav = _navState.initiatedNav == true,
+        reason = _lastReason,
+    }
+end
 
+return M

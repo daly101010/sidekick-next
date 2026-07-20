@@ -14,7 +14,9 @@ local getDamageAttribution = lazy.once('sidekick-next.healing.damage_attribution
 
 -- Target data cache
 local _targets = {}
+local _lastActorScan = 0
 local _lastFullScan = 0
+local _actorDamage = {}       -- [spawnId] = { samples = {}, lastCurrentHP, lastMaxHP, lastPctHP }
 
 -- Rolling damage window (seconds) - updated from Config in init()
 local DAMAGE_WINDOW_SEC = 6
@@ -94,6 +96,8 @@ end
 function M.init(config)
     Config = config
     _targets = {}
+    _lastActorScan = 0
+    _actorDamage = {}
     _remoteMaxHP = {}
     _remoteMaxHPAt = {}
     _danNetObservers = {}
@@ -142,7 +146,20 @@ local function getRole(spawn)
     return 'dps'
 end
 
-local function updateTargetData(spawnId, spawn, roleOverride)
+local function safeBool(fn, fallback)
+    local ok, value = pcall(fn)
+    if not ok or value == nil then return fallback == true end
+    return value == true
+end
+
+function M.updateConfig(config)
+    Config = config or Config
+    if Config and Config.damageWindowSec then
+        DAMAGE_WINDOW_SEC = Config.damageWindowSec
+    end
+end
+
+local function updateTargetData(spawnId, spawn, roleOverride, healthOverride)
     if not spawn or not spawn() then
         _targets[spawnId] = nil
         return nil
@@ -154,15 +171,20 @@ local function updateTargetData(spawnId, spawn, roleOverride)
 
     -- For non-targeted group members, CurrentHPs/MaxHPs return placeholder values (100/100)
     -- PctHPs is always accurate regardless of targeting
-    local currentHP = tonumber(spawn.CurrentHPs()) or 0
-    local maxHP = tonumber(spawn.MaxHPs()) or 1
-    local pctHP = tonumber(spawn.PctHPs()) or 100
+    healthOverride = healthOverride or {}
+    local currentHP = tonumber(healthOverride.currentHP) or tonumber(spawn.CurrentHPs()) or 0
+    local maxHP = tonumber(healthOverride.maxHP) or tonumber(spawn.MaxHPs()) or 1
+    local pctHP = tonumber(healthOverride.pctHP) or tonumber(spawn.PctHPs()) or 100
 
     -- Get target name for DanNet lookup
     local targetName = spawn.CleanName() or spawn.Name() or ''
 
-    -- Try to get real MaxHP from DanNet observer (for other characters)
-    local remoteMax = getRemoteMaxHP(targetName)
+    local overrideMax = tonumber(healthOverride.maxHP)
+    local spawnMax = tonumber(spawn.MaxHPs()) or 1
+    local remoteMax = nil
+    if not (overrideMax and overrideMax > 100) then
+        remoteMax = getRemoteMaxHP(targetName)
+    end
 
     -- For self, we can get MaxHP directly
     local fallbackMax = nil
@@ -170,8 +192,36 @@ local function updateTargetData(spawnId, spawn, roleOverride)
         fallbackMax = tonumber(mq.TLO.Me.MaxHPs()) or nil
     end
 
-    -- Use DanNet value, then fallback, then spawn value
-    local resolvedMax = remoteMax or fallbackMax
+    local maxHPKnown = false
+    local maxHPSource = 'unknown'
+
+    -- Use real values in priority order. Actor and DanNet are the most useful
+    -- for untargeted/group characters where MQ spawn HP may be 100/100.
+    local resolvedMax = nil
+    if overrideMax and overrideMax > 100 then
+        resolvedMax = overrideMax
+        maxHPKnown = true
+        maxHPSource = healthOverride.actorReported and 'actor' or 'override'
+        _remoteMaxHP[targetName] = overrideMax
+        _remoteMaxHPAt[targetName] = now
+    elseif fallbackMax and fallbackMax > 100 then
+        resolvedMax = fallbackMax
+        maxHPKnown = true
+        maxHPSource = 'self'
+    elseif remoteMax and remoteMax > 100 then
+        resolvedMax = remoteMax
+        maxHPKnown = true
+        maxHPSource = 'dannet'
+    elseif spawnMax and spawnMax > 100 then
+        resolvedMax = spawnMax
+        maxHPKnown = true
+        maxHPSource = 'spawn'
+    elseif existing.maxHPKnown and existing.maxHP and existing.maxHP > 100 then
+        resolvedMax = existing.maxHP
+        maxHPKnown = true
+        maxHPSource = existing.maxHPSource or 'cached'
+    end
+
     if resolvedMax and resolvedMax > 0 then
         maxHP = resolvedMax
         -- If spawn returned placeholder values (100/100), calculate real currentHP from pctHP
@@ -179,13 +229,27 @@ local function updateTargetData(spawnId, spawn, roleOverride)
         if currentHP <= 100 then
             currentHP = math.floor((pctHP / 100) * maxHP)
         end
-    elseif maxHP <= 1 and pctHP < 100 then
-        -- Last resort fallback if no DanNet and spawn returned placeholder
-        maxHP = 100000  -- Default estimate
+    elseif maxHP <= 100 and currentHP <= 100 then
+        -- Untargeted PCs commonly expose placeholder 100/100 values. Reuse a
+        -- previously resolved maximum when possible, otherwise use the
+        -- configurable estimate so pctHP still produces a meaningful deficit.
+        maxHP = (Config and Config.defaultRemoteMaxHP) or 100000
+        maxHPKnown = false
+        maxHPSource = 'estimate'
         currentHP = math.floor(maxHP * pctHP / 100)
     end
 
-    local deficit = maxHP - currentHP
+    local dead = healthOverride.dead == true
+        or safeBool(function() return spawn.Dead and spawn.Dead() end, false)
+        or pctHP <= 0
+    local hovering = healthOverride.hovering == true
+        or safeBool(function() return spawn.Hovering and spawn.Hovering() end, false)
+    local distance3D = tonumber(spawn.Distance3D and spawn.Distance3D()) or 0
+    local lineOfSight = safeBool(function()
+        return not spawn.LineOfSight or spawn.LineOfSight()
+    end, true)
+
+    local deficit = math.max(0, maxHP - currentHP)
     local classShort = spawn.Class and spawn.Class.ShortName and spawn.Class.ShortName() or ''
     classShort = classShort:upper()
 
@@ -245,6 +309,21 @@ local function updateTargetData(spawnId, spawn, roleOverride)
         combinedDps = (hpDeltaDps * hpDpsWeight) + (attrDps * (1 - hpDpsWeight))
     end
 
+    -- Actor snapshots contain real CurrentHP/MaxHP values even when local
+    -- Spawn members expose placeholder 100/100. Preserve their rolling DPS
+    -- across the subsequent local group scan and never dilute it by weighting
+    -- it against a missing combat-log source.
+    local actorDps = tonumber(healthOverride.actorDps)
+    local actorDpsAt = tonumber(healthOverride.actorDpsAt)
+    if actorDps == nil and existing.actorDpsAt
+        and (now - existing.actorDpsAt) <= (DAMAGE_WINDOW_SEC * 1000) then
+        actorDps = tonumber(existing.actorDps) or 0
+        actorDpsAt = existing.actorDpsAt
+    end
+    if actorDps and actorDps > combinedDps then
+        combinedDps = actorDps
+    end
+
     -- Statistical burst detection
     local burstDetected = false
     if dp and dp.checkBurst then
@@ -260,11 +339,20 @@ local function updateTargetData(spawnId, spawn, roleOverride)
 
         currentHP = currentHP,
         maxHP = maxHP,
+        maxHPKnown = maxHPKnown,
+        maxHPSource = maxHPSource,
         pctHP = pctHP,
         deficit = deficit,
+        dead = dead,
+        hovering = hovering,
+        distance3D = distance3D,
+        lineOfSight = lineOfSight,
+        actorReported = healthOverride.actorReported == true,
 
         recentDamage = recentDamage,
         recentDps = combinedDps,
+        actorDps = actorDps or 0,
+        actorDpsAt = actorDpsAt or 0,
         hpDeltaDps = hpDeltaDps,
         logDps = logDps,
         burstDetected = burstDetected,
@@ -287,6 +375,77 @@ local function updateTargetData(spawnId, spawn, roleOverride)
 
     _targets[spawnId] = data
     return data
+end
+
+--- Merge health snapshots reported by SideKick peers in the same zone.
+--- A local Spawn is still required because the character must be targetable.
+function M.updateActorTargets(remoteCharacters)
+    if type(remoteCharacters) ~= 'table' then return end
+    local now = mq.gettime()
+    if (now - _lastActorScan) < 100 then return end
+    _lastActorScan = now
+    local myZone = tostring(mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '')
+    local myId = tonumber(mq.TLO.Me.ID()) or 0
+    for _, remote in pairs(remoteCharacters) do
+        local spawnId = tonumber(remote.id) or 0
+        local sameZone = myZone ~= '' and tostring(remote.zone or '') == myZone
+        if sameZone and spawnId > 0 and spawnId ~= myId then
+            local spawn = mq.TLO.Spawn(spawnId)
+            if spawn and spawn() then
+                local currentHP = tonumber(remote.currentHP) or 0
+                local maxHP = tonumber(remote.maxHP) or 0
+                local pctHP = tonumber(remote.hp) or tonumber(spawn.PctHPs()) or 100
+                local history = _actorDamage[spawnId] or { samples = {} }
+
+                local damage = 0
+                if currentHP > 0 and history.lastCurrentHP and history.lastCurrentHP > currentHP
+                    and maxHP > 100 and history.lastMaxHP == maxHP then
+                    damage = history.lastCurrentHP - currentHP
+                elseif maxHP > 100 and history.lastPctHP and history.lastPctHP > pctHP then
+                    damage = math.floor(((history.lastPctHP - pctHP) / 100) * maxHP)
+                end
+                if damage > 0 then
+                    table.insert(history.samples, { time = now, amount = damage })
+                end
+
+                local cutoff = now - (DAMAGE_WINDOW_SEC * 1000)
+                local samples = {}
+                local totalDamage = 0
+                for _, sample in ipairs(history.samples or {}) do
+                    if sample.time >= cutoff then
+                        table.insert(samples, sample)
+                        totalDamage = totalDamage + sample.amount
+                    end
+                end
+                history.samples = samples
+                history.lastCurrentHP = currentHP > 0 and currentHP or history.lastCurrentHP
+                history.lastMaxHP = maxHP > 0 and maxHP or history.lastMaxHP
+                history.lastPctHP = pctHP
+                history.lastAt = now
+                _actorDamage[spawnId] = history
+
+                local windowSec = math.max(1,
+                    #samples > 0 and ((now - samples[1].time) / 1000) or DAMAGE_WINDOW_SEC)
+                local actorDps = totalDamage / windowSec
+                updateTargetData(spawnId, spawn, remote.role, {
+                    currentHP = currentHP,
+                    maxHP = maxHP,
+                    pctHP = pctHP,
+                    dead = remote.dead,
+                    hovering = remote.hovering,
+                    actorReported = true,
+                    actorDps = actorDps,
+                    actorDpsAt = now,
+                })
+            end
+        end
+    end
+
+    for spawnId, history in pairs(_actorDamage) do
+        if (now - (history.lastAt or 0)) > (DAMAGE_WINDOW_SEC * 2000) then
+            _actorDamage[spawnId] = nil
+        end
+    end
 end
 
 function M.tick()
@@ -350,8 +509,8 @@ function M.tick()
         end
     end
 
-    -- Prune stale targets (not seen in 5 seconds)
-    local staleThreshold = now - 5
+    -- Prune stale targets (not seen in 5 seconds).
+    local staleThreshold = now - 5000
     for id, data in pairs(_targets) do
         if data.lastUpdate < staleThreshold then
             _targets[id] = nil

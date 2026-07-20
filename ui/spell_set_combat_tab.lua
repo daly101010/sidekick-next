@@ -135,6 +135,8 @@ function M.renderGemSlot(slot, spellSet, scanner)
         and gemConfig.condition.conditions
         and #gemConfig.condition.conditions > 0
     local hasBuffTarget = gemConfig and gemConfig.buffTarget
+    local hasUtility = gemConfig and gemConfig.utility
+        and (gemConfig.utility.combat == true or gemConfig.utility.ooc == true)
 
     -- Get spell icon
     local spellIcon = 0
@@ -163,6 +165,17 @@ function M.renderGemSlot(slot, spellSet, scanner)
     end
     if hasBuffTarget then
         label = label .. " [T]"
+    end
+    if hasUtility then
+        local marker = "U"
+        if gemConfig.utility.combat == true and gemConfig.utility.ooc == true then
+            marker = "U:Both"
+        elseif gemConfig.utility.combat == true then
+            marker = "U:Combat"
+        elseif gemConfig.utility.ooc == true then
+            marker = "U:OOC"
+        end
+        label = label .. " [" .. marker .. "]"
     end
 
     -- Button styling based on whether slot has a spell
@@ -216,15 +229,23 @@ function M.renderGemSlot(slot, spellSet, scanner)
             -- payload is the spell entry table
             local droppedSpell = state.dragSpell
             if droppedSpell and droppedSpell.id then
-                -- Generate default condition for combat spells
-                local ConditionDefaults = getConditionDefaults()
-                local condition = nil
-                if ConditionDefaults and ConditionDefaults.shouldGenerateDefaults(droppedSpell) then
-                    condition = ConditionDefaults.generateCombatCondition(droppedSpell)
+                -- A previously configured spell keeps its condition, priority,
+                -- target, and utility flags even after being removed from a
+                -- slot. Brand-new spells still receive generated defaults.
+                local profile = SpellsetData.getSpellProfile(spellSet, droppedSpell.id)
+                local condition = profile and profile.condition or nil
+                if not profile then
+                    local ConditionDefaults = getConditionDefaults()
+                    if ConditionDefaults and ConditionDefaults.shouldGenerateDefaults(droppedSpell) then
+                        condition = ConditionDefaults.generateCombatCondition(droppedSpell)
+                    end
                 end
 
                 -- Set the gem
-                SpellsetData.setGem(spellSet, slot, droppedSpell.id, condition, nil, nil)
+                SpellsetData.setGem(spellSet, slot, droppedSpell.id, condition,
+                    profile and profile.priority or nil,
+                    profile and profile.buffTarget or nil,
+                    profile and profile.utility or nil)
             end
         end
         imgui.EndDragDropTarget()
@@ -422,6 +443,40 @@ function M.renderConditionEditor(spellSet)
     end)
     if newCondition then
         gemConfig.condition = newCondition
+    end
+
+    imgui.Spacing()
+    imgui.Separator()
+    imgui.Text("Utility:")
+
+    local utility = gemConfig.utility or {}
+    local combatUtility = utility.combat == true
+    local newCombatUtility, combatChanged = imgui.Checkbox("In Combat Utility##utilityCombat", combatUtility)
+    if combatChanged then
+        gemConfig.utility = gemConfig.utility or {}
+        gemConfig.utility.combat = newCombatUtility == true
+        if gemConfig.utility.combat ~= true and gemConfig.utility.ooc ~= true then
+            gemConfig.utility = nil
+        end
+        saveSpellSets()
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip("Allows the resource/utility worker to cast this spell in combat when its condition is true.")
+    end
+
+    utility = gemConfig.utility or {}
+    local oocUtility = utility.ooc == true
+    local newOocUtility, oocChanged = imgui.Checkbox("Out of Combat Utility##utilityOOC", oocUtility)
+    if oocChanged then
+        gemConfig.utility = gemConfig.utility or {}
+        gemConfig.utility.ooc = newOocUtility == true
+        if gemConfig.utility.combat ~= true and gemConfig.utility.ooc ~= true then
+            gemConfig.utility = nil
+        end
+        saveSpellSets()
+    end
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip("Allows the resource/utility worker to cast this spell out of combat when its condition is true.")
     end
 
     imgui.Spacing()

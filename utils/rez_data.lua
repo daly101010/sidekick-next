@@ -1,8 +1,8 @@
 -- utils/rez_data.lua
 -- Per-class resurrection spell + AA tables.
 -- Spell lists are ordered best-XP-return first; the rez module walks the
--- list and picks the first entry where mq.TLO.Spell(name).Stacks() is true
--- (i.e. learned and currently usable).
+-- list and picks the first entry present in the character's spell book.
+-- Readiness, mana, memorization, and combat policy are checked separately.
 
 local M = {}
 

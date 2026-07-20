@@ -5,6 +5,7 @@
 local mq = require('mq')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
+local ActorsTeam = require('sidekick-next.utils.actors_team')
 
 local M = {}
 
@@ -31,8 +32,15 @@ local State = {
 
     -- World snapshot
     worldState = {
+        inGame = true,
         inCombat = false,
         selfDead = false,
+        incapacitated = false,
+        incapacitationReason = nil,
+        stunned = false,
+        mezzed = false,
+        silenced = false,
+        feared = false,
         myHpPct = 100,
         myManaPct = 100,
         groupNeedsHealing = false,
@@ -43,6 +51,7 @@ local State = {
 
     -- Module heartbeats
     moduleHeartbeats = {}, -- [module] = { sentAtMs, ready, script, mailbox }
+    moduleScripts = {},    -- [module] = last known script path (survives a crash)
     knownModules = {},     -- [module] = true once seen locally
 
     -- Need hints from modules
@@ -55,11 +64,84 @@ local State = {
 
     -- Running flag
     running = true,
+
+    -- Canonical UI/supervisor liveness. The absence timer starts only after
+    -- the first supervisor heartbeat arrives.
+    supervisorSeen = false,
+    supervisorLastSeenAt = 0,
+    supervisorLastSentAt = 0,
+    supervisorSessionId = nil,
+    supervisorShutdownRequested = false,
+    automationPaused = false,
+    settingsRevision = 0,
 }
 
 -- Actor dropbox
 local dropbox = nil
 local mailboxDropboxes = {}
+local _teamSettingsRevision = nil
+local _teamSettings = {}
+
+local function refreshTeamSettings()
+    local revision = tonumber(State.settingsRevision) or 0
+    if _teamSettingsRevision ~= revision then
+        _teamSettings = lib.refreshSettings(revision) or lib.getSettings() or {}
+        _teamSettingsRevision = revision
+    end
+    return _teamSettings
+end
+
+local function buildTeamTickSnapshot()
+    local modules = {}
+    local now = lib.getTimeMs()
+    for moduleName in pairs(State.knownModules) do
+        local hb = State.moduleHeartbeats[moduleName]
+        local need = State.moduleNeeds[moduleName]
+        local heartbeatAge = hb and (now - (hb.receivedAtMs or 0)) or 0
+        modules[moduleName] = {
+            ready = hb ~= nil and hb.ready ~= false and heartbeatAge <= lib.Timing.MODULE_CRASH_MS,
+            needsAction = need ~= nil and need.needsAction == true
+                and (now - (need.receivedAtMs or 0)) <= (need.ttlMs or 250),
+            priority = need and tonumber(need.priority) or nil,
+            reason = need and tostring(need.reason or '') or '',
+        }
+    end
+
+    local action = nil
+    if State.castOwner then
+        local hb = State.moduleHeartbeats[State.castOwner.module]
+        local lifecycle = hb and hb.action or nil
+        local requested = State.castOwner.action or {}
+        action = {
+            module = tostring(State.castOwner.module or ''),
+            claimId = tostring(State.castOwner.claimId or ''),
+            kind = tostring((lifecycle and lifecycle.kind) or requested.kind or ''),
+            name = tostring((lifecycle and lifecycle.name)
+                or requested.spellName or requested.itemName or requested.discName or requested.name or ''),
+            phase = tostring((lifecycle and lifecycle.phase) or 'claimed'),
+            targetId = tonumber((lifecycle and lifecycle.targetId) or requested.targetId) or 0,
+        }
+    end
+
+    local settings = refreshTeamSettings()
+    return {
+        zone = lib.getZone(),
+        class = tostring(lib.safeTLO(function() return mq.TLO.Me.Class.ShortName() end, '') or ''),
+        role = tostring(settings.CombatMode or 'off'),
+        inGame = State.worldState.inGame ~= false,
+        inCombat = State.worldState.inCombat == true,
+        dead = State.worldState.selfDead == true,
+        incapacitated = State.worldState.incapacitated == true,
+        automationPaused = State.automationPaused == true,
+        activePriority = State.activePriority,
+        action = action,
+        modules = modules,
+    }
+end
+
+local function tickActorsTeam()
+    ActorsTeam.tick(buildTeamTickSnapshot(), refreshTeamSettings())
+end
 
 local function parseSenderScript(senderMailbox)
     if type(senderMailbox) ~= 'string' then return nil end
@@ -98,9 +180,16 @@ end
 -------------------------------------------------------------------------------
 
 local function updateWorldState()
+    State.worldState.inGame = true
     local me = mq.TLO.Me
     if not (me and me()) then
         State.worldState.selfDead = true
+        State.worldState.incapacitated = false
+        State.worldState.incapacitationReason = nil
+        State.worldState.stunned = false
+        State.worldState.mezzed = false
+        State.worldState.silenced = false
+        State.worldState.feared = false
         State.castBusy = false
         return
     end
@@ -110,6 +199,14 @@ local function updateWorldState()
     State.worldState.myHpPct = lib.safeNum(function() return me.PctHPs() end, 100)
     State.worldState.myManaPct = lib.safeNum(function() return me.PctMana() end, 100)
     State.worldState.mainAssistId = lib.getMainAssistId()
+
+    local control = lib.getIncapacitationState()
+    State.worldState.incapacitated = control.incapacitated
+    State.worldState.incapacitationReason = control.reason
+    State.worldState.stunned = control.stunned
+    State.worldState.mezzed = control.mezzed
+    State.worldState.silenced = control.silenced
+    State.worldState.feared = control.feared
 
     -- Count dead group members
     local deadCount = 0
@@ -173,12 +270,9 @@ local function computeActivePriority()
         return lib.Priority.IDLE
     end
 
-    -- Emergency takes precedence
-    if ws.emergencyActive then
-        return lib.Priority.EMERGENCY
-    end
-
-    -- Check module need hints (authoritative for HI thresholds)
+    -- Fresh, heartbeating module need hints are the only source of work.
+    -- World-state fields are diagnostic/validation data; they must not select
+    -- a priority for a category that is disabled or unavailable on this class.
     local bestNeed = nil
     local validNeeds = {}
     for moduleName, need in pairs(State.moduleNeeds) do
@@ -205,35 +299,6 @@ local function computeActivePriority()
         return bestNeed
     end
 
-    -- Check for healing needs
-    if ws.groupNeedsHealing then
-        return lib.Priority.HEALING
-    end
-
-    -- Check for dead members needing rez
-    if ws.deadCount > 0 then
-        return lib.Priority.RESURRECTION
-    end
-
-    -- In combat, default to DPS only if a DPS module can actually act.
-    -- Without this check, classes with no DPS spells (e.g. clerics) get stuck
-    -- at a dead DPS priority where no module requests claims.
-    if ws.inCombat then
-        local dpsNeed = State.moduleNeeds['dps']
-        local dpsCanAct = dpsNeed and dpsNeed.needsAction == true
-            and (now - (dpsNeed.receivedAtMs or 0)) <= (dpsNeed.ttlMs or 250)
-        if dpsCanAct then
-            return lib.Priority.DPS
-        end
-    end
-
-    -- Check if meditation module needs to act (mana/hp/end regen)
-    local medNeed = State.moduleNeeds['meditation']
-    if medNeed and medNeed.needsAction == true
-        and (now - (medNeed.receivedAtMs or 0)) <= (medNeed.ttlMs or 500) then
-        return lib.Priority.MEDITATION
-    end
-
     -- Nothing actionable
     return lib.Priority.IDLE
 end
@@ -253,60 +318,66 @@ end
 local function isOwnerExpired(owner)
     if not owner then return true end
     local now = lib.getTimeMs()
-    return (now - owner.claimedAtMs) > owner.ttlMs
+    local leaseStartedAtMs = owner.castStartedAtMs or owner.claimedAtMs
+    return (now - leaseStartedAtMs) > owner.ttlMs
 end
 
---- Check if a module has a valid (non-expired) need hint requesting action
-local function hasValidNeed(moduleName)
-    if not hasFreshHeartbeat(moduleName) then return false end
-    local need = State.moduleNeeds[moduleName]
-    if not need or not need.needsAction then return false end
-    local ttl = need.ttlMs or 250
-    local age = lib.getTimeMs() - (need.receivedAtMs or 0)
-    return age <= ttl
+local function clearMatchingOwners(owner, reason)
+    if not owner then return false end
+    local changed = false
+    local moduleName = owner.module
+    local claimId = owner.claimId
+    if State.castOwner and State.castOwner.module == moduleName and State.castOwner.claimId == claimId then
+        State.castOwner = nil
+        changed = true
+    end
+    if State.targetOwner and State.targetOwner.module == moduleName and State.targetOwner.claimId == claimId then
+        State.targetOwner = nil
+        changed = true
+    end
+    if changed then
+        debugLog('REVOKE: module=%s claimId=%s reason=%s',
+            tostring(moduleName), tostring(claimId), tostring(reason or 'unknown'))
+    end
+    return changed
 end
 
 local function expireOwners()
     local changed = false
-    -- Don't expire cast owner while actively casting - let the cast complete
-    -- Also don't expire if the owning module still has an active need hint
-    -- (covers multi-step operations like gem memorization where castBusy is
-    --  still false but the module is actively working toward a cast)
-    -- Snapshot State.castOwner to a local — defensive against state
-    -- mutations from any handler that runs synchronously below.
+    -- Need hints describe scheduling demand; they never extend ownership.
+    -- Snapshot cast ownership defensively against synchronous state changes.
     local castOwner = State.castOwner
     if castOwner then
-        local expired = isOwnerExpired(castOwner)
-        local moduleHasNeed = hasValidNeed(castOwner.module)
-        if expired and not State.castBusy and not moduleHasNeed then
+        if castOwner.expectsCastStart and not castOwner.castStartedAtMs and State.castBusy then
+            -- Move from the short acquisition window to the normal operation
+            -- lease only after an actual cast bar is observed.
+            castOwner.castStartedAtMs = lib.getTimeMs()
+            State.pendingBroadcast = true
+            debugLog('CAST STARTED: module=%s claimId=%s', castOwner.module, castOwner.claimId)
+        elseif castOwner.expectsCastStart and not castOwner.castStartedAtMs
+            and lib.getTimeMs() > (castOwner.castStartDeadlineMs or 0) then
+            lib.log('warn', M.MODULE_NAME, 'Revoking cast claim that did not start: %s', castOwner.module)
+            changed = clearMatchingOwners(castOwner, 'cast_start_timeout') or changed
+        elseif isOwnerExpired(castOwner) and not State.castBusy then
             lib.log('debug', M.MODULE_NAME, 'Cast owner expired: %s', castOwner.module)
-            debugLog('EXPIRE: Cast owner %s expired (castBusy=%s, moduleHasNeed=%s)',
-                castOwner.module, tostring(State.castBusy), tostring(moduleHasNeed))
-            State.castOwner = nil
-            changed = true
-        elseif expired and State.castBusy then
+            changed = clearMatchingOwners(castOwner, 'claim_ttl_expired') or changed
+        elseif isOwnerExpired(castOwner) and State.castBusy then
             debugLog('EXPIRE: Cast owner %s expired but castBusy=true, keeping', castOwner.module)
-        elseif expired and moduleHasNeed then
-            debugLog('EXPIRE: Cast owner %s expired but module has active need, keeping', castOwner.module)
         end
     end
-    -- Target owner: same logic — extend if owning module has valid need OR castBusy
-    -- castBusy must protect BOTH cast and target owners to prevent epoch drift that
-    -- causes the casting module to lose ownership mid-cast via the epoch check
+    -- Target ownership uses the same bounded lease.
+    -- Preserve matching target ownership only while its cast is active.
     if State.targetOwner and isOwnerExpired(State.targetOwner) then
-        local moduleHasNeed = hasValidNeed(State.targetOwner.module)
         local castingModuleOwns = State.castBusy and State.castOwner
             and State.castOwner.module == State.targetOwner.module
-        if not moduleHasNeed and not castingModuleOwns then
+        if not castingModuleOwns then
             lib.log('debug', M.MODULE_NAME, 'Target owner expired: %s', State.targetOwner.module)
-            debugLog('EXPIRE: Target owner %s expired (castBusy=%s, moduleHasNeed=%s)',
-                State.targetOwner.module, tostring(State.castBusy), tostring(moduleHasNeed))
+            debugLog('EXPIRE: Target owner %s expired (castBusy=%s)',
+                State.targetOwner.module, tostring(State.castBusy))
             State.targetOwner = nil
             changed = true
         elseif castingModuleOwns then
             debugLog('EXPIRE: Target owner %s expired but same module is casting, keeping', State.targetOwner.module)
-        else
-            debugLog('EXPIRE: Target owner %s expired but module has active need, keeping', State.targetOwner.module)
         end
     end
     return changed
@@ -326,6 +397,21 @@ local function clearOwnersForSelfDead()
         changed = true
     end
     State.castBusy = false
+    return changed
+end
+
+local function clearOwnersForIncapacitation()
+    if not State.worldState.incapacitated then return false end
+    local changed = false
+    local reason = State.worldState.incapacitationReason or 'incapacitated'
+    if State.castOwner then
+        changed = clearMatchingOwners(State.castOwner, reason) or changed
+    end
+    if State.targetOwner then
+        debugLog('REVOKE: target owner=%s reason=%s', tostring(State.targetOwner.module), tostring(reason))
+        State.targetOwner = nil
+        changed = true
+    end
     return changed
 end
 
@@ -368,6 +454,11 @@ local function canGrantResource(owner, claimPriority)
     -- 2. Current owner expired
     -- 3. Requester has higher priority (lower number)
     if not owner then return true end
+    if State.castBusy and State.castOwner
+        and owner.module == State.castOwner.module
+        and owner.claimId == State.castOwner.claimId then
+        return false
+    end
     if isOwnerExpired(owner) then return true end
     if claimPriority < owner.priority then return true end
     return false
@@ -377,6 +468,13 @@ local function processClaim(content, sender)
     local now = lib.getTimeMs()
     debugLog('processClaim: module=%s type=%s priority=%d epochSeen=%d currentEpoch=%d activePriority=%d',
         content.module, content.type or 'nil', content.priority, content.epochSeen, State.epoch, State.activePriority)
+
+    if State.worldState.selfDead or State.worldState.incapacitated or State.worldState.inGame == false then
+        debugLog('CLAIM REJECTED: local character unavailable (%s)',
+            tostring(State.worldState.incapacitationReason
+                or (State.worldState.selfDead and 'self_dead') or 'not_ingame'))
+        return false
+    end
 
     -- Validate epochSeen (allow small drift from async message delivery)
     -- In multi-module systems, other modules' claims/releases increment epoch between
@@ -419,7 +517,12 @@ local function processClaim(content, sender)
         wantsCast = true
     end
 
-    -- Check if resources are grantable
+    -- Check if resources are grantable. A cast with no castOwner is
+    -- external/manual; workers must wait for that cast bar to clear.
+    if wantsCast and State.castBusy and not State.castOwner then
+        debugLog('CLAIM REJECTED: unowned/manual cast is active')
+        return false
+    end
     if wantsTarget and not canGrantResource(State.targetOwner, content.priority) then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (target not available): %s', content.module)
         debugLog('CLAIM REJECTED: target not available (owner=%s)', State.targetOwner and State.targetOwner.module or 'nil')
@@ -442,6 +545,12 @@ local function processClaim(content, sender)
         epoch = State.epoch,
         claimedAtMs = now,
         ttlMs = content.ttlMs or lib.Timing.CLAIM_DEFAULT_TTL_MS,
+        expectsCastStart = content.expectsCastStart == true,
+        castStartDeadlineMs = content.expectsCastStart == true
+            and (now + math.max(100,
+                tonumber(content.castStartTimeoutMs) or lib.Timing.CLAIM_CAST_START_MS))
+            or nil,
+        castStartedAtMs = nil,
         action = content.action,
     }
 
@@ -597,6 +706,7 @@ local function buildStatePayload()
             needAge = needAge,
             needTtl = need and need.ttlMs or 0,
             reason = need and need.reason or nil,
+            action = hb and hb.action or nil,
         }
     end
 
@@ -613,6 +723,9 @@ local function buildStatePayload()
         castBusy = State.castBusy,
         worldState = State.worldState,
         moduleDiag = moduleDiag,
+        team = ActorsTeam.getSnapshot(),
+        automationPaused = State.automationPaused == true,
+        settingsRevision = tonumber(State.settingsRevision) or 0,
     }
 end
 
@@ -675,13 +788,19 @@ end
 local _restartTracker = {}  -- { [script] = { count, lastAttemptMs } }
 local _lastWatchdogCheck = 0
 local _pendingReload = nil  -- { module, script, restartAtMs } — deferred reload from /sk_coord reload
+local _wasInGame = true
 
 --- Reset restart counter for a module when it sends a fresh heartbeat
 --- (called from onMessage heartbeat handler)
 local function onModuleHeartbeatReceived(scriptPath)
-    if scriptPath and _restartTracker[scriptPath] then
-        -- Module is alive again — reset its restart counter
-        _restartTracker[scriptPath].count = 0
+    local tracker = scriptPath and _restartTracker[scriptPath] or nil
+    if not tracker then return end
+    local now = lib.getTimeMs()
+    tracker.gaveUp = false
+    tracker.stableSinceMs = tracker.stableSinceMs or now
+    if (now - tracker.stableSinceMs) >= lib.Timing.RESTART_STABLE_MS then
+        tracker.count = 0
+        tracker.stableSinceMs = now
     end
 end
 
@@ -713,7 +832,36 @@ local function onMessage(message)
     end
 
     -- Route by mailbox
-    if msgType == 'claim' then
+    if msgType == 'supervisor_heartbeat' then
+        if not isLocalModuleMessage(content) then return end
+        local sentAtMs = tonumber(content.sentAtMs) or 0
+        -- Actors delivery is asynchronous. Never let a delayed heartbeat from
+        -- an older SideKick session replace the current supervisor session.
+        if sentAtMs < State.supervisorLastSentAt then return end
+        State.supervisorSeen = true
+        State.supervisorLastSeenAt = lib.getTimeMs()
+        State.supervisorLastSentAt = sentAtMs
+        State.supervisorSessionId = content.sessionId
+        local nextPaused = content.automationPaused == true
+        local nextRevision = tonumber(content.settingsRevision) or 0
+        if State.automationPaused ~= nextPaused or State.settingsRevision ~= nextRevision then
+            State.automationPaused = nextPaused
+            State.settingsRevision = nextRevision
+            State.pendingBroadcast = true
+        end
+    elseif msgType == 'supervisor_shutdown' then
+        if not isLocalModuleMessage(content) then return end
+        -- Only the currently heartbeating parent session may request a
+        -- destructive shutdown. Delayed cleanup from an older run is stale.
+        if not State.supervisorSeen
+            or not content.sessionId
+            or content.sessionId ~= State.supervisorSessionId then
+            debugLog('SUPERVISOR: ignored stale shutdown for session=%s (current=%s)',
+                tostring(content.sessionId), tostring(State.supervisorSessionId))
+            return
+        end
+        State.supervisorShutdownRequested = true
+    elseif msgType == 'claim' then
         if not isLocalModuleMessage(content) then return end
         processClaim(content, sender)
     elseif msgType == 'release' then
@@ -733,9 +881,13 @@ local function onMessage(message)
                 receivedAtMs = lib.getTimeMs(),  -- Use coordinator-local time for staleness (not sender time)
                 sentAtMs = content.sentAtMs,      -- Keep sender time for diagnostics only
                 ready = content.ready ~= false,
+                action = type(content.action) == 'table' and content.action or nil,
                 script = senderScript,
                 mailbox = mailbox,
             }
+            if senderScript and senderScript ~= '' then
+                State.moduleScripts[content.module] = senderScript
+            end
             -- Reset restart counter — module is alive
             onModuleHeartbeatReceived(senderScript)
         end
@@ -790,10 +942,11 @@ local function attemptRestart(moduleName, scriptPath)
     end
 
     local now = lib.getTimeMs()
-    local tracker = _restartTracker[scriptPath] or { count = 0, lastAttemptMs = 0 }
+    local tracker = _restartTracker[scriptPath] or { count = 0, lastAttemptMs = 0, stableSinceMs = nil }
 
     -- Enforce max restarts
     if tracker.count >= lib.MAX_MODULE_RESTARTS then
+        tracker.gaveUp = true
         debugLog('WATCHDOG: %s exceeded max restarts (%d/%d), giving up',
             scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS)
         return false
@@ -806,6 +959,7 @@ local function attemptRestart(moduleName, scriptPath)
 
     tracker.count = tracker.count + 1
     tracker.lastAttemptMs = now
+    tracker.stableSinceMs = nil
     _restartTracker[scriptPath] = tracker
 
     debugLog('WATCHDOG: Restarting %s (attempt %d/%d)',
@@ -850,7 +1004,8 @@ local function checkModuleHealth()
 
         -- Attempt restart (logs user-facing message on max restarts too)
         local scriptPath = entry.hb.script
-        if not attemptRestart(entry.name, scriptPath) and scriptPath then
+        local processAlive = scriptPath and lib.isLuaScriptRunning(scriptPath)
+        if not processAlive and not attemptRestart(entry.name, scriptPath) and scriptPath then
             local tracker = _restartTracker[scriptPath]
             if tracker and tracker.count >= lib.MAX_MODULE_RESTARTS then
                 -- print(string.format(
@@ -859,8 +1014,32 @@ local function checkModuleHealth()
             end
         end
 
-        -- Remove stale heartbeat so we don't re-detect next scan
-        State.moduleHeartbeats[entry.name] = nil
+        if processAlive then
+            -- Actors delivery can be delayed across zoning. MQ2Lua's process
+            -- table is authoritative, so keep a confirmed-live worker and
+            -- refresh its local watchdog timestamp instead of duplicating it.
+            entry.hb.receivedAtMs = now
+            debugLog('WATCHDOG: %s heartbeat stale but Lua process is %s; keeping it',
+                scriptPath, lib.getLuaScriptStatus(scriptPath))
+        else
+            -- Remove a genuinely stale heartbeat while restart is pending.
+            State.moduleHeartbeats[entry.name] = nil
+        end
+    end
+
+    -- A script that dies before sending its first post-restart heartbeat has
+    -- no heartbeat entry to become stale again. Retain its last script path
+    -- and retry after the cooldown until the session limit is reached.
+    for moduleName in pairs(State.knownModules) do
+        if not State.moduleHeartbeats[moduleName] then
+            local scriptPath = State.moduleScripts[moduleName]
+            local tracker = scriptPath and _restartTracker[scriptPath] or nil
+            if tracker and not tracker.gaveUp
+                and (now - tracker.lastAttemptMs) >= lib.Timing.RESTART_COOLDOWN_MS
+                and not lib.isLuaScriptRunning(scriptPath) then
+                attemptRestart(moduleName, scriptPath)
+            end
+        end
     end
 end
 
@@ -880,6 +1059,9 @@ local function initialize()
     mailboxDropboxes.interrupt = actors.register(lib.Mailbox.INTERRUPT, onMessage)
     mailboxDropboxes.heartbeat = actors.register(lib.Mailbox.HEARTBEAT, onMessage)
     mailboxDropboxes.need = actors.register(lib.Mailbox.NEED, onMessage)
+    mailboxDropboxes.supervisor = actors.register(lib.Mailbox.SUPERVISOR, onMessage)
+    ActorsTeam.init()
+    refreshTeamSettings()
 
     debugLog('Watchdog: crash=%dms, cooldown=%dms, maxRestarts=%d, checkInterval=%dms',
         lib.Timing.MODULE_CRASH_MS, lib.Timing.RESTART_COOLDOWN_MS,
@@ -891,6 +1073,101 @@ local _lastStatusLog = 0
 
 local function tick()
     local now = lib.getTimeMs()
+
+    -- An explicit shutdown remains authoritative even if it arrives during a
+    -- zone transition. Supervisor.stop() also directly stops the workers.
+    if State.supervisorShutdownRequested then
+        local reason = 'shutdown requested'
+        debugLog('SUPERVISOR: %s; stopping managed workers', reason)
+        lib.log('info', M.MODULE_NAME,
+            'Stopping managed workers: current supervisor session requested shutdown')
+        for _, script in ipairs(lib.Scripts.WORKERS) do
+            mq.cmdf('/lua stop %s', script)
+        end
+        State.running = false
+        return
+    end
+
+    -- A zone transition is a suspended automation state. Keep the coordinator
+    -- and supervisor session alive, clear any in-flight ownership, and publish
+    -- an idle snapshot without probing character/world TLOs or restarting
+    -- workers whose normal work is also suspended.
+    local inGame = lib.isInGame()
+    if not inGame then
+        _wasInGame = false
+        local changed = false
+        if State.worldState.inGame ~= false then
+            State.worldState.inGame = false
+            State.worldState.inCombat = false
+            State.worldState.groupNeedsHealing = false
+            State.worldState.emergencyActive = false
+            State.worldState.deadCount = 0
+            State.worldState.incapacitated = false
+            State.worldState.incapacitationReason = nil
+            State.worldState.stunned = false
+            State.worldState.mezzed = false
+            State.worldState.silenced = false
+            State.worldState.feared = false
+            State.castBusy = false
+            changed = true
+        end
+        if State.castOwner or State.targetOwner then
+            State.castOwner = nil
+            State.targetOwner = nil
+            changed = true
+        end
+        if State.activePriority ~= lib.Priority.IDLE then
+            State.activePriority = lib.Priority.IDLE
+            changed = true
+        end
+        if changed then
+            State.epoch = State.epoch + 1
+            State.pendingBroadcast = true
+        end
+        tickActorsTeam()
+        if State.pendingBroadcast or (now - State.lastBroadcastAt) >= lib.Timing.STATE_BROADCAST_MS then
+            broadcastState()
+        end
+        return
+    end
+
+    if not _wasInGame then
+        -- All timestamps below were recorded before zoning. Rebase them on
+        -- re-entry so the first in-game coordinator tick cannot declare the
+        -- still-running supervisor/workers stale before their callbacks run.
+        _wasInGame = true
+        if State.supervisorSeen then
+            State.supervisorLastSeenAt = now
+        end
+        for _, heartbeat in pairs(State.moduleHeartbeats) do
+            if heartbeat then heartbeat.receivedAtMs = now end
+        end
+        _lastWatchdogCheck = now
+        State.pendingBroadcast = true
+        debugLog('ZONE: in-game resumed; watchdog timestamps rebased')
+    end
+
+    if State.supervisorSeen
+        and (now - State.supervisorLastSeenAt) > lib.Timing.SUPERVISOR_ABSENCE_MS then
+        local parentScript = type(lib.Scripts.UI) == 'table' and lib.Scripts.UI[1] or lib.Scripts.UI
+        local parentStatus = lib.getLuaScriptStatus(parentScript)
+        if parentStatus == 'EXITED' then
+            debugLog('SUPERVISOR: heartbeat absent and parent exited; stopping managed workers')
+            lib.log('warn', M.MODULE_NAME,
+                'Stopping managed workers: SideKick parent process is EXITED')
+            for _, script in ipairs(lib.Scripts.WORKERS) do
+                mq.cmdf('/lua stop %s', script)
+            end
+            State.running = false
+            return
+        end
+
+        -- A missed Actors heartbeat must not kill healthy local processes.
+        -- Unknown status is also treated non-destructively.
+        State.supervisorLastSeenAt = now
+        debugLog('SUPERVISOR: heartbeat stale but parent status=%s; keeping workers',
+            parentStatus ~= '' and parentStatus or 'UNKNOWN')
+    end
 
     -- Handle pending module reload (deferred from /sk_coord reload bind)
     if _pendingReload and now >= _pendingReload.restartAtMs then
@@ -922,6 +1199,11 @@ local function tick()
         State.pendingBroadcast = true
     end
 
+    if clearOwnersForIncapacitation() then
+        State.epoch = State.epoch + 1
+        State.pendingBroadcast = true
+    end
+
     -- Compute active priority
     local newPriority = computeActivePriority()
     if newPriority ~= State.activePriority then
@@ -944,6 +1226,10 @@ local function tick()
 
     -- Watchdog: check for crashed modules
     checkModuleHealth()
+
+    -- Cross-character team presence is advanced from the coordinator coroutine.
+    -- Its Actor callback only enqueues packets and never reads TLOs or yields.
+    tickActorsTeam()
 
     -- Broadcast state
     local timeSinceBroadcast = now - State.lastBroadcastAt
@@ -986,6 +1272,14 @@ mq.bind('/sk_coord', function(cmd, arg1)
             State.epoch, State.activePriority,
             State.castOwner and State.castOwner.module or 'nil',
             State.targetOwner and State.targetOwner.module or 'nil')
+    elseif cmd == 'team' then
+        local team = ActorsTeam.getSnapshot()
+        printf('\ay[SK-Team]\ax enabled=%s ready=%s mode=%s team=%s leader=%s members=%d peers=%d reason=%s',
+            tostring(team.enabled), tostring(team.ready), tostring(team.mode),
+            tostring(team.label ~= '' and team.label or team.teamId),
+            tostring(team.leader ~= '' and team.leader or '-'),
+            tonumber(team.memberCount) or 0, tonumber(team.peerCount) or 0,
+            tostring(team.reason or '-'))
     elseif cmd == 'reload' then
         -- Reload a module by name: /sk_coord reload <modulename>
         if not arg1 or arg1 == '' then
@@ -1039,5 +1333,6 @@ M.broadcastState = broadcastState
 
 -- Run main loop
 mainLoop()
+ActorsTeam.shutdown()
 
 return M

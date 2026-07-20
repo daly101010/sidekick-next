@@ -351,6 +351,38 @@ function M.activate(def)
         end
 
         mq.cmd('/disc ' .. chosen)
+
+        -- Register active-duration strip entry for the disc bar countdown.
+        pcall(function()
+            local ActiveDur = require('sidekick-next.ui.active_duration_strip')
+            local durS = 0
+            local recastS = 0
+            local spell = mq.TLO.Spell(chosen)
+            if spell and spell() then
+                local d = spell.Duration and spell.Duration.TotalSeconds and spell.Duration.TotalSeconds()
+                durS = tonumber(d) or 0
+                if durS == 0 then
+                    local raw = spell.Duration and spell.Duration()
+                    raw = tonumber(raw) or 0
+                    if raw > 0 and raw < 5000 and math.floor(raw) == raw then
+                        durS = raw * 6  -- ticks → seconds
+                    end
+                end
+                local rms = spell.RecastTime and spell.RecastTime()
+                recastS = (tonumber(rms) or 0) / 1000
+            end
+            -- Prefer the live CombatAbilityTimer if it gives a value (more accurate
+            -- than the static Spell.RecastTime — accounts for any modifiers).
+            local cat = mq.TLO.Me and mq.TLO.Me.CombatAbilityTimer and mq.TLO.Me.CombatAbilityTimer(chosen)
+            if cat and cat() then
+                local ts = cat.TotalSeconds and cat.TotalSeconds()
+                ts = tonumber(ts) or 0
+                if ts > 0 then recastS = ts end
+            end
+            -- Skip the strip for instant/near-instant abilities (reuse < 2s).
+            if recastS < 2 then return end
+            if durS > 0 then ActiveDur.register(chosen, durS) end
+        end)
         return
     end
     if kind == 'spell' then
@@ -365,6 +397,21 @@ function M.activate(def)
             -- Fallback: direct cast (no state tracking)
             mq.cmdf('/cast "%s"', spellName)
         end
+        return
+    end
+    if kind == 'skill' then
+        local name = tostring(def.skillName or def.name or def.altName or '')
+        if name == '' then return end
+        local lower = name:lower()
+        -- Skills with their own slash commands take precedence over /doability.
+        if lower == 'sit' or lower == 'sit/stand' or lower == 'stand' then
+            mq.cmd('/sit')  -- /sit toggles between sit and stand
+        elseif lower == 'camp' then
+            mq.cmd('/camp')
+        else
+            mq.cmdf('/doability "%s"', name)
+        end
+        -- Cooldown overlay reads mq.TLO.Me.AbilityTimer live; no click hook needed.
         return
     end
 end

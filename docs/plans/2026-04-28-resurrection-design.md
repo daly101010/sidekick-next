@@ -1,8 +1,11 @@
 # Resurrection Module — Design
 
 **Date:** 2026-04-28
-**Status:** Approved (sections 1-4)
-**Implementer next step:** see writing-plans skill / impl doc
+**Status:** Superseded by the rez v2 implementation (2026-07-19)
+
+This document records the original v1 scope. Rez v2 adds item resources,
+automatic OOC memorization/restoration, Actor election, commands, NEC-visible
+settings, telemetry, optional navigation, and combat target-class filters.
 
 ## Context
 

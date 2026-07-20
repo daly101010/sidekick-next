@@ -23,6 +23,8 @@ local CLAIM_CATEGORIES = {
     ['buff:landed']     = 'buff_landed',
     ['cure:claim']      = 'cure_claim',
     ['cure:landed']     = 'cure_landed',
+    ['rez:claim']       = 'rez_claim',
+    ['rez:completed']   = 'rez_landed',
 }
 
 local M = {}
@@ -40,6 +42,8 @@ local _lastSendErr = nil
 local _lastSendResult = nil
 local _lastSendDbgAt = 0
 local _lastTickDbgAt = 0
+local _pendingActorMessages = {}
+local _processActorMessage = nil
 
 local _lastDockedSendAt = 0
 local _lastStatusSendAt = 0
@@ -99,6 +103,7 @@ local function normalize_sender(sender)
         character = sender.character or sender.Character or '',
         server = sender.server or sender.Server or '',
         mailbox = sender.mailbox or sender.Mailbox or '',
+        script = sender.script or sender.Script or '',
     }
 end
 
@@ -192,6 +197,23 @@ function M.init(opts)
     -- Load persisted claim ledger (archives any in-progress session into history).
     local L = ledger()
     if L and L.load then pcall(L.load) end
+
+    -- Actor handlers run with yielding disabled. Load every internal receiver
+    -- before registering the mailbox so a first message can never trigger a
+    -- module import from inside the callback.
+    local receiverModules = {
+        'sidekick-next.utils.core',
+        'sidekick-next.automation.assist',
+        'sidekick-next.utils.positioning',
+        'sidekick-next.automation.cc',
+        'sidekick-next.automation.debuff',
+        'sidekick-next.automation.buff',
+        'sidekick-next.utils.buff_requests',
+        'sidekick-next.automation.cures',
+    }
+    for _, moduleName in ipairs(receiverModules) do
+        pcall(require, moduleName)
+    end
     local _selfNameLower = tostring(_selfName or ''):lower()
     local _selfServerLower = tostring(_selfServer or ''):lower()
 
@@ -202,11 +224,8 @@ function M.init(opts)
         return _selfServerLower == '' or server == '' or server == _selfServerLower
     end
 
-    _dropbox = _actors.register('sidekick', function(message)
-        local content = message()
-        if type(content) ~= 'table' then return end
+    local function processActorMessage(content, sender)
         local id = tostring(content.id or ''):lower()
-        local sender = normalize_sender(message.sender)
 
         local senderCharLower = tostring(sender.character or ''):lower()
         local senderServerLower = tostring(sender.server or ''):lower()
@@ -261,7 +280,24 @@ function M.init(opts)
             reply.from = reply.from or _selfName
             reply.server = reply.server or _selfServer
             reply.zone = reply.zone or _selfZone
-            sendToGroupTarget(reply)
+            -- The classic UI asks from its own medley_remote mailbox. Reply
+            -- directly so it can display SideKick's internal automation pause
+            -- rather than merely MQ2Lua's process status.
+            if tostring(sender.mailbox or ''):find('medley_remote', 1, true)
+                and tostring(sender.character or '') ~= '' then
+                pcall(function()
+                    _dropbox:send({
+                        mailbox = 'medley_remote',
+                        script = tostring(sender.script or '') ~= '' and sender.script
+                            or (tostring(content.replyScript or '') ~= ''
+                                and content.replyScript or 'eq_ui_rebuild_classic'),
+                        character = sender.character,
+                        server = sender.server,
+                    }, reply)
+                end)
+            else
+                sendToGroupTarget(reply)
+            end
             return
         end
 
@@ -284,6 +320,12 @@ function M.init(opts)
                 server = tostring(content.server or sender.server or ''),
                 zone = tostring(content.zone or ''),
                 class = content.class or '',
+                id = tonumber(content.characterId or content.spawnId or content.charId) or 0,
+                currentHP = tonumber(content.currentHP) or 0,
+                maxHP = tonumber(content.maxHP) or 0,
+                dead = content.dead == true,
+                hovering = content.hovering == true,
+                role = content.role,
                 abilities = content.abilities or {},
                 buffs = content.buffs or {},  -- What buffs this character currently has
                 chase = content.chase,
@@ -311,8 +353,8 @@ function M.init(opts)
 
             -- Check if we should accept assists from this source based on settings
             -- Load settings via Core module
-            local okCore, Core = pcall(require, 'sidekick-next.utils.core')
-            local settings = okCore and Core and Core.Settings or {}
+            local Core = package.loaded['sidekick-next.utils.core']
+            local settings = Core and Core.Settings or {}
 
             -- Determine if sender is in group, raid, or is a known peer
             local senderSpawn = mq.TLO.Spawn('pc =' .. fromName)
@@ -364,8 +406,8 @@ function M.init(opts)
             end
 
             -- Import assist module and set the target
-            local ok, Assist = pcall(require, 'sidekick-next.automation.assist')
-            if ok and Assist then
+            local Assist = package.loaded['sidekick-next.automation.assist']
+            if Assist then
                 Assist.primaryTargetId = targetId
                 Assist.currentTargetId = targetId
                 Assist.tankName = fromName
@@ -438,8 +480,11 @@ function M.init(opts)
         -- for the session if positioning.lua failed to load; wrap with pcall
         -- to match the pattern used by other handlers in this file.
         local function _callPositioning(method)
-            local ok, Positioning = pcall(require, 'sidekick-next.utils.positioning')
-            if not ok or not Positioning or not Positioning[method] then return end
+            if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
+                return
+            end
+            local Positioning = package.loaded['sidekick-next.utils.positioning']
+            if not Positioning or not Positioning[method] then return end
             Positioning[method]()
         end
 
@@ -527,8 +572,8 @@ function M.init(opts)
         if id == 'cc:mezlist' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, CC = pcall(require, 'sidekick-next.automation.cc')
-            if ok and CC and CC.receiveMezList then
+            local CC = package.loaded['sidekick-next.automation.cc']
+            if CC and CC.receiveMezList then
                 CC.receiveMezList(content)
             end
             return
@@ -538,8 +583,8 @@ function M.init(opts)
         if id == 'cc:claim' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, CC = pcall(require, 'sidekick-next.automation.cc')
-            if ok and CC and CC.receiveClaim then
+            local CC = package.loaded['sidekick-next.automation.cc']
+            if CC and CC.receiveClaim then
                 CC.receiveClaim(content)
             end
             return
@@ -549,8 +594,8 @@ function M.init(opts)
         if id == 'debuff:claim' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Debuff = pcall(require, 'sidekick-next.automation.debuff')
-            if ok and Debuff and Debuff.receiveClaim then
+            local Debuff = package.loaded['sidekick-next.automation.debuff']
+            if Debuff and Debuff.receiveClaim then
                 Debuff.receiveClaim(content)
             end
             return
@@ -560,8 +605,8 @@ function M.init(opts)
         if id == 'debuff:landed' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Debuff = pcall(require, 'sidekick-next.automation.debuff')
-            if ok and Debuff and Debuff.receiveDebuffLanded then
+            local Debuff = package.loaded['sidekick-next.automation.debuff']
+            if Debuff and Debuff.receiveDebuffLanded then
                 Debuff.receiveDebuffLanded(content)
             end
             return
@@ -570,6 +615,7 @@ function M.init(opts)
         -- Healing coordination: incoming heal broadcasts (uses callback to avoid circular require)
         if id == 'heal:incoming' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local cb = _healingCallbacks['heal:incoming']
             if cb then
                 local senderName = tostring(sender.character or sender.name or 'unknown')
@@ -580,6 +626,7 @@ function M.init(opts)
 
         if id == 'heal:landed' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local cb = _healingCallbacks['heal:landed']
             if cb then
                 local senderName = tostring(sender.character or sender.name or 'unknown')
@@ -590,6 +637,7 @@ function M.init(opts)
 
         if id == 'heal:cancelled' then
             if fromMe then return end
+            if not senderInSameZone(content, sender) then return end
             local cb = _healingCallbacks['heal:cancelled']
             if cb then
                 local senderName = tostring(sender.character or sender.name or 'unknown')
@@ -611,6 +659,12 @@ function M.init(opts)
             _healClaims[tid][from] = {
                 spellName = tostring(content.spellName or ''),
                 tier = tostring(content.tier or ''),
+                priority = tonumber(content.priority),
+                expectedAmount = math.max(0, tonumber(content.expectedAmount) or 0),
+                castTimeMs = math.max(0, tonumber(content.castTimeMs) or 0),
+                projectedNeed = math.max(0, tonumber(content.projectedNeed) or 0),
+                coveragePct = math.max(0, tonumber(content.coveragePct) or 0),
+                claimKey = tostring(content.claimKey or ''),
                 expiresAt = tonumber(content.expiresAt) or (os.time() + HEAL_CLAIM_TTL),
                 claimedAt = os.time(),   -- keep in epoch seconds to match expiresAt
                 from = from,
@@ -645,8 +699,8 @@ function M.init(opts)
         if id == 'buff:list' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
-            if ok and Buff and Buff.receiveBuffList then
+            local Buff = package.loaded['sidekick-next.automation.buff']
+            if Buff and Buff.receiveBuffList then
                 Buff.receiveBuffList(content)
             end
             return
@@ -656,8 +710,8 @@ function M.init(opts)
         if id == 'buff:claim' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
-            if ok and Buff and Buff.receiveClaim then
+            local Buff = package.loaded['sidekick-next.automation.buff']
+            if Buff and Buff.receiveClaim then
                 Buff.receiveClaim(content)
             end
             return
@@ -667,15 +721,15 @@ function M.init(opts)
         if id == 'buff:landed' then
             if not fromMe then
                 if not senderInSameZone(content, sender) then return end
-                local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
-                if ok and Buff and Buff.receiveBuffLanded then
+                local Buff = package.loaded['sidekick-next.automation.buff']
+                if Buff and Buff.receiveBuffLanded then
                     Buff.receiveBuffLanded(content)
                 end
             end
             -- Clear any pending buff request that this landing satisfies (also
             -- when fromMe — we may have answered our own request).
-            local okR, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
-            if okR and Reqs and Reqs.clearRequest then
+            local Reqs = package.loaded['sidekick-next.utils.buff_requests']
+            if Reqs and Reqs.clearRequest then
                 local tid = tonumber(content.targetId) or 0
                 local cat = tostring(content.buffType or content.category or '')
                 if tid > 0 and cat ~= '' then Reqs.clearRequest(tid, cat) end
@@ -686,8 +740,8 @@ function M.init(opts)
         -- Buff request: peer asks the team for a specific buff category
         if id == 'buff:need' then
             if not senderInSameZone(content, sender) then return end
-            local okR, Reqs = pcall(require, 'sidekick-next.utils.buff_requests')
-            if okR and Reqs and Reqs.receiveNeed then
+            local Reqs = package.loaded['sidekick-next.utils.buff_requests']
+            if Reqs and Reqs.receiveNeed then
                 Reqs.receiveNeed(content)
             end
             return
@@ -697,8 +751,8 @@ function M.init(opts)
         if id == 'buff:blocks' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Buff = pcall(require, 'sidekick-next.automation.buff')
-            if ok and Buff and Buff.receiveBlocks then
+            local Buff = package.loaded['sidekick-next.automation.buff']
+            if Buff and Buff.receiveBlocks then
                 Buff.receiveBlocks(content)
             end
             return
@@ -708,8 +762,8 @@ function M.init(opts)
         if id == 'cure:claim' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
-            if ok and Cures and Cures.receiveClaim then
+            local Cures = package.loaded['sidekick-next.automation.cures']
+            if Cures and Cures.receiveClaim then
                 Cures.receiveClaim(content)
             end
             return
@@ -719,8 +773,8 @@ function M.init(opts)
         if id == 'cure:capabilities' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
-            if ok and Cures and Cures.receiveCapabilities then
+            local Cures = package.loaded['sidekick-next.automation.cures']
+            if Cures and Cures.receiveCapabilities then
                 Cures.receiveCapabilities(content)
             end
             return
@@ -730,12 +784,25 @@ function M.init(opts)
         if id == 'cure:landed' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
-            local ok, Cures = pcall(require, 'sidekick-next.automation.cures')
-            if ok and Cures and Cures.receiveCureLanded then
+            local Cures = package.loaded['sidekick-next.automation.cures']
+            if Cures and Cures.receiveCureLanded then
                 Cures.receiveCureLanded(content)
             end
             return
         end
+    end
+
+    _processActorMessage = processActorMessage
+    _dropbox = _actors.register('sidekick', function(message)
+        local content = message()
+        if type(content) ~= 'table' then return end
+        if #_pendingActorMessages >= 500 then
+            table.remove(_pendingActorMessages, 1)
+        end
+        _pendingActorMessages[#_pendingActorMessages + 1] = {
+            content = content,
+            sender = normalize_sender(message.sender),
+        }
     end)
 
     return _dropbox
@@ -763,6 +830,16 @@ end
 function M.tick(opts)
     opts = opts or {}
     local now = os.clock()
+
+    -- Actor callbacks only enqueue. Process messages here in the yieldable
+    -- main coroutine, where receiver code may safely perform normal work.
+    if _processActorMessage and #_pendingActorMessages > 0 then
+        local pending = _pendingActorMessages
+        _pendingActorMessages = {}
+        for _, entry in ipairs(pending) do
+            pcall(_processActorMessage, entry.content, entry.sender)
+        end
+    end
 
     -- Refresh our cached zone every tick so outbound replies and the
     -- senderInSameZone fallback never use a stale value across zone-ins.
@@ -803,16 +880,23 @@ function M.tick(opts)
         local prev = _lastStatusPayload
         local changed = not prev
             or (opts.status.hp or 0) ~= (prev.hp or 0)
+            or (opts.status.currentHP or 0) ~= (prev.currentHP or 0)
+            or (opts.status.maxHP or 0) ~= (prev.maxHP or 0)
             or (opts.status.mana or 0) ~= (prev.mana or 0)
             or (opts.status.endur or 0) ~= (prev.endur or 0)
+            or (opts.status.dead == true) ~= (prev.dead == true)
+            or (opts.status.hovering == true) ~= (prev.hovering == true)
+            or (opts.status.characterId or 0) ~= (prev.characterId or 0)
+            or (opts.status.zone or '') ~= (prev.zone or '')
             or (opts.status.targetId or 0) ~= (prev.targetId or 0)
             or (opts.status.combat) ~= (prev.combat)
             or (opts.status.casting or '') ~= (prev.casting or '')
+            or (opts.status.automationPaused == true) ~= (prev.automationPaused == true)
             or (now - _lastStatusSendAt) >= 2.0  -- Force send every 2s as heartbeat
         if changed then
             _lastStatusSendAt = now
             _lastStatusPayload = opts.status
-            sendToGroupTarget(opts.status)
+            if not opts.peerOnly then sendToGroupTarget(opts.status) end
             -- Also broadcast to other SideKick instances for remote abilities
             if _dropbox then
                 pcall(function()
@@ -895,20 +979,104 @@ end
 --- Returns the most recent (winning) claim, or nil if unclaimed.
 --- @param targetId number The spawn ID to check
 --- @return table|nil The winning claim { from, spellName, tier, claimedAt, expiresAt } or nil
-function M.getWinningClaim(targetId)
+local function healClaimPriority(claim)
+    if claim and tonumber(claim.priority) then return tonumber(claim.priority) end
+    return claim and tostring(claim.tier or ''):lower() == 'emergency' and 0 or 1
+end
+
+local HEAL_REQUIRED_COVERAGE = 0.80
+
+local function claimCoverage(claim)
+    local expected = math.max(0, tonumber(claim and claim.expectedAmount) or 0)
+    local need = math.max(0, tonumber(claim and claim.projectedNeed) or 0)
+    if need <= 0 then return 0, expected, need end
+    return expected / need, expected, need
+end
+
+local function claimBeats(a, b)
+    if not b then return true end
+    local ap = healClaimPriority(a)
+    local bp = healClaimPriority(b)
+    if ap ~= bp then return ap < bp end
+
+    local ac, ae, an = claimCoverage(a)
+    local bc, be, bn = claimCoverage(b)
+    local aa = ac >= HEAL_REQUIRED_COVERAGE
+    local ba = bc >= HEAL_REQUIRED_COVERAGE
+    if aa ~= ba then return aa end
+
+    local at = math.max(0, tonumber(a and a.castTimeMs) or 0)
+    local bt = math.max(0, tonumber(b and b.castTimeMs) or 0)
+    if aa then
+        -- Once both heals are sufficient, prefer the one that lands first,
+        -- then the one that wastes less healing.
+        if at ~= bt then return at < bt end
+        local ao = math.max(0, ae - an)
+        local bo = math.max(0, be - bn)
+        if ao ~= bo then return ao < bo end
+    else
+        -- If neither heal is sufficient, take the strongest coverage first.
+        if ac ~= bc then return ac > bc end
+        if at ~= bt then return at < bt end
+    end
+
+    -- Final deterministic tie-break; no synchronized clocks are required.
+    return tostring(a.from or ''):lower() < tostring(b.from or ''):lower()
+end
+
+function M.getWinningClaim(targetId, localClaim)
     pruneHealTables()
     local perFrom = _healClaims[targetId]
-    if not perFrom then return nil end
-    local best = nil
-    for _, claim in pairs(perFrom) do
-        -- Skip our own claims
-        if claim.from ~= _selfName then
-            if not best or (claim.claimedAt or 0) > (best.claimedAt or 0) then
-                best = claim
-            end
+    local best = localClaim
+    for _, claim in pairs(perFrom or {}) do
+        if claim.from ~= _selfName and claimBeats(claim, best) then
+            best = claim
         end
     end
     return best
+end
+
+--- Determine whether this character wins a distributed heal intent claim.
+function M.isHealClaimWinner(targetId, localClaim)
+    localClaim = localClaim or {}
+    localClaim.from = localClaim.from or _selfName
+    pruneHealTables()
+
+    local localName = tostring(localClaim.from or _selfName or ''):lower()
+    local claims = { localClaim }
+    for _, claim in pairs(_healClaims[targetId] or {}) do
+        if tostring(claim.from or ''):lower() ~= localName then
+            claims[#claims + 1] = claim
+        end
+    end
+    table.sort(claims, claimBeats)
+
+    local requiredNeed = 0
+    local hasExpected = false
+    for _, claim in ipairs(claims) do
+        requiredNeed = math.max(requiredNeed, tonumber(claim.projectedNeed) or 0)
+        hasExpected = hasExpected or (tonumber(claim.expectedAmount) or 0) > 0
+    end
+
+    -- Preserve one-winner behavior if no contender has usable coverage data.
+    if requiredNeed <= 0 or not hasExpected then
+        local winner = claims[1]
+        return winner ~= nil and tostring(winner.from or ''):lower() == localName, winner
+    end
+
+    local requiredCoverage = requiredNeed * HEAL_REQUIRED_COVERAGE
+    local covered = 0
+    local first = claims[1]
+    for _, claim in ipairs(claims) do
+        local accepted = covered < requiredCoverage
+        if accepted then
+            covered = covered + math.max(0, tonumber(claim.expectedAmount) or 0)
+        end
+        if tostring(claim.from or ''):lower() == localName then
+            return accepted, accepted and claim or first
+        end
+    end
+    return false, first
 end
 
 --- Register a callback for healing-related Actor messages
@@ -944,6 +1112,36 @@ function M.broadcast(msgId, payload)
         local L = ledger()
         if L then L.record(payload.from, cat) end
     end
+end
+
+--- Send to a logical mailbox owned by a specific Lua script. Omitting a
+--- character intentionally broadcasts to that script on connected peers.
+function M.sendToScript(scriptName, msgId, payload)
+    if not _dropbox or not scriptName or scriptName == '' then return false end
+    payload = payload or {}
+    payload.id = msgId
+    payload.from = payload.from or _selfName
+    return pcall(function()
+        _dropbox:send({ mailbox = 'sidekick', script = scriptName }, payload)
+    end)
+end
+
+--- Send to another Lua script for this same character only. This avoids
+--- broadcasting UI-only telemetry to every connected SideKick peer.
+function M.sendToLocalScript(scriptName, msgId, payload)
+    if not _dropbox or not scriptName or scriptName == '' then return false end
+    payload = payload or {}
+    payload.id = msgId
+    payload.from = payload.from or _selfName
+    payload.server = payload.server or _selfServer
+    return pcall(function()
+        _dropbox:send({
+            mailbox = 'sidekick',
+            script = scriptName,
+            character = _selfName,
+            server = _selfServer,
+        }, payload)
+    end)
 end
 
 --- Broadcast the primary kill target to assisters

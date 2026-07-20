@@ -903,18 +903,16 @@ local function cleanupExpired()
     end
 end
 
---------------------------------------------------------------------------------
--- Main Tick
---------------------------------------------------------------------------------
-
-function M.tick(settings)
+--- Select a cure without issuing a cast. Coordinated workers use this before
+-- requesting exclusive cast ownership.
+function M.selectCureAction(settings)
     if not _state.initialized then
         M.init()
     end
 
     local now = os.clock()
     if (now - _state.lastTick) < TICK_INTERVAL then
-        return false
+        return nil, 'throttled'
     end
     _state.lastTick = now
 
@@ -933,19 +931,30 @@ function M.tick(settings)
 
     -- Check if we can cure right now
     if not canCureNow(settings) then
-        return false
+        return nil, 'not_ready'
     end
 
     -- Don't spam cures too fast
     if (now - _state.lastCureCastAt) < 1.5 then
-        return false
+        return nil, 'cast_throttle'
     end
 
     -- Find best cure target
     local target = M.getBestCureTarget(settings)
     if not target then
-        return false
+        return nil, 'no_target'
     end
+
+    return target, 'cure'
+end
+
+--------------------------------------------------------------------------------
+-- Main Tick
+--------------------------------------------------------------------------------
+
+function M.tick(settings)
+    local target = M.selectCureAction(settings)
+    if not target then return false end
 
     -- Cast the cure
     local success, reason = M.castCure(target.targetId, target.debuffType, target.cureSpell)

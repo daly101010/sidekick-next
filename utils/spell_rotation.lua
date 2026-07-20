@@ -135,51 +135,49 @@ function M.selectNextSpell(spells, settings, targetId)
     end
 
     for _, spellDef in ipairs(spells) do
-        if type(spellDef) ~= 'table' then goto continue end
+        -- A repeat block gives us a continue-like `break` without Lua goto
+        -- scope hazards around the locals declared during spell evaluation.
+        repeat
+            if type(spellDef) ~= 'table' then break end
 
-        local spellName = spellDef.spellName or spellDef.name
-        if not spellName or spellName == '' then goto continue end
+            local spellName = spellDef.spellName or spellDef.name
+            if not spellName or spellName == '' then break end
 
-        -- Check if enabled
-        local enabled = spellDef.settingKey and settings[spellDef.settingKey]
-        if enabled == false then goto continue end
+            -- Check if enabled
+            local enabled = spellDef.settingKey and settings[spellDef.settingKey]
+            if enabled == false then break end
 
-        -- Check category condition
-        if not M.checkCategoryCondition(spellDef, settings) then
-            goto continue
-        end
+            -- Check category condition
+            if not M.checkCategoryCondition(spellDef, settings) then break end
 
-        -- Get spell info
-        local spell = mq.TLO.Spell(spellName)
-        if not spell or not spell() then goto continue end
+            -- Get spell info
+            local spell = mq.TLO.Spell(spellName)
+            if not spell or not spell() then break end
 
-        -- Check resist type filter for damage spells
-        local category = spellDef.category or ''
-        if category == 'nuke' or category == 'dot' then
-            if not M.matchesResistType(spell, preferredResist) then
-                goto continue
+            -- Check resist type filter for damage spells
+            local category = spellDef.category or ''
+            if (category == 'nuke' or category == 'dot')
+                and not M.matchesResistType(spell, preferredResist) then
+                break
             end
-        end
 
-        -- Check immune database
-        if ImmuneDB and type(ImmuneDB.isImmune) == 'function' and settings.UseImmuneDatabase and targetName ~= '' then
-            local immuneCategory = M.getImmuneCategoryForSpell(spellDef, spell)
-            if ImmuneDB.isImmune(targetName, immuneCategory) then
-                goto continue
+            -- Check immune database
+            if ImmuneDB and type(ImmuneDB.isImmune) == 'function'
+                and settings.UseImmuneDatabase and targetName ~= '' then
+                local immuneCategory = M.getImmuneCategoryForSpell(spellDef, spell)
+                if ImmuneDB.isImmune(targetName, immuneCategory) then break end
             end
-        end
 
-        -- Check if spell is ready (in gem and not on cooldown)
-        local gemSlot = mq.TLO.Me.Gem(spellName)
-        if not gemSlot or not gemSlot() then goto continue end
+            -- Check if spell is ready (in gem and not on cooldown)
+            local gemSlot = mq.TLO.Me.Gem(spellName)
+            if not gemSlot or not gemSlot() then break end
 
-        local ready = mq.TLO.Me.SpellReady(spellName)
-        if not ready or not ready() then goto continue end
+            local ready = mq.TLO.Me.SpellReady(spellName)
+            if not ready or not ready() then break end
 
-        -- This spell is available
-        return spellDef
-
-        ::continue::
+            -- This spell is available
+            return spellDef
+        until true
     end
 
     return nil

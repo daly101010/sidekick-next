@@ -19,6 +19,7 @@ local M = {}
 ---@field condition table|nil Condition data from condition_builder (nil = always cast)
 ---@field priority number|nil Priority override (nil = use type-based default from spell category)
 ---@field buffTarget BuffTarget|nil Target configuration for beneficial spells
+---@field utility table|nil Utility flags for non-rotation self utility spells
 
 ---@class OocBuffConfig
 ---@field spellId number The spell ID for this OOC buff
@@ -31,6 +32,7 @@ local M = {}
 ---@field name string The spell set name
 ---@field gems table<number, GemConfig> Map of gem slot (1-13) to GemConfig
 ---@field oocBuffs OocBuffConfig[] Array of OOC buff configurations, ordered by priority
+---@field spellProfiles table<number, GemConfig> Saved automation metadata keyed by spell ID
 
 --------------------------------------------------------------------------------
 -- Constants
@@ -61,6 +63,19 @@ M.OOC_BUFF_PRIORITY_INCREMENT = 10
 --------------------------------------------------------------------------------
 -- Utility Functions
 --------------------------------------------------------------------------------
+
+local function deepCopy(value, seen)
+    if type(value) ~= 'table' then return value end
+    seen = seen or {}
+    if seen[value] then return seen[value] end
+
+    local copy = {}
+    seen[value] = copy
+    for key, item in pairs(value) do
+        copy[deepCopy(key, seen)] = deepCopy(item, seen)
+    end
+    return copy
+end
 
 --- Get the total number of gem slots available
 ---@return number Total gem count from Me.NumGems()
@@ -100,6 +115,7 @@ function M.newSpellSet(name)
         name = name,
         gems = {},
         oocBuffs = {},
+        spellProfiles = {},
     }
 
     return set
@@ -108,6 +124,39 @@ end
 --------------------------------------------------------------------------------
 -- Gem Operations
 --------------------------------------------------------------------------------
+
+--- Preserve a gem's automation metadata by spell identity.
+--- This lets a temporarily removed spell recover its condition and targeting
+--- configuration when it is later placed in any gem slot.
+---@param spellSet SpellSet The spell set to modify
+---@param gemConfig GemConfig The configured spell to remember
+---@return boolean True if a profile was stored
+function M.rememberGemProfile(spellSet, gemConfig)
+    local spellId = gemConfig and tonumber(gemConfig.spellId) or nil
+    if not spellSet or not spellId or spellId <= 0 then return false end
+
+    spellSet.spellProfiles = spellSet.spellProfiles or {}
+    spellSet.spellProfiles[spellId] = {
+        spellId = spellId,
+        condition = deepCopy(gemConfig.condition),
+        priority = gemConfig.priority,
+        buffTarget = deepCopy(gemConfig.buffTarget),
+        utility = deepCopy(gemConfig.utility),
+    }
+    return true
+end
+
+--- Retrieve a copy of the saved automation metadata for a spell.
+---@param spellSet SpellSet The spell set to query
+---@param spellId number The spell ID to find
+---@return GemConfig|nil A detached profile copy, or nil when none was saved
+function M.getSpellProfile(spellSet, spellId)
+    spellId = tonumber(spellId)
+    if not spellSet or not spellId or not spellSet.spellProfiles then return nil end
+    local profile = spellSet.spellProfiles[spellId]
+    if not profile then return nil end
+    return deepCopy(profile)
+end
 
 --- Find which gem slot contains a spell ID
 ---@param spellSet SpellSet The spell set to search
@@ -133,8 +182,9 @@ end
 ---@param condition table|nil Optional condition data
 ---@param priority number|nil Optional priority override
 ---@param buffTarget BuffTarget|nil Optional buff target configuration
+---@param utility table|nil Optional utility flags
 ---@return boolean True if successful
-function M.setGem(spellSet, slot, spellId, condition, priority, buffTarget)
+function M.setGem(spellSet, slot, spellId, condition, priority, buffTarget, utility)
     if not spellSet or not slot or not spellId then return false end
     if slot < 1 then return false end
 
@@ -143,13 +193,31 @@ function M.setGem(spellSet, slot, spellId, condition, priority, buffTarget)
 
     spellSet.gems = spellSet.gems or {}
 
+    -- Save the displaced spell before replacing it. Restore any metadata that
+    -- was previously saved for the incoming spell when the caller did not
+    -- provide a replacement value for that field.
+    local existing = spellSet.gems[slot]
+    if existing then
+        M.rememberGemProfile(spellSet, existing)
+    end
+    local profile = M.getSpellProfile(spellSet, spellId)
+    if profile then
+        if condition == nil then condition = profile.condition end
+        if priority == nil then priority = profile.priority end
+        if buffTarget == nil then buffTarget = profile.buffTarget end
+        if utility == nil then utility = profile.utility end
+    end
+
     ---@type GemConfig
-    spellSet.gems[slot] = {
+    local gemConfig = {
         spellId = spellId,
-        condition = condition,
+        condition = deepCopy(condition),
         priority = priority,
-        buffTarget = buffTarget,
+        buffTarget = deepCopy(buffTarget),
+        utility = deepCopy(utility),
     }
+    spellSet.gems[slot] = gemConfig
+    M.rememberGemProfile(spellSet, gemConfig)
 
     return true
 end
@@ -163,6 +231,7 @@ function M.clearGem(spellSet, slot)
     if not spellSet.gems then return false end
 
     if spellSet.gems[slot] then
+        M.rememberGemProfile(spellSet, spellSet.gems[slot])
         spellSet.gems[slot] = nil
         return true
     end
@@ -494,31 +563,18 @@ function M.clone(spellSet)
     local copy = M.newSpellSet(spellSet.name)
     if not copy then return nil end
 
-    -- Copy gems
+    -- Copy gems and saved per-spell automation profiles
     for slot, gemConfig in pairs(spellSet.gems or {}) do
-        copy.gems[slot] = {
-            spellId = gemConfig.spellId,
-            condition = gemConfig.condition, -- Note: shallow copy of condition table
-            priority = gemConfig.priority,
-            buffTarget = gemConfig.buffTarget and {
-                type = gemConfig.buffTarget.type,
-                value = gemConfig.buffTarget.value,
-            } or nil,
-        }
+        copy.gems[slot] = deepCopy(gemConfig)
+    end
+
+    for spellId, profile in pairs(spellSet.spellProfiles or {}) do
+        copy.spellProfiles[spellId] = deepCopy(profile)
     end
 
     -- Copy OOC buffs
     for _, buffConfig in ipairs(spellSet.oocBuffs or {}) do
-        table.insert(copy.oocBuffs, {
-            spellId = buffConfig.spellId,
-            enabled = buffConfig.enabled,
-            priority = buffConfig.priority,
-            condition = buffConfig.condition, -- Note: shallow copy of condition table
-            buffTarget = buffConfig.buffTarget and {
-                type = buffConfig.buffTarget.type,
-                value = buffConfig.buffTarget.value,
-            } or nil,
-        })
+        table.insert(copy.oocBuffs, deepCopy(buffConfig))
     end
 
     return copy

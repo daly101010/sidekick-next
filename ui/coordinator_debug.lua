@@ -17,10 +17,18 @@ M._stateDropbox = nil
 local State = {
     last = nil,
     receivedAtMs = 0,
+    rezTelemetry = nil,
 }
+local renderRezTelemetry
 
--- Lazy-load healing module
-local getHealing = lazy.once('sidekick-next.healing')
+-- The coordinated healing runtime belongs exclusively to sk_healing.lua.
+-- This UI process reads its persisted config and coordinator diagnostics; it
+-- must not initialize a second copy of the healing sensors and event handlers.
+local getHealingConfig = lazy('sidekick-next.healing.config')
+local _healingConfigLoaded = false
+local _healingConfigLoadError = nil
+local _lastHealingConfigRefreshMs = 0
+local HEALING_CONFIG_REFRESH_MS = 2000
 
 -- Get spell availability info
 local function getSpellAvailability(spellName)
@@ -74,10 +82,19 @@ end
 
 -- Get all heals with their availability
 local function getHealAvailability()
-    local healing = getHealing()
-    if not healing or not healing.Config then return nil end
-
-    local config = healing.Config
+    local config = getHealingConfig()
+    if not config then return nil end
+    local now = mq.gettime()
+    if config.load and (now - _lastHealingConfigRefreshMs) >= HEALING_CONFIG_REFRESH_MS then
+        local ok, err = pcall(config.load)
+        _lastHealingConfigRefreshMs = now
+        if ok then
+            _healingConfigLoaded = true
+            _healingConfigLoadError = nil
+        else
+            _healingConfigLoadError = tostring(err)
+        end
+    end
     if not config.spells then return nil end
 
     local categories = { 'fast', 'small', 'medium', 'large', 'group', 'hot', 'hotLight', 'groupHot', 'promised' }
@@ -114,12 +131,17 @@ local moduleOrder = {
     healing_emergency = 10,
     emergency = 20,
     healing = 30,
+    cures = 35,
     resurrection = 40,
+    cc = 45,
     disciplines = 50,
+    assist = 55,
     dps = 60,
+    resources = 65,
     buffs = 70,
     spell_memorize = 80,
     meditation = 90,
+    next_meditation = 90,
 }
 
 local function formatBool(v)
@@ -177,6 +199,8 @@ local function renderOwnerBlock(title, owner)
         { 'Priority', tostring(priorityNames[owner.priority] or owner.priority or '?') },
         { 'Claim ID', tostring(owner.claimId or '?') },
         { 'TTL (ms)', tostring(owner.ttlMs or '?') },
+        { 'Expects Cast Start', formatBool(owner.expectsCastStart) },
+        { 'Cast Started', formatBool(owner.castStartedAtMs ~= nil) },
     }
     renderTable('##' .. title .. '_owner', rows)
 
@@ -248,11 +272,12 @@ local function renderModuleDiagnostics(moduleDiag)
         )
     end
 
-    if imgui.BeginTable('##module_diag', 6, flags) then
+    if imgui.BeginTable('##module_diag', 7, flags) then
         imgui.TableSetupColumn('Module', ImGuiTableColumnFlags.WidthFixed, 130)
         imgui.TableSetupColumn('HB', ImGuiTableColumnFlags.WidthFixed, 55)
         imgui.TableSetupColumn('Needs', ImGuiTableColumnFlags.WidthFixed, 50)
         imgui.TableSetupColumn('Priority', ImGuiTableColumnFlags.WidthFixed, 70)
+        imgui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 150)
         imgui.TableSetupColumn('Age', ImGuiTableColumnFlags.WidthFixed, 60)
         imgui.TableSetupColumn('Reason', ImGuiTableColumnFlags.WidthStretch)
         imgui.TableHeadersRow()
@@ -306,6 +331,27 @@ local function renderModuleDiagnostics(moduleDiag)
                 imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
             end
 
+            -- Unified executor lifecycle (active action or most recent result)
+            imgui.TableNextColumn()
+            local action = diag.action
+            if action and action.phase then
+                local label = string.format('%s: %s', tostring(action.phase), tostring(action.name or '?'))
+                if action.active then
+                    imgui.TextColored(0.3, 1.0, 0.3, 1, label)
+                elseif action.phase == 'failed' or action.phase == 'cancelled' then
+                    imgui.TextColored(1.0, 0.5, 0.3, 1, label)
+                else
+                    imgui.TextDisabled(label)
+                end
+                if imgui.IsItemHovered() then
+                    local tooltip = string.format('reason=%s elapsed=%dms',
+                        tostring(action.reason or '-'), tonumber(action.elapsedMs) or 0)
+                    imgui.SetTooltip(tooltip:gsub('%%', '%%%%'))
+                end
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
+            end
+
             -- Need age
             imgui.TableNextColumn()
             if diag.needsAction or diag.needValid then
@@ -330,7 +376,8 @@ local function renderModuleDiagnostics(moduleDiag)
                 -- Color code common reasons
                 if reason == 'no_action' or reason == 'no_emergency' or reason == 'no_emergency_action' then
                     imgui.TextColored(0.6, 0.6, 0.6, 1, reason)
-                elseif reason == 'heals_disabled' or reason == 'spells_disabled' or reason == 'not_clr' then
+                elseif reason == 'heals_disabled' or reason == 'spells_disabled'
+                    or reason == 'not_healer' or reason == 'not_clr' then
                     imgui.TextColored(1.0, 0.3, 0.3, 1, reason)  -- Red = config/class problem
                 elseif reason == 'init_failed' or reason == 'no_settings' then
                     imgui.TextColored(1.0, 0.5, 0.3, 1, reason)  -- Orange = init problem
@@ -346,6 +393,76 @@ local function renderModuleDiagnostics(moduleDiag)
             imgui.PopID()
         end
 
+        imgui.EndTable()
+    end
+end
+
+local function renderTeamDiagnostics(team)
+    if not team or type(team) ~= 'table' then
+        imgui.TextDisabled('No Actor team data in coordinator state')
+        return
+    end
+
+    local stats = team.stats or {}
+    renderTable('##actor_team_summary', {
+        { 'Enabled / Ready', string.format('%s / %s', formatBool(team.enabled), formatBool(team.ready)) },
+        { 'Mode', tostring(team.mode or '-') },
+        { 'Team', tostring(team.label ~= '' and team.label or team.teamId or '-') },
+        { 'Leader', tostring(team.leader ~= '' and team.leader or '-') },
+        { 'Members / Peers', string.format('%d / %d', tonumber(team.memberCount) or 0, tonumber(team.peerCount) or 0) },
+        { 'Reason', tostring(team.reason or '-') },
+        { 'Packets S/R/D', string.format('%d / %d / %d', tonumber(stats.sent) or 0,
+            tonumber(stats.received) or 0, tonumber(stats.dropped) or 0) },
+        { 'Last Error', tostring(team.lastError or '-') },
+    })
+
+    local members = type(team.members) == 'table' and team.members or {}
+    if #members == 0 then return end
+
+    local flags = 0
+    if ImGuiTableFlags and bit32 and bit32.bor then
+        flags = bit32.bor(ImGuiTableFlags.Borders, ImGuiTableFlags.RowBg, ImGuiTableFlags.Resizable)
+    end
+    if imgui.BeginTable('##actor_team_members', 7, flags) then
+        imgui.TableSetupColumn('Character', ImGuiTableColumnFlags.WidthFixed, 110)
+        imgui.TableSetupColumn('Class / Role', ImGuiTableColumnFlags.WidthFixed, 95)
+        imgui.TableSetupColumn('Zone', ImGuiTableColumnFlags.WidthFixed, 90)
+        imgui.TableSetupColumn('State', ImGuiTableColumnFlags.WidthFixed, 75)
+        imgui.TableSetupColumn('Priority', ImGuiTableColumnFlags.WidthFixed, 75)
+        imgui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthStretch)
+        imgui.TableSetupColumn('Age', ImGuiTableColumnFlags.WidthFixed, 55)
+        imgui.TableHeadersRow()
+        for _, member in ipairs(members) do
+            local action = member.action or {}
+            local state = member.dead and 'dead'
+                or member.incapacitated and 'blocked'
+                or member.automationPaused and 'paused'
+                or member.inCombat and 'combat'
+                or member.inGame and 'idle'
+                or 'zoning'
+            imgui.TableNextRow()
+            imgui.TableNextColumn()
+            local name = tostring(member.character or '?')
+            if member.self then name = name .. ' (you)' end
+            if member.key == team.leaderKey then name = name .. ' *' end
+            imgui.Text(name)
+            imgui.TableNextColumn()
+            imgui.Text(string.format('%s / %s', tostring(member.class or '-'), tostring(member.role or '-')))
+            imgui.TableNextColumn()
+            imgui.Text(tostring(member.zone or '-'))
+            imgui.TableNextColumn()
+            imgui.Text(state)
+            imgui.TableNextColumn()
+            imgui.Text(tostring(priorityNames[member.activePriority] or member.activePriority or '-'))
+            imgui.TableNextColumn()
+            if action.name and action.name ~= '' then
+                imgui.Text(string.format('%s: %s', tostring(action.phase or 'claimed'), tostring(action.name)))
+            else
+                imgui.TextDisabled('-')
+            end
+            imgui.TableNextColumn()
+            imgui.Text(member.self and '-' or string.format('%.1fs', (tonumber(member.ageMs) or 0) / 1000))
+        end
         imgui.EndTable()
     end
 end
@@ -371,53 +488,46 @@ local function getHealingDecision()
     end
     _healDiagCache.lastCheckAt = now
 
-    local healing = getHealing()
-    if not healing then
+    local state = State.last
+    local moduleDiag = state and state.moduleDiag or nil
+    local worker = moduleDiag and moduleDiag.healing or nil
+    if not worker then
         _healDiagCache.result = nil
-        _healDiagCache.reason = 'module not loaded'
+        _healDiagCache.reason = 'worker not registered'
         _healDiagCache.emergencyResult = nil
-        _healDiagCache.emergencyReason = 'module not loaded'
+        _healDiagCache.emergencyReason = 'worker not registered'
         return _healDiagCache
     end
 
-    if not healing.isInitialized or not healing.isInitialized() then
+    if worker.stale or worker.ready == false then
+        local reason = worker.stale and 'worker heartbeat stale' or 'worker not ready'
         _healDiagCache.result = nil
-        _healDiagCache.reason = 'not initialized'
+        _healDiagCache.reason = reason
         _healDiagCache.emergencyResult = nil
-        _healDiagCache.emergencyReason = 'not initialized'
+        _healDiagCache.emergencyReason = reason
         return _healDiagCache
     end
 
-    -- Check non-emergency heal decision
-    local ok1, action1, reason1 = pcall(function()
-        return healing.buildHealAction({
-            excludeEmergency = true,
-            ignoreSpellEngine = true,
-            skipIfCasting = true,
-        })
-    end)
-    if ok1 then
-        _healDiagCache.result = action1
-        _healDiagCache.reason = reason1 or (action1 and 'action found' or 'no action needed')
+    -- The claimed action is the authoritative decision made by the worker.
+    -- Before a claim is granted, the need reason still explains its state.
+    local owner = state and state.castOwner or nil
+    local action = owner and owner.module == 'healing' and owner.action or nil
+    local reason = tostring(worker.reason or (worker.needValid and 'awaiting claim' or 'no action needed'))
+    if action and action.tier == 'emergency' then
+        _healDiagCache.result = nil
+        _healDiagCache.reason = reason
+        _healDiagCache.emergencyResult = action
+        _healDiagCache.emergencyReason = 'action claimed'
+    elseif action then
+        _healDiagCache.result = action
+        _healDiagCache.reason = 'action claimed'
+        _healDiagCache.emergencyResult = nil
+        _healDiagCache.emergencyReason = reason
     else
         _healDiagCache.result = nil
-        _healDiagCache.reason = 'error: ' .. tostring(action1)
-    end
-
-    -- Check emergency heal decision
-    local ok2, action2, reason2 = pcall(function()
-        return healing.buildHealAction({
-            onlyEmergency = true,
-            ignoreSpellEngine = true,
-            skipIfCasting = true,
-        })
-    end)
-    if ok2 then
-        _healDiagCache.emergencyResult = action2
-        _healDiagCache.emergencyReason = reason2 or (action2 and 'action found' or 'no emergency')
-    else
+        _healDiagCache.reason = reason
         _healDiagCache.emergencyResult = nil
-        _healDiagCache.emergencyReason = 'error: ' .. tostring(action2)
+        _healDiagCache.emergencyReason = reason
     end
 
     return _healDiagCache
@@ -500,7 +610,10 @@ end
 local function renderHealAvailability()
     local avail = getHealAvailability()
     if not avail then
-        imgui.TextColored(0.6, 0.6, 0.6, 1, 'Healing module not loaded')
+        local message = _healingConfigLoadError
+            and ('Healing configuration failed to load: ' .. tostring(_healingConfigLoadError))
+            or 'Healing configuration unavailable'
+        imgui.TextColored(0.8, 0.5, 0.3, 1, message)
         return
     end
 
@@ -585,6 +698,19 @@ function M.init()
     if M._initialized then return end
     M._initialized = true
 
+    local config = getHealingConfig()
+    if config and config.load and not _healingConfigLoaded then
+        local ok, err = pcall(config.load)
+        if ok then
+            _healingConfigLoaded = true
+            _healingConfigLoadError = nil
+        else
+            _healingConfigLoadError = tostring(err)
+        end
+    elseif not config then
+        _healingConfigLoadError = 'config module unavailable'
+    end
+
     M._stateDropbox = actors.register(lib.Mailbox.STATE, function(message)
         local content = message()
         if type(content) ~= 'table' then return end
@@ -617,6 +743,8 @@ function M.drawContent()
     local rows = {
         { 'Active Priority', tostring(priorityNames[State.last.activePriority] or State.last.activePriority or '?') },
         { 'Cast Busy', formatBool(State.last.castBusy) },
+        { 'Automation Paused', formatBool(State.last.automationPaused) },
+        { 'Settings Revision', tostring(State.last.settingsRevision or 0) },
         { 'Epoch', tostring(State.last.epoch or '?') },
         { 'Tick ID', tostring(State.last.tickId or '?') },
         { 'Age (s)', string.format('%.2f', ageMs / 1000) },
@@ -643,6 +771,10 @@ function M.drawContent()
         { 'My Mana %', tostring(ws.myManaPct or '?') },
         { 'Group Needs Healing', formatBool(ws.groupNeedsHealing) },
         { 'Emergency Active', formatBool(ws.emergencyActive) },
+        { 'Incapacitated', formatBool(ws.incapacitated) },
+        { 'Control Reason', tostring(ws.incapacitationReason or '-') },
+        { 'Stunned / Mezzed', string.format('%s / %s', formatBool(ws.stunned), formatBool(ws.mezzed)) },
+        { 'Silenced / Feared', string.format('%s / %s', formatBool(ws.silenced), formatBool(ws.feared)) },
         { 'Dead Count', tostring(ws.deadCount or '?') },
         { 'Main Assist ID', tostring(ws.mainAssistId or '?') },
     }
@@ -654,6 +786,14 @@ function M.drawContent()
     -- Module Status (always visible - key diagnostic)
     if imgui.CollapsingHeader('Module Status##modules') then
         renderModuleDiagnostics(State.last.moduleDiag)
+    end
+
+    if imgui.CollapsingHeader('Actor Team##actorteam') then
+        renderTeamDiagnostics(State.last.team)
+    end
+
+    if imgui.CollapsingHeader('Resurrection Status##rezstatus') then
+        renderRezTelemetry()
     end
 
     imgui.Spacing()
@@ -693,6 +833,37 @@ end
 
 function M.hide()
     M.open = false
+end
+
+renderRezTelemetry = function()
+    local rez = State.rezTelemetry
+    if type(rez) ~= 'table' then
+        imgui.TextDisabled('No resurrection worker telemetry received')
+        return
+    end
+    renderTable('##rez_telemetry', {
+        { 'Reason', tostring(rez.reason or '-') },
+        { 'Phase', tostring(rez.phase or 'idle') },
+        { 'Target', string.format('%s (%s)', tostring(rez.targetName or '-'), tostring(rez.targetClass or '-')) },
+        { 'Corpse ID', tostring(rez.corpseId or 0) },
+        { 'Resource', string.format('%s: %s', tostring(rez.resourceKind or '-'), tostring(rez.resourceName or '-')) },
+        { 'Actor Winner', tostring(rez.winner or '-') },
+        { 'OOC Policy', string.format('%s / %s', formatBool(rez.oocEnabled), tostring(rez.oocMethod or '-')) },
+        { 'Combat Policy', string.format('%s / %s', formatBool(rez.combatEnabled), tostring(rez.combatMethod or '-')) },
+        { 'Configured Item', tostring(rez.itemName or '-') },
+        { 'Last Result', tostring(rez.lastResult or '-') },
+    })
+end
+
+function M.setRezTelemetry(telemetry)
+    if type(telemetry) == 'table' then
+        State.rezTelemetry = telemetry
+    end
+end
+
+function M.getLastState()
+    M.init()
+    return State.last, State.receivedAtMs
 end
 
 return M

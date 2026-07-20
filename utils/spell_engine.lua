@@ -133,7 +133,8 @@ local function preCastChecks(spellName, targetId, opts)
     -- Check mana
     local manaCost = tonumber(spell.Mana()) or 0
     local currentMana = tonumber(me.CurrentMana()) or 0
-    if manaCost > 0 and currentMana < manaCost then
+    local manaBuffer = tonumber(opts.manaBuffer) or 0
+    if manaCost > 0 and currentMana < (manaCost + manaBuffer) then
         return false, 'insufficient_mana'
     end
 
@@ -165,6 +166,9 @@ local function preCastChecks(spellName, targetId, opts)
     end
     if me.Silenced and me.Silenced() then
         return false, 'silenced'
+    end
+    if me.Feared and me.Feared() then
+        return false, 'feared'
     end
 
     -- Check standing (stand up if sitting)
@@ -364,6 +368,15 @@ function M.cast(spellName, targetId, opts)
         end
         if d and d > 0 then mq.delay(d) end
     end
+
+    -- Control effects can land during targeting or the humanized pre-cast
+    -- delay. Revalidate at the last possible point before issuing /cast.
+    local me = mq.TLO.Me
+    if not (me and me()) then return false, 'no_character' end
+    if me.Stunned() then return false, 'stunned' end
+    if me.Mezzed and me.Mezzed() then return false, 'mezzed' end
+    if me.Silenced and me.Silenced() then return false, 'silenced' end
+    if me.Feared and me.Feared() then return false, 'feared' end
 
     -- Issue cast command
     mq.cmdf('/cast "%s"', spellName)

@@ -4,7 +4,7 @@
 -- Remote abilities and cross-character control settings.
 
 local imgui = require('ImGui')
-local Settings = require('sidekick-next.ui.settings')
+local Settings = require('sidekick-next.ui.settings.init')
 local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}

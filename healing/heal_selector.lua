@@ -128,12 +128,23 @@ local function getSpellMeta(spellName)
 end
 
 local function isSpellUsable(spellName, meta)
+    local me = mq.TLO.Me
+    if me and me() and me.Book then
+        local ok, known = pcall(function()
+            local bookSpell = me.Book(spellName)
+            return bookSpell and bookSpell() and true or false
+        end)
+        if ok and not known then
+            return false
+        end
+    end
     local ready = mq.TLO.Me.SpellReady(spellName)
     if ready ~= nil and not ready() then
         return false
     end
     local currentMana = mq.TLO.Me.CurrentMana() or 0
-    if meta.mana > 0 and currentMana < meta.mana then
+    local manaBuffer = meta.mana > 0 and math.max(5, math.ceil(meta.mana * 0.03)) or 0
+    if meta.mana > 0 and currentMana < (meta.mana + manaBuffer) then
         return false
     end
     return true
@@ -493,15 +504,12 @@ local function preFilterSpells(allSpells, deficit, situation, tracker, config)
         return candidates
     end
 
-    local minCoverage = deficit * 0.5
     local maxOverheal = deficit * (config.maxOverhealRatio or 2.0)
     local filtered = {}
     for _, spell in ipairs(candidates) do
         local expected = spell.expected or 0
-        if expected >= minCoverage then
-            if expected <= maxOverheal or (situation and situation.hasEmergency) then
-                table.insert(filtered, spell)
-            end
+        if expected <= maxOverheal or (situation and situation.hasEmergency) then
+            table.insert(filtered, spell)
         end
     end
 
@@ -514,6 +522,34 @@ local function preFilterSpells(allSpells, deficit, situation, tracker, config)
     end)
 
     return filtered
+end
+
+local function maxHpIsKnown(targetInfo)
+    if not targetInfo then return false end
+    if targetInfo.maxHPKnown == true then return true end
+    local source = tostring(targetInfo.maxHPSource or ''):lower()
+    return source ~= '' and source ~= 'estimate' and source ~= 'unknown'
+end
+
+local function chooseConservativeUnknownMaxHpHeal(candidates, tracker)
+    local best = nil
+    for _, candidate in ipairs(candidates or {}) do
+        local spellName = candidate.name
+        local meta = spellName and getSpellMeta(spellName) or nil
+        if meta and isSpellUsable(spellName, meta) then
+            local expected = candidate.expected or getExpectedWithFallback(tracker, spellName, 1, false) or 0
+            local row = {
+                spell = spellName,
+                expected = expected,
+                category = candidate.cat,
+                details = 'trigger=efficient category=single maxhp_unknown_conservative',
+            }
+            if not best or expected < (best.expected or math.huge) then
+                best = row
+            end
+        end
+    end
+    return best
 end
 
 local function formatComponents(components)
@@ -1230,6 +1266,27 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
     local best = nil
     local bestScore = -999
     local scores = {}
+
+    if not maxHpIsKnown(targetInfo) and not (situation and situation.hasEmergency) then
+        best = chooseConservativeUnknownMaxHpHeal(filtered, tracker)
+        if best then
+            local log = getLogger()
+            local unknownScores = {}
+            for _, candidate in ipairs(filtered) do
+                table.insert(unknownScores, {
+                    spell = candidate.name,
+                    category = candidate.cat,
+                    expected = candidate.expected,
+                    score = 0,
+                })
+            end
+            stashScores('efficient', targetInfo, unknownScores, best.spell, 0)
+            if log and log.logSpellSelection then
+                log.logSpellSelection(targetInfo, 'single', M._lastScores.scores, best.spell, 0)
+            end
+            return best
+        end
+    end
 
     for _, candidate in ipairs(filtered) do
         local spellName = candidate.name

@@ -5,7 +5,7 @@
 
 local imgui = require('ImGui')
 local C = require('sidekick-next.ui.constants')
-local Settings = require('sidekick-next.ui.settings')
+local Settings = require('sidekick-next.ui.settings.init')
 local Components = require('sidekick-next.ui.components')
 
 local M = {}

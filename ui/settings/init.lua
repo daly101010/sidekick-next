@@ -5,7 +5,7 @@
 -- Each tab is a separate module for maintainability.
 --
 -- Usage:
---   local Settings = require('sidekick-next.ui.settings')
+--   local Settings = require('sidekick-next.ui.settings.init')
 --   Settings.draw(settings, themeNames, onChange)
 
 local imgui = require('ImGui')
@@ -14,6 +14,12 @@ require('sidekick-next.ui.imgui_compat')
 local C = require('sidekick-next.ui.constants')
 
 local M = {}
+
+local function selectableClicked(label, selected)
+    local first, clicked = imgui.Selectable(label, selected)
+    if clicked == nil then clicked = first end
+    return clicked == true
+end
 
 -- ============================================================
 -- LAZY-LOADED TAB MODULES
@@ -98,6 +104,7 @@ local function loadTabs()
     -- Note: Items and Buffs tabs moved to top-level tabs
     local tabDefs = {
         { name = 'Automation', module = 'sidekick-next.ui.settings.tab_automation' },
+        { name = 'Resurrection', module = 'sidekick-next.ui.settings.tab_resurrection' },
         { name = 'Integration', module = 'sidekick-next.ui.settings.tab_integration' },
         { name = 'Animations', module = 'sidekick-next.ui.settings.tab_animations' },
         { name = 'Humanize', module = 'sidekick-next.ui.settings.tab_humanize' },
@@ -292,7 +299,7 @@ function M.comboString(label, current, options)
         for _, opt in ipairs(options) do
             local v = tostring(opt or '')
             local selected = (v == current)
-            if imgui.Selectable(v, selected) then
+            if selectableClicked(v, selected) then
                 current = v
             end
             if selected then imgui.SetItemDefaultFocus() end
@@ -337,7 +344,7 @@ function M.comboKeyed(label, currentKey, options)
             local k = tostring(opt.key or '')
             local v = tostring(opt.label or k)
             local selected = (k == currentKey)
-            if imgui.Selectable(v, selected) then
+            if selectableClicked(v, selected) then
                 currentKey = k
             end
             if selected then imgui.SetItemDefaultFocus() end
@@ -449,13 +456,14 @@ local function buildSearchResults(filter, settings)
 
     for _, key in Registry.iter_all() do
         local meta = Registry.defaults[key]
-        if meta then
+        if meta and meta.Internal ~= true then
             local displayName = meta.DisplayName or key
             local category = meta.Category or 'Other'
-            local searchable = (displayName .. ' ' .. category .. ' ' .. key):lower()
+            local owner = Registry.owner and select(1, Registry.owner(key)) or meta.Module or 'unregistered'
+            local searchable = (displayName .. ' ' .. category .. ' ' .. key .. ' ' .. tostring(owner)):lower()
 
             if searchable:find(lowerFilter, 1, true) then
-                table.insert(results, { key = key, meta = meta, category = category })
+                table.insert(results, { key = key, meta = meta, category = category, owner = owner })
             end
         end
     end
@@ -484,14 +492,25 @@ local function drawSettingWidget(key, meta, settings, onChange)
         local numVal = tonumber(value) or meta.Default or 0
         -- Use slider for bounded numbers, input for unbounded
         if meta.Min and meta.Max then
-            numVal, changed = M.labeledSliderInt(displayName .. '##search_' .. key, math.floor(numVal), meta.Min, meta.Max)
+            local defaultNumber = tonumber(meta.Default) or numVal
+            local useInteger = defaultNumber % 1 == 0 and meta.Min % 1 == 0 and meta.Max % 1 == 0
+            if useInteger then
+                numVal, changed = M.labeledSliderInt(displayName .. '##search_' .. key, math.floor(numVal), meta.Min, meta.Max)
+            else
+                numVal, changed = M.labeledSliderFloat(displayName .. '##search_' .. key, numVal, meta.Min, meta.Max)
+            end
         else
             numVal, changed = M.labeledSliderFloat(displayName .. '##search_' .. key, numVal, 0, 100)
         end
         if changed and onChange then onChange(key, numVal) end
     elseif settingType == 'text' then
         local textVal = tostring(value or meta.Default or '')
-        local newVal = M.labeledInputText(displayName .. '##search_' .. key, textVal)
+        local newVal
+        if type(meta.Options) == 'table' and #meta.Options > 0 then
+            newVal = M.labeledCombo(displayName .. '##search_' .. key, textVal, meta.Options, meta.Tooltip)
+        else
+            newVal = M.labeledInputText(displayName .. '##search_' .. key, textVal, meta.Tooltip)
+        end
         if newVal ~= textVal and onChange then onChange(key, newVal) end
     end
 end
@@ -527,6 +546,7 @@ local function drawSearchResults(settings, onChange)
             imgui.Separator()
         end
 
+        imgui.TextDisabled(string.format('%s  ->  %s', entry.key, tostring(entry.owner or 'unregistered')))
         drawSettingWidget(entry.key, entry.meta, settings, onChange)
     end
 end
@@ -572,7 +592,12 @@ function M.draw(settings, themeNames, onChange, opts)
         -- Begin tab bar
         if imgui.BeginTabBar('SideKickSettings') then
             for _, tab in ipairs(_tabs) do
-                if imgui.BeginTabItem(tab.name) then
+                local visible = true
+                if tab.module.isAvailable then
+                    local ok, available = pcall(tab.module.isAvailable)
+                    visible = ok and available ~= false
+                end
+                if visible and imgui.BeginTabItem(tab.name) then
                     imgui.BeginChild('##' .. tab.name .. '_content', 0, 0, false)
 
                     -- Draw tab content

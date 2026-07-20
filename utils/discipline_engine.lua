@@ -311,7 +311,8 @@ end
 
 --- Walk classConfig.defaultConditions (or .Conditions) and return the first
 --- predicate that returns true AND whose resolved ability is ready.
---- @param opts table|nil { allowKinds = { aa=true, disc=true, spell=true } }
+--- @param opts table|nil { allowKinds = { aa=true, disc=true, spell=true },
+---                          excludeConditions = { doFoo=true } }
 ---            — defaults to all kinds. Pass { aa=true, disc=true } to
 ---            exclude spell-based predicates so the dispatcher doesn't
 ---            steal heal/nuke ownership from dedicated rotation modules.
@@ -326,6 +327,7 @@ function M.pickReadyAbility(classConfig, ctx, opts)
     if not ctx then return nil end
 
     local allowKinds = (opts and opts.allowKinds) or { aa = true, disc = true, spell = true }
+    local excludeConditions = (opts and opts.excludeConditions) or {}
 
     -- Honor an explicit ordering on the class config when supplied. This
     -- lets a config author choose firing priority (e.g. defensive discs
@@ -358,22 +360,24 @@ function M.pickReadyAbility(classConfig, ctx, opts)
     end
 
     for _, condKey in ipairs(keys) do
-        local pred = conditions[condKey]
-        if type(pred) == 'function' then
-            local okEval, allow = pcall(pred, ctx)
-            if okEval and allow then
-                -- Strip the leading "do" prefix to get the ability-set name
-                -- ("doFortitude" -> "Fortitude", "doStandDisc" -> "StandDisc").
-                local setName = condKey:gsub('^do', '')
-                for _, kind in ipairs(kindCandidates(classConfig, setName, allowKinds)) do
-                    local resolved = resolveAbilityForKind(classConfig, setName, kind)
-                    if resolved and isReady(kind, resolved) then
-                        return {
-                            name    = resolved,
-                            kind    = kind,
-                            setName = setName,
-                            condKey = condKey,
-                        }
+        if not excludeConditions[condKey] then
+            local pred = conditions[condKey]
+            if type(pred) == 'function' then
+                local okEval, allow = pcall(pred, ctx)
+                if okEval and allow then
+                    -- Strip the leading "do" prefix to get the ability-set name
+                    -- ("doFortitude" -> "Fortitude", "doStandDisc" -> "StandDisc").
+                    local setName = condKey:gsub('^do', '')
+                    for _, kind in ipairs(kindCandidates(classConfig, setName, allowKinds)) do
+                        local resolved = resolveAbilityForKind(classConfig, setName, kind)
+                        if resolved and isReady(kind, resolved) then
+                            return {
+                                name    = resolved,
+                                kind    = kind,
+                                setName = setName,
+                                condKey = condKey,
+                            }
+                        end
                     end
                 end
             end

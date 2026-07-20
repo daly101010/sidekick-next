@@ -22,6 +22,23 @@ local Config = nil
 local HealTracker = nil
 local HealSelector = nil
 local MobAssessor = nil
+local _telemetry = nil
+local _telemetryReceivedAtMs = 0
+
+local RemoteAnalytics = {}
+function RemoteAnalytics.getStats()
+    return (_telemetry and _telemetry.stats) or {}
+end
+function RemoteAnalytics.getSessionDuration()
+    return tonumber(_telemetry and _telemetry.duration) or 0
+end
+function RemoteAnalytics.getEfficiencyPct()
+    return tonumber(_telemetry and _telemetry.efficiencyPct) or 100
+end
+
+local function getAnalytics()
+    return Analytics or (_telemetry and RemoteAnalytics) or nil
+end
 
 -- Helper function to format numbers in 'k' format
 local function formatK(value)
@@ -85,6 +102,15 @@ end
 
 function M.setOpen(open)
     _open = open
+end
+
+--- Receive a pre-aggregated snapshot from the authoritative healing worker.
+--- Actor callbacks only replace this plain table; all rendering remains local.
+function M.setTelemetry(snapshot)
+    if type(snapshot) ~= 'table' or type(snapshot.stats) ~= 'table' then return false end
+    _telemetry = snapshot
+    _telemetryReceivedAtMs = mq.gettime()
+    return true
 end
 
 -- Draw the Status tab
@@ -200,12 +226,13 @@ end
 
 -- Draw the Heal Data tab
 local function DrawHealDataTab()
-    if not Analytics then
+    local analytics = getAnalytics()
+    if not analytics then
         imgui.TextDisabled('Analytics not available')
         return
     end
 
-    local stats = Analytics.getStats()
+    local stats = analytics.getStats()
     local bySpell = stats.bySpell or {}
     local aggregated = {}
     for spellName, data in pairs(bySpell) do
@@ -566,13 +593,23 @@ end
 
 -- Draw the Analytics tab
 local function DrawAnalyticsTab()
-    if not Analytics then
+    local analytics = getAnalytics()
+    if not analytics then
         imgui.TextDisabled('Analytics not available')
         return
     end
 
-    local stats = Analytics.getStats()
-    local duration = Analytics.getSessionDuration() or 0
+    local stats = analytics.getStats()
+    local duration = analytics.getSessionDuration() or 0
+
+    if _telemetry and not Analytics then
+        local ageMs = math.max(0, mq.gettime() - _telemetryReceivedAtMs)
+        if ageMs > 3000 then
+            imgui.TextColored(1.0, 0.6, 0.2, 1.0, string.format('Worker telemetry stale: %.1fs', ageMs / 1000))
+        else
+            imgui.TextDisabled(string.format('Worker telemetry: %.1fs old', ageMs / 1000))
+        end
+    end
 
     -- Duration
     imgui.Text('Session Duration:')
@@ -657,7 +694,7 @@ local function DrawAnalyticsTab()
     -- Efficiency bar
     imgui.Separator()
     imgui.Text('Efficiency:')
-    local efficiency = (Analytics.getEfficiencyPct() or 100) / 100
+    local efficiency = (analytics.getEfficiencyPct() or 100) / 100
     local effR, effG, effB = 0.3, 0.9, 0.3
     if efficiency < 0.7 then
         effR, effG, effB = 0.9, 0.3, 0.3
@@ -665,7 +702,7 @@ local function DrawAnalyticsTab()
         effR, effG, effB = 0.9, 0.9, 0.3
     end
     imgui.PushStyleColor(ImGuiCol.PlotHistogram, effR, effG, effB, 1.0)
-    imgui.ProgressBar(efficiency, -1, 20, string.format('%.1f%%', Analytics.getEfficiencyPct() or 100))
+    imgui.ProgressBar(efficiency, -1, 20, string.format('%.1f%%', analytics.getEfficiencyPct() or 100))
     imgui.PopStyleColor()
 
     imgui.Separator()
@@ -900,14 +937,28 @@ end
 --- @return boolean True if initialized and content was drawn
 function M.drawContent()
     -- Check if we have the required dependencies
-    if not TargetMonitor and not CombatAssessor and not HealSelector then
+    if not TargetMonitor and not CombatAssessor and not HealSelector and not _telemetry then
         imgui.TextDisabled('Healing monitor not initialized')
-        imgui.TextDisabled('(Only available for CLR class)')
+        imgui.TextDisabled('(Available for CLR, DRU, SHM, and PAL)')
         return false
     end
 
+    local telemetryOnly = _telemetry ~= nil and not TargetMonitor and not CombatAssessor and not HealSelector
+
     -- Tab bar (nested tabs within the Healing tab)
         if imgui.BeginTabBar('HealingMonitorTabs##Embedded') then
+            if telemetryOnly then
+                if imgui.BeginTabItem('Analytics') then
+                    _currentTab = 'analytics'
+                    DrawAnalyticsTab()
+                    imgui.EndTabItem()
+                end
+                if imgui.BeginTabItem('Heal Data') then
+                    _currentTab = 'healdata'
+                    DrawHealDataTab()
+                    imgui.EndTabItem()
+                end
+            else
             if imgui.BeginTabItem('Status') then
                 _currentTab = 'status'
                 DrawStatusTab()
@@ -941,6 +992,7 @@ function M.drawContent()
                 end
                 imgui.EndTabItem()
             end
+            end
 
             imgui.EndTabBar()
         end
@@ -950,7 +1002,7 @@ end
 
 --- Check if the monitor has been initialized with dependencies
 function M.isInitialized()
-    return TargetMonitor ~= nil or CombatAssessor ~= nil or HealSelector ~= nil
+    return TargetMonitor ~= nil or CombatAssessor ~= nil or HealSelector ~= nil or _telemetry ~= nil
 end
 
 function M.draw()

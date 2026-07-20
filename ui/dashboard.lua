@@ -32,13 +32,7 @@ end
 
 local Mods = {
     Core            = lazy('sidekick-next.utils.core'),
-    Healing         = lazy('sidekick-next.healing'),
-    HealSelector    = lazy('sidekick-next.healing.heal_selector'),
-    HealTracker     = lazy('sidekick-next.healing.heal_tracker'),
-    TargetMonitor   = lazy('sidekick-next.healing.target_monitor'),
-    IncomingHeals   = lazy('sidekick-next.healing.incoming_heals'),
-    CombatAssessor  = lazy('sidekick-next.healing.combat_assessor'),
-    Proactive       = lazy('sidekick-next.healing.proactive'),
+    CoordinatorDebug = lazy('sidekick-next.ui.coordinator_debug'),
     Actors          = lazy('sidekick-next.utils.actors_coordinator'),
     BuffMod         = lazy('sidekick-next.automation.buff'),
     BuffRequests    = lazy('sidekick-next.utils.buff_requests'),
@@ -58,33 +52,11 @@ local Mods = {
     RuntimeCache    = lazy('sidekick-next.utils.runtime_cache'),
 }
 
--- ---------------------------------------------------------------------------
--- Throttled cache for the heal-decision query (only expensive read)
--- ---------------------------------------------------------------------------
-local QUERY_INTERVAL = 0.25
-local _lastQueryAt = 0
-local _cachedAction, _cachedActionReason, _cachedQueryError
-
-local function refreshHealCache()
-    local now = os.clock()
-    if (now - _lastQueryAt) < QUERY_INTERVAL then return end
-    _lastQueryAt = now
-
-    local Healing = Mods.Healing()
-    if not Healing or not Healing.buildHealAction then
-        _cachedAction, _cachedActionReason = nil, 'healing module not loaded'
-        return
-    end
-    local ok, action, reason = pcall(Healing.buildHealAction, {
-        skipIfCasting = false, requireCanHeal = false,
-    })
-    if not ok then
-        _cachedQueryError = tostring(action)
-        _cachedAction = nil
-        return
-    end
-    _cachedQueryError = nil
-    _cachedAction, _cachedActionReason = action, reason
+local function coordinatorState()
+    local C = Mods.CoordinatorDebug()
+    if not C or not C.getLastState then return nil end
+    local state = C.getLastState()
+    return state
 end
 
 -- ---------------------------------------------------------------------------
@@ -231,7 +203,7 @@ M.register('Overview', 'Module Status', function()
     modRow('Cures',      nil, function() return s.DoCures == true end)
     modRow('Debuffs',    nil, function() return s.DoDebuffs == true end)
     modRow('CC (mez)',   nil, function() return s.MezzingEnabled == true end)
-    modRow('Assist',     nil, function() return s.AssistEnabled == true end)
+    modRow('Assist',     nil, function() return (s.CombatMode or 'off') == 'assist' end)
     modRow('Chase',      nil, function() return s.ChaseEnabled == true end)
     modRow('Positioning',nil, function() return s.PositioningEnabled == true end)
 end)
@@ -263,13 +235,25 @@ local function parseDetails(s)
 end
 
 M.register('Healing', 'Decision', function()
-    if _cachedQueryError then
-        imgui.TextColored(1.0, 0.4, 0.4, 1.0, 'Error: ' .. _cachedQueryError); return
+    local state = coordinatorState()
+    if not state then
+        imgui.TextDisabled('Waiting for coordinator state')
+        return
     end
-    local action = _cachedAction
+
+    local worker = state.moduleDiag and state.moduleDiag.healing or nil
+    if worker then
+        safeBool('Worker ready', worker.ready == true and not worker.stale)
+        safeBool('Needs action', worker.needValid == true)
+        if worker.reason and worker.reason ~= '' then safeText('Reason', worker.reason) end
+    else
+        imgui.TextDisabled('Healing worker not registered')
+    end
+
+    local owner = state.castOwner
+    local action = owner and owner.module == 'healing' and owner.action or nil
     if not action then
-        imgui.TextDisabled('Idle (no heal target)')
-        if _cachedActionReason then imgui.TextDisabled('reason: ' .. tostring(_cachedActionReason)) end
+        imgui.TextDisabled('No coordinator-owned healing action')
         return
     end
     local r, g, b = tierColor(action.tier)
@@ -308,104 +292,22 @@ M.register('Healing', 'Decision', function()
 end)
 
 M.register('Healing', 'Alternates Considered', function()
-    local Sel = Mods.HealSelector()
-    local snap = Sel and Sel.getLastScores and Sel.getLastScores() or nil
-    if not snap or not snap.scores or #snap.scores == 0 then
-        imgui.TextDisabled('No scoring snapshot yet. Trigger a heal pass to populate.')
-        return
-    end
-    safeText('Pass kind', tostring(snap.kind or 'efficient'))
-    safeText('Last pass for', string.format('%s (deficit %d)',
-        tostring(snap.targetName or '?'), tonumber(snap.deficit) or 0))
-    safeText('Winner', string.format('%s (score %.2f)',
-        tostring(snap.winner or '-'), tonumber(snap.winnerScore) or 0))
-    safeText('Aged', string.format('%ds', os.time() - (snap.at or 0)))
-
-    if imgui.BeginTable('##sk_dash_alts', 6, 0) then
-        imgui.TableSetupColumn('')           -- winner indicator
-        imgui.TableSetupColumn('Spell')
-        imgui.TableSetupColumn('Cat')
-        imgui.TableSetupColumn('Score')
-        imgui.TableSetupColumn('Expected')
-        imgui.TableSetupColumn('Mana / Cast')
-        imgui.TableHeadersRow()
-        for _, sc in ipairs(snap.scores) do
-            imgui.TableNextRow()
-            imgui.TableNextColumn()
-            if sc.spell == snap.winner then
-                imgui.TextColored(0.6, 1.0, 0.6, 1.0, '*')
-            else
-                imgui.TextDisabled(' ')
-            end
-            imgui.TableNextColumn(); imgui.Text(tostring(sc.spell or '?'))
-            imgui.TableNextColumn(); imgui.Text(tostring(sc.category or '-'))
-            imgui.TableNextColumn(); imgui.Text(string.format('%.2f', tonumber(sc.score) or 0))
-            imgui.TableNextColumn(); imgui.Text(tostring(tonumber(sc.expected) or 0))
-            imgui.TableNextColumn(); imgui.Text(string.format('%d / %.2fs',
-                tonumber(sc.mana) or 0, (tonumber(sc.castTime) or 0) / 1000))
-        end
-        imgui.EndTable()
-    end
+    imgui.TextDisabled('Selector scoring lives in sk_healing. Add worker telemetry before showing this here.')
 end)
 
 M.register('Healing', 'Last Cast', function()
-    local Sel = Mods.HealSelector()
-    local last = Sel and Sel.getLastAction and Sel.getLastAction() or nil
-    if last and last.spell and last.spell ~= '' then
-        local age = os.time() - (last.time or 0)
-        imgui.Text(string.format('%s on %s', tostring(last.spell), tostring(last.target or '?')))
-        imgui.TextDisabled(string.format('%ds ago, expected %s', age, tostring(last.expected or '?')))
-    else
-        imgui.TextDisabled('none')
-    end
+    imgui.TextDisabled('Last-cast telemetry is not broadcast by the healing worker yet.')
 end)
 
 M.register('Healing', 'Injured Targets', function()
-    local TM = Mods.TargetMonitor()
-    if not TM or not TM.getInjuredTargets then imgui.TextDisabled('Target monitor unavailable'); return end
-    local list = TM.getInjuredTargets(100) or {}
-    if #list == 0 then imgui.TextDisabled('All targets healthy'); return end
-    if imgui.BeginTable('##sk_dash_injured', 5, 0) then
-        imgui.TableSetupColumn('Name'); imgui.TableSetupColumn('Role')
-        imgui.TableSetupColumn('HP%'); imgui.TableSetupColumn('Deficit'); imgui.TableSetupColumn('Inc')
-        imgui.TableHeadersRow()
-        for _, t in ipairs(list) do
-            imgui.TableNextRow()
-            imgui.TableNextColumn(); imgui.Text(tostring(t.name or '?'))
-            imgui.TableNextColumn(); imgui.Text(tostring(t.role or '-'))
-            imgui.TableNextColumn(); imgui.Text(tostring(tonumber(t.pctHP) or 0))
-            imgui.TableNextColumn(); imgui.Text(tostring(tonumber(t.deficit or 0) or 0))
-            imgui.TableNextColumn(); imgui.Text(tostring(tonumber(t.incomingTotal or 0) or 0))
-        end
-        imgui.EndTable()
-    end
+    local state = coordinatorState()
+    local ws = state and state.worldState or {}
+    safeBool('Group needs healing', ws.groupNeedsHealing == true)
+    safeBool('Emergency active', ws.emergencyActive == true)
 end)
 
 M.register('Healing', 'Incoming Heals', function()
-    local IH = Mods.IncomingHeals()
-    if not IH or not IH.getAll then imgui.TextDisabled('Tracker unavailable'); return end
-    local all = IH.getAll() or {}
-    if isEmpty(all) then imgui.TextDisabled('No heals in flight'); return end
-    local nowMs = mq.gettime()
-    if imgui.BeginTable('##sk_dash_inc', 5, 0) then
-        imgui.TableSetupColumn('Target'); imgui.TableSetupColumn('Healer')
-        imgui.TableSetupColumn('Spell'); imgui.TableSetupColumn('Expected'); imgui.TableSetupColumn('Lands')
-        imgui.TableHeadersRow()
-        for tid, perH in pairs(all) do
-            for hid, data in pairs(perH) do
-                imgui.TableNextRow()
-                imgui.TableNextColumn(); imgui.Text(spawnName(tid))
-                imgui.TableNextColumn(); imgui.Text(spawnName(hid))
-                imgui.TableNextColumn(); imgui.Text(tostring(data.spellName or '?'))
-                imgui.TableNextColumn(); imgui.Text(tostring(tonumber(data.expectedAmount) or 0))
-                local landsIn = ((tonumber(data.landsAt) or 0) - nowMs) / 1000
-                imgui.TableNextColumn()
-                if landsIn > 0 then imgui.Text(string.format('+%.1fs', landsIn))
-                else imgui.TextColored(0.7,0.7,0.7,1.0, string.format('%.1fs late', -landsIn)) end
-            end
-        end
-        imgui.EndTable()
-    end
+    imgui.TextDisabled('Incoming-heal telemetry is owned by sk_healing and is not broadcast to the dashboard yet.')
 end)
 
 M.register('Healing', 'Active HoTs', function()
@@ -435,24 +337,12 @@ M.register('Healing', 'Active HoTs', function()
 end)
 
 M.register('Healing', 'Combat Assessor', function()
-    local CA = Mods.CombatAssessor()
-    if not CA or not CA.getState then imgui.TextDisabled('Combat assessor unavailable'); return end
-    local s = CA.getState() or {}
-    safeBool('In combat', s.inCombat)
-    safeText('Phase', tostring(s.fightPhase or 'none'))
-    safeBool('Survival mode', s.survivalMode)
-    safeBool('High pressure', s.highPressure)
-    safeText('Active mobs', string.format('%d (mezzed %d)', s.activeMobCount or 0, s.mezzedMobCount or 0))
-    safeText('Avg mob HP', string.format('%d%%', tonumber(s.avgMobHP) or 0))
-    safeText('Estimated TTK', string.format('%ds', tonumber(s.estimatedTTK) or 0))
-    safeText('Incoming DPS', tostring(tonumber(s.totalIncomingDps) or 0))
-    safeText('Tank DPS%', string.format('%.0f%%', tonumber(s.tankDpsPct) or 0))
-    safeBool('Named mob', s.hasNamedMob)
-    safeBool('Raid mob', s.hasRaidMob)
-    safeText('Difficulty', tostring(s.mobDifficultyTier or 'normal'))
-    safeText('Mob DPS x', string.format('%.2f', tonumber(s.mobDpsMultiplier) or 1.0))
-    safeText('Overheal % / Throttle',
-        string.format('%.0f%%  /  %.2f', tonumber(s.fightOverhealPct) or 0, tonumber(s.throttleLevel) or 0))
+    local state = coordinatorState()
+    local ws = state and state.worldState or {}
+    safeBool('In combat', ws.inCombat == true)
+    safeText('My HP %', tostring(ws.myHpPct or '?'))
+    safeText('My mana %', tostring(ws.myManaPct or '?'))
+    safeText('Dead count', tostring(ws.deadCount or 0))
 end)
 
 -- ---------------------------------------------------------------------------
@@ -934,7 +824,6 @@ end
 
 function M.draw()
     if not M.isVisible() then return end
-    refreshHealCache()
 
     imgui.SetNextWindowSize(ImVec2(560, 720), 4)  -- ImGuiCond_FirstUseEver = 4
     local open, visible = imgui.Begin('SideKick Dashboard###sk_dashboard', true, 0)

@@ -328,7 +328,7 @@ local function renderUpgradePopup()
                     local gemConfig = SpellSetData.getGem(spellSet, slot)
                     if gemConfig then
                         SpellSetData.setGem(spellSet, slot, upgradeInfo.upgrade.id,
-                            gemConfig.condition, gemConfig.priority, gemConfig.buffTarget)
+                            gemConfig.condition, gemConfig.priority, gemConfig.buffTarget, gemConfig.utility)
                     else
                         SpellSetData.setGem(spellSet, slot, upgradeInfo.upgrade.id, nil, nil, nil)
                     end
@@ -355,7 +355,7 @@ local function renderUpgradePopup()
                             local gemConfig = SpellSetData.getGem(spellSet, slot)
                             if gemConfig then
                                 SpellSetData.setGem(spellSet, slot, upgradeInfo.upgrade.id,
-                                    gemConfig.condition, gemConfig.priority, gemConfig.buffTarget)
+                                    gemConfig.condition, gemConfig.priority, gemConfig.buffTarget, gemConfig.utility)
                             else
                                 SpellSetData.setGem(spellSet, slot, upgradeInfo.upgrade.id, nil, nil, nil)
                             end

@@ -354,7 +354,7 @@ local function checkSurvivalMode()
 
     -- Lower threshold when fighting raid/high-tier mobs (trigger survival earlier)
     -- Raid mobs hit harder, so we want to be more defensive sooner
-    if _state.hasRaidMob then
+    if _state.hasRaidMob or _state.hasNamedMob then
         local reduction = (Config and Config.raidMobSurvivalDpsPctReduction) or 2
         survivalDpsPct = math.max(1, survivalDpsPct - reduction)
     end
@@ -365,6 +365,12 @@ end
 -- Check if we're in high pressure situation
 local function checkHighPressure(totalDps)
     local minDps = (Config and Config.highPressureMinDps) or 3000
+
+    -- A confirmed named/raid target is high pressure even before enough HP
+    -- samples have accumulated to calculate incoming DPS.
+    if _state.hasNamedMob or _state.hasRaidMob then
+        return true
+    end
 
     -- Primary check: Total incoming DPS to group
     if totalDps >= minDps then
@@ -457,8 +463,6 @@ function M.tick()
 
     _state.estimatedTTK, _state.fightPhase, _state.avgMobHP = estimateFightDuration(mobs)
     _state.totalIncomingDps = calcTotalIncomingDps()
-    _state.survivalMode = checkSurvivalMode()
-    _state.highPressure = checkHighPressure(_state.totalIncomingDps)
 
     -- Calculate tank DPS %
     if TargetMonitor then
@@ -501,6 +505,11 @@ function M.tick()
         _checkedMobIds = {}
     end
 
+
+    -- Difficulty state must be current before pressure/survival are derived.
+    _state.survivalMode = checkSurvivalMode()
+    _state.highPressure = checkHighPressure(_state.totalIncomingDps)
+
     -- Log combat state changes
     local stateKey = string.format('%s_%s_%s_%s_%d',
         _state.fightPhase, tostring(_state.inCombat), tostring(_state.survivalMode),
@@ -535,7 +544,7 @@ function M.getScoringWeights()
 
     -- Determine base preset
     local preset = 'normal'
-    if _state.hasRaidMob or (_state.hasNamedMob and _state.mobDpsMultiplier >= 2.0) then
+    if _state.hasRaidMob or _state.hasNamedMob then
         weights = Config.scoringPresets.raidFight or Config.scoringPresets.normal
         preset = 'raidFight'
     elseif _state.activeMobCount <= 1 then
@@ -670,8 +679,8 @@ function M.getPromisedSafetyFloor()
         floor = baseSafetyFloor
     end
 
-    -- Raise floor when fighting raid mobs (they can spike damage quickly)
-    if _state and _state.hasRaidMob then
+    -- Raise floor when fighting named or raid mobs (they can spike damage quickly)
+    if _state and (_state.hasRaidMob or _state.hasNamedMob) then
         local increase = (Config and Config.raidMobPromisedFloorIncrease) or 10
         floor = floor + increase
     end

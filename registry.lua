@@ -1,5 +1,50 @@
 local M = {}
 
+-- Keys deliberately retired from both the active registry and compatibility
+-- passthrough. Keeping the tombstones here prevents old combined/module INIs
+-- from resurrecting no-op options as dynamic settings.
+M.removed = {
+    AssistEnabled = true,
+    AssistEngageHpThreshold = true,
+    AuraSelection = true,
+    AutoStandFD = true,
+    BuffAllowInCombat = true,
+    BuffCoordinateActors = true,
+    BuffFellowshipEnabled = true,
+    BuffGroupEnabled = true,
+    BuffRaidEnabled = true,
+    BuffRebuffWindow = true,
+    BuffSelfOnly = true,
+    CooldownSweepEnabled = true,
+    DoCombatRez = true,
+    DoOutOfCombatRez = true,
+    EmergencyHealPct = true,
+    LowResourceThreshold = true,
+    MAScanZRange = true,
+    ResourceAllowCombat = true,
+    ResourceHpAbovePctCombat = true,
+    ResourceHpAbovePctOOC = true,
+    ResourceManaBelowPct = true,
+    SpecialEnabled = true,
+
+    TravelBrokerEnabled = true,
+    DebuffAutoSlow = true,
+    DebuffAutoCripple = true,
+    DebuffAutoMalo = true,
+    DebuffCoordinateActors = true,
+    DebuffPrioritizeSelfHeal = true,
+    DebuffSelfHealHpThreshold = true,
+    DebuffGroupHealHpThreshold = true,
+    CCEnabled = true,
+    CCCoordinateActors = true,
+    CCPrioritizeSelfHeal = true,
+    CCSelfHealHpThreshold = true,
+    CCMaxMezTargets = true,
+    BuffPetsEnabled = true,
+    CureCoordinateActors = true,
+    DoCharm = true,
+}
+
 M.defaults = {
     SideKickTheme = { type = 'text', Default = 'Classic', Category = 'UI', DisplayName = 'Theme' },
     SideKickSyncThemeWithGT = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Sync Theme With GroupTarget' },
@@ -16,11 +61,17 @@ M.defaults = {
     SideKickMainAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'UI', DisplayName = 'Main Anchor Target' },
     SideKickMainAnchorGap = { type = 'number', Default = 2, Category = 'UI', DisplayName = 'Main Anchor Gap' },
     SideKickMainButtonScale = { type = 'number', Default = 1.0, Category = 'UI', DisplayName = 'Main Button Scale' },
+    SideKickMainRounding = { type = 'number', Default = 6, Category = 'UI', DisplayName = 'Main Window Rounding' },
+    SideKickMainWidth = { type = 'number', Default = 0, Category = 'UI', DisplayName = 'Main Width Override' },
+    SideKickMainShowBorder = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Main Gold Border' },
     SideKickFontScale = { type = 'number', Default = 1.0, Category = 'UI', DisplayName = 'Font Scale' },
     SideKickMainTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'UI', DisplayName = 'Main Bar Texture Tint' },
     SideKickMainBgStyle = { type = 'text', Default = 'lightrock', Category = 'UI', DisplayName = 'Main Bar Background Style' },
     SideKickMainBgTexture = { type = 'text', Default = 'A_Listbox_Background1', Category = 'UI', DisplayName = 'Main Bar Background Texture' },
     SideKickMainBgTile = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Main Bar Background Tile' },
+    SideKickLaunchGroup = { type = 'bool', Default = true, Category = 'Integration', DisplayName = 'Launch GroupTarget' },
+    AutostartPromptShown = { type = 'bool', Default = false, Category = 'Integration', DisplayName = 'Autostart Prompt Shown' },
+    SideKickButtonsSubtab = { type = 'text', Default = 'aas', Category = 'UI', DisplayName = 'Buttons Subtab' },
 
     SideKickBarEnabled = { type = 'bool', Default = true, Category = 'Bar', DisplayName = 'Show Ability Bar' },
     SideKickBarCell = { type = 'number', Default = 48, Category = 'Bar', DisplayName = 'Cell Size' },
@@ -28,6 +79,8 @@ M.defaults = {
     SideKickBarGap = { type = 'number', Default = 4, Category = 'Bar', DisplayName = 'Gap' },
     SideKickBarPad = { type = 'number', Default = 6, Category = 'Bar', DisplayName = 'Padding' },
     SideKickBarBgAlpha = { type = 'number', Default = 0.85, Category = 'Bar', DisplayName = 'Background Alpha' },
+    SideKickBarWidth = { type = 'number', Default = 0, Category = 'Bar', DisplayName = 'Width Override' },
+    SideKickBarShowBorder = { type = 'bool', Default = true, Category = 'Bar', DisplayName = 'Show Gold Border' },
     SideKickBarAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Bar', DisplayName = 'Anchor Target' },
     SideKickBarAnchor = { type = 'text', Default = 'none', Category = 'Bar', DisplayName = 'Anchor Mode' },
     SideKickBarAnchorGap = { type = 'number', Default = 2, Category = 'Bar', DisplayName = 'Anchor Gap' },
@@ -42,6 +95,8 @@ M.defaults = {
     SideKickSpecialGap = { type = 'number', Default = 4, Category = 'Special', DisplayName = 'Gap' },
     SideKickSpecialPad = { type = 'number', Default = 6, Category = 'Special', DisplayName = 'Padding' },
     SideKickSpecialBgAlpha = { type = 'number', Default = 0.85, Category = 'Special', DisplayName = 'Background Alpha' },
+    SideKickSpecialWidth = { type = 'number', Default = 0, Category = 'Special', DisplayName = 'Width Override' },
+    SideKickSpecialShowBorder = { type = 'bool', Default = true, Category = 'Special', DisplayName = 'Show Gold Border' },
     SideKickSpecialAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Special', DisplayName = 'Anchor Target' },
     SideKickSpecialAnchor = { type = 'text', Default = 'none', Category = 'Special', DisplayName = 'Anchor Mode' },
     SideKickSpecialAnchorGap = { type = 'number', Default = 2, Category = 'Special', DisplayName = 'Anchor Gap' },
@@ -53,6 +108,8 @@ M.defaults = {
     SideKickDiscBarGap = { type = 'number', Default = 4, Category = 'Disciplines', DisplayName = 'Bar Gap' },
     SideKickDiscBarPad = { type = 'number', Default = 6, Category = 'Disciplines', DisplayName = 'Bar Padding' },
     SideKickDiscBarBgAlpha = { type = 'number', Default = 0.85, Category = 'Disciplines', DisplayName = 'Bar Background Alpha' },
+    SideKickDiscBarWidth = { type = 'number', Default = 0, Category = 'Disciplines', DisplayName = 'Bar Width Override' },
+    SideKickDiscBarShowBorder = { type = 'bool', Default = true, Category = 'Disciplines', DisplayName = 'Show Gold Border' },
     SideKickDiscBarAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Disciplines', DisplayName = 'Bar Anchor Target' },
     SideKickDiscBarAnchor = { type = 'text', Default = 'none', Category = 'Disciplines', DisplayName = 'Bar Anchor Mode' },
     SideKickDiscBarAnchorGap = { type = 'number', Default = 2, Category = 'Disciplines', DisplayName = 'Bar Anchor Gap' },
@@ -64,23 +121,37 @@ M.defaults = {
     SideKickItemBarGap = { type = 'number', Default = 4, Category = 'Items', DisplayName = 'Gap' },
     SideKickItemBarPad = { type = 'number', Default = 6, Category = 'Items', DisplayName = 'Padding' },
     SideKickItemBarBgAlpha = { type = 'number', Default = 0.85, Category = 'Items', DisplayName = 'Background Alpha' },
+    SideKickItemBarWidth = { type = 'number', Default = 0, Category = 'Items', DisplayName = 'Width Override' },
     SideKickItemBarAnchorTarget = { type = 'text', Default = 'grouptarget', Category = 'Items', DisplayName = 'Anchor Target' },
     SideKickItemBarAnchor = { type = 'text', Default = 'none', Category = 'Items', DisplayName = 'Anchor Mode' },
     SideKickItemBarAnchorGap = { type = 'number', Default = 2, Category = 'Items', DisplayName = 'Anchor Gap' },
     SideKickItemBarTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Items', DisplayName = 'Item Bar Texture Tint' },
 
+    SideKickSkillBarEnabled = { type = 'bool', Default = true, Category = 'Bar', DisplayName = 'Show Skills Bar' },
+    SideKickSkillBarCell = { type = 'number', Default = 48, Category = 'Bar', DisplayName = 'Skills Bar Cell Size' },
+    SideKickSkillBarRows = { type = 'number', Default = 2, Category = 'Bar', DisplayName = 'Skills Bar Rows' },
+    SideKickSkillBarGap = { type = 'number', Default = 4, Category = 'Bar', DisplayName = 'Skills Bar Gap' },
+    SideKickSkillBarPad = { type = 'number', Default = 6, Category = 'Bar', DisplayName = 'Skills Bar Padding' },
+    SideKickSkillBarBgAlpha = { type = 'number', Default = 0.85, Category = 'Bar', DisplayName = 'Skills Bar Background Alpha' },
+    SideKickSkillBarWidth = { type = 'number', Default = 0, Category = 'Bar', DisplayName = 'Skills Bar Width Override' },
+    SideKickSkillBarAnchorTarget = { type = 'text', Default = 'none', Category = 'Bar', DisplayName = 'Skills Bar Anchor Target' },
+    SideKickSkillBarAnchor = { type = 'text', Default = 'none', Category = 'Bar', DisplayName = 'Skills Bar Anchor Mode' },
+    SideKickSkillBarAnchorGap = { type = 'number', Default = 2, Category = 'Bar', DisplayName = 'Skills Bar Anchor Gap' },
+    SideKickSkillBarShowBorder = { type = 'bool', Default = true, Category = 'Bar', DisplayName = 'Skills Bar Gold Border' },
+    SideKickSkillBarTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Bar', DisplayName = 'Skills Bar Texture Tint' },
+    SideKickBERDiscDefaultsApplied = { type = 'bool', Default = false, Category = 'Disciplines', DisplayName = 'Berserker Defaults Applied', Internal = true },
+
     ChaseEnabled = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Chase Enabled' },
-    ChaseRole = { type = 'text', Default = 'ma', Category = 'Automation', DisplayName = 'Chase Role (none/ma/mt/leader/raid1/raid2/raid3)' },
+    ChaseRole = { type = 'text', Default = 'ma', Category = 'Automation', DisplayName = 'Chase Role (none/ma/mt/leader/raid1/raid2/raid3/byname)', Options = { 'none', 'ma', 'mt', 'leader', 'raid1', 'raid2', 'raid3', 'byname' } },
     ChaseTarget = { type = 'text', Default = '', Category = 'Automation', DisplayName = 'Chase Target (name)' },
     ChaseDistance = { type = 'number', Default = 30, Category = 'Automation', DisplayName = 'Chase Distance' },
 
-    AutomationLevel = { type = 'text', Default = 'auto', Category = 'Automation', DisplayName = 'Play Style (manual/hybrid/auto)' },
+    AutomationLevel = { type = 'text', Default = 'auto', Category = 'Automation', DisplayName = 'Play Style (manual/hybrid/auto)', Options = { 'manual', 'hybrid', 'auto' } },
     AutomationPaused = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Global Pause' },
     AutoAbilitiesEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Abilities (AAs/Discs)' },
     AutoItemsEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Items (Clickies)' },
-    TravelBrokerEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Travel Broker Enabled' },
 
-    MeditationMode = { type = 'text', Default = 'off', Category = 'Automation', DisplayName = 'Meditation (off/ooc/in combat)' },
+    MeditationMode = { type = 'text', Default = 'off', Category = 'Automation', DisplayName = 'Meditation (off/ooc/in combat)', Options = { 'off', 'ooc', 'always', 'in combat' }, Aliases = { on = 'ooc', incombat = 'in combat', inout = 'always' } },
     MeditationAfterCombatDelay = { type = 'number', Default = 2, Category = 'Automation', DisplayName = 'Meditation After Combat Delay (sec)' },
     MeditationAggroCheck = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Meditation Aggro Safety Check' },
     MeditationAggroPct = { type = 'number', Default = 95, Category = 'Automation', DisplayName = 'Meditation Aggro % (stand if >=)' },
@@ -94,8 +165,10 @@ M.defaults = {
     MeditationEndStartPct = { type = 'number', Default = 60, Category = 'Automation', DisplayName = 'Meditation Start Endurance %' },
     MeditationEndStopPct = { type = 'number', Default = 95, Category = 'Automation', DisplayName = 'Meditation Stop Endurance %' },
 
-    AssistEnabled = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Assist Enabled' },
-    AssistMode = { type = 'text', Default = 'group', Category = 'Automation', DisplayName = 'Assist Mode (group/raid1/raid2/raid3/byname)' },
+    ResourceConversionEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Resource Conversion Enabled' },
+    ResourceMinSecondsBetweenCasts = { type = 'number', Default = 3, Category = 'Automation', DisplayName = 'Resource Conversion Cast Gap (sec)' },
+
+    AssistMode = { type = 'text', Default = 'group', Category = 'Automation', DisplayName = 'Assist Mode (group/raid1/raid2/raid3/byname)', Options = { 'group', 'raid1', 'raid2', 'raid3', 'byname' } },
     AssistName = { type = 'text', Default = '', Category = 'Automation', DisplayName = 'Assist Name (if byname)' },
     AssistAt = { type = 'number', Default = 97, Category = 'Automation', DisplayName = 'Assist At %' },
     AssistRange = { type = 'number', Default = 100, Category = 'Automation', DisplayName = 'Assist Range' },
@@ -104,10 +177,10 @@ M.defaults = {
     BurnDuration = { type = 'number', Default = 30, Category = 'Automation', DisplayName = 'Burn Duration (sec)' },
 
     -- Combat Mode (Tank/Assist role selection)
-    CombatMode = { type = 'text', Default = 'off', Category = 'Combat', DisplayName = 'Combat Mode (off/tank/assist)' },
+    CombatMode = { type = 'text', Default = 'off', Category = 'Combat', DisplayName = 'Combat Mode (off/tank/assist)', Options = { 'off', 'tank', 'assist' } },
 
     -- Tank Settings
-    TankTargetMode = { type = 'text', Default = 'auto', Category = 'Combat', DisplayName = 'Tank Target Mode (auto/manual)' },
+    TankTargetMode = { type = 'text', Default = 'auto', Category = 'Combat', DisplayName = 'Tank Target Mode (auto/manual)', Options = { 'auto', 'manual' } },
     TankAoEThreshold = { type = 'number', Default = 3, Category = 'Combat', DisplayName = 'AoE Mob Threshold' },
     TankRequireAggroDeficit = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Require Aggro Deficit for AoE' },
     TankSafeAECheck = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Safe AE Check (no mezzed)' },
@@ -115,9 +188,8 @@ M.defaults = {
     TankRepositionCooldown = { type = 'number', Default = 5, Category = 'Combat', DisplayName = 'Reposition Cooldown (sec)' },
 
     -- Assist Settings (when in assist combat mode)
-    AssistTargetMode = { type = 'text', Default = 'sticky', Category = 'Combat', DisplayName = 'Assist Target Mode (sticky/follow)' },
-    AssistEngageCondition = { type = 'text', Default = 'hp', Category = 'Combat', DisplayName = 'Engage Condition (hp/tank_aggro)' },
-    AssistEngageHpThreshold = { type = 'number', Default = 97, Category = 'Combat', DisplayName = 'Engage HP Threshold' },
+    AssistTargetMode = { type = 'text', Default = 'sticky', Category = 'Combat', DisplayName = 'Assist Target Mode (sticky/follow)', Options = { 'sticky', 'follow' } },
+    AssistEngageCondition = { type = 'text', Default = 'hp', Category = 'Combat', DisplayName = 'Engage Condition (hp/tank_aggro)', Options = { 'hp', 'tank_aggro' } },
 
     -- Stick Settings
     StickCommand = { type = 'text', Default = '/stick snaproll behind 10 moveback uw', Category = 'Combat', DisplayName = 'Stick Command' },
@@ -142,13 +214,6 @@ M.defaults = {
 
     -- Debuffer Settings (Shaman, Enchanter, Mage)
     DebuffAllTask = { type = 'bool', Default = false, Category = 'Debuff', DisplayName = 'Debuff All Task Mobs' },
-    DebuffAutoSlow = { type = 'bool', Default = true, Category = 'Debuff', DisplayName = 'Auto-Slow' },
-    DebuffAutoCripple = { type = 'bool', Default = false, Category = 'Debuff', DisplayName = 'Auto-Cripple' },
-    DebuffAutoMalo = { type = 'bool', Default = true, Category = 'Debuff', DisplayName = 'Auto-Malo/Tash' },
-    DebuffCoordinateActors = { type = 'bool', Default = true, Category = 'Debuff', DisplayName = 'Coordinate via Actors' },
-    DebuffPrioritizeSelfHeal = { type = 'bool', Default = true, Category = 'Debuff', DisplayName = 'Prioritize Self/Group Heals' },
-    DebuffSelfHealHpThreshold = { type = 'number', Default = 60, Category = 'Debuff', DisplayName = 'Self Heal HP Threshold' },
-    DebuffGroupHealHpThreshold = { type = 'number', Default = 50, Category = 'Debuff', DisplayName = 'Group Heal HP Threshold' },
 
     -- Caster Assist Settings
     CasterUseStick = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Use Stick' },
@@ -170,7 +235,7 @@ M.defaults = {
     HealThreshold = { type = 'number', Default = 80, Category = 'Spells', DisplayName = 'Heal HP Threshold' },
     HealPetsEnabled = { type = 'bool', Default = false, Category = 'Spells', DisplayName = 'Heal Pets' },
 
-    -- Healing (rgmercs-style tiers; excludes PAL in implementation)
+    -- Healing (legacy tiers plus Healing Intelligence for healer classes)
     DoHeals = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Enable Heals' },
     PriorityHealing = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Priority Healing' },
     HealBreakInvisOOC = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Break Invis OOC To Heal' },
@@ -194,11 +259,6 @@ M.defaults = {
     HealTrackHoTsViaActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Track HoTs via Actors' },
 
     -- CC Settings (Enchanter, Bard, Necro)
-    CCEnabled = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'CC Enabled' },
-    CCCoordinateActors = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Coordinate via Actors' },
-    CCPrioritizeSelfHeal = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Prioritize Self Heals/Runes' },
-    CCSelfHealHpThreshold = { type = 'number', Default = 60, Category = 'CC', DisplayName = 'Self Heal HP Threshold' },
-    CCMaxMezTargets = { type = 'number', Default = 3, Category = 'CC', DisplayName = 'Max Mez Targets' },
 
     -- Mez/charm immune persistence — records mobs that fail mez/charm
     -- attempts to a per-zone persistent DB; future attempts skip them.
@@ -243,9 +303,11 @@ M.defaults = {
 
     -- Buff Settings
     BuffingEnabled = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Enable Buffing' },
-    BuffPetsEnabled = { type = 'bool', Default = true, Category = 'Buffs', DisplayName = 'Buff Pets' },
 
     ActorsEnabled = { type = 'bool', Default = true, Category = 'Integration', DisplayName = 'Enable Actors' },
+    ActorsTeamEnabled = { type = 'bool', Default = true, Category = 'Integration', DisplayName = 'Enable Actor Team' },
+    ActorsTeamMode = { type = 'text', Default = 'auto', Category = 'Integration', DisplayName = 'Actor Team Mode', Options = { 'auto', 'group', 'raid', 'manual' } },
+    ActorsTeamName = { type = 'text', Default = '', Category = 'Integration', DisplayName = 'Manual Actor Team Name' },
 
     -- Safe Targeting (KS Prevention)
     SafeTargetingEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Safe Targeting (KS Prevention)' },
@@ -272,12 +334,23 @@ M.defaults = {
     DoCures = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Enable Cures' },
     CurePrioritySelf = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Cure Self First' },
     CureInCombat = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Cure During Combat' },
-    CureCoordinateActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Coordinate Cures via Actors' },
 
-    -- Resurrection Settings (group-only auto-rez; first-cast-wins coordination)
+    -- Resurrection Settings
     AutoRezOOC = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Auto-Rez Out of Combat' },
-    AutoRezInCombat = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Auto Battle-Rez (AA only)' },
+    AutoRezInCombat = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Auto-Rez In Combat' },
     AutoAcceptRez = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Auto-Accept Rez Offers' },
+    RezOOCMethod = { type = 'text', Default = 'Auto', Category = 'Heal/Rez', DisplayName = 'OOC Rez Method', Options = { 'Auto', 'Item', 'Spell' } },
+    RezCombatMethod = { type = 'text', Default = 'Auto', Category = 'Heal/Rez', DisplayName = 'Combat Rez Method', Options = { 'Auto', 'Item', 'AA', 'Spell' } },
+    RezCombatTargetClasses = { type = 'text', Default = 'ALL', Category = 'Heal/Rez', DisplayName = 'Combat Rez Target Classes' },
+    RezItemName = { type = 'text', Default = '', Category = 'Heal/Rez', DisplayName = 'Rez Item Name' },
+    RezAutoMemorize = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Auto-Memorize Rez Spells' },
+    RezGem = { type = 'number', Default = 0, Category = 'Heal/Rez', DisplayName = 'Temporary Rez Gem (0 = Last)' },
+    RezRestoreGem = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Restore Temporary Rez Gem' },
+    RezCoordinateActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Coordinate Rez via Actors' },
+    RezPriority = { type = 'number', Default = 50, Category = 'Heal/Rez', DisplayName = 'Rezzer Priority' },
+    RezNavigate = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Navigate to Corpses' },
+    RezNavMaxDistance = { type = 'number', Default = 250, Category = 'Heal/Rez', DisplayName = 'Maximum Corpse Navigation Distance' },
+    RezDebug = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Rez Debug Logging' },
 
     -- Animation Settings
     AnimationsEnabled = { type = 'bool', Default = true, Category = 'Animations', DisplayName = 'Enable Animations' },
@@ -303,6 +376,15 @@ local VALIDATORS = {
     SideKickSpecialAnchorGap = { min = 0, max = 48 },
     SideKickDiscBarAnchorGap = { min = 0, max = 48 },
     SideKickItemBarAnchorGap = { min = 0, max = 48 },
+    SideKickSkillBarAnchorGap = { min = 0, max = 48 },
+
+    -- Width overrides: 0 means automatic.
+    SideKickMainWidth = { min = 0, max = 1200 },
+    SideKickBarWidth = { min = 0, max = 1200 },
+    SideKickSpecialWidth = { min = 0, max = 1200 },
+    SideKickDiscBarWidth = { min = 0, max = 1200 },
+    SideKickItemBarWidth = { min = 0, max = 1200 },
+    SideKickMainRounding = { min = 0, max = 20 },
 
     -- Button scale: 0.5-3.0
     SideKickMainButtonScale = { min = 0.5, max = 3.0 },
@@ -315,18 +397,21 @@ local VALIDATORS = {
     SideKickSpecialCell = { min = 32, max = 120 },
     SideKickDiscBarCell = { min = 32, max = 120 },
     SideKickItemBarCell = { min = 32, max = 120 },
+    SideKickSkillBarCell = { min = 24, max = 96 },
 
     -- Rows: 1-6
     SideKickBarRows = { min = 1, max = 6 },
     SideKickSpecialRows = { min = 1, max = 6 },
     SideKickDiscBarRows = { min = 1, max = 6 },
     SideKickItemBarRows = { min = 1, max = 6 },
+    SideKickSkillBarRows = { min = 1, max = 8 },
 
     -- Alpha: 0-1
     SideKickBarBgAlpha = { min = 0.0, max = 1.0 },
     SideKickSpecialBgAlpha = { min = 0.0, max = 1.0 },
     SideKickDiscBarBgAlpha = { min = 0.0, max = 1.0 },
     SideKickItemBarBgAlpha = { min = 0.0, max = 1.0 },
+    SideKickSkillBarBgAlpha = { min = 0.0, max = 1.0 },
 
     -- Percentages: 0-100
     AssistAt = { min = 0, max = 100 },
@@ -341,37 +426,392 @@ local VALIDATORS = {
     BigHealPoint = { min = 0, max = 100 },
     GroupHealPoint = { min = 0, max = 100 },
     EmergencyHpThreshold = { min = 0, max = 100 },
-    AssistEngageHpThreshold = { min = 0, max = 100 },
 }
 
+for key, bounds in pairs(VALIDATORS) do
+    local meta = M.defaults[key]
+    if meta then
+        if meta.Min == nil then meta.Min = bounds.min end
+        if meta.Max == nil then meta.Max = bounds.max end
+    end
+end
+
+-- ============================================================
+-- MODULE OWNERSHIP
+-- ============================================================
+--
+-- Ownership is deliberately enumerated by key. UI categories and naming
+-- conventions are presentation concerns; they must never decide which file
+-- wins a persistence conflict. Dynamically generated settings are handled by
+-- the declared namespaces below.
+
+local MODULE_KEYS = {
+    ui = [[
+        SideKickTheme SideKickSyncThemeWithGT SideKickDebugSettings DashboardVisible HealPreviewVisible
+        SideKickMainEnabled SideKickOptionsManual SideKickOptionsPosX SideKickOptionsPosY
+        SideKickOptionsWidth SideKickOptionsHeight SideKickMainAnchor SideKickMainAnchorTarget
+        SideKickMainAnchorGap SideKickMainButtonScale SideKickMainRounding SideKickMainWidth
+        SideKickMainShowBorder SideKickFontScale SideKickMainTextureTint SideKickMainBgStyle
+        SideKickMainBgTexture SideKickMainBgTile SideKickButtonsSubtab
+        SideKickBarEnabled SideKickBarCell SideKickBarRows SideKickBarGap SideKickBarPad
+        SideKickBarBgAlpha SideKickBarWidth SideKickBarShowBorder SideKickBarAnchorTarget SideKickBarAnchor SideKickBarAnchorGap
+        SideKickBarTextureTint SideKickSpecialEnabled SideKickSpecialForceSingleRow
+        SideKickSpecialForceSingleColumn SideKickSpecialPerButtonMove SideKickSpecialCell
+        SideKickSpecialRows SideKickSpecialGap SideKickSpecialPad SideKickSpecialBgAlpha
+        SideKickSpecialWidth SideKickSpecialShowBorder
+        SideKickSpecialAnchorTarget SideKickSpecialAnchor SideKickSpecialAnchorGap
+        SideKickSpecialTextureTint SideKickDiscBarEnabled SideKickDiscBarCell SideKickDiscBarRows
+        SideKickDiscBarGap SideKickDiscBarPad SideKickDiscBarBgAlpha SideKickDiscBarWidth
+        SideKickDiscBarShowBorder SideKickDiscBarAnchorTarget
+        SideKickDiscBarAnchor SideKickDiscBarAnchorGap SideKickDiscBarTextureTint
+        SideKickItemBarEnabled SideKickItemBarCell SideKickItemBarRows SideKickItemBarGap
+        SideKickItemBarPad SideKickItemBarBgAlpha SideKickItemBarWidth SideKickItemBarAnchorTarget SideKickItemBarAnchor
+        SideKickItemBarAnchorGap SideKickItemBarTextureTint SideKickSkillBarEnabled
+        SideKickSkillBarCell SideKickSkillBarRows SideKickSkillBarGap SideKickSkillBarPad
+        SideKickSkillBarBgAlpha SideKickSkillBarWidth SideKickSkillBarAnchorTarget
+        SideKickSkillBarAnchor SideKickSkillBarAnchorGap SideKickSkillBarShowBorder
+        SideKickSkillBarTextureTint AnimationsEnabled HoverScaleEnabled ClickBounceEnabled
+        TogglePopEnabled ReadyPulseEnabled CooldownColorTweenEnabled ToggleColorTweenEnabled
+        StaggerAnimationEnabled LowResourceWarningEnabled DamageFlashEnabled
+    ]],
+    main = [[
+        AutomationLevel AutomationPaused AutoAbilitiesEnabled AutoItemsEnabled AutostartPromptShown
+    ]],
+    chase = [[
+        ChaseEnabled ChaseRole ChaseTarget ChaseDistance
+    ]],
+    meditation = [[
+        MeditationMode MeditationAfterCombatDelay MeditationAggroCheck MeditationAggroPct
+        MeditationStandWhenDone MeditationMinStateSeconds MeditationHPStartPct MeditationHPStopPct
+        MeditationManaStartPct MeditationManaStopPct MeditationEndStartPct MeditationEndStopPct
+    ]],
+    resources = [[
+        ResourceConversionEnabled ResourceMinSecondsBetweenCasts
+    ]],
+    assist = [[
+        AssistMode AssistName AssistAt AssistRange AssistTargetMode AssistEngageCondition
+        AssistOutsideGroup AssistOutsideRaid AssistOutsidePeers
+    ]],
+    dps = [[
+        BurnActive BurnDuration BurnNow SpellRotationEnabled RotationResetWindow
+    ]],
+    combat = [[
+        CombatMode TankTargetMode TankAoEThreshold TankRequireAggroDeficit TankSafeAECheck
+        TankRepositionEnabled TankRepositionCooldown StickCommand SoftPauseStick DragonPositioning
+        DragonPositionAngle IgnorePCPets EmergencyHpThreshold DefenseHpThreshold
+        TankDefenseHpThreshold UseSpells UseAAs UseDiscs CasterUseStick CasterEscapeRange
+        CasterSafeZoneRadius PreferredResistType SafeTargetingEnabled SafeTargetingCheckRaid
+        SafeTargetingCheckPeers TargetingForcedTargetName TargetingIgnoredTargetNames
+        NamedDetectionUseSpawnMaster NamedDetectionUseAlertMaster NamedDetectionMinLevel
+        NamedDetectionCustomNames NamedDetectionForceNamed
+    ]],
+    debuff = [[ DebuffAllTask ]],
+    spells = [[
+        RetryOnFizzle RetryOnResist RetryOnInterrupt UseImmuneDatabase AdaptiveResistSkip
+        SpellRescanOnZone SpellRole SpellAutoMemorize SpellMaxRetries SpellMemTimeout
+        SpellReadyTimeout InterruptOnTargetDeath InterruptOnOutOfRange InterruptHpThreshold
+        InterruptOnSelfEmergency RaidHealStopEnabled RaidHealStopHpThreshold RaidDamageStopEnabled
+        RaidDamageStopHpThreshold GemLockEnabled
+    ]],
+    healing = [[
+        HealThreshold HealPetsEnabled DoHeals PriorityHealing HealBreakInvisOOC MainHealPoint
+        BigHealPoint GroupHealPoint GroupInjureCnt DoPetHeals PetHealPoint HealWatchMA
+        HealXTargetEnabled HealXTargetSlots HealUseHoTs HealHoTMinSeconds HealCoordinateActors
+        HealTrackHoTsViaActors
+    ]],
+    cc = [[
+        MezImmunePersistEnabled MezzingEnabled MezMinLevel MezMaxTargets UseAEMez
+        AEMezMinTargets UseFastMez MezRefreshWindow
+    ]],
+    disciplines = [[ DisciplinesEnabled SideKickBERDiscDefaultsApplied ]],
+    buffs = [[ BuffingEnabled ]],
+    integration = [[ ActorsEnabled ActorsTeamEnabled ActorsTeamMode ActorsTeamName SideKickLaunchGroup ]],
+    cures = [[ DoCures CurePrioritySelf CureInCombat ]],
+    resurrection = [[
+        AutoRezOOC AutoRezInCombat AutoAcceptRez RezOOCMethod RezCombatMethod
+        RezCombatTargetClasses RezItemName RezAutoMemorize RezGem RezRestoreGem
+        RezCoordinateActors RezPriority RezNavigate RezNavMaxDistance RezDebug
+    ]],
+}
+
+local _owners = {}
+local _moduleKeys = {}
+local _lowerToKey = {}
+local _registrationErrors = {}
+local _dynamicNamespaces = {}
+local _changeListeners = {}
+local _sortedKeys = nil
+
+local function recordRegistrationError(message)
+    _registrationErrors[#_registrationErrors + 1] = tostring(message)
+end
+
+local function assignOwner(moduleName, key)
+    moduleName = tostring(moduleName or ''):lower()
+    key = tostring(key or '')
+    if moduleName == '' or key == '' then
+        recordRegistrationError('module and key are required')
+        return false
+    end
+    if not M.defaults[key] then
+        recordRegistrationError(string.format('module %s owns unknown key %s', moduleName, key))
+        return false
+    end
+    local lowerKey = key:lower()
+    if _lowerToKey[lowerKey] and _lowerToKey[lowerKey] ~= key then
+        recordRegistrationError(string.format('case-insensitive setting collision: %s and %s',
+            _lowerToKey[lowerKey], key))
+        return false
+    end
+    local previous = _owners[key]
+    if previous and previous ~= moduleName then
+        recordRegistrationError(string.format('duplicate setting owner for %s: %s and %s', key, previous, moduleName))
+        return false
+    end
+    _owners[key] = moduleName
+    _lowerToKey[lowerKey] = key
+    M.defaults[key].Module = moduleName
+    _moduleKeys[moduleName] = _moduleKeys[moduleName] or {}
+    _moduleKeys[moduleName][key] = true
+    return true
+end
+
+for moduleName, keys in pairs(MODULE_KEYS) do
+    for key in tostring(keys):gmatch('[%w_]+') do
+        assignOwner(moduleName, key)
+    end
+end
+
+--- Register additional settings owned by a module.
+--- Existing metadata may be completed by the owning module, but a second
+--- module can never claim the same key.
+function M.registerModule(moduleName, definitions)
+    if type(definitions) ~= 'table' then return false, 'definitions must be a table' end
+    local added = {}
+    for key, definition in pairs(definitions) do
+        if type(definition) ~= 'table' then
+            recordRegistrationError(string.format('invalid schema for %s.%s', tostring(moduleName), tostring(key)))
+        else
+            local current = M.defaults[key]
+            if current and _owners[key] and _owners[key] ~= tostring(moduleName):lower() then
+                recordRegistrationError(string.format('duplicate setting owner for %s: %s and %s',
+                    tostring(key), tostring(_owners[key]), tostring(moduleName)))
+            else
+                if current then
+                    for field, value in pairs(definition) do current[field] = value end
+                else
+                    M.defaults[key] = definition
+                end
+                if assignOwner(moduleName, key) then added[#added + 1] = key end
+            end
+        end
+    end
+    _sortedKeys = nil
+    if #added == 0 then return false, 'no settings registered' end
+    return true, added
+end
+
+--- Declare ownership for a generated key family. These namespaces do not
+--- invent schema metadata; they only provide a stable persistence owner.
+function M.registerNamespace(moduleName, luaPattern)
+    moduleName = tostring(moduleName or ''):lower()
+    luaPattern = tostring(luaPattern or '')
+    if moduleName == '' or luaPattern == '' then return false, 'module and pattern are required' end
+    for _, entry in ipairs(_dynamicNamespaces) do
+        if entry.pattern == luaPattern then
+            if entry.module ~= moduleName then
+                recordRegistrationError(string.format('dynamic namespace %s owned by %s and %s',
+                    luaPattern, entry.module, moduleName))
+                return false, 'duplicate namespace owner'
+            end
+            return true
+        end
+    end
+    _dynamicNamespaces[#_dynamicNamespaces + 1] = { module = moduleName, pattern = luaPattern }
+    return true
+end
+
+M.registerNamespace('abilities', '^do')
+M.registerNamespace('pull', '^Pull_')
+M.registerNamespace('humanize', '^Humanize_')
+M.registerNamespace('humanize', '^HUMANIZE_')
+M.registerNamespace('ui', '^SideKickSkill_')
+
+function M.owner(key)
+    key = tostring(key or '')
+    key = _lowerToKey[key:lower()] or key
+    if _owners[key] then return _owners[key], 'schema' end
+    for _, entry in ipairs(_dynamicNamespaces) do
+        if key:match(entry.pattern) then return entry.module, 'namespace' end
+    end
+    return nil, 'unregistered'
+end
+
+function M.resolveKey(key)
+    key = tostring(key or '')
+    return _lowerToKey[key:lower()] or key
+end
+
+function M.keysForModule(moduleName)
+    local result = {}
+    for key in pairs(_moduleKeys[tostring(moduleName or ''):lower()] or {}) do
+        result[#result + 1] = key
+    end
+    table.sort(result)
+    return result
+end
+
+function M.audit()
+    local errors = {}
+    for _, message in ipairs(_registrationErrors) do errors[#errors + 1] = message end
+    local missingOwners = {}
+    local allowedTypes = { bool = true, number = true, text = true }
+    for key, meta in pairs(M.defaults) do
+        if not _owners[key] then missingOwners[#missingOwners + 1] = key end
+        if type(meta) ~= 'table' then
+            errors[#errors + 1] = string.format('setting %s has no schema table', key)
+        else
+            local valType = tostring(meta.type or ''):lower()
+            if not allowedTypes[valType] then
+                errors[#errors + 1] = string.format('setting %s has unsupported type %s', key, tostring(meta.type))
+            end
+            if meta.Default == nil then
+                errors[#errors + 1] = string.format('setting %s has no default', key)
+            else
+                local valid, _, reason = M.normalize(key, meta.Default)
+                if not valid then
+                    errors[#errors + 1] = string.format('setting %s has invalid default: %s', key, tostring(reason))
+                end
+            end
+        end
+    end
+    table.sort(missingOwners)
+    for _, key in ipairs(missingOwners) do
+        errors[#errors + 1] = string.format('registered setting has no owner: %s', key)
+    end
+    return {
+        ok = #errors == 0,
+        errors = errors,
+        registered = (function()
+            local count = 0
+            for _ in pairs(M.defaults) do count = count + 1 end
+            return count
+        end)(),
+        owned = (function()
+            local count = 0
+            for _ in pairs(_owners) do count = count + 1 end
+            return count
+        end)(),
+        namespaces = #_dynamicNamespaces,
+    }
+end
+
+function M.addChangeListener(listener)
+    if type(listener) ~= 'function' then return false end
+    _changeListeners[#_changeListeners + 1] = listener
+    return true
+end
+
+function M.notifyChanged(key, newValue, oldValue, source)
+    local meta = M.defaults[key]
+    if meta and type(meta.OnChange) == 'function' then
+        pcall(meta.OnChange, oldValue, newValue, source)
+    end
+    for _, listener in ipairs(_changeListeners) do
+        pcall(listener, key, oldValue, newValue, source)
+    end
+end
+
 function M.meta(key)
-    return M.defaults[key]
+    return M.defaults[M.resolveKey(key)]
+end
+
+function M.is_removed(key)
+    return M.removed[tostring(key or '')] == true
+end
+
+local function strictBool(value)
+    if type(value) == 'boolean' then return true, value end
+    if type(value) == 'number' and (value == 0 or value == 1) then return true, value == 1 end
+    if type(value) == 'string' then
+        local normalized = value:lower():match('^%s*(.-)%s*$')
+        if normalized == '1' or normalized == 'true' or normalized == 'yes' or normalized == 'on' then
+            return true, true
+        end
+        if normalized == '0' or normalized == 'false' or normalized == 'no' or normalized == 'off' then
+            return true, false
+        end
+    end
+    return false, nil
+end
+
+--- Validate and normalize a setting without mutating persistence.
+--- @return boolean ok, any normalizedValue, string|nil error
+function M.normalize(key, value)
+    key = M.resolveKey(key)
+    if key == '' then return false, nil, 'setting key is required' end
+    if M.is_removed(key) then return false, nil, string.format('setting %s was removed', key) end
+
+    local meta = M.defaults[key]
+    if not meta then
+        -- Compatibility and generated namespaces remain writable, but callers
+        -- can identify them by the third return value.
+        return true, value, 'unregistered'
+    end
+
+    local valType = tostring(meta.type or 'text'):lower()
+    local normalized = value
+    if valType == 'bool' then
+        local ok
+        ok, normalized = strictBool(value)
+        if not ok then return false, nil, string.format('%s expects a boolean', key) end
+    elseif valType == 'number' then
+        normalized = tonumber(value)
+        if not normalized then return false, nil, string.format('%s expects a number', key) end
+        local validator = VALIDATORS[key] or {}
+        local minValue = meta.Min ~= nil and tonumber(meta.Min) or tonumber(validator.min)
+        local maxValue = meta.Max ~= nil and tonumber(meta.Max) or tonumber(validator.max)
+        if minValue and normalized < minValue then
+            return false, nil, string.format('%s must be >= %s', key, tostring(minValue))
+        end
+        if maxValue and normalized > maxValue then
+            return false, nil, string.format('%s must be <= %s', key, tostring(maxValue))
+        end
+    elseif valType == 'text' then
+        if value == nil then return false, nil, string.format('%s expects text', key) end
+        normalized = tostring(value)
+    end
+
+    if type(meta.Aliases) == 'table' then
+        local alias = meta.Aliases[tostring(normalized):lower()]
+        if alias ~= nil then normalized = alias end
+    end
+
+    if type(meta.Options) == 'table' and #meta.Options > 0 then
+        local wanted = tostring(normalized):lower()
+        local matched = nil
+        for _, option in ipairs(meta.Options) do
+            if tostring(option):lower() == wanted then matched = option break end
+        end
+        if matched == nil then
+            return false, nil, string.format('%s must be one of: %s', key, table.concat(meta.Options, ', '))
+        end
+        normalized = matched
+    end
+
+    return true, normalized, nil
 end
 
 function M.validate(key, value)
-    local validator = VALIDATORS[key]
-    if not validator then return value end
-
     local meta = M.defaults[key]
-    local valType = meta and meta.type or 'text'
-
-    if valType == 'number' then
-        local num = tonumber(value)
-        if not num then return meta and meta.Default or 0 end
-        if validator.min and num < validator.min then num = validator.min end
-        if validator.max and num > validator.max then num = validator.max end
-        return num
-    end
-
-    return value
+    local ok, normalized = M.normalize(key, value)
+    if ok then return normalized end
+    return meta and meta.Default or value
 end
 
 function M.getValidator(key)
     return VALIDATORS[key]
 end
-
--- Cache sorted keys (M.defaults is static, never changes at runtime)
-local _sortedKeys = nil
 
 function M.iter_all()
     if not _sortedKeys then

@@ -9,6 +9,7 @@ local Anchor = require('sidekick-next.ui.anchor')
 local Draw = require('sidekick-next.ui.draw_helpers')
 local Helpers = require('sidekick-next.lib.helpers')
 local lazy = require('sidekick-next.utils.lazy_require')
+local ActiveDur = require('sidekick-next.ui.active_duration_strip')
 
 local M = {}
 
@@ -288,7 +289,8 @@ function M.draw(opts)
 
     local cols = math.max(1, math.ceil(#enabled / rows))
     local autoW = cols * cell + (cols - 1) * gap + pad * 2
-    local winH = rows * cell + (rows - 1) * gap + pad * 2
+    local stripH = (ActiveDur and ActiveDur.HEIGHT) or 0
+    local winH = rows * cell + (rows - 1) * gap + pad * 2 + stripH
 
     -- Width override (0 = auto)
     local widthOverride = tonumber(settings.SideKickDiscBarWidth) or 0
@@ -381,6 +383,14 @@ function M.draw(opts)
                 end
             end)
         end
+
+        -- Active discipline countdown strip (matches in-game Combat Abilities header).
+        pcall(function()
+            if ActiveDur and ActiveDur.draw then
+                local stripW = winW - pad * 2
+                ActiveDur.draw(stripW)
+            end
+        end)
 
         local startX, startY = imgui.GetCursorPos()
 

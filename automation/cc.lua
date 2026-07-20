@@ -934,11 +934,13 @@ function M.castMez(mobId, mobName, spellName, opts)
     return success, reason
 end
 
---- Main mez tick function - call this from main loop
--- Checks conditions, selects targets, and initiates mez casts
+--- Select the next mez action without casting it.
+-- Coordinator workers use this to advertise need and obtain exclusive cast
+-- ownership before any target or spell command is issued.
 -- @param settings table Settings table with mez options
--- @return boolean True if mez action was taken or pending
-function M.mezTick(settings)
+-- @return table|nil action { targetId, targetName, spellName }
+-- @return string reason
+function M.selectMezAction(settings)
     settings = settings or {}
     local Core = getCore()
     if Core and Core.Settings then
@@ -952,16 +954,16 @@ function M.mezTick(settings)
 
     -- Check if mezzing is enabled
     if settings.MezzingEnabled ~= true then
-        return false
+        return nil, 'disabled'
     end
 
     -- Only mez classes should mez
     if not M.isMezClass() then
-        return false
+        return nil, 'not_mez_class'
     end
 
     local me = mq.TLO.Me
-    if not (me and me()) then return false end
+    if not (me and me()) then return nil, 'no_me' end
 
     -- Check if we can cast (not stunned, mezzed, etc.)
     -- me.Stunned/Silenced are bool TLOs (true/false); me.Mezzed is a Spell
@@ -972,37 +974,37 @@ function M.mezTick(settings)
         mezzedNow = (tonumber(me.Mezzed.ID()) or 0) > 0
     end
     if me.Stunned() or mezzedNow or (me.Silenced and me.Silenced()) then
-        return false
+        return nil, 'incapacitated'
     end
 
     -- Don't mez while moving (except for bards)
     local cls = tostring(me.Class.ShortName() or ''):upper()
     if cls ~= 'BRD' and me.Moving() then
-        return false
+        return nil, 'moving'
     end
 
     -- Check if SpellEngine is busy
     local SpellEngine = getSpellEngine()
     if SpellEngine and SpellEngine.isBusy and SpellEngine.isBusy() then
-        return true -- Spell in progress
+        return nil, 'spell_engine_busy'
     end
 
     -- Throttle decision making
     local now = os.clock()
     if (now - (_mezCastState.lastMezDecisionAt or 0)) < 0.2 then
-        return false
+        return nil, 'throttled'
     end
     _mezCastState.lastMezDecisionAt = now
 
     -- Get class profile and class config
     local profile = _mezProfiles[cls]
     if not profile then
-        return false
+        return nil, 'no_profile'
     end
 
     local classConfig = loadClassConfig(cls)
     if not classConfig then
-        return false
+        return nil, 'no_class_config'
     end
 
     -- Count current mezzed targets
@@ -1021,22 +1023,27 @@ function M.mezTick(settings)
                     spellName = chooseSpellForLines(classConfig, profile.main)
                 end
                 if spellName and isValidMezTarget(mobId, settings) then
-                    return M.castMez(mobId, data.name, spellName)
+                    return {
+                        targetId = mobId,
+                        targetName = data.name,
+                        spellName = spellName,
+                        reason = 'remez',
+                    }, 'remez'
                 end
             end
         end
-        return false
+        return nil, 'mez_cap_reached'
     end
 
     -- Get best mez target
     local targetId, targetName = M.getBestMezTarget(maxTargets)
     if not targetId then
-        return false
+        return nil, 'no_target'
     end
 
     -- Validate target
     if not isValidMezTarget(targetId, settings) then
-        return false
+        return nil, 'invalid_target'
     end
 
     -- Check for AE mez opportunity
@@ -1066,12 +1073,24 @@ function M.mezTick(settings)
     end
 
     if not spellName then
-        return false
+        return nil, 'no_spell'
     end
 
-    -- Cast the mez
-    local success, reason = M.castMez(targetId, targetName, spellName)
-    return success
+    return {
+        targetId = targetId,
+        targetName = targetName,
+        spellName = spellName,
+        reason = 'mez',
+    }, 'mez'
+end
+
+--- Backward-compatible monolithic entry point.
+-- The coordinated runtime calls selectMezAction() from sk_cc.lua and does not
+-- reach this function.
+function M.mezTick(settings)
+    local action = M.selectMezAction(settings)
+    if not action then return false end
+    return M.castMez(action.targetId, action.targetName, action.spellName)
 end
 
 return M

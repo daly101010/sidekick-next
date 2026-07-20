@@ -5,6 +5,10 @@ local mq = require('mq')
 
 local M = {}
 
+local _Core = nil
+local _coreLoadedAtMs = 0
+local _settingsRevision = nil
+
 -- Version for compatibility checks
 M.VERSION = '2.0.0'
 
@@ -42,12 +46,30 @@ M.Mailbox = {
     INTERRUPT = 'sk:interrupt',
     HEARTBEAT = 'sk:hb',
     NEED = 'sk:need',
+    SUPERVISOR = 'sk:supervisor',
+    TEAM = 'sk:team',
 }
 
 -- Script names used for routing between multi-script modules
 M.Scripts = {
     COORDINATOR = 'sidekick-next/sk_coordinator',
     UI = { 'sidekick-next', 'sidekick-next/init' },
+    WORKERS = {
+        'sidekick-next/sk_emergency',
+        'sidekick-next/sk_healing',
+        'sidekick-next/sk_cures',
+        'sidekick-next/sk_cc',
+        'sidekick-next/sk_assist',
+        'sidekick-next/sk_dps',
+        'sidekick-next/sk_resources',
+        'sidekick-next/sk_buffs',
+        'sidekick-next/sk_meditation',
+        'sidekick-next/sk_resurrection',
+        'sidekick-next/sk_disciplines',
+    },
+    LEGACY_WORKERS = {
+        'sidekick-next/sk_healing_emergency',
+    },
 }
 
 -- Timing constants (milliseconds)
@@ -56,8 +78,11 @@ M.Timing = {
     STATE_BROADCAST_MS = 200,
     STATE_TTL_MS = 750,
     MODULE_HEARTBEAT_MS = 500,
-    CLAIM_DEFAULT_TTL_MS = 1000,
-    TARGET_CLAIM_TTL_MS = 2000,
+    SUPERVISOR_HEARTBEAT_MS = 500,
+    SUPERVISOR_ABSENCE_MS = 10000,
+    CLAIM_DEFAULT_TTL_MS = 15000,
+    TARGET_CLAIM_TTL_MS = 15000,
+    CLAIM_CAST_START_MS = 1000,      -- Revoke ordinary spell claims that never start a cast
     WARMUP_MS = 500,
     COALESCE_MS = 20,
 
@@ -66,6 +91,7 @@ M.Timing = {
     COORDINATOR_ABSENCE_MS = 10000, -- 10s without state = coordinator presumed crashed
     RESTART_COOLDOWN_MS = 15000,    -- 15s between restart attempts for same module
     WATCHDOG_CHECK_MS = 1000,       -- 1s between watchdog scans
+    RESTART_STABLE_MS = 60000,      -- Reset crash-loop count only after 60s healthy
 }
 
 -- Watchdog limits
@@ -75,7 +101,9 @@ M.MAX_MODULE_RESTARTS = 3  -- Max restart attempts per module per session
 M.ActionKind = {
     CAST_SPELL = 'cast_spell',
     USE_AA = 'use_aa',
+    USE_DISC = 'use_disc',
     USE_ITEM = 'use_item',
+    USE_SKILL = 'use_skill',
 }
 
 -- Claim types
@@ -97,6 +125,26 @@ end
 -- @return number Current time in ms
 function M.getTimeMs()
     return mq.gettime()
+end
+
+--- Return MacroQuest's current status for a Lua script.
+--- This queries MQ2Lua directly and does not depend on Actors delivery.
+-- @param scriptName string Canonical script name, e.g. sidekick-next/sk_healing
+-- @return string STARTING, RUNNING, PAUSED, EXITED, or empty when unavailable
+function M.getLuaScriptStatus(scriptName)
+    if not scriptName or scriptName == '' then return '' end
+    local status = M.safeTLO(function()
+        return mq.TLO.Lua.Script(tostring(scriptName)).Status()
+    end, '')
+    return tostring(status or ''):upper()
+end
+
+--- True when MQ2Lua confirms that a script currently has a live process.
+-- @param scriptName string
+-- @return boolean
+function M.isLuaScriptRunning(scriptName)
+    local status = M.getLuaScriptStatus(scriptName)
+    return status == 'STARTING' or status == 'RUNNING' or status == 'PAUSED'
 end
 
 --- Check if a timestamp is stale
@@ -134,6 +182,61 @@ function M.isMeValid()
     return mq.TLO.Me and mq.TLO.Me() ~= nil
 end
 
+--- Read MacroQuest's current game state without allowing a transient TLO
+--- failure to terminate a long-running SideKick script.
+-- @return string Uppercase game-state name, or an empty string if unavailable
+function M.getGameState()
+    local state = M.safeTLO(function()
+        return mq.TLO.MacroQuest.GameState()
+    end, '')
+    return tostring(state or ''):upper()
+end
+
+--- True only while the local character is fully available for automation.
+function M.isInGame()
+    return M.getGameState() == 'INGAME'
+end
+
+--- Read the persisted global automation pause flag.
+--- Coordinated workers are separate Lua processes, so they cannot rely on the
+--- UI script's in-memory Core.Settings table. Reload the shared config on a
+--- short throttle so /sidekick pause/resume propagates to every worker.
+---@param force boolean|nil
+---@return boolean
+function M.refreshSettings(revision)
+    if revision ~= nil and _Core and _settingsRevision == revision then return _Core.Settings end
+    do
+        local ok, core = pcall(require, 'sidekick-next.utils.core')
+        if ok and core then
+            _Core = core
+            if core.load then pcall(core.load) end
+            _coreLoadedAtMs = M.getTimeMs()
+            _settingsRevision = revision
+        end
+    end
+    return _Core and _Core.Settings or nil
+end
+
+function M.getSettings()
+    if not _Core then M.refreshSettings() end
+    return _Core and _Core.Settings or nil
+end
+
+function M.isAutomationPaused(force)
+    if force == true or not _Core then M.refreshSettings() end
+    return _Core and _Core.Settings and _Core.Settings.AutomationPaused == true or false
+end
+
+--- States that represent leaving the character rather than a transient zone.
+--- Unknown/empty states are deliberately non-terminal because MQ TLOs can be
+--- briefly unavailable while zoning.
+function M.isTerminalGameState(state)
+    state = tostring(state or M.getGameState()):upper()
+    return state == 'CHARSELECT'
+        or state == 'PRECHARSELECT'
+        or state == 'SERVERSELECT'
+end
+
 --- Check whether the local character cannot act because they are dead/hovering.
 -- @return boolean
 function M.isSelfDeadOrHovering()
@@ -144,17 +247,31 @@ function M.isSelfDeadOrHovering()
     return M.safeTLO(function() return mq.TLO.Me.Dead() end, false) == true
 end
 
---- Get my character name
+local _cachedMyName = ''
+local _cachedMyServer = ''
+
+--- Get my character name. Preserve the last valid identity while zoning so
+--- Actors heartbeats remain attributable to this character.
 -- @return string
 function M.getMyName()
-    if not M.isMeValid() then return '' end
-    return M.safeTLO(function() return mq.TLO.Me.CleanName() end, '') or ''
+    if M.isMeValid() then
+        local name = M.safeTLO(function() return mq.TLO.Me.CleanName() end, '') or ''
+        if name ~= '' and name ~= 'NULL' then
+            _cachedMyName = tostring(name)
+        end
+    end
+    return _cachedMyName
 end
 
---- Get current server name normalized the same way config paths do.
+--- Get current server name. Preserve the last valid value while zoning for
+--- the same reason as getMyName().
 -- @return string
 function M.getMyServer()
-    return M.safeTLO(function() return mq.TLO.EverQuest.Server() end, '') or ''
+    local server = M.safeTLO(function() return mq.TLO.EverQuest.Server() end, '') or ''
+    if server ~= '' and server ~= 'NULL' then
+        _cachedMyServer = tostring(server)
+    end
+    return _cachedMyServer
 end
 
 --- Build identity fields for local module/coordinator messages.
@@ -191,6 +308,50 @@ function M.isCasting()
         local wnd = mq.TLO.Window and mq.TLO.Window('CastingWindow')
         return wnd and wnd.Open and wnd.Open()
     end, false) == true
+end
+
+--- Return the local character states that prevent starting or owning an action.
+--- Keep this TLO sampling in normal ticks; Actor callbacks consume copied state only.
+-- @return table { incapacitated, reason, stunned, mezzed, silenced, feared }
+function M.getIncapacitationState()
+    local result = {
+        incapacitated = false,
+        reason = nil,
+        stunned = false,
+        mezzed = false,
+        silenced = false,
+        feared = false,
+    }
+
+    if not M.isMeValid() then
+        return result
+    end
+
+    local me = mq.TLO.Me
+    result.stunned = M.safeTLO(function() return me.Stunned() end, false) == true
+    result.mezzed = M.safeNum(function() return me.Mezzed.ID() end, 0) > 0
+        or M.safeTLO(function() return me.Mezzed() end, false) == true
+    result.silenced = M.safeTLO(function() return me.Silenced() end, false) == true
+    result.feared = M.safeTLO(function() return me.Feared() end, false) == true
+
+    if result.stunned then
+        result.reason = 'stunned'
+    elseif result.mezzed then
+        result.reason = 'mezzed'
+    elseif result.silenced then
+        result.reason = 'silenced'
+    elseif result.feared then
+        result.reason = 'feared'
+    end
+    result.incapacitated = result.reason ~= nil
+    return result
+end
+
+--- True when the local character cannot safely begin or retain an action claim.
+-- @return boolean, string|nil
+function M.isIncapacitated()
+    local state = M.getIncapacitationState()
+    return state.incapacitated, state.reason
 end
 
 --- Get remaining cast time in seconds

@@ -119,11 +119,12 @@ function M.logTargetSelection(targets, selected, reason)
     table.insert(lines, string.format('  Candidates: %d', #targets))
     for i, t in ipairs(targets) do
         if i <= 5 then  -- Top 5 only
-                table.insert(lines, string.format('    %d. %s [%s] HP:%d%% Deficit:%d Incoming:%d EffDeficit:%d',
-                    i, t.name or '?', t.role or '?', t.pctHP or 0, t.deficit or 0,
+                table.insert(lines, string.format('    %d. %s [%s] HP:%d%% MaxHP:%d/%s Deficit:%d Incoming:%d EffDeficit:%d',
+                    i, t.name or '?', t.role or '?', t.pctHP or 0,
+                    t.maxHP or 0, t.maxHPSource or '?', t.deficit or 0,
                     t.incomingTotal or 0, t.effectiveDeficit or 0))
+            end
         end
-    end
     if selected then
         table.insert(lines, string.format('  SELECTED: %s - %s', selected.name or '?', reason or 'best candidate'))
     else
@@ -163,7 +164,7 @@ function M.logSpellSelection(target, tier, spells, selected, score)
         for i, s in ipairs(spells) do
             if i <= 8 then  -- Top 8 spells
                 table.insert(lines, string.format('    %d. %s Score:%.2f Expected:%d Mana:%d Cast:%.1fs',
-                    i, s.name or '?', s.score or 0, s.expected or 0, s.mana or 0, (s.castTime or 0) / 1000))
+                    i, s.spell or s.name or '?', s.score or 0, s.expected or 0, s.mana or 0, (s.castTime or 0) / 1000))
             end
         end
     end

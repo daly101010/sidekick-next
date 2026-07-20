@@ -4,6 +4,7 @@
 -- across multiple main loop ticks with frame yields between them.
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local HealerClasses = require('sidekick-next.utils.healer_classes')
 
 local debugLog = require('sidekick-next.utils.debug_log').tagged('Heal', 'SideKick_HealDebug.log')
 
@@ -58,6 +59,8 @@ local _optionalReady = false  -- True after all optional modules loaded (phases 
 local _lastHealAttempt = 0
 local _priorityActive = false
 local ActorsCoordinator = nil
+local _configReloadPending = false
+local _lastClaimMetrics = nil
 
 -- Lazy-load DamageParser (optional dual-source DPS tracking)
 local DamageParser = nil
@@ -95,8 +98,7 @@ local function isHealerClass()
     local me = mq.TLO.Me
     if not me or not me() then return false end
     local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
-    classShort = classShort:upper()
-    return classShort == 'CLR' or classShort == 'PAL'
+    return HealerClasses.isSupported(classShort)
 end
 
 local function isCastingValueActive(casting)
@@ -153,27 +155,77 @@ local function shouldDuck(castInfo)
     local target = TargetMonitor.getTarget(castInfo.targetId)
     if not target then return false end
 
-    local threshold
-    if castInfo.tier == 'emergency' then
-        threshold = (Config and Config.duckEmergencyThreshold ~= nil) and Config.duckEmergencyThreshold or 70
-    elseif castInfo.isHoT then
-        threshold = (Config and Config.duckHotThreshold ~= nil) and Config.duckHotThreshold or 92
-    else
-        threshold = (Config and Config.duckHpThreshold ~= nil) and Config.duckHpThreshold or 85
+    local now = mq.gettime()
+    local castAgeMs = now - (tonumber(castInfo.startTime) or now)
+    local incomingGraceMs = (Config and Config.duckIncomingGraceMs ~= nil) and Config.duckIncomingGraceMs or 900
+
+    -- Ducking is not a second HP-threshold system. Heal selection already
+    -- right-sizes by expected heal amount versus uncovered missing HP. Once a
+    -- heal has started, only cancel if that missing HP has become covered by
+    -- another healer's incoming cast or by an active HoT that is keeping up
+    -- with the target's current damage intake.
+    local rawDeficit = tonumber(target.deficit) or 0
+
+    if IncomingHeals and IncomingHeals.sumForTarget and IncomingHeals.getMyId then
+        local myId = IncomingHeals.getMyId()
+        local incomingFromOthers = IncomingHeals.sumForTarget(castInfo.targetId, myId)
+        if incomingFromOthers > 0 and (rawDeficit - incomingFromOthers) <= 0 then
+            if castAgeMs < incomingGraceMs then
+                return false, nil, nil
+            end
+            return true, 'incoming_covers', nil
+        end
     end
 
-    local buffer = (Config and Config.duckBufferPct ~= nil) and Config.duckBufferPct or 0.5
-    local thresholdWithBuffer = threshold + buffer
-
-    if target.pctHP >= thresholdWithBuffer then
-        return true, 'target_full', thresholdWithBuffer
+    local me = mq.TLO.Me
+    local invisible = false
+    if me and me() and me.Invis then
+        local value = me.Invis()
+        invisible = value == true or (tonumber(value) or 0) > 0
+    end
+    if invisible and not (Config and Config.breakInvisOOC == true) then
+        debugLog('[CanHealNow] FAIL: invisible')
+        return false
     end
 
-    if Config.considerIncomingHot and target.effectiveDeficit <= 0 then
-        return true, 'incoming_covers', thresholdWithBuffer
+    if Config.considerIncomingHot then
+        local proactive = getProactive()
+        local hotRemaining = 0
+        if proactive and proactive.getIncomingHotRemaining then
+            hotRemaining = tonumber(proactive.getIncomingHotRemaining(target.name or castInfo.targetName or castInfo.targetId)) or 0
+        end
+
+        if hotRemaining > 0 then
+            local hotTarget = {}
+            for k, v in pairs(target) do hotTarget[k] = v end
+            hotTarget.incomingHotRemaining = hotRemaining
+
+            local hotAnalyzer = getHotAnalyzer()
+            if hotAnalyzer and hotAnalyzer.shouldTrustHoT then
+                local trustHoT = hotAnalyzer.shouldTrustHoT(hotTarget, {
+                    urgency = castInfo.tier,
+                    duckCheck = true,
+                })
+                if trustHoT then
+                    if castAgeMs < incomingGraceMs then
+                        return false, nil, nil
+                    end
+                    return true, 'hot_covers', nil
+                end
+            else
+                local castRemainingSec = math.max(0, ((tonumber(castInfo.expectedEnd) or now) - now) / 1000)
+                local projectedDeficit = rawDeficit + ((tonumber(target.recentDps) or 0) * castRemainingSec)
+                if hotRemaining >= projectedDeficit then
+                    if castAgeMs < incomingGraceMs then
+                        return false, nil, nil
+                    end
+                    return true, 'hot_covers', nil
+                end
+            end
+        end
     end
 
-    return false, nil, thresholdWithBuffer
+    return false, nil, nil
 end
 
 local function is_hot_spell(spellName)
@@ -260,7 +312,7 @@ local function executeHeal(spellName, targetId, tier, isHoT)
         end
 
         IncomingHeals.registerMyCast(targetId, spellName, expected, castSec, isHoT, hotTickAmount, hotDuration)
-        M.broadcastIncoming(targetId, spellName, expected, mq.gettime() + castTimeMs, isHoT)
+        M.broadcastIncoming(targetId, spellName, expected, castTimeMs, isHoT)
 
         -- Track HoT presence for proactive logic + peers
         if isHoT then
@@ -316,13 +368,16 @@ end
 local function buildHealingContext()
     local proactive = getProactive()
     local allTargets = {}
+    local localTargets = {}
     local priorityTargets = {}
     local groupTargets = {}
 
     local targets = TargetMonitor.getAllTargets() or {}
     for _, t in pairs(targets) do
-        if Config.healPetsEnabled or t.role ~= 'pet' then
+        if not t.dead and not t.hovering and (t.pctHP or 0) > 0
+            and (Config.healPetsEnabled or t.role ~= 'pet') then
             local entry = cloneTarget(t)
+            entry._isSelf = entry.id == tonumber(mq.TLO.Me.ID())
             local incomingTotal = IncomingHeals.sumForTarget(entry.id)
             entry.incomingTotal = incomingTotal
             entry.deficit = math.max(0, (entry.deficit or 0) - incomingTotal)
@@ -331,6 +386,7 @@ local function buildHealingContext()
                 entry.incomingHotRemaining = proactive.getIncomingHotRemaining(entry.name or entry.id)
             end
             table.insert(allTargets, entry)
+            if not entry.actorReported then table.insert(localTargets, entry) end
             if entry.role == 'tank' then
                 table.insert(priorityTargets, entry)
             else
@@ -345,6 +401,15 @@ local function buildHealingContext()
         if pa ~= pb then return pa < pb end
         return (a.pctHP or 100) < (b.pctHP or 100)
     end)
+
+    local function targetOrder(a, b)
+        local pa = TargetMonitor.getPriority(a) or 99
+        local pb = TargetMonitor.getPriority(b) or 99
+        if pa ~= pb then return pa < pb end
+        return (a.pctHP or 100) < (b.pctHP or 100)
+    end
+    table.sort(priorityTargets, targetOrder)
+    table.sort(groupTargets, targetOrder)
 
     local situation = {
         hasEmergency = false,
@@ -374,11 +439,12 @@ local function buildHealingContext()
     situation.hasRaidMob = combatState.hasRaidMob == true
     situation.hasNamedMob = combatState.hasNamedMob == true
     situation.mobDpsMultiplier = combatState.mobDpsMultiplier or 1.0
-    situation.raidFight = situation.hasRaidMob or (situation.hasNamedMob and situation.mobDpsMultiplier >= 2.0)
+    situation.raidFight = situation.hasRaidMob or situation.hasNamedMob
 
     return {
         proactive = proactive,
         allTargets = allTargets,
+        localTargets = localTargets,
         priorityTargets = priorityTargets,
         groupTargets = groupTargets,
         situation = situation,
@@ -389,6 +455,12 @@ local function buildHealActionForTarget(targetInfo, heal, tier, reason)
     if not targetInfo or not heal then return nil end
     local spellName = heal.spell
     if not spellName or spellName == '' then return nil end
+    local spell = mq.TLO.Spell(spellName)
+    local range = spell and spell() and tonumber(spell.Range()) or 0
+    if range > 0 and (tonumber(targetInfo.distance3D) or 0) > (range + 5) then
+        return nil
+    end
+    if targetInfo.lineOfSight == false then return nil end
     return {
         spellName = spellName,
         targetId = targetInfo.id,
@@ -399,6 +471,19 @@ local function buildHealActionForTarget(targetInfo, heal, tier, reason)
         details = heal.details,
         reason = reason,
     }
+end
+
+local function localGroupClaimId()
+    local best = tonumber(mq.TLO.Me.ID()) or 0
+    local count = tonumber(mq.TLO.Group.Members()) or 0
+    for i = 1, count do
+        local member = mq.TLO.Group.Member(i)
+        if member and member() then
+            local id = tonumber(member.ID()) or 0
+            if id > 0 and (best <= 0 or id < best) then best = id end
+        end
+    end
+    return best
 end
 
 local function buildHealAction(opts)
@@ -449,7 +534,7 @@ local function buildHealAction(opts)
     end
 
     -- Group heal
-    local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(ctx.allTargets)
+    local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(ctx.localTargets)
     if useGroup and groupHeal then
         local myId = mq.TLO.Me.ID()
         if myId and myId > 0 then
@@ -462,18 +547,21 @@ local function buildHealAction(opts)
                 expected = groupHeal.expected,
                 details = groupHeal.details,
                 reason = 'group_heal',
+                claimTargetId = localGroupClaimId(),
             }, 'group_heal'
         end
     end
 
     -- Group HoT
     if proactive and proactive.ShouldApplyGroupHot then
-        local useGroupHot, groupHot, _, _ = proactive.ShouldApplyGroupHot(ctx.allTargets, situation)
+        local useGroupHot, groupHot, _, _ = proactive.ShouldApplyGroupHot(ctx.localTargets, situation)
         if useGroupHot and groupHot then
             local myId = mq.TLO.Me.ID()
             if myId and myId > 0 then
                 local targetNames = {}
-                for _, t in ipairs(ctx.allTargets) do
+                local targetIds = {}
+                for _, t in ipairs(ctx.localTargets) do
+                    if t.id then table.insert(targetIds, t.id) end
                     if (t.deficit or 0) > 0 and t.name then
                         table.insert(targetNames, t.name)
                     end
@@ -488,6 +576,8 @@ local function buildHealAction(opts)
                     details = groupHot.details,
                     reason = 'group_hot',
                     groupHotTargets = targetNames,
+                    groupHotTargetIds = targetIds,
+                    claimTargetId = localGroupClaimId(),
                 }, 'group_hot'
             end
         end
@@ -599,6 +689,7 @@ local function prepareHealCast(action)
         startTime = startTime,
         expectedEnd = startTime + castTimeMs + 1000,
         groupHotTargets = action.groupHotTargets,
+        groupHotTargetIds = action.groupHotTargetIds,
     }
 
     if info.isHoT then
@@ -635,7 +726,7 @@ local function registerHealCast(castInfo)
     local hotDuration = castInfo.hotDuration
 
     IncomingHeals.registerMyCast(targetId, spellName, expected, castSec, isHoT, hotTickAmount, hotDuration)
-    M.broadcastIncoming(targetId, spellName, expected, mq.gettime() + (castInfo.castTimeMs or 0), isHoT)
+    M.broadcastIncoming(targetId, spellName, expected, castInfo.castTimeMs or 0, isHoT)
 
     local proactive = getProactive()
     if isHoT then
@@ -649,11 +740,15 @@ local function registerHealCast(castInfo)
             -- Wall-clock epoch seconds so cross-peer receivers can compare.
             local castTimeSec = (castInfo.castTimeMs or 0) / 1000
             local exp = os.time() + castTimeSec + (hotDuration or 18)
-            ActorsCoordinator.broadcast('heal:hots', {
-                targetId = targetId,
-                spellName = spellName,
-                expiresAt = exp,
-            })
+            local hotTargetIds = castInfo.groupHotTargetIds or { targetId }
+            for _, hotTargetId in ipairs(hotTargetIds) do
+                ActorsCoordinator.broadcast('heal:hots', {
+                    targetId = hotTargetId,
+                    spellName = spellName,
+                    expiresAt = exp,
+                    zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
+                })
+            end
         end
     end
 
@@ -724,13 +819,24 @@ local function monitorDuck(opts)
     if duck then
         -- Log duck decision with details
         local targetInfo = TargetMonitor.getTarget(castInfo.targetId)
-        local details = string.format('targetHP=%d%% incoming=%d threshold=%d',
+        local hotRemaining = 0
+        local proactive = getProactive()
+        if proactive and proactive.getIncomingHotRemaining then
+            hotRemaining = tonumber(proactive.getIncomingHotRemaining(
+                targetInfo and (targetInfo.name or targetInfo.id) or (castInfo.targetName or castInfo.targetId)
+            )) or 0
+        end
+        local details = string.format('targetHP=%d%% deficit=%d incoming=%d hotRemaining=%d dps=%.1f',
             targetInfo and targetInfo.pctHP or 0,
+            targetInfo and targetInfo.deficit or 0,
             targetInfo and targetInfo.incomingTotal or 0,
-            threshold or ((Config and Config.duckHpThreshold ~= nil) and Config.duckHpThreshold or 85))
+            hotRemaining,
+            targetInfo and targetInfo.recentDps or 0)
         Logger.logDuckDecision(castInfo.spellName, castInfo.targetName or '?', reason, details)
 
-        if opts and opts.onDuck then
+        if opts and opts.deferCancel then
+            return true, reason, threshold
+        elseif opts and opts.onDuck then
             opts.onDuck(castInfo, reason, threshold)
         else
             mq.cmd('/stopcast')
@@ -743,7 +849,7 @@ local function monitorDuck(opts)
         end
 
         cancelHealCast(castInfo, reason)
-        return true
+        return true, reason, threshold
     end
     return false
 end
@@ -755,10 +861,22 @@ end
 function M.initPhased(phase)
     if phase == 1 then
         -- Phase 1: Config + Logger (~1100 lines)
+        _lastClaimMetrics = nil
         Config = require('sidekick-next.healing.config')
         Logger = require('sidekick-next.healing.logger')
         Config.load()
-        Config.autoAssignFromSpellBar()
+        -- Persisted/imported categories are authoritative. Auto-assignment is
+        -- only a first-run fallback; otherwise startup could erase a valid
+        -- configuration merely because the spell bar was still being loaded.
+        if not Config.HasConfiguredSpells or not Config.HasConfiguredSpells() then
+            if not Config.autoAssignFromActiveSpellSet or not Config.autoAssignFromActiveSpellSet() then
+                Config.autoAssignFromSpellBar()
+            end
+        elseif Config.mergeFromSpellBar then
+            -- Discover newly memorized heals without replacing the persisted
+            -- assignments that were already selected for this character.
+            Config.mergeFromSpellBar()
+        end
         Logger.init(Config)
 
     elseif phase == 2 then
@@ -825,6 +943,14 @@ function M.initPhased(phase)
                 end)
                 ac.registerHealingCallback('heal:cancelled', function(content, senderName)
                     M.handleActorMessage('heal:cancelled', content, senderName)
+                end)
+            end
+            if ac.registerMessageCallback then
+                ac.registerMessageCallback('heal:config', function(content)
+                    local mine = tostring(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or ''):lower()
+                    local target = tostring(content.character or ''):lower()
+                    if target == '' or target == mine then _configReloadPending = true end
+                    return true
                 end)
             end
         end
@@ -1015,7 +1141,7 @@ function M.tick(settings)
     situation.hasRaidMob = combatState.hasRaidMob == true
     situation.hasNamedMob = combatState.hasNamedMob == true
     situation.mobDpsMultiplier = combatState.mobDpsMultiplier or 1.0
-    situation.raidFight = situation.hasRaidMob or (situation.hasNamedMob and situation.mobDpsMultiplier >= 2.0)
+    situation.raidFight = situation.hasRaidMob or situation.hasNamedMob
 
     -- Log situation summary
     local hurtCount = 0
@@ -1179,6 +1305,15 @@ end
 
 function M.tickSensors()
     if not _initialized then return end
+    if _configReloadPending then
+        _configReloadPending = false
+        Config.load()
+        if TargetMonitor.updateConfig then TargetMonitor.updateConfig(Config) end
+        Logger.info('config', 'Reloaded healing configuration from peer update')
+    end
+    if ActorsCoordinator and ActorsCoordinator.getRemoteCharacters and TargetMonitor.updateActorTargets then
+        TargetMonitor.updateActorTargets(ActorsCoordinator.getRemoteCharacters())
+    end
     TargetMonitor.tick()
     IncomingHeals.tick()
     CombatAssessor.tick()
@@ -1229,7 +1364,7 @@ function M.cancelHealCast(castInfo, reason)
 end
 
 -- Broadcast functions for multi-healer coordination
-function M.broadcastIncoming(targetId, spellName, expectedAmount, landsAt, isHoT)
+function M.broadcastIncoming(targetId, spellName, expectedAmount, remainingMs, isHoT)
     if not ActorsCoordinator or not ActorsCoordinator.broadcast then return end
     if not Config.broadcastEnabled then return end
 
@@ -1237,8 +1372,9 @@ function M.broadcastIncoming(targetId, spellName, expectedAmount, landsAt, isHoT
         targetId = targetId,
         spellName = spellName,
         expectedAmount = expectedAmount,
-        landsAt = landsAt,
+        remainingMs = math.max(0, tonumber(remainingMs) or 0),
         isHoT = isHoT,
+        zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
     })
 end
 
@@ -1249,6 +1385,7 @@ function M.broadcastLanded(targetId, spellName)
     ActorsCoordinator.broadcast('heal:landed', {
         targetId = targetId,
         spellName = spellName,
+        zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
     })
 end
 
@@ -1260,6 +1397,7 @@ function M.broadcastCancelled(targetId, spellName, reason)
         targetId = targetId,
         spellName = spellName,
         reason = reason,
+        zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
     })
 end
 
@@ -1273,6 +1411,101 @@ function M.handleActorMessage(msgType, data, senderId)
     elseif msgType == 'heal:cancelled' then
         IncomingHeals.remove(senderId, data.targetId)
     end
+end
+
+local function claimMetricsKey(action)
+    return string.format('%s:%d:%s', tostring(action.tier or 'heal'),
+        tonumber(action.claimTargetId or action.targetId) or 0,
+        tostring(action.spellName or action.name or ''))
+end
+
+local function buildClaimMetrics(action, reuseBroadcast)
+    local key = claimMetricsKey(action)
+    if reuseBroadcast and _lastClaimMetrics and _lastClaimMetrics.key == key then
+        return _lastClaimMetrics.metrics
+    end
+    local spellName = tostring(action.spellName or action.name or '')
+    local expectedAmount = tonumber(action.expected)
+    if expectedAmount == nil and HealTracker and HealTracker.getExpected then
+        expectedAmount = tonumber(HealTracker.getExpected(spellName))
+    end
+    expectedAmount = math.max(0, expectedAmount or 0)
+
+    local castTimeMs = tonumber(action.castTimeMs)
+    if not castTimeMs and spellName ~= '' then
+        local spell = mq.TLO.Spell(spellName)
+        if spell and spell() then
+            local me = mq.TLO.Me
+            ---@diagnostic disable-next-line: undefined-field
+            local mySpell = me and me() and me.Spell and me.Spell(spellName)
+            castTimeMs = mySpell and tonumber(mySpell.MyCastTime()) or tonumber(spell.CastTime())
+        end
+    end
+    castTimeMs = math.max(0, castTimeMs or 2000)
+
+    local healTargetId = tonumber(action.targetId) or 0
+    local target = TargetMonitor and TargetMonitor.getTarget and TargetMonitor.getTarget(healTargetId) or nil
+    local deficit = target and math.max(0,
+        tonumber(target.effectiveDeficit) or tonumber(target.deficit) or 0) or 0
+    local projectedDamage = target and math.max(0, tonumber(target.recentDps) or 0)
+        * (castTimeMs / 1000) or 0
+    local projectedNeed = math.max(1, deficit + projectedDamage)
+
+    return {
+        spellName = spellName,
+        expectedAmount = expectedAmount,
+        castTimeMs = castTimeMs,
+        projectedNeed = projectedNeed,
+        coveragePct = (expectedAmount / projectedNeed) * 100,
+    }
+end
+
+function M.broadcastClaim(action, ttlMs)
+    if not ActorsCoordinator or not ActorsCoordinator.broadcast or not action then return false end
+    if Config and Config.broadcastEnabled == false then return false end
+    local targetId = tonumber(action.claimTargetId or action.targetId) or 0
+    if targetId <= 0 then return false end
+    local tier = tostring(action.tier or 'heal')
+    local priority = tier == 'emergency' and 0 or 1
+    local metrics = buildClaimMetrics(action, false)
+    _lastClaimMetrics = { key = claimMetricsKey(action), metrics = metrics }
+    ActorsCoordinator.broadcast('heal:claim', {
+        targetId = targetId,
+        spellName = metrics.spellName,
+        tier = tier,
+        priority = priority,
+        expectedAmount = metrics.expectedAmount,
+        castTimeMs = metrics.castTimeMs,
+        projectedNeed = metrics.projectedNeed,
+        coveragePct = metrics.coveragePct,
+        claimKey = string.format('%s:%d', tier, targetId),
+        expiresAt = os.time() + math.max(2, math.ceil((tonumber(ttlMs) or 1000) / 1000) + 1),
+        zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
+    })
+    return true
+end
+
+function M.isClaimWinner(action)
+    if Config and Config.broadcastEnabled == false then return true end
+    if not ActorsCoordinator or not ActorsCoordinator.isHealClaimWinner or not action then return true end
+    local targetId = tonumber(action.claimTargetId or action.targetId) or 0
+    if targetId <= 0 then return false end
+    local tier = tostring(action.tier or 'heal')
+    local myName = mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or ''
+    -- Reuse the values that were broadcast for this intent. That guarantees
+    -- every client sorts the exact same claim even if HP changes while the
+    -- short claim-settling window is running.
+    local metrics = buildClaimMetrics(action, true)
+    return ActorsCoordinator.isHealClaimWinner(targetId, {
+        from = myName,
+        spellName = metrics.spellName,
+        tier = tier,
+        priority = tier == 'emergency' and 0 or 1,
+        expectedAmount = metrics.expectedAmount,
+        castTimeMs = metrics.castTimeMs,
+        projectedNeed = metrics.projectedNeed,
+        coveragePct = metrics.coveragePct,
+    })
 end
 
 function M.shutdown()
@@ -1303,6 +1536,7 @@ function M.shutdown()
     end
 
     Logger.shutdown()  -- Close log file
+    _lastClaimMetrics = nil
     _initialized = false
 end
 

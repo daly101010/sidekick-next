@@ -16,6 +16,8 @@ local M = {}
 M.isMemorizing = false  -- Flag while memorization in progress
 M.pendingSet = nil      -- Queued set to apply when out of combat
 M.pendingSave = false   -- Whether to save before applying
+M.suspendUntilMs = 0    -- External lease holder can pause spellset enforcement
+M.suspendReason = nil
 
 --------------------------------------------------------------------------------
 -- Lazy-loaded dependencies
@@ -23,6 +25,7 @@ M.pendingSave = false   -- Whether to save before applying
 
 local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
 local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
+local getConditionDefaults = lazy('sidekick-next.utils.condition_defaults')
 
 --------------------------------------------------------------------------------
 -- Constants
@@ -31,7 +34,8 @@ local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
 local CLEAR_DELAY_MS = 500          -- Delay after right-click to clear gem
 local MEMORIZE_TIMEOUT_MS = 12000   -- Max time to wait for memorization
 local WAIT_POLL_MS = 100            -- Poll interval for wait functions
-local DIRTY_CHECK_INTERVAL = 30     -- Seconds between automatic dirty-gem checks
+local MANUAL_SCAN_INTERVAL_MS = 250 -- Polling is cheap and runs only while idle/OOC
+local MANUAL_SETTLE_MS = 750        -- Require a stable post-memorization layout
 local STATUS_MODULE = 'spell_memorize'
 
 --------------------------------------------------------------------------------
@@ -97,6 +101,52 @@ local function getSpellName(spellId)
     return nil
 end
 
+local function isSpellIdKnown(spellId)
+    local spellName = getSpellName(spellId)
+    if not spellName or spellName == '' then return false end
+    local me = mq.TLO.Me
+    if not (me and me() and me.Book) then return true end
+    local ok, known = pcall(function()
+        local bookSpell = me.Book(spellName)
+        return bookSpell and bookSpell() and true or false
+    end)
+    if not ok then return true end
+    return known == true
+end
+
+local function pruneUnavailableSpells(spellSet)
+    if not spellSet then return false end
+    local changed = false
+    local SpellSetData = getSpellSetData()
+
+    for slot, gemConfig in pairs(spellSet.gems or {}) do
+        if gemConfig and gemConfig.spellId and not isSpellIdKnown(gemConfig.spellId) then
+            print(string.format('\ay[SpellSetMemorize]\ax Removing unavailable spell ID %s from gem %s',
+                tostring(gemConfig.spellId), tostring(slot)))
+            if SpellSetData and SpellSetData.clearGem then
+                SpellSetData.clearGem(spellSet, slot)
+            else
+                spellSet.gems[slot] = nil
+            end
+            changed = true
+        end
+    end
+
+    if type(spellSet.oocBuffs) == 'table' then
+        for i = #spellSet.oocBuffs, 1, -1 do
+            local buffConfig = spellSet.oocBuffs[i]
+            if buffConfig and buffConfig.spellId and not isSpellIdKnown(buffConfig.spellId) then
+                print(string.format('\ay[SpellSetMemorize]\ax Removing unavailable OOC buff spell ID %s',
+                    tostring(buffConfig.spellId)))
+                table.remove(spellSet.oocBuffs, i)
+                changed = true
+            end
+        end
+    end
+
+    return changed
+end
+
 --- Get current spell ID in a gem slot
 ---@param slot number The gem slot
 ---@return number|nil The spell ID or nil if empty
@@ -148,6 +198,69 @@ M._memJob = nil  -- nil when idle; otherwise see schema below
 
 local function _nowMs()
     return (mq.gettime and mq.gettime()) or (os.clock() * 1000)
+end
+
+local function getExternalLeasePath()
+    return string.format('%s/SideKick_buff_gem_lease.txt', tostring(mq.configDir or 'config'))
+end
+
+local function readExternalLease()
+    local path = getExternalLeasePath()
+    local fh = io.open(path, 'r')
+    if not fh then return 0, nil end
+    local line = fh:read('*l') or ''
+    fh:close()
+    local expiry, reason = line:match('^(%d+)%s*(.*)$')
+    expiry = tonumber(expiry) or 0
+    if expiry > 0 and os.time() > expiry then
+        pcall(os.remove, path)
+    end
+    return expiry, reason
+end
+
+local function isSuspended()
+    if _nowMs() < (M.suspendUntilMs or 0) then
+        return true
+    end
+
+    local expiry, reason = readExternalLease()
+    if os.time() <= expiry then
+        M.suspendReason = reason ~= '' and reason or 'external_buff_hotswap'
+        return true
+    end
+    M.suspendReason = nil
+    return false
+end
+
+local function ensurePersistenceLoaded(Persistence)
+    if not Persistence then return false end
+    if not Persistence.loaded and Persistence.load then
+        local ok, loaded = pcall(Persistence.load)
+        return ok and loaded == true
+    end
+    return true
+end
+
+--- Temporarily pause spellset memorization/enforcement.
+--- Used by buff hotswap so the reserved OOC buff gem is not cleared while
+--- sk_buffs is memorizing/casting from it.
+---@param ttlMs number Milliseconds to suspend
+---@param reason string|nil Human-readable reason
+function M.suspend(ttlMs, reason)
+    ttlMs = tonumber(ttlMs) or 0
+    if ttlMs <= 0 then return end
+    local untilMs = _nowMs() + ttlMs
+    if untilMs > (M.suspendUntilMs or 0) then
+        M.suspendUntilMs = untilMs
+    end
+    M.suspendReason = reason or M.suspendReason or 'suspended'
+end
+
+function M.clearSuspend(reason)
+    if not reason or reason == M.suspendReason then
+        M.suspendUntilMs = 0
+        M.suspendReason = nil
+    end
 end
 
 local _statusActor = nil
@@ -244,6 +357,13 @@ end
 ---@param setName string The name of the spell set to apply
 ---@return boolean True if a memorize job is in progress, false if rejected
 function M.apply(setName)
+    if isSuspended() then
+        M.pendingSet = setName
+        print(string.format('\ay[SpellSetMemorize]\ax Suspended (%s), queuing "%s"',
+            tostring(M.suspendReason or 'external'), tostring(setName or '')))
+        return false
+    end
+
     -- Check if already memorizing
     if M.isMemorizing or M._memJob then
         print(string.format('\ay[SpellSetMemorize]\ax Already memorizing, queuing "%s"', setName or ''))
@@ -263,11 +383,18 @@ function M.apply(setName)
         print('\ar[SpellSetMemorize]\ax Failed to load persistence module')
         return false
     end
+    if not ensurePersistenceLoaded(Persistence) then
+        print('\ar[SpellSetMemorize]\ax Failed to load spell set persistence')
+        return false
+    end
 
     local spellSet = Persistence.getSet(setName)
     if not spellSet then
         print(string.format('\ar[SpellSetMemorize]\ax Spell set "%s" not found', setName or ''))
         return false
+    end
+    if pruneUnavailableSpells(spellSet) then
+        pcall(Persistence.save)
     end
 
     local SpellSetData = getSpellSetData()
@@ -442,46 +569,116 @@ local function _stepMemJob()
 end
 
 --------------------------------------------------------------------------------
--- Dirty-Gem Watchdog
+-- Manual Gem Adoption
 --------------------------------------------------------------------------------
 
-local _lastDirtyCheck = 0
+local _lastManualScanAtMs = -MANUAL_SCAN_INTERVAL_MS
+local _manualGemObservations = {}
 
---- Compare live gems against the active spell set.
---- If any slot mismatches, queue the active set for re-memorization.
-local function checkDirtyGems()
-    local now = os.clock()
-    if (now - _lastDirtyCheck) < DIRTY_CHECK_INTERVAL then return end
-    _lastDirtyCheck = now
+local function isSpellBookOpen()
+    local ok, open = pcall(function()
+        local window = mq.TLO.Window('SpellBookWnd')
+        return window and window.Open and window.Open() or false
+    end)
+    return ok and open == true
+end
 
-    if inCombat() then return end
+--- Adopt stable live gem changes into the active spell set.
+--- The spellbook guard prevents capturing the transient empty gem created in
+--- the middle of /memspell. SideKick jobs and buff swaps are excluded by the
+--- caller and the cross-script suspension lease.
+local function adoptManualGemChanges()
+    local nowMs = _nowMs()
+    if (nowMs - _lastManualScanAtMs) < MANUAL_SCAN_INTERVAL_MS then return end
+    _lastManualScanAtMs = nowMs
+
+    if inCombat() then
+        _manualGemObservations = {}
+        return
+    end
+    if isSpellBookOpen() then
+        _manualGemObservations = {}
+        return
+    end
 
     local Persistence = getPersistence()
     if not Persistence then return end
+    if not ensurePersistenceLoaded(Persistence) then return end
 
     local activeSetName = Persistence.activeSetName
     if not activeSetName then return end
 
     local spellSet = Persistence.getSet(activeSetName)
     if not spellSet or not spellSet.gems then return end
+    if pruneUnavailableSpells(spellSet) then
+        pcall(Persistence.save)
+    end
 
     local SpellSetData = getSpellSetData()
     if not SpellSetData then return end
 
     local hasOocBuffs = SpellSetData.hasOocBuffs(spellSet)
     local rotationGems = SpellSetData.getRotationGemCount(hasOocBuffs)
+    local changed = 0
 
     for slot = 1, rotationGems do
         local gemConfig = spellSet.gems[slot]
-        if gemConfig and gemConfig.spellId then
-            local currentId = getCurrentGemSpellId(slot)
-            if currentId ~= gemConfig.spellId then
+        local configuredId = gemConfig and tonumber(gemConfig.spellId) or nil
+        local currentId = tonumber(getCurrentGemSpellId(slot))
+        if currentId == 0 then currentId = nil end
+
+        if currentId == configuredId then
+            _manualGemObservations[slot] = nil
+        else
+            local observation = _manualGemObservations[slot]
+            if not observation or observation.spellId ~= currentId or observation.configuredId ~= configuredId then
+                _manualGemObservations[slot] = {
+                    spellId = currentId,
+                    configuredId = configuredId,
+                    sinceMs = nowMs,
+                }
+            elseif (nowMs - observation.sinceMs) >= MANUAL_SETTLE_MS then
+                local oldName = configuredId and (getSpellName(configuredId) or tostring(configuredId)) or '(empty)'
+                local newName = currentId and (getSpellName(currentId) or tostring(currentId)) or '(empty)'
+                local restoredProfile = currentId and SpellSetData.getSpellProfile
+                    and SpellSetData.getSpellProfile(spellSet, currentId) or nil
+
+                if currentId then
+                    local condition = restoredProfile and restoredProfile.condition or nil
+                    if not restoredProfile then
+                        local ConditionDefaults = getConditionDefaults()
+                        if ConditionDefaults and ConditionDefaults.shouldGenerateDefaults(currentId) then
+                            condition = ConditionDefaults.generateCombatCondition(currentId)
+                        end
+                    end
+                    SpellSetData.setGem(spellSet, slot, currentId, condition,
+                        restoredProfile and restoredProfile.priority or nil,
+                        restoredProfile and restoredProfile.buffTarget or nil,
+                        restoredProfile and restoredProfile.utility or nil)
+                else
+                    SpellSetData.clearGem(spellSet, slot)
+                end
+
+                changed = changed + 1
+                _manualGemObservations[slot] = nil
                 print(string.format(
-                    '\ay[SpellSetMemorize]\ax Gem %d is dirty — queuing "%s" for re-memorization',
-                    slot, activeSetName))
-                M.pendingSet = activeSetName
-                return
+                    '\ag[SpellSetMemorize]\ax Adopted manual gem %d: %s -> %s%s',
+                    slot, oldName, newName,
+                    restoredProfile and ' (restored saved condition/settings)' or ''))
             end
+        end
+    end
+
+    if changed > 0 then
+        local ok, saved = pcall(Persistence.save)
+        if not ok or saved ~= true then
+            print(string.format(
+                '\ar[SpellSetMemorize]\ax Adopted %d manual gem change(s) in memory but failed to save: %s',
+                changed, tostring(ok and saved or saved)))
+        else
+            print(string.format(
+                '\ag[SpellSetMemorize]\ax Saved %d manual gem change(s) to active set "%s"',
+                changed, activeSetName))
         end
     end
 end
@@ -489,6 +686,14 @@ end
 --- Process pending spell set / advance active job. Called from main loop.
 --- One state-machine step per tick — never blocks.
 function M.processPending()
+    if isSuspended() then
+        -- Suspension means another worker owns the temporary buff gem. Do not
+        -- advertise need=true here, or the coordinator can give spell_memorize
+        -- active priority even though this module is intentionally idle.
+        publishStatus(false, 'suspended:' .. tostring(M.suspendReason or 'external'))
+        return
+    end
+
     -- If a job is already running, advance it one step and return.
     if M._memJob then
         publishStatus(true, 'phase:' .. tostring(M._memJob.phase or 'active'))
@@ -501,10 +706,10 @@ function M.processPending()
 
     publishStatus(false, 'idle')
 
-    -- No active job. Run the periodic dirty-gem check if not memorizing.
+    -- No active job. Adopt stable manual gem changes if not memorizing.
     if not M.pendingSet then
         if not M.isMemorizing then
-            checkDirtyGems()
+            adoptManualGemChanges()
         end
         if not M.pendingSet then return end
     end
@@ -520,7 +725,7 @@ function M.processPending()
     -- Save first if requested
     if shouldSave then
         local Persistence = getPersistence()
-        if Persistence then
+        if Persistence and ensurePersistenceLoaded(Persistence) then
             local ok = Persistence.save()
             if ok ~= false then
                 print('\ag[SpellSetMemorize]\ax Spell sets saved')

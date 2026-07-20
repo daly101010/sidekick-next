@@ -5,8 +5,10 @@
 
 local imgui = require('ImGui')
 local mq = require('mq')
-local Settings = require('sidekick-next.ui.settings')
+local Settings = require('sidekick-next.ui.settings.init')
 local Components = require('sidekick-next.ui.components')
+local HealerClasses = require('sidekick-next.utils.healer_classes')
+local RezData = require('sidekick-next.utils.rez_data')
 
 local M = {}
 
@@ -17,37 +19,182 @@ local _healingModChecked = false
 local _healingLoadError = nil
 local _settingsSynced = false
 
+local REZ_CLASSES = {
+    'WAR', 'CLR', 'PAL', 'RNG', 'SHD', 'DRU', 'MNK', 'BRD',
+    'ROG', 'SHM', 'NEC', 'WIZ', 'MAG', 'ENC', 'BST', 'BER',
+}
+
+local function parseRezClasses(raw)
+    raw = tostring(raw or 'ALL'):upper()
+    local selected = {}
+    if raw == 'ALL' or raw == '*' or raw == '' then
+        for _, code in ipairs(REZ_CLASSES) do selected[code] = true end
+        return selected
+    end
+    for code in raw:gmatch('[A-Z]+') do selected[code] = true end
+    return selected
+end
+
+local function serializeRezClasses(selected)
+    local values = {}
+    for _, code in ipairs(REZ_CLASSES) do
+        if selected[code] then values[#values + 1] = code end
+    end
+    if #values == #REZ_CLASSES then return 'ALL' end
+    return table.concat(values, '|')
+end
+
+local function drawResurrection(settings, themeName, onChange)
+    imgui.Spacing()
+    Components.SettingGroup.section('Resurrection', themeName)
+
+    local autoRezOOC = settings.AutoRezOOC ~= false
+    local oocVal, oocChanged = Components.CheckboxRow.draw('Auto-Rez Out of Combat', 'AutoRezOOC', autoRezOOC, nil, {
+        tooltip = 'Automatically rez dead group members after combat.',
+    })
+    if oocChanged and onChange then onChange('AutoRezOOC', oocVal) end
+    local oocMethod = Settings.labeledCombo('OOC Method##RezOOCMethod', settings.RezOOCMethod or 'Auto',
+        { 'Auto', 'Spell', 'Item' },
+        'Auto tries the configured item first, then the best learned rez spell.')
+    if oocMethod ~= settings.RezOOCMethod and onChange then onChange('RezOOCMethod', oocMethod) end
+
+    local autoRezCombat = settings.AutoRezInCombat == true
+    local combatVal, combatChanged = Components.CheckboxRow.draw('Auto-Rez In Combat', 'AutoRezInCombat', autoRezCombat, nil, {
+        tooltip = 'Allow rez actions during combat. The class filter below controls eligible recipients.',
+    })
+    if combatChanged and onChange then onChange('AutoRezInCombat', combatVal) end
+    local combatMethod = Settings.labeledCombo('Combat Method##RezCombatMethod', settings.RezCombatMethod or 'Auto',
+        { 'Auto', 'AA', 'Spell', 'Item' },
+        'Auto tries the configured item, then a battle-rez AA, then an already-memorized spell. Combat never auto-memorizes.')
+    if combatMethod ~= settings.RezCombatMethod and onChange then onChange('RezCombatMethod', combatMethod) end
+
+    local autoAcceptRez = settings.AutoAcceptRez ~= false
+    local acceptVal, acceptChanged = Components.CheckboxRow.draw('Auto-Accept Rez Offers', 'AutoAcceptRez', autoAcceptRez, nil, {
+        tooltip = 'Automatically click Yes only when the confirmation dialog is identified as a resurrection offer.',
+    })
+    if acceptChanged and onChange then onChange('AutoAcceptRez', acceptVal) end
+
+    Components.SettingGroup.draw('Resources', function()
+        local itemName = Settings.labeledInputText('Rez Item Name##RezItemName', settings.RezItemName or '',
+            'Exact inventory item name. Auto mode prefers this item when it exists and is ready.')
+        if itemName ~= (settings.RezItemName or '') and onChange then onChange('RezItemName', itemName) end
+
+        local autoMem = settings.RezAutoMemorize ~= false
+        local memVal, memChanged = Components.CheckboxRow.draw('Auto-Memorize OOC Rez Spell', 'RezAutoMemorize', autoMem, nil, {
+            tooltip = 'Temporarily use the selected gem when the best learned rez spell is not memorized. Never memorizes during combat.',
+        })
+        if memChanged and onChange then onChange('RezAutoMemorize', memVal) end
+
+        if memVal then
+            local gem = tonumber(settings.RezGem) or 0
+            local gemChanged, newGem = Components.SliderRow.int('Temporary Gem (0 = Last)', 'RezGem', gem, 0, 13, nil, {
+                tooltip = 'Gem used for temporary rez memorization. Zero selects the character\'s final gem.',
+            })
+            if gemChanged and onChange then onChange('RezGem', newGem) end
+
+            local restore = settings.RezRestoreGem ~= false
+            local restoreVal, restoreChanged = Components.CheckboxRow.draw('Restore Replaced Gem', 'RezRestoreGem', restore, nil, {
+                tooltip = 'Restore the prior gem after the rez attempt. Crash recovery also restores an interrupted swap.',
+            })
+            if restoreChanged and onChange then onChange('RezRestoreGem', restoreVal) end
+        end
+    end, { id = 'rez_resources', defaultOpen = true })
+
+    Components.SettingGroup.draw('Combat Target Classes', function()
+        if not combatVal then
+            imgui.TextDisabled('Preconfigure the class filter here; it is applied when combat rez is enabled.')
+        else
+            imgui.TextDisabled('Only checked classes are eligible for an in-combat rez.')
+        end
+        local selected = parseRezClasses(settings.RezCombatTargetClasses)
+
+        if imgui.SmallButton('All Classes##rez_all_classes') and onChange then
+            onChange('RezCombatTargetClasses', 'ALL')
+        end
+        imgui.SameLine()
+        if imgui.SmallButton('Tanks + Healers##rez_critical_classes') and onChange then
+            onChange('RezCombatTargetClasses', 'WAR|PAL|SHD|CLR|DRU|SHM')
+        end
+
+        for index, code in ipairs(REZ_CLASSES) do
+            local value, changed = imgui.Checkbox(code .. '##rez_class_' .. code, selected[code] == true)
+            if changed then
+                selected[code] = value
+                if onChange then onChange('RezCombatTargetClasses', serializeRezClasses(selected)) end
+            end
+            if index % 4 ~= 0 then imgui.SameLine() end
+        end
+    end, { id = 'rez_combat_classes', defaultOpen = true })
+
+    Components.SettingGroup.draw('Coordination and Movement', function()
+        local actorsEnabled = settings.RezCoordinateActors ~= false
+        local actorsVal, actorsChanged = Components.CheckboxRow.draw('Coordinate via Actors', 'RezCoordinateActors', actorsEnabled, nil, {
+            tooltip = 'Rez-capable characters exchange short-lived corpse intents; lowest priority number wins, with character name as the tie-breaker.',
+        })
+        if actorsChanged and onChange then onChange('RezCoordinateActors', actorsVal) end
+
+        if actorsVal then
+            local priority = tonumber(settings.RezPriority) or 50
+            local priorityChanged, newPriority = Components.SliderRow.int('Rezzer Priority', 'RezPriority', priority, 0, 100, nil, {
+                tooltip = 'Lower numbers win Actor coordination. Use this to prefer a primary rezzer.',
+            })
+            if priorityChanged and onChange then onChange('RezPriority', newPriority) end
+        end
+
+        local navigate = settings.RezNavigate == true
+        local navVal, navChanged = Components.CheckboxRow.draw('Navigate to OOC Corpses', 'RezNavigate', navigate, nil, {
+            tooltip = 'Use MQ2Nav to approach an out-of-range corpse. Navigation is never started during combat.',
+        })
+        if navChanged and onChange then onChange('RezNavigate', navVal) end
+        if navVal then
+            local maxDistance = tonumber(settings.RezNavMaxDistance) or 250
+            local distanceChanged, newDistance = Components.SliderRow.int('Maximum Nav Distance', 'RezNavMaxDistance', maxDistance, 25, 1000, nil, {
+                tooltip = 'Do not navigate to corpses farther away than this.',
+            })
+            if distanceChanged and onChange then onChange('RezNavMaxDistance', newDistance) end
+        end
+
+        local debug = settings.RezDebug == true
+        local debugVal, debugChanged = Components.CheckboxRow.draw('Rez Debug Logging', 'RezDebug', debug, nil, {
+            tooltip = 'Echo throttled selection and workflow transitions to the MacroQuest console.',
+        })
+        if debugChanged and onChange then onChange('RezDebug', debugVal) end
+    end, { id = 'rez_coordination', defaultOpen = false })
+end
+
+-- Shared by the dedicated Options > Resurrection tab. Keeping the renderer in
+-- one place prevents the two entry points from drifting or persisting settings
+-- differently.
+M.drawResurrection = drawResurrection
+
 local function initHealingTab()
     if _healingModChecked then return end
     _healingModChecked = true
 
-    local ok, modOrErr = pcall(require, 'sidekick-next.healing')
+    -- The coordinated worker is the sole owner of the healing runtime. The UI
+    -- only needs the persistent configuration; initializing the full healing
+    -- module here would duplicate events, sensors, and heal-data writes.
+    local ok, configOrErr = pcall(require, 'sidekick-next.healing.config')
     if not ok then
-        _healingLoadError = tostring(modOrErr)
+        _healingLoadError = tostring(configOrErr)
         return
     end
 
-    local mod = modOrErr
-    if not mod then
-        _healingLoadError = 'Module returned nil'
+    local config = configOrErr
+    if not config then
+        _healingLoadError = 'Config module returned nil'
         return
     end
 
-    -- Ensure healing module is initialized
-    if mod.init then
-        local initOk, initErr = pcall(mod.init)
+    if config.load then
+        local initOk, initErr = pcall(config.load)
         if not initOk then
-            _healingLoadError = 'init() failed: ' .. tostring(initErr)
+            _healingLoadError = 'Config load failed: ' .. tostring(initErr)
             return
         end
     end
 
-    if not mod.Config then
-        _healingLoadError = 'mod.Config is nil'
-        return
-    end
-
-    _healingMod = mod
+    _healingMod = { Config = config }
 
     -- Sync Config.enabled with DoHeals on init (DoHeals is the source of truth)
     -- This will be done in draw() when settings are available
@@ -68,13 +215,21 @@ function M.draw(settings, themeNames, onChange)
     local myClass = mq.TLO.Me.Class.ShortName()
     local themeName = settings.SideKickTheme or 'Classic'
 
-    -- Check if this is a healer class
-    local isHealer = myClass == 'CLR' or myClass == 'DRU' or myClass == 'SHM' or myClass == 'PAL'
+    -- Rez classes such as NEC get the resurrection surface without loading a
+    -- second healing runtime.
+    local isHealer = HealerClasses.isSupported(myClass)
+    local isRezClass = RezData.isRezClass(myClass)
 
     if not isHealer then
-        Components.StatusBadge.neutral('Non-Healer', themeName, { showIcon = false })
-        imgui.TextDisabled('Healing settings are for healer classes.')
-        imgui.TextDisabled('Current class: ' .. (myClass or 'Unknown'))
+        if isRezClass then
+            Components.StatusBadge.neutral('Rez Utility', themeName, { showIcon = false })
+            imgui.TextDisabled('This class has resurrection utility but does not run Healing Intelligence.')
+            drawResurrection(settings, themeName, onChange)
+        else
+            Components.StatusBadge.neutral('Non-Healer', themeName, { showIcon = false })
+            imgui.TextDisabled('Healing and resurrection settings are not available for this class.')
+            imgui.TextDisabled('Current class: ' .. (myClass or 'Unknown'))
+        end
         return
     end
 
@@ -88,10 +243,22 @@ function M.draw(settings, themeNames, onChange)
     if not _settingsSynced and hiConfig then
         _settingsSynced = true
         local doHealsValue = settings.DoHeals == true
+        local changedConfig = false
         if hiConfig.enabled ~= doHealsValue then
             hiConfig.enabled = doHealsValue
-            if hiConfig.save then hiConfig.save() end
+            changedConfig = true
         end
+        -- One-time compatibility migration from the former Core toggles.
+        if (settings.DoPetHeals == true or settings.HealPetsEnabled == true)
+            and hiConfig.healPetsEnabled ~= true then
+            hiConfig.healPetsEnabled = true
+            changedConfig = true
+        end
+        if settings.HealBreakInvisOOC == true and hiConfig.breakInvisOOC ~= true then
+            hiConfig.breakInvisOOC = true
+            changedConfig = true
+        end
+        if changedConfig and hiConfig.save then hiConfig.save() end
     end
 
     local hiEnabled = hiConfig and hiConfig.enabled == true
@@ -133,11 +300,14 @@ function M.draw(settings, themeNames, onChange)
             end
 
             -- Break invis OOC
-            local breakInvis = settings.HealBreakInvisOOC == true
+            local breakInvis = hiConfig and hiConfig.breakInvisOOC == true
             local breakVal, breakChanged = Components.CheckboxRow.draw('Break Invis OOC To Heal', 'HealBreakInvisOOC', breakInvis, nil, {
                 tooltip = 'Drop invisibility to heal out of combat',
             })
-            if breakChanged and onChange then onChange('HealBreakInvisOOC', breakVal) end
+            if breakChanged and hiConfig then
+                hiConfig.breakInvisOOC = breakVal
+                if hiConfig.save then hiConfig.save() end
+            end
         end, { id = 'heal_options', defaultOpen = true })
 
         -- Heal Points (hidden when HI enabled - HI uses its own thresholds)
@@ -174,25 +344,31 @@ function M.draw(settings, themeNames, onChange)
     imgui.Spacing()
     Components.SettingGroup.section('Pet Healing', themeName)
 
-    local doPetHeals = settings.DoPetHeals == true
-    local petVal, petChanged = Components.CheckboxRow.draw('Enable Pet Heals', 'DoPetHeals', doPetHeals, nil, {
+    local doPetHeals = hiConfig and hiConfig.healPetsEnabled == true
+    local petVal, petChanged = Components.CheckboxRow.draw('Enable Pet Heals', 'healPetsEnabled', doPetHeals, nil, {
         tooltip = 'Heal group pets',
     })
-    if petChanged and onChange then onChange('DoPetHeals', petVal) end
+    if petChanged and hiConfig then
+        hiConfig.healPetsEnabled = petVal
+        if hiConfig.save then hiConfig.save() end
+    end
     doPetHeals = petVal
 
-    -- Pet Heal Point (hidden when HI enabled - HI uses its own petHealMinPct)
-    if doPetHeals and not hiEnabled then
-        local petHealPt = tonumber(settings.PetHealPoint) or 50
-        local petPtChanged, newPetPt = Components.SliderRow.percent('Pet Heal Point', 'PetHealPoint', petHealPt, nil, {
+    if doPetHeals and hiConfig then
+        local petHealPt = tonumber(hiConfig.petHealMinPct) or 40
+        local petPtChanged, newPetPt = Components.SliderRow.percent('Pet Heal Point', 'petHealMinPct', petHealPt, nil, {
             tooltip = 'Heal pets when their HP drops below this',
         })
-        if petPtChanged and onChange then onChange('PetHealPoint', newPetPt) end
+        if petPtChanged then
+            hiConfig.petHealMinPct = newPetPt
+            if hiConfig.save then hiConfig.save() end
+        end
     end
 
     -- ========== EXTENDED TARGETS ==========
-    imgui.Spacing()
-    Components.SettingGroup.section('Extended Healing', themeName)
+    if not hiConfig then
+        imgui.Spacing()
+        Components.SettingGroup.section('Extended Healing', themeName)
 
     -- Watch MA
     local watchMA = settings.HealWatchMA == true
@@ -216,9 +392,10 @@ function M.draw(settings, themeNames, onChange)
             onChange('HealXTargetSlots', buf)
         end
     end
+    end
 
     -- ========== HOTS (hidden when HI enabled - HI has its own HoT logic) ==========
-    if not hiEnabled then
+    if not hiConfig then
         imgui.Spacing()
         Components.SettingGroup.section('HoTs', themeName)
 
@@ -270,29 +447,7 @@ function M.draw(settings, themeNames, onChange)
     end
 
     -- ========== RESURRECTION ==========
-    -- Group-only auto-rez. CLR/DRU/SHM/PAL render here (healer classes); NEC
-    -- gets the same Core.Settings keys but without a UI surface — they fall
-    -- back to defaults (auto-OOC on, auto-in-combat off, auto-accept on).
-    imgui.Spacing()
-    Components.SettingGroup.section('Resurrection', themeName)
-
-    local autoRezOOC = settings.AutoRezOOC ~= false
-    local oocVal, oocChanged = Components.CheckboxRow.draw('Auto-Rez Out of Combat', 'AutoRezOOC', autoRezOOC, nil, {
-        tooltip = 'After combat ends, automatically rez dead group members. Issues /corpse to drag the corpse before casting.',
-    })
-    if oocChanged and onChange then onChange('AutoRezOOC', oocVal) end
-
-    local autoRezCombat = settings.AutoRezInCombat == true
-    local combatVal2, combatChanged2 = Components.CheckboxRow.draw('Auto Battle-Rez (AA only)', 'AutoRezInCombat', autoRezCombat, nil, {
-        tooltip = 'During combat, fire the class battle-rez AA (e.g. Blessing of Resurrection). The AA has a real cast time (~5s) and will pause the heal rotation for its duration. Never spell-rezzes during a fight.',
-    })
-    if combatChanged2 and onChange then onChange('AutoRezInCombat', combatVal2) end
-
-    local autoAcceptRez = settings.AutoAcceptRez ~= false
-    local accVal, accChanged = Components.CheckboxRow.draw('Auto-Accept Rez Offers', 'AutoAcceptRez', autoAcceptRez, nil, {
-        tooltip = 'When this character receives a rez offer dialog, automatically click Yes.',
-    })
-    if accChanged and onChange then onChange('AutoAcceptRez', accVal) end
+    drawResurrection(settings, themeName, onChange)
 
     -- ========== ADVANCED (Healing Module) ==========
     if _healingSettingsUI and _healingSettingsUI.draw then

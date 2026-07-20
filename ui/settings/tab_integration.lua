@@ -4,7 +4,7 @@
 -- Actors, autostart, and external system integration settings.
 
 local imgui = require('ImGui')
-local Settings = require('sidekick-next.ui.settings')
+local Settings = require('sidekick-next.ui.settings.init')
 local Components = require('sidekick-next.ui.components')
 local lazy = require('sidekick-next.utils.lazy_require')
 
@@ -25,7 +25,8 @@ function M.draw(settings, themeNames, onChange)
     local ActorsCoordinator = getActorsCoordinator()
     local peerCount = (ActorsCoordinator and ActorsCoordinator.getPeerCount and ActorsCoordinator.getPeerCount()) or 0
 
-    -- Toggle badge with peer count (clickable to toggle)
+    -- This controls UI peer/status publishing. Coordinator worker transport is
+    -- always active in coordinated mode and is deliberately not user-toggleable.
     local actorsVal, actorsChanged = Components.StatusBadge.togglePeers(peerCount, actorsEnabled, themeName, {
         tooltip = 'Click to toggle cross-character communication',
     })
@@ -33,6 +34,32 @@ function M.draw(settings, themeNames, onChange)
     actorsEnabled = actorsVal
 
     if actorsEnabled then
+        Components.SettingGroup.draw('Actor Team', function()
+            local teamEnabled = settings.ActorsTeamEnabled ~= false
+            local teamVal, teamChanged = Components.CheckboxRow.draw('Enable Team Presence', 'ActorsTeamEnabled', teamEnabled, nil, {
+                tooltip = 'Publish coordinator presence, role, action, and module readiness to this character team.',
+            })
+            if teamChanged and onChange then onChange('ActorsTeamEnabled', teamVal) end
+
+            if teamVal then
+                local mode = tostring(settings.ActorsTeamMode or 'auto'):lower()
+                local newMode = Settings.labeledCombo('Team Mode', mode, { 'auto', 'group', 'raid', 'manual' },
+                    'Auto selects raid, then group, then solo. Manual joins characters using the same team name.')
+                if newMode ~= mode and onChange then onChange('ActorsTeamMode', newMode) end
+
+                if newMode == 'manual' then
+                    local name = tostring(settings.ActorsTeamName or '')
+                    local newName = Settings.labeledInputText('Team Name', name,
+                        'Every character must use the same manual team name. Matching is case-insensitive.')
+                    if newName ~= name and onChange then onChange('ActorsTeamName', newName) end
+                end
+            end
+        end, { id = 'actor_team', defaultOpen = true })
+    end
+
+    local coordinatedMode = not _G.SIDEKICK_NEXT_CONFIG
+        or _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
+    if actorsEnabled and not coordinatedMode then
         Components.SettingGroup.draw('Actor Coordination', function()
             -- Coordinate healing
             local healCoord = settings.HealCoordinateActors ~= false
@@ -41,20 +68,6 @@ function M.draw(settings, themeNames, onChange)
             })
             if healChanged and onChange then onChange('HealCoordinateActors', healVal) end
 
-            -- Coordinate debuffs
-            local debuffCoord = settings.DebuffCoordinateActors ~= false
-            local debuffVal, debuffChanged = Components.CheckboxRow.draw('Coordinate Debuffs', 'DebuffCoordinateActors', debuffCoord, nil, {
-                tooltip = 'Share debuff tracking with other characters',
-            })
-            if debuffChanged and onChange then onChange('DebuffCoordinateActors', debuffVal) end
-
-            -- Coordinate CC
-            local ccCoord = settings.CCCoordinateActors ~= false
-            local ccVal, ccChanged = Components.CheckboxRow.draw('Coordinate CC', 'CCCoordinateActors', ccCoord, nil, {
-                tooltip = 'Share crowd control assignments',
-            })
-            if ccChanged and onChange then onChange('CCCoordinateActors', ccVal) end
-
             -- Track HoTs via actors
             local hotTrack = settings.HealTrackHoTsViaActors ~= false
             local hotVal, hotChanged = Components.CheckboxRow.draw('Track HoTs via Actors', 'HealTrackHoTsViaActors', hotTrack, nil, {
@@ -62,13 +75,9 @@ function M.draw(settings, themeNames, onChange)
             })
             if hotChanged and onChange then onChange('HealTrackHoTsViaActors', hotVal) end
 
-            -- Cure coordination
-            local cureCoord = settings.CureCoordinateActors ~= false
-            local cureVal, cureChanged = Components.CheckboxRow.draw('Coordinate Cures', 'CureCoordinateActors', cureCoord, nil, {
-                tooltip = 'Share cure assignments between characters',
-            })
-            if cureChanged and onChange then onChange('CureCoordinateActors', cureVal) end
         end, { id = 'actor_coord', defaultOpen = true })
+    elseif coordinatedMode then
+        imgui.TextDisabled('Heal, cure, CC, and cast ownership is coordinator-managed.')
     end
 
     -- ========== SAFE TARGETING SECTION ==========
@@ -164,12 +173,6 @@ function M.draw(settings, themeNames, onChange)
     -- ========== MISC INTEGRATION ==========
     imgui.Spacing()
     Components.SettingGroup.section('Miscellaneous', themeName)
-
-    local travelBroker = settings.TravelBrokerEnabled ~= false
-    local travelVal, travelChanged = Components.CheckboxRow.draw('Enable Travel Broker', 'TravelBrokerEnabled', travelBroker, nil, {
-        tooltip = 'Share transport spells and allow peers to request ports through SideKick actors.',
-    })
-    if travelChanged and onChange then onChange('TravelBrokerEnabled', travelVal) end
 
     -- Ignore PC Pets
     local ignorePets = settings.IgnorePCPets ~= false

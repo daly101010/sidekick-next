@@ -39,12 +39,17 @@ function M.add(healerId, targetId, data)
     -- Use mq.gettime() for wall-clock accuracy (milliseconds)
     local now = mq.gettime()
     local castDurationMs = (tonumber(data.castDuration) or 2.0) * 1000
+    local remainingMs = tonumber(data.remainingMs)
     _incoming[targetId] = _incoming[targetId] or {}
     _incoming[targetId][healerId] = {
         spellName = data.spellName,
         expectedAmount = tonumber(data.expectedAmount) or 0,
         castStartTime = tonumber(data.castStartTime) or now,
-        landsAt = tonumber(data.landsAt) or (now + castDurationMs),
+        -- Cross-client messages carry a duration, not another process's
+        -- mq.gettime() deadline. Local registrations may still pass landsAt.
+        landsAt = remainingMs and (now + math.max(0, remainingMs))
+            or tonumber(data.landsAt)
+            or (now + castDurationMs),
         isHoT = data.isHoT or false,
         hotExpiresAt = tonumber(data.hotExpiresAt),
     }
@@ -80,7 +85,7 @@ function M.getAll()
     return _incoming
 end
 
-function M.sumForTarget(targetId)
+function M.sumForTarget(targetId, excludeHealerId)
     local total = 0
     local entries = _incoming[targetId]
     if not entries then return 0 end
@@ -88,7 +93,7 @@ function M.sumForTarget(targetId)
     local now = mq.gettime()
     for healerId, data in pairs(entries) do
         -- Only count heals that haven't landed yet
-        if data.landsAt > now then
+        if healerId ~= excludeHealerId and data.landsAt > now then
             total = total + (data.expectedAmount or 0)
         end
     end

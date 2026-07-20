@@ -4,7 +4,7 @@
 -- Combat mode, chase, assist, and meditation settings.
 
 local imgui = require('ImGui')
-local Settings = require('sidekick-next.ui.settings')
+local Settings = require('sidekick-next.ui.settings.init')
 local Components = require('sidekick-next.ui.components')
 
 local M = {}
@@ -75,6 +75,25 @@ function M.draw(settings, themeNames, onChange)
     -- Assist-specific settings
     if combatMode == 'assist' then
         Components.SettingGroup.draw('Assist Settings', function()
+            local assistModes = { 'group', 'raid1', 'raid2', 'raid3', 'byname' }
+            local assistMode = tostring(settings.AssistMode or 'group')
+            local sourceChanged, newAssistMode = Components.ComboRow.byValue('Assist Source', 'AssistMode', assistMode, assistModes, nil, {
+                tooltip = 'Group MA, Raid MA 1-3, or by name. Used when an Actor tank broadcast is unavailable.',
+                width = 100,
+            })
+            if sourceChanged and onChange then
+                onChange('AssistMode', newAssistMode)
+                assistMode = newAssistMode
+            end
+
+            if assistMode == 'byname' then
+                local name = settings.AssistName or ''
+                local buf = Settings.labeledInputText('Assist Name', name)
+                if buf ~= name and onChange then
+                    onChange('AssistName', buf)
+                end
+            end
+
             local assistTargetModes = { 'sticky', 'follow' }
             local assistTargetMode = tostring(settings.AssistTargetMode or 'sticky')
             local astModeChanged, newAstMode = Components.ComboRow.byValue('Target Mode', 'AssistTargetMode', assistTargetMode, assistTargetModes, nil, {
@@ -91,11 +110,17 @@ function M.draw(settings, themeNames, onChange)
             })
             if engageChanged and onChange then onChange('AssistEngageCondition', newEngage) end
 
-            local engageHp = tonumber(settings.AssistEngageHpThreshold) or 97
-            local hpChanged, newHp = Components.SliderRow.percent('Engage HP', 'AssistEngageHpThreshold', engageHp, nil, {
+            local engageHp = tonumber(settings.AssistAt) or 97
+            local hpChanged, newHp = Components.SliderRow.percent('Engage HP', 'AssistAt', engageHp, nil, {
                 tooltip = 'Start attacking when mob HP drops below this percentage',
             })
-            if hpChanged and onChange then onChange('AssistEngageHpThreshold', newHp) end
+            if hpChanged and onChange then onChange('AssistAt', newHp) end
+
+            local assistRange = tonumber(settings.AssistRange) or 100
+            local rangeChanged, newRange = Components.SliderRow.int('Assist Range', 'AssistRange', assistRange, 30, 200, nil, {
+                tooltip = 'Maximum distance to the fallback assist target (units)',
+            })
+            if rangeChanged and onChange then onChange('AssistRange', newRange) end
         end, { id = 'assist_settings', defaultOpen = true })
     end
 
@@ -141,56 +166,6 @@ function M.draw(settings, themeNames, onChange)
             })
             if distChanged and onChange then onChange('ChaseDistance', newDist) end
         end, { id = 'chase_target', defaultOpen = true })
-    end
-
-    -- ========== ASSIST SECTION ==========
-    imgui.Spacing()
-    Components.SettingGroup.section('Assist', themeName)
-
-    local assistEnabled = settings.AssistEnabled == true
-
-    -- Toggle badge for assist (clickable to toggle)
-    local assistVal, assistChanged = Components.StatusBadge.toggle('Assist', assistEnabled, themeName, {
-        enabledText = 'Active',
-        disabledText = 'Off',
-        tooltip = 'Click to toggle assist mode',
-    })
-    if assistChanged and onChange then onChange('AssistEnabled', assistVal) end
-    assistEnabled = assistVal
-
-    if assistEnabled then
-        Components.SettingGroup.draw('Assist Target', function()
-            local assistModes = { 'group', 'raid1', 'raid2', 'raid3', 'byname' }
-            local assistMode = tostring(settings.AssistMode or 'group')
-            local astMdChanged, newAstMd = Components.ComboRow.byValue('Assist Mode', 'AssistMode', assistMode, assistModes, nil, {
-                tooltip = 'Group MA, Raid MA 1-3, or by name',
-                width = 100,
-            })
-            if astMdChanged and onChange then
-                onChange('AssistMode', newAstMd)
-                assistMode = newAstMd
-            end
-
-            if assistMode == 'byname' then
-                local name = settings.AssistName or ''
-                local buf = Settings.labeledInputText('Assist Name', name)
-                if buf ~= name and onChange then
-                    onChange('AssistName', buf)
-                end
-            end
-
-            local assistAt = tonumber(settings.AssistAt) or 97
-            local atChanged, newAt = Components.SliderRow.percent('Assist At', 'AssistAt', assistAt, nil, {
-                tooltip = 'Start assisting when mob HP drops below this percentage',
-            })
-            if atChanged and onChange then onChange('AssistAt', newAt) end
-
-            local assistRange = tonumber(settings.AssistRange) or 100
-            local rangeChanged, newRange = Components.SliderRow.int('Assist Range', 'AssistRange', assistRange, 30, 200, nil, {
-                tooltip = 'Maximum distance to assist target (units)',
-            })
-            if rangeChanged and onChange then onChange('AssistRange', newRange) end
-        end, { id = 'assist_target', defaultOpen = true })
     end
 
     -- ========== MEDITATION SECTION ==========
