@@ -28,6 +28,8 @@ M.removed = {
     SpecialEnabled = true,
 
     TravelBrokerEnabled = true,
+    Humanize_RestickAfterMs = true,
+    Humanize_FW_face_spawn = true,
     DebuffAutoSlow = true,
     DebuffAutoCripple = true,
     DebuffAutoMalo = true,
@@ -49,6 +51,9 @@ M.defaults = {
     SideKickTheme = { type = 'text', Default = 'Classic', Category = 'UI', DisplayName = 'Theme' },
     SideKickSyncThemeWithGT = { type = 'bool', Default = true, Category = 'UI', DisplayName = 'Sync Theme With GroupTarget' },
     SideKickDebugSettings = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Debug Settings Logging' },
+    SideKickLogLevel = { type = 'number', Default = 3, Min = 1, Max = 5, Category = 'Diagnostics', DisplayName = 'Log Level' },
+    SideKickLogFile = { type = 'bool', Default = false, Category = 'Diagnostics', DisplayName = 'Write General Log File' },
+    SideKickLogFilter = { type = 'text', Default = '', Category = 'Diagnostics', DisplayName = 'Log Filter' },
     DashboardVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Dashboard Visible' },
     HealPreviewVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Heal Preview Visible' },
     SideKickMainEnabled = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Show Main Bar' },
@@ -115,6 +120,7 @@ M.defaults = {
     SideKickDiscBarAnchorGap = { type = 'number', Default = 2, Category = 'Disciplines', DisplayName = 'Bar Anchor Gap' },
     SideKickDiscBarTextureTint = { type = 'text', Default = '1.0,1.0,1.0', Category = 'Disciplines', DisplayName = 'Disc Bar Texture Tint' },
 
+    BandolierEnabled = { type = 'bool', Default = false, Category = 'Items', DisplayName = 'Bandolier Swapping' },
     SideKickItemBarEnabled = { type = 'bool', Default = true, Category = 'Items', DisplayName = 'Show Item Bar' },
     SideKickItemBarCell = { type = 'number', Default = 40, Category = 'Items', DisplayName = 'Cell Size' },
     SideKickItemBarRows = { type = 'number', Default = 1, Category = 'Items', DisplayName = 'Rows' },
@@ -183,9 +189,11 @@ M.defaults = {
     TankTargetMode = { type = 'text', Default = 'auto', Category = 'Combat', DisplayName = 'Tank Target Mode (auto/manual)', Options = { 'auto', 'manual' } },
     TankAoEThreshold = { type = 'number', Default = 3, Category = 'Combat', DisplayName = 'AoE Mob Threshold' },
     TankRequireAggroDeficit = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Require Aggro Deficit for AoE' },
-    TankSafeAECheck = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Safe AE Check (no mezzed)' },
-    TankRepositionEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Tank Repositioning' },
-    TankRepositionCooldown = { type = 'number', Default = 5, Category = 'Combat', DisplayName = 'Reposition Cooldown (sec)' },
+    TankSafeAECheck = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Extended Safe AE Check' },
+    TankRepositionEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Tank Moveback Positioning' },
+    TankRepositionCooldown = { type = 'number', Default = 5, Category = 'Combat', DisplayName = 'Position Refresh (sec)' },
+    TankTauntChaseRange = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Taunt Chase Range' },
+    TankEngageRange = { type = 'number', Default = 125, Category = 'Combat', DisplayName = 'Engage Range' },
 
     -- Assist Settings (when in assist combat mode)
     AssistTargetMode = { type = 'text', Default = 'sticky', Category = 'Combat', DisplayName = 'Assist Target Mode (sticky/follow)', Options = { 'sticky', 'follow' } },
@@ -447,7 +455,8 @@ end
 
 local MODULE_KEYS = {
     ui = [[
-        SideKickTheme SideKickSyncThemeWithGT SideKickDebugSettings DashboardVisible HealPreviewVisible
+        SideKickTheme SideKickSyncThemeWithGT SideKickDebugSettings SideKickLogLevel SideKickLogFile
+        SideKickLogFilter DashboardVisible HealPreviewVisible
         SideKickMainEnabled SideKickOptionsManual SideKickOptionsPosX SideKickOptionsPosY
         SideKickOptionsWidth SideKickOptionsHeight SideKickMainAnchor SideKickMainAnchorTarget
         SideKickMainAnchorGap SideKickMainButtonScale SideKickMainRounding SideKickMainWidth
@@ -497,7 +506,8 @@ local MODULE_KEYS = {
     ]],
     combat = [[
         CombatMode TankTargetMode TankAoEThreshold TankRequireAggroDeficit TankSafeAECheck
-        TankRepositionEnabled TankRepositionCooldown StickCommand SoftPauseStick DragonPositioning
+        TankRepositionEnabled TankRepositionCooldown TankTauntChaseRange TankEngageRange
+        BandolierEnabled StickCommand SoftPauseStick DragonPositioning
         DragonPositionAngle IgnorePCPets EmergencyHpThreshold DefenseHpThreshold
         TankDefenseHpThreshold UseSpells UseAAs UseDiscs CasterUseStick CasterEscapeRange
         CasterSafeZoneRadius PreferredResistType SafeTargetingEnabled SafeTargetingCheckRaid

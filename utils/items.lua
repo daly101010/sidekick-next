@@ -386,6 +386,43 @@ local function shouldAutoUse(entry, inCombat, hpPct)
     return false
 end
 
+-- Read-only helpers used by the coordinated item worker. Keeping selection and
+-- readiness here ensures the UI, monolithic compatibility path, and worker all
+-- interpret the per-slot modes and saved conditions identically.
+function M.itemReady(itemName)
+    return itemReady(itemName)
+end
+
+function M.effectAlreadyActive(entry)
+    return effectAlreadyActive(entry)
+end
+
+function M.shouldAutoUse(entry, inCombat, hpPct)
+    return shouldAutoUse(entry, inCombat, hpPct)
+end
+
+function M.evaluateAutoEntry(entry, context)
+    context = context or {}
+    if not entry or trim(entry.itemName) == '' then return false, 'not_configured' end
+
+    local mode = tostring(entry.mode or 'on_demand')
+    if mode == 'on_demand' then return false, 'on_demand' end
+    if not shouldAutoUse(entry, context.inCombat == true, tonumber(context.hpPct)) then
+        if mode == 'combat' then
+            if context.inCombat ~= true then return false, 'not_in_combat' end
+            return false, 'above_combat_hp'
+        elseif mode == 'ooc' then
+            return false, 'in_combat'
+        elseif mode == 'on_condition' then
+            return false, 'condition_false'
+        end
+        return false, 'mode_disabled'
+    end
+    if not itemReady(entry.itemName) then return false, 'item_not_ready' end
+    if effectAlreadyActive(entry) then return false, 'effect_active' end
+    return true, 'ready'
+end
+
 function M.useItem(itemName, opts)
     itemName = trim(itemName)
     if itemName == '' then return end

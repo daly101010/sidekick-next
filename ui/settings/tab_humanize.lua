@@ -172,9 +172,6 @@ function M.draw(settings, themeNames, onChange)
             local newMin, ch = imgui.SliderInt('Engage HP% floor##eng_min', minPct, 50, 100)
             if ch then persist('engage_min', nil, newMin) end
 
-            local restick = T.restickAfterMs or 60000
-            local newRs, rsCh = imgui.SliderInt('Re-stick after (ms)##eng_restick', restick, 5000, 600000)
-            if rsCh then persist('restick_ms', nil, newRs) end
         end
     end
 

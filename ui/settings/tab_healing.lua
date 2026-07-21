@@ -50,7 +50,7 @@ local function drawResurrection(settings, themeName, onChange)
 
     local autoRezOOC = settings.AutoRezOOC ~= false
     local oocVal, oocChanged = Components.CheckboxRow.draw('Auto-Rez Out of Combat', 'AutoRezOOC', autoRezOOC, nil, {
-        tooltip = 'Automatically rez dead group members after combat.',
+        tooltip = 'Automatically rez dead group members and fresh same-zone Actor Team peers after combat.',
     })
     if oocChanged and onChange then onChange('AutoRezOOC', oocVal) end
     local oocMethod = Settings.labeledCombo('OOC Method##RezOOCMethod', settings.RezOOCMethod or 'Auto',
@@ -366,7 +366,7 @@ function M.draw(settings, themeNames, onChange)
     end
 
     -- ========== EXTENDED TARGETS ==========
-    if not hiConfig then
+    if not hiEnabled then
         imgui.Spacing()
         Components.SettingGroup.section('Extended Healing', themeName)
 
@@ -395,7 +395,7 @@ function M.draw(settings, themeNames, onChange)
     end
 
     -- ========== HOTS (hidden when HI enabled - HI has its own HoT logic) ==========
-    if not hiConfig then
+    if not hiEnabled then
         imgui.Spacing()
         Components.SettingGroup.section('HoTs', themeName)
 

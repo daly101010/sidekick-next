@@ -30,6 +30,7 @@ end
 
 -- Lazy-load Items module
 local getItems = lazy('sidekick-next.utils.items')
+local getBandolier = lazy('sidekick-next.utils.bandolier')
 
 -- Undo state for clear operations
 local _lastCleared = nil
@@ -181,6 +182,63 @@ end
 function M.draw(settings, themeNames, onChange)
     local changed
     local Items = getItems()
+
+    -- ========== BANDOLIER SWAPPING ==========
+    local Bandolier = getBandolier()
+    if Bandolier then
+        Components.SettingGroup.draw('Bandolier Swapping', function()
+            local cfg = Bandolier.getConfig()
+
+            local enabled = settings.BandolierEnabled == true
+            local enVal, enChanged = Components.CheckboxRow.draw('Enable Bandolier Swapping', 'BandolierEnabled', enabled, nil, {
+                tooltip = 'Swap in-game bandolier sets by condition (first match wins).\nSet names must match sets saved in the EQ bandolier window.',
+            })
+            if enChanged and onChange then onChange('BandolierEnabled', enVal) end
+
+            local pullBuf = Settings.labeledInputText('Pull Set', cfg.pullSet or '')
+            if pullBuf ~= (cfg.pullSet or '') then
+                cfg.pullSet = pullBuf
+                Bandolier.save()
+            end
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Bandolier set forced while pulling (bow/thrown). Blank = disabled.')
+            end
+
+            imgui.Separator()
+            local removeIdx = nil
+            for i, set in ipairs(cfg.sets) do
+                imgui.PushID('bando_set_' .. i)
+                local nameBuf = Settings.labeledInputText('Set ' .. i .. ' Name', set.name or '')
+                if nameBuf ~= (set.name or '') then
+                    set.name = nameBuf
+                    Bandolier.save()
+                end
+                -- Stable per-set id keeps the condition editor cache valid
+                -- across removals (positional ids would cross-wire editors).
+                if not set.id then
+                    cfg.nextId = (cfg.nextId or 0) + 1
+                    set.id = cfg.nextId
+                end
+                ConditionBuilder.drawInline('bando_cond_' .. tostring(set.id), set.condition, function(data)
+                    set.condition = data
+                    Bandolier.save()
+                end)
+                if imgui.Button('Remove##bando' .. i) then removeIdx = i end
+                imgui.PopID()
+                imgui.Separator()
+            end
+            if removeIdx then
+                table.remove(cfg.sets, removeIdx)
+                Bandolier.save()
+            end
+            if imgui.Button('Add Bandolier Set') then
+                cfg.sets[#cfg.sets + 1] = { name = '', condition = nil }
+                Bandolier.save()
+            end
+            imgui.TextWrapped('Sets are evaluated top-down; the first whose condition passes is worn. An empty condition always matches — use one as the last/default set.')
+        end, { id = 'bandolier_settings', defaultOpen = false })
+        imgui.Spacing()
+    end
 
     -- Item slots management
     if Items then

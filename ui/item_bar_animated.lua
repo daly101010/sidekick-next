@@ -201,7 +201,14 @@ function M.draw(opts)
             end
 
             if released and hovered and not isDragging then
-                Items.useItem(entry.itemName, { throttleKey = tostring(entry.slotKey or entry.itemName), minInterval = 0.25 })
+                if type(opts.onActivate) == 'function' then
+                    -- The host callback only enqueues transport from this ImGui
+                    -- frame; coordinated execution happens in sk_items.
+                    opts.onActivate(entry)
+                else
+                    -- Monolithic/backward-compatible callers retain direct use.
+                    Items.useItem(entry.itemName, { throttleKey = tostring(entry.slotKey or entry.itemName), minInterval = 0.25 })
+                end
             end
 
             local uniqueId = entry.slotKey or entry.itemName or tostring(idx)

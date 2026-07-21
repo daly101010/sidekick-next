@@ -117,12 +117,24 @@ function M.getSpellTypeCategory(spellEntry)
         end
     end
 
+    -- Dispel detection is SPA-based (SPA 27 = cancel magic): spell category
+    -- strings vary across servers/eras, the SPA does not.
+    if spell and spell() and spell.HasSPA then
+        local okSpa, isDispel = pcall(function() return spell.HasSPA(27)() end)
+        if okSpa and isDispel == true then
+            return 'dispel'
+        end
+    end
+
     -- Use entry data if available
     if entry then
-        local category = (entry.category or ''):lower()
-        local subcategory = (entry.subcategory or ''):lower()
+        local category = tostring(entry.category or ''):lower()
+        local subcategory = tostring(entry.subcategory or ''):lower()
         local beneficial = entry.beneficial
-        local duration = entry.duration or 0
+        -- Scanner/TLO values are not guaranteed to retain their numeric Lua
+        -- type.  In particular, Spell.Duration() can be returned as a numeric
+        -- string, which must not be compared directly with a number.
+        local duration = tonumber(entry.duration) or 0
 
         -- Check for heal
         if category:find('heal') or subcategory:find('heal') then
@@ -165,9 +177,9 @@ function M.getSpellTypeCategory(spellEntry)
     -- Fall back to spell TLO data
     if spell and spell() then
         local beneficial = spell.Beneficial and spell.Beneficial() or false
-        local duration = spell.Duration and spell.Duration() or 0
-        local category = spell.Category and spell.Category() or ''
-        local subcategory = spell.Subcategory and spell.Subcategory() or ''
+        local duration = tonumber(spell.Duration and spell.Duration() or nil) or 0
+        local category = tostring(spell.Category and spell.Category() or '')
+        local subcategory = tostring(spell.Subcategory and spell.Subcategory() or '')
         local categoryLower = category:lower()
         local subcategoryLower = subcategory:lower()
 
@@ -272,6 +284,19 @@ function M.generateCombatCondition(spellEntry)
     if category == 'heal' then
         -- Healing spells: no conditions (healing intelligence handles targeting)
         return nil
+    end
+
+    if category == 'dispel' then
+        -- Dispel: only strip when the NPC actually has a beneficial buff.
+        -- (rgmercs equivalent: DoDispel and mq.TLO.Target.Beneficial() ~= nil)
+        return {
+            conditions = {
+                newCondition("beneficial", "Me", "Combat", "true", nil),
+                newCondition("detrimental", "Target", "Type", "==", "NPC"),
+                newCondition("detrimental", "Target", "Beneficial", "true", nil),
+            },
+            logic = { "AND", "AND" },
+        }
     end
 
     if category == 'direct_damage' then

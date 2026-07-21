@@ -13,6 +13,54 @@ local imgui = require('ImGui')
 local _rcOk, RuntimeCache = pcall(require, 'sidekick-next.utils.runtime_cache')
 if not _rcOk then RuntimeCache = nil end
 local _ccOk, CC = pcall(require, 'sidekick-next.automation.cc')
+local _tgOk, Targeting = pcall(require, 'sidekick-next.utils.targeting')
+if not _tgOk then Targeting = nil end
+
+-- Find the first name from a pipe-separated list currently on me as a buff
+-- or short-duration song. Exact spell-name matching. Returns name or nil.
+local function findMyBuff(nameList)
+  for name in tostring(nameList or ''):gmatch('[^|]+') do
+    name = name:match('^%s*(.-)%s*$')
+    if name and name ~= '' then
+      local ok, found = pcall(function()
+        local b = mq.TLO.Me.Buff(name)
+        if b and b() then return true end
+        local s = mq.TLO.Me.Song(name)
+        return s and s() and true or false
+      end)
+      if ok and found then return name end
+    end
+  end
+  return nil
+end
+
+local function firstPipeToken(value)
+  return tostring(value or ''):match('[^|]+') or ''
+end
+
+-- Seconds remaining on the first matching buff/song from a pipe-separated
+-- name list. Missing buff = 0 (so "seconds left below N" also covers "already
+-- gone"); permanent buffs report a huge value so they never read as expiring.
+local function myBuffSecondsLeft(nameList)
+  for name in tostring(nameList or ''):gmatch('[^|]+') do
+    name = name:match('^%s*(.-)%s*$')
+    if name and name ~= '' then
+      local ok, secs = pcall(function()
+        local b = mq.TLO.Me.Buff(name)
+        if b and b() then return tonumber(b.Duration.TotalSeconds()) end
+        local s = mq.TLO.Me.Song(name)
+        if s and s() then return tonumber(s.Duration.TotalSeconds()) end
+        return nil
+      end)
+      if ok and secs ~= nil then
+        secs = tonumber(secs) or 0
+        if secs < 0 then return 999999 end
+        return secs
+      end
+    end
+  end
+  return 0
+end
 if not _ccOk then CC = nil end
 
 local M = {}
@@ -83,6 +131,13 @@ M.properties = {
     { key = "SecondaryPctAggro", label = "Secondary Aggro %", type = "numeric", isPercent = true, min = 0, max = 100 },
     { key = "XTargetHaterCount", label = "XTarget Haters", type = "numeric", min = 0, max = 20 },
     { key = "XTargetHasMezzed", label = "XTarget Has Mezzed Mob", type = "boolean" },
+    -- Named buff lookups (checks buffs AND songs, exact spell names). Value
+    -- is the buff name; multi-value "Aegolism|Temperance" matches any listed.
+    { key = "BuffPresent", label = "Has Buff",     type = "match" },
+    { key = "BuffMissing", label = "Missing Buff", type = "match" },
+    -- Numeric seconds-remaining on a named buff (missing buff = 0s), for
+    -- early-swap style conditions e.g. "Buff Seconds Left is below 30".
+    { key = "BuffDuration", label = "Buff Seconds Left", type = "buffduration", min = 0, max = 7200 },
   },
   ["beneficial:Group"] = {
     { key = "Injured", label = "members w/ HP below", type = "group", thresholdLabel = "%", min = 0, max = 6, thresholdMin = 1, thresholdMax = 99 },
@@ -105,7 +160,14 @@ M.properties = {
     { key = "Distance", label = "Distance", type = "numeric", min = 0, max = 500 },
     { key = "Class",    label = "Class",    type = "match" },
     { key = "Type",     label = "Type",     type = "match" },
+    -- Body type name (e.g. "Undead", "Animal", "Giant"); supports
+    -- multi-value matching like "Undead|Skeleton".
+    { key = "Body",     label = "Body Type", type = "match" },
     { key = "Named",    label = "Is a Named",    type = "affirmed" },
+    -- Target.Beneficial returns the first beneficial buff on the target
+    -- (skips player-cast buffs, shows NPC self-buffs) — the standard dispel
+    -- gate; evaluated truthy when any strippable buff is present.
+    { key = "Beneficial", label = "Has Beneficial Buff", type = "boolean" },
     { key = "Slowed",   label = "is not Slowed",   type = "negated" },
     { key = "Rooted",   label = "is not Rooted",   type = "negated" },
     { key = "Mezzed",   label = "is not Mezzed",   type = "negated" },
@@ -114,6 +176,19 @@ M.properties = {
   ["spawn:Spawn"] = {
     { key = "SpawnCount", label = "Spawns", type = "spawn", min = 1, max = 50, thresholdMin = 10, thresholdMax = 300 },
   },
+}
+
+-- Spawn body type names, per the MacroQuest body-types reference. Common
+-- combat categories first, then bane/special categories. IDs 24 and 27 are
+-- both named "Elemental"; name matching covers both with one entry.
+M.bodyTypes = {
+  'Humanoid', 'Undead', 'Animal', 'Insect', 'Monster', 'Giant', 'Dragon',
+  'Elemental', 'Plant', 'Summoned Creature', 'Extraplanar', 'Magical',
+  'Construct', 'Lycanthrope', 'Vampyre', 'Undead Pet', 'Swarm Pet',
+  'Bane Giant', 'Bane Dragon', 'Puff Dragon', 'Dain', 'Zek', 'Luggald',
+  'Muramite', 'Atenha Ra', 'Greater Akheva', 'Khati Sha', 'Seru', 'Greig',
+  'Draz Nurakk', 'Cursed', 'Monster Summoning', 'Familiar', 'Proc Pet',
+  'Object',
 }
 
 -- Natural language operators for numeric comparisons
@@ -265,6 +340,16 @@ local function buildSingleConditionString(cond)
     return "When " .. subjectLabel .. " " .. propLabel .. " is " .. value
   end
 
+  -- Handle buffduration (e.g., "When My 'Temperance' Seconds Left is below 30s")
+  if propType == "buffduration" then
+    local opLabel = cond.operator or "<"
+    for _, o in ipairs(M.numericOperators) do
+      if o.value == cond.operator then opLabel = o.label break end
+    end
+    return string.format("When %s '%s' Seconds Left %s %ds",
+      subjectLabel, tostring(cond.text or '?'), opLabel, tonumber(cond.value) or 0)
+  end
+
   -- Handle group type (e.g., "When My Group's members w/ HP below 50% >= 3")
   if propType == "group" then
     local threshold = cond.threshold or 50
@@ -373,6 +458,10 @@ local function drawConditionRowEdit(condition, index, uniqueId)
     elseif propDef and propDef.type == "match" then
       condition.operator = "=="
       condition.value = ""  -- Default to empty string for text input
+    elseif propDef and propDef.type == "buffduration" then
+      condition.operator = "<"
+      condition.value = 30
+      condition.text = ""
     else
       condition.operator = "<"
     end
@@ -421,6 +510,10 @@ local function drawConditionRowEdit(condition, index, uniqueId)
       elseif propDef and propDef.type == "match" then
         condition.operator = "=="
         condition.value = ""  -- Default to empty string for text input
+      elseif propDef and propDef.type == "buffduration" then
+        condition.operator = "<"
+        condition.value = 30
+        condition.text = ""
       else
         condition.operator = "<"
       end
@@ -464,17 +557,99 @@ local function drawConditionRowEdit(condition, index, uniqueId)
     imgui.SameLine()
     imgui.TextColored(0.7, 0.7, 0.7, 1.0, "is")
     imgui.SameLine()
-    imgui.PushItemWidth(80)
-    local value = condition.value or ""
-    local newValue = imgui.InputText("##matchvalue", value)
-    if newValue ~= value then
-      condition.value = newValue
+    if condition.property == "Body" then
+      -- Enumerated body types (MQ body-types reference) instead of free text.
+      -- Old pipe-list values still evaluate; the combo shows them verbatim.
+      local current = condition.value or ""
+      imgui.PushItemWidth(150)
+      if imgui.BeginCombo("##bodyvalue", current ~= "" and current or "(select)") then
+        for _, bodyName in ipairs(M.bodyTypes) do
+          local _, clicked = imgui.Selectable(bodyName, bodyName == condition.value)
+          if clicked then
+            condition.value = bodyName
+            changed = true
+          end
+        end
+        imgui.EndCombo()
+      end
+      imgui.PopItemWidth()
+      if imgui.IsItemHovered() then
+        imgui.SetTooltip("Spawn body type. Bane categories (Zek, Muramite, Bane Giant...) included.")
+      end
+    else
+      imgui.PushItemWidth(80)
+      local value = condition.value or ""
+      local newValue = imgui.InputText("##matchvalue", value)
+      if newValue ~= value then
+        condition.value = newValue
+        changed = true
+      end
+      imgui.PopItemWidth()
+      if imgui.IsItemHovered() then
+        imgui.SetTooltip("Use | for multiple values: WAR|PAL|SHD")
+      end
+    end
+
+    -- Delete button
+    imgui.SameLine()
+    imgui.PushStyleColor(ImGuiCol.Button, 0.6, 0.2, 0.2, 1.0)
+    imgui.PushStyleColor(ImGuiCol.ButtonHovered, 0.8, 0.3, 0.3, 1.0)
+    if imgui.SmallButton("X##delete") then
+      deleted = true
+    end
+    imgui.PopStyleColor(2)
+    imgui.PopID()
+    return changed, deleted
+  end
+
+  -- Handle "buffduration" type: buff name text, then operator, then seconds
+  if propType == "buffduration" then
+    imgui.SameLine()
+    imgui.PushItemWidth(110)
+    local text = condition.text or ""
+    local newText = imgui.InputText("##buffname", text)
+    if newText ~= text then
+      condition.text = newText
       changed = true
     end
     imgui.PopItemWidth()
     if imgui.IsItemHovered() then
-      imgui.SetTooltip("Use | for multiple values: WAR|PAL|SHD")
+      imgui.SetTooltip("Exact buff/song name. Use | for alternatives.")
     end
+
+    imgui.SameLine()
+    local ops = M.numericOperators
+    local opIdx = 1
+    local currentOpLabel = "is below"
+    for i, o in ipairs(ops) do
+      if o.value == condition.operator then
+        opIdx = i
+        currentOpLabel = o.label
+        break
+      end
+    end
+    imgui.PushItemWidth(calcComboWidth(currentOpLabel))
+    local opLabels = buildOperatorLabels(false)
+    local newOpIdx = imgui.Combo("##operator", opIdx, opLabels)
+    if newOpIdx ~= opIdx then
+      condition.operator = ops[newOpIdx].value
+      changed = true
+    end
+    imgui.PopItemWidth()
+
+    imgui.SameLine()
+    imgui.PushItemWidth(45)
+    local secs = tonumber(condition.value) or 30
+    local newSecs = imgui.InputInt("##secs", secs, 0, 0)
+    if newSecs ~= secs then
+      local vMin = propDef.min or 0
+      local vMax = propDef.max or 7200
+      condition.value = math.max(vMin, math.min(vMax, newSecs))
+      changed = true
+    end
+    imgui.PopItemWidth()
+    imgui.SameLine(0, 1)
+    imgui.TextColored(0.7, 0.7, 0.7, 1.0, "s")
 
     -- Delete button
     imgui.SameLine()
@@ -913,11 +1088,17 @@ local function evaluateSingleCondition(cond)
       local raw = Target[cond.property]()
       return raw == true
     elseif propType == "boolean" then
-      local raw = Target[cond.property]()
-      if cond.property == "Named" then
-        value = raw == true
+      if cond.property == "Beneficial" and Targeting then
+        -- Robust check: Target.Beneficial skips player-cast buffs, so scan
+        -- the cached buff list too.
+        value = Targeting.targetHasBeneficial()
       else
-        value = raw ~= nil and raw ~= ''
+        local raw = Target[cond.property]()
+        if cond.property == "Named" then
+          value = raw == true
+        else
+          value = raw ~= nil and raw ~= ''
+        end
       end
     else
       value = Target[cond.property]()
@@ -925,6 +1106,17 @@ local function evaluateSingleCondition(cond)
 
   elseif cond.type == "beneficial" then
     if cond.subject == "Me" then
+      -- Named buff lookups: the condition VALUE is the buff name(s), and the
+      -- computed value echoes it back on a hit so the generic match compare
+      -- passes. Missing = echo when NONE of the names are present.
+      if cond.property == 'BuffPresent' then
+        value = findMyBuff(cond.value) or ''
+      elseif cond.property == 'BuffMissing' then
+        value = (findMyBuff(cond.value) == nil) and firstPipeToken(cond.value) or ''
+      elseif cond.property == 'BuffDuration' then
+        value = myBuffSecondsLeft(cond.text)
+      end
+
       -- Try to get values from runtime cache first (more efficient)
       local Cache = RuntimeCache
       if Cache and Cache.me then
@@ -978,6 +1170,22 @@ local function evaluateSingleCondition(cond)
   end
 
   if value == nil then return false end
+
+  -- String match (Class / Type / Body). Without this branch, match
+  -- conditions fell through to the numeric comparator where both sides
+  -- tonumber() to 0 — making every match condition silently always-true.
+  if propType == "match" then
+    if value == '' then return false end
+    local condValue = cond.value or ''
+    if condValue == '' then return false end
+    -- Support multi-value matching: "Undead|Skeleton", "WAR|PAL|SHD"
+    for matchValue in string.gmatch(condValue, "[^|]+") do
+      if tostring(value):upper() == matchValue:upper() then
+        return true
+      end
+    end
+    return false
+  end
 
   -- Evaluate based on property type and operator
   if propType == "boolean" then
@@ -1049,7 +1257,13 @@ function M.evaluateWithContext(conditionData, ctx)
     -- Resolve actual value based on type + subject + property
     if cond.type == "beneficial" then
       if cond.subject == "Me" then
-        if cond.property == "PctHPs" then
+        if cond.property == "BuffPresent" then
+          actual = findMyBuff(cond.value) or ''
+        elseif cond.property == "BuffMissing" then
+          actual = (findMyBuff(cond.value) == nil) and firstPipeToken(cond.value) or ''
+        elseif cond.property == "BuffDuration" then
+          actual = myBuffSecondsLeft(cond.text)
+        elseif cond.property == "PctHPs" then
           actual = ctx.myHp
           if actual == nil then actual = mq.TLO.Me.PctHPs() or 100 end
         elseif cond.property == "PctMana" then
@@ -1182,6 +1396,11 @@ function M.evaluateWithContext(conditionData, ctx)
         if actual == nil and mq.TLO.Target() then
           actual = mq.TLO.Target.Named() == true
         end
+      elseif cond.property == "Beneficial" then
+        actual = ctx.targetBeneficial
+        if actual == nil and mq.TLO.Target() then
+          actual = Targeting and Targeting.targetHasBeneficial() or false
+        end
       elseif cond.property == "Slowed" then
         actual = ctx.targetSlowed
         if actual == nil and mq.TLO.Target() then
@@ -1215,6 +1434,11 @@ function M.evaluateWithContext(conditionData, ctx)
         actual = ctx.targetType
         if actual == nil and mq.TLO.Target() then
           actual = mq.TLO.Target.Type()
+        end
+      elseif cond.property == "Body" then
+        actual = ctx.targetBody
+        if actual == nil and mq.TLO.Target() then
+          actual = mq.TLO.Target.Body()
         end
       end
 

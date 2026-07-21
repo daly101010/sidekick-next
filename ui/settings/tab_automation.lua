@@ -58,17 +58,29 @@ function M.draw(settings, themeNames, onChange)
 
             local safeAE = settings.TankSafeAECheck == true
             local safeVal, safeChanged = Components.CheckboxRow.draw('Safe AE Check', 'TankSafeAECheck', safeAE, nil, {
-                tooltip = 'Only use AE abilities when safe',
+                tooltip = 'Also suppress AE hate when nearby NPCs are not on XTarget. Active mez is always protected.',
             })
             if safeChanged and onChange then onChange('TankSafeAECheck', safeVal) end
 
             local reposition = settings.TankRepositionEnabled == true
-            local repoVal, repoChanged = Components.CheckboxRow.draw('Auto Reposition', 'TankRepositionEnabled', reposition)
+            local repoVal, repoChanged = Components.CheckboxRow.draw('Moveback Positioning', 'TankRepositionEnabled', reposition, nil, {
+                tooltip = 'Use a tank-facing moveback stick so engaged mobs remain in front of the tank.',
+            })
             if repoChanged and onChange then onChange('TankRepositionEnabled', repoVal) end
 
             local repoCooldown = tonumber(settings.TankRepositionCooldown) or 5
-            local repocdChanged, newRepocd = Components.SliderRow.int('Reposition Cooldown (sec)', 'TankRepositionCooldown', repoCooldown, 2, 15)
+            local repocdChanged, newRepocd = Components.SliderRow.int('Position Refresh (sec)', 'TankRepositionCooldown', repoCooldown, 2, 15)
             if repocdChanged and onChange then onChange('TankRepositionCooldown', newRepocd) end
+
+            local tauntRange = tonumber(settings.TankTauntChaseRange) or 60
+            local rangeChanged, newRange = Components.SliderRow.int('Taunt Chase Range', 'TankTauntChaseRange', tauntRange, 30, 100)
+            if rangeChanged and onChange then onChange('TankTauntChaseRange', newRange) end
+
+            local engageRange = tonumber(settings.TankEngageRange) or 125
+            local engChanged, newEngRange = Components.SliderRow.int('Engage Range', 'TankEngageRange', engageRange, 30, 300, nil, {
+                tooltip = 'Only haters within this distance can become the primary kill target',
+            })
+            if engChanged and onChange then onChange('TankEngageRange', newEngRange) end
         end, { id = 'tank_settings', defaultOpen = true })
     end
 
@@ -122,6 +134,31 @@ function M.draw(settings, themeNames, onChange)
             })
             if rangeChanged and onChange then onChange('AssistRange', newRange) end
         end, { id = 'assist_settings', defaultOpen = true })
+    end
+
+    -- Stick commands apply to any combat mode that moves the character
+    -- (assist engage stick + soft-pause stick). Melee positioning lives here:
+    -- e.g. a rogue needs a "behind" variant for backstabs.
+    if combatMode ~= 'off' then
+        Components.SettingGroup.draw('Stick Commands', function()
+            local stickCmd = tostring(settings.StickCommand or '')
+            local stickBuf = Settings.labeledInputText('Engage Stick', stickCmd)
+            if stickBuf ~= stickCmd and onChange then
+                onChange('StickCommand', stickBuf)
+            end
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Full /stick command used when engaging.\nMelee DPS behind mobs: /stick snaproll behind 10 moveback uw\nTank front: /stick front')
+            end
+
+            local softStick = tostring(settings.SoftPauseStick or '')
+            local softBuf = Settings.labeledInputText('Soft-Pause Stick', softStick)
+            if softBuf ~= softStick and onChange then
+                onChange('SoftPauseStick', softBuf)
+            end
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip('Stick command applied while the tank repositions (soft pause).')
+            end
+        end, { id = 'stick_settings', defaultOpen = false })
     end
 
     -- ========== CHASE SECTION ==========

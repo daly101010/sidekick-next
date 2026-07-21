@@ -27,6 +27,7 @@ local MODES = { 'Normal', 'Chain' }
 local function colorState(s)
     if s == 'IDLE'          then return 0.55, 0.85, 0.55, 1 end
     if s == 'SCAN'          then return 0.55, 0.85, 0.95, 1 end
+    if s == 'READY'         then return 0.55, 0.75, 1.00, 1 end
     if s == 'NAV_TO_TARGET' then return 0.95, 0.85, 0.45, 1 end
     if s == 'PULLING'       then return 1.00, 0.45, 0.30, 1 end
     if s == 'RETURN_CAMP'   then return 0.95, 0.85, 0.45, 1 end
@@ -44,6 +45,18 @@ function M.draw(settings, themeNames, onChange)
 
     local cfg = Pull.getConfig()
     local st  = Pull.getState()
+    local telemetry = _G.SK_PULL_TELEMETRY
+    if type(telemetry) == 'table'
+        and (mq.gettime() - (tonumber(telemetry.receivedAt) or 0)) <= 5000 then
+        st = {
+            state = telemetry.state,
+            reason = telemetry.reason,
+            pullId = telemetry.pullId,
+            campSet = telemetry.campSet,
+            config = cfg,
+            ownsTarget = telemetry.ownsTarget,
+        }
+    end
 
     -- Status block --------------------------------------------------------
     local r, g, b, a = colorState(st.state)
@@ -74,9 +87,9 @@ function M.draw(settings, themeNames, onChange)
     imgui.SameLine()
     if imgui.Button('Set Camp Here##pull_camp') then mq.cmd('/sk_pull camp') end
     imgui.SameLine()
-    if imgui.Button('Pull Current Target##pull_one') then Pull.pullCurrentTarget() end
+    if imgui.Button('Pull Current Target##pull_one') then mq.cmd('/sk_pull pulltarget') end
     imgui.SameLine()
-    if imgui.Button('Clear Ignore##pull_ignore') then Pull.clearIgnore() end
+    if imgui.Button('Clear Ignore##pull_ignore') then mq.cmd('/sk_pull clearignore') end
 
     imgui.Separator()
 

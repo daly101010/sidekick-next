@@ -69,6 +69,14 @@ local function getSpellName(spellId)
     return "Unknown"
 end
 
+local function getSpellType(spellId)
+    if not spellId or spellId <= 0 then return nil end
+    local ConditionDefaults = getConditionDefaults()
+    if not (ConditionDefaults and ConditionDefaults.getSpellTypeCategory) then return nil end
+    local ok, spellType = pcall(ConditionDefaults.getSpellTypeCategory, spellId)
+    return ok and tostring(spellType or '') or nil
+end
+
 --- Check if a spell is beneficial (for buff target selector)
 ---@param spellId number The spell ID
 ---@return boolean beneficial True if spell is beneficial
@@ -129,6 +137,7 @@ function M.renderGemSlot(slot, spellSet, scanner)
     local gemConfig = SpellsetData.getGem(spellSet, slot)
     local spellId = gemConfig and gemConfig.spellId or 0
     local spellName = getSpellName(spellId)
+    local spellType = getSpellType(spellId)
 
     -- Indicators
     local hasCondition = gemConfig and gemConfig.condition
@@ -160,6 +169,10 @@ function M.renderGemSlot(slot, spellSet, scanner)
 
     -- Build button label
     local label = string.format("[%d] %s", slot, spellName)
+    if spellType and spellType ~= '' then
+        local typeLabel = spellType:gsub('_', ' '):gsub('^%l', string.upper)
+        label = label .. " [" .. typeLabel .. "]"
+    end
     if hasCondition then
         label = label .. " [C]"
     end
@@ -428,6 +441,7 @@ function M.renderConditionEditor(spellSet)
     end
 
     local spellName = getSpellName(gemConfig.spellId)
+    local spellType = getSpellType(gemConfig.spellId)
 
     imgui.Spacing()
     imgui.Separator()
@@ -486,10 +500,12 @@ function M.renderConditionEditor(spellSet)
         imgui.Separator()
         imgui.Text("Buff Target:")
 
-        local targetTypes = { "self", "group", "role", "class", "name", "npc" }
-        local targetLabels = { "Self Only", "Group Members", "By Role", "By Class", "By Name", "Current NPC Target" }
+        local targetTypes = { "default", "self", "group", "role", "class", "name", "npc" }
+        local targetLabels = { "(Default)", "Self Only", "Group Members", "By Role", "By Class", "By Name", "Current NPC Target" }
 
-        local currentType = gemConfig.buffTarget and gemConfig.buffTarget.type or "self"
+        -- nil buffTarget = no override ("(Default)"), distinct from an
+        -- explicit Self Only override.
+        local currentType = gemConfig.buffTarget and gemConfig.buffTarget.type or "default"
         local currentIdx = 1
         for i, t in ipairs(targetTypes) do
             if t == currentType then
@@ -501,11 +517,26 @@ function M.renderConditionEditor(spellSet)
         imgui.PushItemWidth(150)
         if imgui.BeginCombo("##buffTarget", targetLabels[currentIdx]) then
             for i, label in ipairs(targetLabels) do
-                if imgui.Selectable(label, currentIdx == i) then
-                    gemConfig.buffTarget = gemConfig.buffTarget or {}
-                    gemConfig.buffTarget.type = targetTypes[i]
-                    if targetTypes[i] == "self" or targetTypes[i] == "group" or targetTypes[i] == "npc" then
-                        gemConfig.buffTarget.value = nil
+                -- Selectable returns (selected, clicked): the first value is
+                -- true for the CURRENT item every frame, so acting on it
+                -- re-applies the old selection and overwrites any click on a
+                -- lower-index option. Only the click matters.
+                local _, clicked = imgui.Selectable(label, currentIdx == i)
+                if clicked then
+                    if targetTypes[i] == "default" then
+                        -- Remove the override entirely — including from the
+                        -- spell's remembered profile, so it doesn't resurrect
+                        -- when the spell is re-slotted later.
+                        gemConfig.buffTarget = nil
+                        local profile = SpellsetData.getSpellProfile
+                            and SpellsetData.getSpellProfile(spellSet, gemConfig.spellId) or nil
+                        if profile then profile.buffTarget = nil end
+                    else
+                        gemConfig.buffTarget = gemConfig.buffTarget or {}
+                        gemConfig.buffTarget.type = targetTypes[i]
+                        if targetTypes[i] == "self" or targetTypes[i] == "group" or targetTypes[i] == "npc" then
+                            gemConfig.buffTarget.value = nil
+                        end
                     end
                     saveSpellSets()
                 end
@@ -530,7 +561,8 @@ function M.renderConditionEditor(spellSet)
             imgui.PushItemWidth(120)
             if imgui.BeginCombo("##buffRole", roles[roleIdx]) then
                 for i, role in ipairs(roles) do
-                    if imgui.Selectable(role, roleIdx == i) then
+                    local _, roleClicked = imgui.Selectable(role, roleIdx == i)
+                    if roleClicked then
                         gemConfig.buffTarget = gemConfig.buffTarget or {}
                         gemConfig.buffTarget.value = role
                         saveSpellSets()
@@ -592,6 +624,12 @@ function M.renderConditionEditor(spellSet)
     imgui.PopItemWidth()
     if imgui.IsItemHovered() then
         imgui.SetTooltip("Lower = higher priority. Leave at 50 for default.")
+    end
+
+    if spellType == 'buff' then
+        imgui.TextDisabled('Buff spells are excluded from DPS. Enable automatic maintenance under OOC Buffs.')
+    elseif spellType == 'pet' then
+        imgui.TextDisabled('Pet/utility spells are excluded from DPS. Use an explicit Utility mode if automation is desired.')
     end
 
     -- Close button

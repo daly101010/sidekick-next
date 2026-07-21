@@ -110,6 +110,7 @@ local function loadTabs()
         { name = 'Humanize', module = 'sidekick-next.ui.settings.tab_humanize' },
         { name = 'Pull', module = 'sidekick-next.ui.settings.tab_pull' },
         { name = 'Remote', module = 'sidekick-next.ui.settings.tab_remote' },
+        { name = 'Logging', module = 'sidekick-next.ui.settings.tab_logging' },
     }
 
     for _, def in ipairs(tabDefs) do

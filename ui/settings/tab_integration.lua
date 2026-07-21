@@ -37,14 +37,14 @@ function M.draw(settings, themeNames, onChange)
         Components.SettingGroup.draw('Actor Team', function()
             local teamEnabled = settings.ActorsTeamEnabled ~= false
             local teamVal, teamChanged = Components.CheckboxRow.draw('Enable Team Presence', 'ActorsTeamEnabled', teamEnabled, nil, {
-                tooltip = 'Publish coordinator presence, role, action, and module readiness to this character team.',
+                tooltip = 'Publish coordinator presence, role, action, and module readiness to this trusted character team. OOG rez uses this team, not every generic Actor peer.',
             })
             if teamChanged and onChange then onChange('ActorsTeamEnabled', teamVal) end
 
             if teamVal then
                 local mode = tostring(settings.ActorsTeamMode or 'auto'):lower()
                 local newMode = Settings.labeledCombo('Team Mode', mode, { 'auto', 'group', 'raid', 'manual' },
-                    'Auto selects raid, then group, then solo. Manual joins characters using the same team name.')
+                    'Auto selects raid, then group, then solo. OOG characters in unrelated groups need Manual mode with the same team name.')
                 if newMode ~= mode and onChange then onChange('ActorsTeamMode', newMode) end
 
                 if newMode == 'manual' then
