@@ -1,6 +1,6 @@
 -- Resurrection worker for SideKick-Next.
 --
--- Rez v2 owns group-corpse selection, per-state resource policy, optional
+-- Rez v2 owns group/Actor-team corpse selection, per-state resource policy, optional
 -- item use, OOC spell memorization/restoration, optional navigation, and
 -- deterministic cross-character intent claims. All yielding work advances in
 -- this worker's main coroutine; Actor callbacks only copy message state.
@@ -52,6 +52,7 @@ local Runtime = {
     runtimeDebug = nil,
     stopAfterCleanup = false,
     lastDebug = {},
+    actorScan = nil,
 }
 
 local function nowMs()
@@ -118,6 +119,58 @@ end
 
 local function zoneShort()
     return lib.safeTLO(function() return mq.TLO.Zone.ShortName() end, '') or ''
+end
+
+local function normalizedSpawnName(value)
+    return trim(value):lower():gsub('_', ' ')
+end
+
+local function corpseNameMatches(spawn, memberName)
+    local wanted = normalizedSpawnName(memberName)
+    if wanted == '' then return false end
+    local observed = {
+        lib.safeTLO(function() return spawn.DisplayName() end, '') or '',
+        lib.safeTLO(function() return spawn.CleanName() end, '') or '',
+        lib.safeTLO(function() return spawn.Name() end, '') or '',
+    }
+    for _, value in ipairs(observed) do
+        value = normalizedSpawnName(value)
+        if value == wanted then return true end
+        if value:sub(1, #wanted) == wanted then
+            local suffix = value:sub(#wanted + 1)
+            if suffix:match("^'s corpse%d*$") then return true end
+        end
+    end
+    return false
+end
+
+local function findPlayerCorpse(memberName)
+    local queries = {
+        string.format([[pccorpse ="%s's Corpse"]], memberName),
+        string.format('pccorpse %s', memberName),
+    }
+    local diagnostic = { query = queries[1], corpseId = 0, corpseType = '', corpseName = '' }
+    for index, query in ipairs(queries) do
+        local spawn = mq.TLO.Spawn(query)
+        if spawn and spawn() then
+            local corpseId = lib.safeNum(function() return spawn.ID() end, 0)
+            local corpseType = lib.safeTLO(function() return spawn.Type() end, '') or ''
+            local corpseName = lib.safeTLO(function() return spawn.CleanName() end, '') or ''
+            diagnostic = {
+                query = query,
+                corpseId = corpseId,
+                corpseType = corpseType,
+                corpseName = corpseName,
+            }
+            -- The first query is already an exact full-name search. The fallback
+            -- mirrors established MQ rez searches and additionally verifies the
+            -- returned corpse belongs to this specific Actor Team member.
+            if corpseId > 0 and (index == 1 or corpseNameMatches(spawn, memberName)) then
+                return spawn, diagnostic
+            end
+        end
+    end
+    return nil, diagnostic
 end
 
 local function isSpellBookOpen()
@@ -313,16 +366,31 @@ local function findRezTarget(inCombat)
     local forced = trim(Runtime.forcedTargetName):lower()
     local groupCount = lib.getGroupCount()
     local sawDead, sawFiltered, sawSuppressed = false, false, false
+    local seenNames = {}
+    local team = module.state and module.state.team or nil
+    local currentZone = zoneShort():lower()
+    Runtime.actorScan = {
+        currentZone = currentZone,
+        teamEnabled = type(team) == 'table' and team.enabled == true,
+        entries = {},
+    }
 
     for index = 1, groupCount do
         local member = mq.TLO.Group.Member(index)
         if member and member() then
+            local memberName = lib.safeTLO(function() return member.CleanName() end, '') or ''
             local dead = lib.safeTLO(function() return member.Dead() end, false) == true
             local offline = lib.safeTLO(function() return member.Offline() end, false) == true
             local otherZone = lib.safeTLO(function() return member.OtherZone() end, false) == true
+            -- A released-to-bind group member may remain in Group while the
+            -- local corpse is only discoverable through Actor Team fallback.
+            -- Suppress fallback only for a live, online, same-zone member.
+            if memberName ~= '' and not dead and not offline and not otherZone then
+                seenNames[memberName:lower()] = true
+            end
             if dead and not offline and not otherZone then
                 sawDead = true
-                local name = lib.safeTLO(function() return member.CleanName() end, '') or ''
+                local name = memberName
                 local classShort = lib.safeTLO(function() return member.Class.ShortName() end, '') or ''
                 if forced ~= '' and name:lower() ~= forced then goto continue end
                 if inCombat and not Runtime.forceNext and not combatClassAllowed(classShort) then
@@ -342,6 +410,7 @@ local function findRezTarget(inCombat)
                                 memberName = name,
                                 classShort = classShort,
                                 distance = lib.safeNum(function() return spawn.Distance() end, 99999),
+                                source = 'group',
                             }, nil
                         end
                         sawSuppressed = true
@@ -352,10 +421,87 @@ local function findRezTarget(inCombat)
         ::continue::
     end
 
+    -- OOG candidates come only from the current coordinator-owned Actor team.
+    -- Actor death state and zone can both differ from the corpse after a player
+    -- releases to bind. Fresh team membership establishes eligibility while the
+    -- exact PC corpse visible in the rezzer's zone is authoritative.
+    if type(team) == 'table' and team.enabled == true and type(team.members) == 'table' then
+        for _, member in ipairs(team.members) do
+            local name = trim(member and member.character)
+            local nameLower = name:lower()
+            local memberZone = trim(member and member.zone):lower()
+            local ageMs = tonumber(member and member.ageMs) or 999999
+            local fresh = ageMs <= 5000
+            local scan = {
+                name = name ~= '' and name or '-',
+                zone = memberZone ~= '' and memberZone or '-',
+                ageMs = ageMs,
+                self = member and member.self == true or false,
+                deadHint = member and member.dead == true or false,
+                result = 'ineligible',
+                corpseId = 0,
+                corpseType = '',
+                corpseName = '',
+                query = '',
+            }
+            Runtime.actorScan.entries[#Runtime.actorScan.entries + 1] = scan
+            local eligiblePeer = member and member.self ~= true and name ~= ''
+                and nameLower ~= myName():lower() and not seenNames[nameLower]
+                and fresh
+            if eligiblePeer then
+                local classShort = trim(member.class):upper()
+                if forced ~= '' and nameLower ~= forced then
+                    scan.result = 'not_requested'
+                    goto continue_actor
+                end
+
+                local spawn, corpseDiag = findPlayerCorpse(name)
+                scan.query = corpseDiag.query or ''
+                scan.corpseId = tonumber(corpseDiag.corpseId) or 0
+                scan.corpseType = tostring(corpseDiag.corpseType or '')
+                scan.corpseName = tostring(corpseDiag.corpseName or '')
+                if spawn and scan.corpseId > 0 then
+                    sawDead = true
+                    scan.result = 'corpse_found'
+                    if inCombat and not Runtime.forceNext and not combatClassAllowed(classShort) then
+                        sawFiltered = true
+                        scan.result = 'combat_class_filtered'
+                        goto continue_actor
+                    end
+                    local lastAt = Runtime.lastAttempt[scan.corpseId] or 0
+                    if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
+                        return {
+                            corpseId = scan.corpseId,
+                            memberName = name,
+                            classShort = classShort,
+                            distance = lib.safeNum(function() return spawn.Distance() end, 99999),
+                                source = 'actor_team',
+                                targetServer = tostring(member.server or ''),
+                            }, nil
+                    end
+                    scan.result = 'attempt_suppressed'
+                    sawSuppressed = true
+                end
+                if not spawn then scan.result = 'corpse_not_found' end
+            elseif scan.self then
+                scan.result = 'self'
+            elseif name == '' then
+                scan.result = 'name_missing'
+            elseif nameLower == myName():lower() then
+                scan.result = 'local_character'
+            elseif seenNames[nameLower] then
+                scan.result = 'already_in_group'
+            elseif not fresh then
+                scan.result = 'stale'
+            end
+            ::continue_actor::
+        end
+    end
+
     if sawSuppressed then return nil, 'corpse_attempt_suppressed' end
     if sawFiltered then return nil, 'combat_target_class_filtered' end
     if sawDead then return nil, 'dead_member_corpse_not_found' end
-    return nil, forced ~= '' and 'requested_member_not_dead_or_present' or 'no_dead_group_member'
+    return nil, forced ~= '' and 'requested_member_not_dead_or_present' or 'no_dead_group_or_actor_member'
 end
 
 local function prunePeerIntents()
@@ -441,12 +587,37 @@ local function receivePeerCompleted(content, sender, fromMe)
     return true
 end
 
+local function receiveConsentRequest(content, sender, fromMe)
+    if fromMe or not settingBool('RezCoordinateActors', true) then return true end
+    if trim(content.targetName):lower() ~= myName():lower() then return true end
+    local rezzer = trim(content.rezzer or content.from)
+    if rezzer == '' then return true end
+
+    local team = module.state and module.state.team or nil
+    if type(team) ~= 'table' or team.enabled ~= true
+        or tostring(content.teamId or '') ~= tostring(team.teamId or '') then return true end
+    local requesterFresh = false
+    for _, member in ipairs(team.members or {}) do
+        if trim(member.character):lower() == rezzer:lower()
+            and (tonumber(member.ageMs) or 999999) <= 5000 then
+            requesterFresh = true
+            break
+        end
+    end
+    if not requesterFresh then return true end
+
+    mq.cmdf('/consent %s', rezzer)
+    echo('Granted corpse consent to Actor Team rezzer %s', rezzer)
+    return true
+end
+
 local function ensureActorCallbacks(self)
     if Runtime.actorCallbacksRegistered or not self.peerActors then return end
     if not self.peerActors.registerMessageCallback then return end
     self.peerActors.registerMessageCallback('rez:claim', receivePeerIntent)
     self.peerActors.registerMessageCallback('rez:cancelled', receivePeerCancelled)
     self.peerActors.registerMessageCallback('rez:completed', receivePeerCompleted)
+    self.peerActors.registerMessageCallback('rez:consent_request', receiveConsentRequest)
     Runtime.actorCallbacksRegistered = true
 end
 
@@ -642,6 +813,26 @@ local function resourceReady(resource)
     return false
 end
 
+local function targetRangeReason(target, resource, inCombat)
+    local distance = corpseDistance(target and target.corpseId)
+        or tonumber(target and target.distance) or 99999
+    target.distance = distance
+    local resourceRange = tonumber(resource and resource.range) or 100
+    if resourceRange <= 0 then resourceRange = 100 end
+    if distance <= resourceRange then return nil end
+
+    -- Navigation is deliberately OOC-only. Without it, an out-of-range corpse
+    -- must never consume an Actor election or coordinator action claim.
+    if inCombat or not settingBool('RezNavigate', false) then
+        return string.format('corpse_out_of_range:%.1f', distance)
+    end
+    local navLimit = math.max(resourceRange, settingNumber('RezNavMaxDistance', 250))
+    if distance > navLimit then
+        return string.format('corpse_beyond_nav_limit:%.1f', distance)
+    end
+    return nil
+end
+
 local function actionFor(target, resource)
     local kind = lib.ActionKind.USE_ITEM
     if resource.kind == 'spell' then kind = lib.ActionKind.CAST_SPELL end
@@ -654,6 +845,8 @@ local function actionFor(target, resource)
         targetId = target.corpseId,
         targetName = target.memberName,
         targetClass = target.classShort,
+        targetSource = target.source,
+        targetServer = target.targetServer,
         resourceKind = resource.kind,
         resourceName = resource.name,
         resourceRange = resource.range,
@@ -802,9 +995,22 @@ local function startWorkflow(action)
         targetId = tonumber(action.targetId) or 0,
         targetName = tostring(action.targetName or ''),
         targetClass = tostring(action.targetClass or ''),
+        targetSource = tostring(action.targetSource or 'group'),
         resource = resource,
         startedAtMs = nowMs(),
     }
+    if Runtime.workflow.targetSource == 'actor_team'
+        and module.peerActors and module.peerActors.sendToCharacter then
+        local team = module.state and module.state.team or {}
+        module.peerActors.sendToCharacter('sidekick-next/sk_resurrection',
+            Runtime.workflow.targetName, tostring(action.targetServer or ''),
+            'rez:consent_request', {
+                targetName = Runtime.workflow.targetName,
+                rezzer = myName(),
+                teamId = tostring(team.teamId or ''),
+                zone = zoneShort(),
+            })
+    end
     echo('Starting %s rez on %s using %s', lib.inCombat() and 'combat' or 'OOC',
         Runtime.workflow.targetName, resource.name)
 end
@@ -1045,6 +1251,7 @@ local function sendTelemetry(self, force)
         combatMethod = combatMethod(),
         targetName = workflow and workflow.targetName or Runtime.target and Runtime.target.memberName or '',
         targetClass = workflow and workflow.targetClass or Runtime.target and Runtime.target.classShort or '',
+        targetSource = workflow and workflow.targetSource or Runtime.target and Runtime.target.source or '',
         corpseId = workflow and workflow.targetId or Runtime.target and Runtime.target.corpseId or 0,
         resourceKind = workflow and workflow.resource and workflow.resource.kind or Runtime.resource and Runtime.resource.kind or '',
         resourceName = workflow and workflow.resource and workflow.resource.name or Runtime.resource and Runtime.resource.name or '',
@@ -1134,6 +1341,15 @@ module.onTick = function(self)
     end
     Runtime.resource = resource
 
+    local rangeReason = targetRangeReason(target, resource, inCombat)
+    if rangeReason then
+        clearLocalIntent(rangeReason)
+        setReason(rangeReason)
+        self:sendNeed(false, nil, Runtime.reason)
+        sendTelemetry(self)
+        return
+    end
+
     local wins, coordinationReason = localWinsIntent(target, resource)
     if not wins then
         setReason(coordinationReason)
@@ -1155,6 +1371,15 @@ end
 module.getAction = function()
     if Runtime.workflow then return Runtime.workflow.action end
     return Runtime.pendingAction
+end
+
+module.onSchedulerResume = function(_, gapMs)
+    local workflow = Runtime.workflow
+    gapMs = math.max(0, tonumber(gapMs) or 0)
+    if not workflow or gapMs <= 0 then return end
+    for _, field in ipairs({ 'startedAtMs', 'deadlineMs' }) do
+        if tonumber(workflow[field]) then workflow[field] = workflow[field] + gapMs end
+    end
 end
 
 module.executeAction = function(self)
@@ -1210,11 +1435,13 @@ mq.bind('/sk_rez', function(cmd, arg)
 
     if cmd == '' or cmd == 'status' then
         local workflow = Runtime.workflow
-        echo('running=%s priority=%s owns=%s reason=%s phase=%s target=%s(%s) resource=%s:%s winner=%s last=%s',
+        local team = module.state and module.state.team or {}
+        echo('running=%s priority=%s owns=%s reason=%s phase=%s target=%s(%s/%s) resource=%s:%s winner=%s last=%s',
             tostring(module.running), tostring(module:isMyPriority()), tostring(module:ownsClaim()),
             Runtime.reason, workflow and workflow.phase or 'idle',
             workflow and workflow.targetName or Runtime.target and Runtime.target.memberName or '-',
             workflow and workflow.targetClass or Runtime.target and Runtime.target.classShort or '-',
+            workflow and workflow.targetSource or Runtime.target and Runtime.target.source or '-',
             workflow and workflow.resource and workflow.resource.kind or Runtime.resource and Runtime.resource.kind or '-',
             workflow and workflow.resource and workflow.resource.name or Runtime.resource and Runtime.resource.name or '-',
             tostring(Runtime.winner or '-'), Runtime.lastResult)
@@ -1226,6 +1453,24 @@ mq.bind('/sk_rez', function(cmd, arg)
             tostring(settingBool('RezRestoreGem', true)), tostring(settingBool('RezCoordinateActors', true)),
             tostring(settingBool('RezNavigate', false)), settingNumber('RezNavMaxDistance', 250),
             tostring(debugEnabled()))
+        echo('ActorTeam enabled=%s mode=%s id=%s members=%d reason=%s',
+            tostring(team.enabled == true), tostring(team.mode or '-'), tostring(team.teamId or '-'),
+            tonumber(team.memberCount) or 0, tostring(team.reason or '-'))
+        local coordinatorState = module.state or {}
+        echo('CoordinatorState tick=%s receiptAge=%dms ttl=%dms valid=%s',
+            tostring(coordinatorState.tickId or '-'),
+            math.max(0, nowMs() - (tonumber(module.stateReceivedAt) or 0)),
+            tonumber(coordinatorState.ttlMs) or 0, tostring(module:hasValidState()))
+        local scan = Runtime.actorScan or {}
+        echo('ActorScan localZone=%s enabled=%s scanned=%d',
+            tostring(scan.currentZone or '-'), tostring(scan.teamEnabled == true), #(scan.entries or {}))
+        for _, entry in ipairs(scan.entries or {}) do
+            echo('  %s zone=%s age=%dms self=%s deadHint=%s result=%s corpse=%d type=%s name="%s" query="%s"',
+                tostring(entry.name or '-'), tostring(entry.zone or '-'), tonumber(entry.ageMs) or -1,
+                tostring(entry.self == true), tostring(entry.deadHint == true), tostring(entry.result or '-'),
+                tonumber(entry.corpseId) or 0, tostring(entry.corpseType or '-'),
+                tostring(entry.corpseName or ''), tostring(entry.query or ''))
+        end
     elseif cmd == 'debug' then
         local wanted = arg:lower()
         Runtime.runtimeDebug = wanted == 'on' or wanted == '1' or wanted == 'true'
@@ -1252,7 +1497,7 @@ mq.bind('/sk_rez', function(cmd, arg)
             echo('Stop requested')
         end
     else
-        echo('Usage: /sk_rez status | debug on|off | retry | now [group member] | stop')
+        echo('Usage: /sk_rez status | debug on|off | retry | now [group/team member] | stop')
     end
 end)
 

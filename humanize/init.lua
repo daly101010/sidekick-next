@@ -195,17 +195,16 @@ function M.getTargetRoll(id) return State.getTargetRoll(id) end
 function M.setTargetRoll(id, r) State.setTargetRoll(id, r) end
 function M.clearTargetRoll(id) State.clearTargetRoll(id) end
 
--- Register slash commands once per Lua state. mq.bind is per-script, so each
--- /lua run process that requires humanize gets its own binds; that's fine —
--- toggling overrides per process is the intended UX since profile state lives
--- in each script's local copy of state.lua.
-local _bindsRegistered = false
-if not _bindsRegistered then
+-- Register slash commands in the UI process ONLY. MQ binds are global per
+-- client — the first script to bind wins and every other process prints
+-- "Cannot bind ... already bound in MQ". Ownership therefore must be
+-- deterministic: the UI process (marked by init.lua's IS_UI_PROCESS) holds
+-- the binds; toggles that must reach workers go through persisted settings.
+if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.IS_UI_PROCESS then
     local ok, Binds = pcall(require, 'sidekick-next.humanize.binds')
     if ok and Binds and Binds.register then
         pcall(Binds.register, M)
     end
-    _bindsRegistered = true
 end
 
 return M

@@ -126,38 +126,44 @@ M.defaultConditions = {
         return ctx.me.pctHPs < 35
     end,
 
-    -- Aggro / Hate
+    -- Aggro / Hate — deliberately tank-mode-only: in assist mode these fire
+    -- constantly (an assister's aggro is always <100%) and rip mobs off the
+    -- real tank. Off-tanks wanting hate tools should run tank mode.
     ['doAddHate1'] = function(ctx)
-        return ctx.combat
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
     end,
     ['doAddHate2'] = function(ctx)
-        return ctx.combat
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
     end,
     ['doAbsorbTaunt'] = function(ctx)
-        return ctx.combat
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
     end,
     ['doAgelessEnmity'] = function(ctx)
-        return ctx.combat and ctx.me.pctAggro < 100 and ctx.target.pctHPs < 90
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
+            and ctx.me.pctAggro < 100 and ctx.target.pctHPs < 90
     end,
     ['doBlastOfAnger'] = function(ctx)
-        return ctx.combat and ctx.target.secondaryPctAggro > 70
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
+            and ctx.target.secondaryPctAggro > 70
     end,
     ['doProjectionOfFury'] = function(ctx)
-        return ctx.combat and ctx.target.named and ctx.target.secondaryPctAggro > 80
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
+            and ctx.target.named and ctx.target.secondaryPctAggro > 80
     end,
     ['doFlashOfAnger'] = function(ctx)
-        return ctx.combat and ctx.me.pctAggro < 100
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank' and ctx.me.pctAggro < 100
     end,
     ['doAttention'] = function(ctx)
-        return ctx.combat and ctx.target.named
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank' and ctx.target.named
     end,
     ['doTongueDisc'] = function(ctx)
-        return ctx.combat and ctx.me.pctAggro < 100
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank' and ctx.me.pctAggro < 100
     end,
 
     -- AE Aggro
     ['doAEBlades'] = function(ctx)
-        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.spawn.count('npc xtarhater radius 50') >= 3
+        return ctx.combat and tostring(ctx.mode):lower() == 'tank'
+            and ctx.me.xTargetCount >= 3 and ctx.spawn.count('npc xtarhater radius 50') >= 3
     end,
 
     -- Combat
@@ -198,6 +204,16 @@ M.defaultConditions = {
     ['doIntensity'] = function(ctx)
         return ctx.burn
     end,
+}
+
+-- Explicit safety order; the discipline engine otherwise falls back to
+-- alphabetical predicate names, which is not an acceptable tank priority.
+M.conditionOrder = {
+    'doFortitude', 'doWarlordsResurgence',
+    'doStandDisc', 'doAbsorbDisc', 'doRuneShield',
+    'doAgelessEnmity', 'doBlastOfAnger', 'doProjectionOfFury',
+    'doAbsorbTaunt', 'doAddHate1', 'doAddHate2', 'doFlashOfAnger',
+    'doAttention', 'doTongueDisc', 'doAEBlades',
 }
 
 -- Category Overrides

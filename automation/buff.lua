@@ -873,6 +873,7 @@ function M.claimBuff(targetId, buffCategory)
     M.localClaims[id] = M.localClaims[id] or {}
     M.localClaims[id][buffCategory] = {
         claimedAt = os.clock(),
+        lastBroadcastAt = os.clock(),
     }
 
     local Actors = getActors()
@@ -884,6 +885,30 @@ function M.claimBuff(targetId, buffCategory)
         })
     end
 
+    return true
+end
+
+--- Renew a locally-owned buff claim while a bounded memorize/cast workflow is
+--- still active. Broadcast at most once every three seconds so an eight-second
+--- remote lease cannot lapse without flooding Actors traffic.
+function M.renewClaim(targetId, buffCategory)
+    local id = tonumber(targetId)
+    local claim = id and M.localClaims[id] and M.localClaims[id][buffCategory]
+    if not claim then return false end
+
+    local now = os.clock()
+    claim.claimedAt = now
+    if (now - (claim.lastBroadcastAt or 0)) < 3.0 then return true end
+    claim.lastBroadcastAt = now
+
+    local Actors = getActors()
+    if Actors and Actors.broadcast then
+        Actors.broadcast('buff:claim', {
+            targetId = id,
+            buffType = buffCategory,
+            claimer = _selfName,
+        })
+    end
     return true
 end
 

@@ -20,12 +20,16 @@ M.discLines = {
     ['UnseenAssailant'] = { "Unseen Assailant's Guile" },
 }
 
+-- Skill Lines: melee skills activated with /doability
+M.skillLines = {
+    ['Backstab'] = { "Backstab" },
+}
+
 -- AA Lines
 M.aaLines = {
     ['Escape'] = { "Escape" },
     ['Assassinate'] = { "Assassinate" },
     ['ThiefsEyes'] = { "Thief's Eyes" },
-    ['Backstab'] = { "Backstab" },
     ['SpireOfRogue'] = { "Spire of the Rake" },
     ['Pinpoint'] = { "Pinpoint Weaknesses" },
     ['Intensity'] = { "Intensity of the Resolute" },

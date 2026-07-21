@@ -26,12 +26,14 @@ local getHumanize = lazy.once('sidekick-next.humanize')
 local getChase    = lazy.once('sidekick-next.automation.chase')
 
 local M = {}
+local READY_TIMEOUT_MS = 10000
 
 -- States ----------------------------------------------------------------------
 
 M.STATES = {
     IDLE          = 'IDLE',
     SCAN          = 'SCAN',
+    READY         = 'READY',
     NAV_TO_TARGET = 'NAV_TO_TARGET',
     PULLING       = 'PULLING',
     RETURN_CAMP   = 'RETURN_CAMP',
@@ -42,6 +44,7 @@ M.STATES = {
 local STATE_TEXT = {
     IDLE          = 'Idle',
     SCAN          = 'Scanning',
+    READY         = 'Waiting for movement ownership',
     NAV_TO_TARGET = 'Naving to target',
     PULLING       = 'Pulling',
     RETURN_CAMP   = 'Returning to camp',
@@ -170,6 +173,9 @@ local function setState(s, reason)
 end
 
 local function abort(reason)
+    if State.pullState ~= M.STATES.IDLE and State.pullState ~= M.STATES.WAITING_GATE then
+        State.lastPullEndedMs = nowMs()
+    end
     setState(M.STATES.IDLE, reason or 'aborted')
     State.pullId = 0
 end
@@ -236,6 +242,9 @@ local function shouldPull()
 
     local me = mq.TLO.Me
     if isCasting() then return false, 'casting' end
+    if Config.pullRespectMedState and me.Sitting and me.Sitting() then
+        return false, 'meditating'
+    end
 
     local hpp = me.PctHPs() or 100
     if hpp < (Config.pullHpPct or 0) then return false, 'low_hp' end
@@ -336,6 +345,13 @@ local function tick_IDLE()
 end
 
 local function tick_SCAN()
+    -- Wear the configured pull bandolier set (bow/thrown) for the whole pull
+    -- cycle. Self-throttled: no-op when unset, already worn, or on cooldown.
+    -- sk_items resumes conditional swapping once pull releases ownership.
+    pcall(function()
+        require('sidekick-next.utils.bandolier').activatePull()
+    end)
+
     local res = Scan.scan({
         checkX = State.campX, checkY = State.campY, checkZ = State.campZ,
         pullRadius = Config.pullRadius,
@@ -359,14 +375,29 @@ local function tick_SCAN()
     State.pullId = res.sortedIds[1]
     State.pullStartedAtMs = nowMs()
 
-    local def = Abilities.getById(Config.ability) or Abilities.getById('AutoAttack')
-    local range = Abilities.rangeOf(def)
-    if range <= 0 then range = 30 end
+    -- Selection is deliberately side-effect free. Coordinated mode stops here
+    -- until sk_pull owns the target/movement operation.
+    setState(M.STATES.READY, 'target_selected')
+end
 
-    -- Stand + nav
+local function tick_READY(allowActions)
+    if (nowMs() - State.pullStartedAtMs) > READY_TIMEOUT_MS then
+        abort('claim_wait_timeout')
+        return
+    end
+    if not allowActions then return end
+    local sp = mq.TLO.Spawn(State.pullId)
+    if not (sp and sp() and sp.ID() == State.pullId) then
+        abort('target_gone')
+        return
+    end
+    local def = Abilities.getById(Config.ability) or Abilities.getById('AutoAttack')
+    local range = Abilities.rangeOf(def, { targetId = State.pullId, cfg = Config })
+    if range <= 0 then range = 30 end
     if mq.TLO.Me.Sitting and mq.TLO.Me.Sitting() then mq.cmd('/stand') end
     mq.cmd('/attack off')
     navToTargetId(State.pullId, range, false)
+    State.pullStartedAtMs = nowMs()
     setState(M.STATES.NAV_TO_TARGET, '')
 end
 
@@ -406,7 +437,7 @@ local function tick_NAV_TO_TARGET()
 
     -- Are we close enough?
     local def = Abilities.getById(Config.ability) or Abilities.getById('AutoAttack')
-    local range = Abilities.rangeOf(def)
+    local range = Abilities.rangeOf(def, { targetId = State.pullId, cfg = Config })
     if range <= 0 then range = 30 end
     local d = spawnDist(State.pullId)
 
@@ -422,6 +453,15 @@ local function tick_NAV_TO_TARGET()
 end
 
 local function tick_PULLING()
+    if (nowMs() - State.pullStartedAtMs) > 5000 then
+        abort('pull_target_timeout')
+        return
+    end
+    local sp = mq.TLO.Spawn(State.pullId)
+    if not (sp and sp() and sp.ID() == State.pullId) then
+        abort('target_gone')
+        return
+    end
     -- Fire ability once we're in range and targeting.
     local tid = mq.TLO.Target.ID() or 0
     if tid ~= State.pullId then
@@ -438,6 +478,7 @@ local function tick_PULLING()
         local d = H.gate('ability', { kind = 'pull', target = State.pullId })
         if d == H.SKIP then
             -- Skip this tick; will retry next iteration.
+            State.pullStartedAtMs = nowMs()
             return
         end
         if d and d > 0 then mq.delay(d) end
@@ -535,24 +576,28 @@ end
 function M.stop()
     persist('enabled', false)
     State.pausedManually = true
-    navStop()
-    setState(M.STATES.IDLE, 'stopped')
+    M.cancel('stopped')
     printf('\at[Pull]\ax stop')
+end
+
+function M.selectTargetId(tid)
+    tid = tonumber(tid) or 0
+    local spawn = tid > 0 and mq.TLO.Spawn(tid) or nil
+    if not (spawn and spawn() and spawn.ID() == tid) then
+        printf('\ar[Pull]\ax invalid target')
+        return false
+    end
+    if not State.campSet then setCampHere() end
+    State.pullId = tid
+    State.pullStartedAtMs = nowMs()
+    setState(M.STATES.READY, 'manual_target_selected')
+    return true
 end
 
 function M.pullCurrentTarget()
     local tid = mq.TLO.Target.ID() or 0
-    if tid <= 0 then printf('\ar[Pull]\ax no target'); return end
-    if not State.campSet then setCampHere() end
-    State.pullId = tid
-    State.pullStartedAtMs = nowMs()
-    local def = Abilities.getById(Config.ability) or Abilities.getById('AutoAttack')
-    local range = Abilities.rangeOf(def)
-    if range <= 0 then range = 30 end
-    if mq.TLO.Me.Sitting and mq.TLO.Me.Sitting() then mq.cmd('/stand') end
-    mq.cmd('/attack off')
-    navToTargetId(tid, range, false)
-    setState(M.STATES.NAV_TO_TARGET, 'manual')
+    if tid <= 0 then printf('\ar[Pull]\ax no target'); return false end
+    return M.selectTargetId(tid)
 end
 
 function M.deny(name)
@@ -594,16 +639,38 @@ end
 
 function M.getConfig() return Config end
 function M.persistKnob(key, value) persist(key, value) end
+function M.reloadSettings()
+    loadFromSettings()
+    if not Config.enabled and State.pullState ~= M.STATES.IDLE and M.cancel then
+        M.cancel('disabled')
+    end
+end
+function M.setCamp() setCampHere() end
+function M.cancel(reason)
+    navStop()
+    mq.cmd('/attack off')
+    abort(reason or 'cancelled')
+end
 
 -- Tick driver -----------------------------------------------------------------
 
-function M.tick()
+function M.tick(opts)
+    opts = opts or {}
+    local allowActions = opts.allowActions ~= false
     if not State.initialized then M.init() end
     if not Config.enabled and State.pullState == M.STATES.IDLE then return end
 
     local s = State.pullState
+    if not allowActions and (s == M.STATES.READY
+        or s == M.STATES.NAV_TO_TARGET
+        or s == M.STATES.PULLING
+        or s == M.STATES.RETURN_CAMP
+        or s == M.STATES.WAITING_MOB) then
+        return
+    end
     if     s == M.STATES.IDLE          then tick_IDLE()
     elseif s == M.STATES.SCAN          then tick_SCAN()
+    elseif s == M.STATES.READY         then tick_READY(allowActions)
     elseif s == M.STATES.NAV_TO_TARGET then tick_NAV_TO_TARGET()
     elseif s == M.STATES.PULLING       then tick_PULLING()
     elseif s == M.STATES.RETURN_CAMP   then tick_RETURN_CAMP()
@@ -612,16 +679,11 @@ function M.tick()
     end
 end
 
--- Slash binds -----------------------------------------------------------------
-
-local function bindOnce(name, fn)
-    if not (mq and mq.bind) then return end
-    if mq.unbind then pcall(mq.unbind, name) end
-    pcall(mq.bind, name, fn)
-end
-
-bindOnce('/sk_pull', function(sub, arg, arg2)
-    sub = (sub or 'status'):lower()
+-- Command handling is registered only by the UI/state host. Keeping the
+-- automation library bind-free prevents the coordinated worker and UI process
+-- from unbinding each other's global command.
+function M.handleCommand(sub, arg, arg2)
+    sub = tostring(sub or 'status'):lower()
     if sub == 'start' or sub == 'on' then M.start()
     elseif sub == 'stop' or sub == 'off' then M.stop()
     elseif sub == 'pulltarget' then M.pullCurrentTarget()
@@ -645,6 +707,6 @@ bindOnce('/sk_pull', function(sub, arg, arg2)
         printf('\at[Pull]\ax usage: /sk_pull start|stop|pulltarget|deny <name>|allow <name>|' ..
             'clearignore|mode <Normal|Chain>|ability <id>|camp|status')
     end
-end)
+end
 
 return M

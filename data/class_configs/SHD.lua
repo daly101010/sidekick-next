@@ -109,7 +109,7 @@ M.defaultConditions = {
         return ctx.burn and not ctx.me.activeDisc
     end,
     ['doAEAggroDisc'] = function(ctx)
-        return ctx.me.xTargetCount >= 3 and ctx.mode == 'Tank'
+        return ctx.me.xTargetCount >= 3 and tostring(ctx.mode):lower() == 'tank'
     end,
 
     ['doExplosionOfHatred'] = function(ctx)
@@ -138,10 +138,10 @@ M.defaultConditions = {
         return ctx.combat and ctx.me.pctHPs < 80
     end,
     ['doTerror'] = function(ctx)
-        return ctx.mode == 'Tank' and not ctx.target.myBuff('Terror')
+        return tostring(ctx.mode):lower() == 'tank' and not ctx.target.myBuff('Terror')
     end,
     ['doTorrent'] = function(ctx)
-        return ctx.me.xTargetCount >= 2 and ctx.mode == 'Tank'
+        return ctx.me.xTargetCount >= 2 and tostring(ctx.mode):lower() == 'tank'
     end,
     ['doPoisonDoT'] = function(ctx)
         return ctx.target.named and not ctx.target.myBuff('Dire') and ctx.target.pctHPs > 30
@@ -154,7 +154,7 @@ M.defaultConditions = {
     end,
 
     ['doHateBuff'] = function(ctx)
-        return not ctx.me.buff('Voice') and ctx.mode == 'Tank'
+        return not ctx.me.buff('Voice') and tostring(ctx.mode):lower() == 'tank'
     end,
     ['doLifetapProc'] = function(ctx)
         return not ctx.me.buff('Lich Sting') and not ctx.me.buff('Touch')
@@ -166,6 +166,14 @@ M.defaultConditions = {
     ['doSpireOfShadowKnight'] = function(ctx)
         return ctx.burn
     end,
+}
+
+M.conditionOrder = {
+    'doLeechcurse', 'doLeech',
+    'doDeflectionDisc', 'doUnholyAura', 'doVisageOfDeath',
+    'doExplosionOfHatred', 'doExplosionOfSpite', 'doAEAggroDisc',
+    'doTerror', 'doTorrent',
+    'doLifeTap', 'doSpearNuke',
 }
 
 -- Category overrides

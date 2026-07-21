@@ -33,14 +33,20 @@ function M.register(api)
     -- Master command: /sk_humanize <subcmd> [arg] [arg2]
     bind('/sk_humanize', function(sub, arg, arg2)
         sub = (sub or 'status'):lower()
-        if sub == 'on' then
-            _G.SIDEKICK_NEXT_CONFIG = _G.SIDEKICK_NEXT_CONFIG or {}
-            _G.SIDEKICK_NEXT_CONFIG.HUMANIZE_BEHAVIOR = true
-            printf('%s layer %s', yellow('[Humanize]'), green('ON'))
-        elseif sub == 'off' then
-            _G.SIDEKICK_NEXT_CONFIG = _G.SIDEKICK_NEXT_CONFIG or {}
-            _G.SIDEKICK_NEXT_CONFIG.HUMANIZE_BEHAVIOR = false
-            printf('%s layer %s', yellow('[Humanize]'), red('OFF'))
+        if sub == 'on' or sub == 'off' then
+            local enabled = sub == 'on'
+            -- Persist through Core settings so worker processes pick the
+            -- master flag up via settings sync — the binds live only in the
+            -- UI process, so a bare _G write would never reach them.
+            local okP, Persistence = pcall(require, 'sidekick-next.humanize.persistence')
+            if okP and Persistence and Persistence.persist then
+                pcall(Persistence.persist, 'master', {}, enabled)
+            else
+                _G.SIDEKICK_NEXT_CONFIG = _G.SIDEKICK_NEXT_CONFIG or {}
+                _G.SIDEKICK_NEXT_CONFIG.HUMANIZE_BEHAVIOR = enabled
+            end
+            printf('%s layer %s', yellow('[Humanize]'),
+                enabled and green('ON') or red('OFF'))
         elseif sub == 'boss' then
             api.setOverride('boss')
             printf('%s override=%s', yellow('[Humanize]'), teal('boss'))
@@ -82,7 +88,15 @@ function M.register(api)
                     yellow('[Humanize]'))
                 return
             end
-            api.setSubsystem(key, val == 'on' or val == 'true')
+            local enabled = val == 'on' or val == 'true'
+            -- Persist through Core so worker processes pick the change up via
+            -- settings sync (same reason as the master flag above).
+            local okP, Persistence = pcall(require, 'sidekick-next.humanize.persistence')
+            if okP and Persistence and Persistence.persist then
+                pcall(Persistence.persist, 'subsystem', { name = key }, enabled)
+            else
+                api.setSubsystem(key, enabled)
+            end
             printf('%s subsystem %s=%s', yellow('[Humanize]'), key, val)
         elseif sub == 'status' or sub == '' then
             status()

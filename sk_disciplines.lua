@@ -85,6 +85,7 @@ local DEFAULT_CLASSES = {
     WAR = true, PAL = true, SHD = true,
     BER = true, MNK = true, ROG = true,
 }
+local TANK_CLASSES = { WAR = true, PAL = true, SHD = true }
 
 local function shouldRunForClass(cfg, classShort)
     -- Explicit class-config opt-out wins.
@@ -123,7 +124,7 @@ local PENDING_TTL_MS = 250  -- accept a freshly-picked action for this long
 -- e.g., ENC wants {'aa','disc','spell'} since its rotation is
 -- predominantly spells (mez/tash/slow/nukes) and there is no
 -- competing ENC nuke module.
-local DEFAULT_ALLOW_KINDS = { aa = true, disc = true }
+local DEFAULT_ALLOW_KINDS = { aa = true, disc = true, skill = true }
 
 -- Mez spell ownership belongs exclusively to sk_cc. ENC's discipline engine
 -- still handles stun/debuff/DPS conditions, but can never select these casts.
@@ -133,6 +134,23 @@ local COORDINATOR_OWNED_CONDITIONS = {
     doAEMez = true,
     doPBAEMez = true,
 }
+
+local function ownedTankConditions(cfg)
+    local excluded = {}
+    for key, value in pairs(COORDINATOR_OWNED_CONDITIONS) do excluded[key] = value end
+    local settings = getSettings()
+    if tostring(settings.CombatMode or 'off'):lower() == 'tank'
+        and TANK_CLASSES[myClassShort()] == true
+        and cfg and type(cfg.categoryOverrides) == 'table' then
+        for condKey, category in pairs(cfg.categoryOverrides) do
+            category = tostring(category or ''):lower()
+            if category == 'emergency' or category == 'defenses' or category == 'aggro' then
+                excluded[condKey] = true
+            end
+        end
+    end
+    return excluded
+end
 
 local function classAllowKinds(cfg)
     if not (cfg and cfg.allowKindsInRotation) then return DEFAULT_ALLOW_KINDS end
@@ -248,7 +266,7 @@ local function pickPendingAction()
     if not _classConfig then return nil end
     return Engine.pickReadyAbility(_classConfig, ctx, {
         allowKinds = classAllowKinds(_classConfig),
-        excludeConditions = COORDINATOR_OWNED_CONDITIONS,
+        excludeConditions = ownedTankConditions(_classConfig),
     })
 end
 
@@ -343,6 +361,7 @@ module.getAction = function(self)
         aa    = lib.ActionKind.USE_AA,
         disc  = 'use_disc',
         spell = lib.ActionKind.CAST_SPELL,
+        skill = lib.ActionKind.USE_SKILL,
     }
 
     return {

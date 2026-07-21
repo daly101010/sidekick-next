@@ -60,33 +60,9 @@ function M.draw()
         if duckEnabled then
             imgui.PushItemWidth(150)
 
-            local duckThresh = (Config.duckHpThreshold ~= nil) and Config.duckHpThreshold or 85
-            duckThresh, changed = imgui.SliderInt('Duck Threshold %', duckThresh, 70, 95)
-            if changed then Config.duckHpThreshold = duckThresh end
-
-            local duckEmergency = (Config.duckEmergencyThreshold ~= nil) and Config.duckEmergencyThreshold or 70
-            duckEmergency, changed = imgui.SliderInt('Emergency Duck %', duckEmergency, 50, 90)
-            if changed then Config.duckEmergencyThreshold = duckEmergency end
-
             local duckHot = (Config.duckHotThreshold ~= nil) and Config.duckHotThreshold or 92
             duckHot, changed = imgui.SliderInt('HoT Duck Threshold %', duckHot, 80, 99)
             if changed then Config.duckHotThreshold = duckHot end
-
-            local duckBuffer = (Config.duckBufferPct ~= nil) and Config.duckBufferPct or 0.5
-            duckBuffer, changed = imgui.SliderFloat('Duck Buffer %', duckBuffer, 0.0, 5.0, '%.1f')
-            if changed then Config.duckBufferPct = duckBuffer end
-
-            local duckHysteresis = (Config.duckHysteresisPct ~= nil) and Config.duckHysteresisPct or 5
-            duckHysteresis, changed = imgui.SliderInt('Direct Heal Duck Hysteresis %', duckHysteresis, 0, 15)
-            if changed then Config.duckHysteresisPct = duckHysteresis end
-
-            local duckHotHysteresis = (Config.duckHotHysteresisPct ~= nil) and Config.duckHotHysteresisPct or 3
-            duckHotHysteresis, changed = imgui.SliderInt('HoT Duck Hysteresis %', duckHotHysteresis, 0, 15)
-            if changed then Config.duckHotHysteresisPct = duckHotHysteresis end
-
-            local duckMinAge = (Config.duckMinCastAgeMs ~= nil) and Config.duckMinCastAgeMs or 600
-            duckMinAge, changed = imgui.SliderInt('Min Cast Age Before Duck (ms)', duckMinAge, 0, 2000)
-            if changed then Config.duckMinCastAgeMs = duckMinAge end
 
             local considerHot = Config.considerIncomingHot ~= false
             considerHot, changed = imgui.Checkbox('Consider Incoming HoTs', considerHot)
@@ -194,12 +170,6 @@ function M.draw()
         if imgui.IsItemHovered() then
             imgui.SetTooltip('Share incoming heal info via Actors')
         end
-
-        local debug = Config.debugLogging == true
-        debug, changed = imgui.Checkbox('Debug Logging', debug)
-        if changed then Config.debugLogging = debug end
-
-        imgui.Separator()
 
         imgui.PushItemWidth(150)
 

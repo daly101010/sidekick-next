@@ -93,28 +93,7 @@ end
 -- Tunables exposed to UI.
 local Tunables = {
     engageMinPct   = 88,      -- floor of engage HP% sample range
-    restickAfterMs = 60000,   -- restick once per minute on long fights
 }
-
--- If the current target has been engaged for >= restickAfterMs, force a re-roll
--- of the stick variant. Returns nil if no re-stick is due, otherwise returns
--- the new stick command (and updates the cache).
-function M.maybeReStick(role, settings, targetId)
-    if not flagOn() then return nil end
-    if not Profiles.subsystemEnabled('engagement') then return nil end
-    if isTank(role, settings) then return nil end
-    if not targetId or targetId == 0 then return nil end
-    local roll = State.getTargetRoll(targetId)
-    if not roll or not roll.stickAt then return nil end
-    if (State.now() - roll.stickAt) < Tunables.restickAfterMs then return nil end
-    -- Roll a new variant; ~50% chance per check after the threshold.
-    if not Distributions.chance(0.5) then return nil end
-
-    -- Force a fresh pick by clearing prior cmd.
-    roll.stickCmd = nil
-    State.setTargetRoll(targetId, roll)
-    return M.pickStickVariant(role, settings, targetId)
-end
 
 -- Pick the mob HP% at which non-tank DPS will start firing on this target.
 -- Tanks: 100 (immediate engage).
@@ -163,13 +142,6 @@ function M.setEngageMinPct(v)
     if v < 50 then v = 50 end
     if v > 100 then v = 100 end
     Tunables.engageMinPct = v
-end
-
-function M.setRestickAfterMs(ms)
-    ms = tonumber(ms) or 60000
-    if ms < 5000 then ms = 5000 end
-    if ms > 600000 then ms = 600000 end
-    Tunables.restickAfterMs = ms
 end
 
 return M

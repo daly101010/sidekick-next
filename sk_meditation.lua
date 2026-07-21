@@ -205,11 +205,57 @@ local function getAggroHolderId()
     return 0
 end
 
+-- Event-driven "something is hitting me" detection. Chat combat events are
+-- the ground truth: they fire regardless of XTarget configuration, target
+-- selection, or buff-cache state. Any melee hit, spell hit, or melee miss
+-- against me marks the character combat-unsafe for DAMAGE_HOLD_MS.
+local DAMAGE_HOLD_MS = 8000
+local _lastDamageAt = 0
+
+local function onDamagedMe()
+    _lastDamageAt = mq.gettime()
+end
+
+-- "A gnoll hits YOU for 15 points of damage." (all melee verbs + non-melee)
+mq.event('skmed_hit_me', '#1# #2# YOU for #3# point#*# of damage#*#', onDamagedMe)
+-- "A gnoll tries to hit YOU, but misses!" (and parry/dodge/riposte variants)
+mq.event('skmed_miss_me', '#1# tries to #2# YOU, but#*#', onDamagedMe)
+
+local function recentlyDamaged()
+    return _lastDamageAt > 0 and (mq.gettime() - _lastDamageAt) < DAMAGE_HOLD_MS
+end
+
+--- True when any live XTarget hater is currently targeting me. This is the
+--- only aggro signal that works for healers: PctAggro and AggroHolder are
+--- both relative to the CURRENT TARGET, and a healer targets group members,
+--- so those checks read nothing while a mob beats on them.
+local function mobAttackingMe(myId)
+    myId = tonumber(myId) or 0
+    if myId <= 0 then return false end
+    local ok, attacked = pcall(function()
+        local count = tonumber(mq.TLO.Me.XTarget()) or 0
+        for i = 1, count do
+            local xt = mq.TLO.Me.XTarget(i)
+            if xt and (tonumber(xt.ID()) or 0) > 0 then
+                local dead = xt.Dead and xt.Dead() == true
+                local tot = (xt.TargetOfTarget and tonumber(xt.TargetOfTarget.ID())) or 0
+                if not dead and tot == myId then return true end
+            end
+        end
+        return false
+    end)
+    return ok and attacked == true
+end
+
 local function iHaveAggro(me, settings)
     if settings.MeditationAggroCheck ~= true then return false end
     local thresh = tonumber(settings.MeditationAggroPct) or 95
 
     me = me or {}
+    -- Combat log events are the strongest signal: if something swung at me
+    -- in the last few seconds, do not sit, whatever the TLOs claim.
+    if recentlyDamaged() then return true end
+
     if (me.pctAggro or 0) >= thresh then return true end
 
     local myId = me.id or 0
@@ -218,14 +264,12 @@ local function iHaveAggro(me, settings)
         return true
     end
 
-    -- NOTE: We intentionally do NOT check XTarget auto hater slots here.
-    -- XTarget 'Auto Hater' means "a mob hating someone in the group" — NOT
-    -- "a mob targeting the player."  For a cleric/healer in a group the tank
-    -- has aggro, but XTarget still shows auto haters.  Using that check would
-    -- block ALL in-combat meditation for every group member.
-    --
-    -- The pctAggro threshold and AggroHolder checks above are sufficient to
-    -- detect personal aggro.
+    -- NOTE: We intentionally do NOT count XTarget auto hater slots as aggro.
+    -- 'Auto Hater' means "a mob hating someone in the group" — that would
+    -- block ALL in-combat meditation for every member. But a hater whose
+    -- target-of-target is ME is personal aggro regardless of what I have
+    -- targeted, and is the only signal that works while targeting a PC.
+    if mobAttackingMe(myId) then return true end
 
     return false
 end
@@ -535,11 +579,15 @@ local function tick()
         return
     end
 
-    -- Aggro check
+    -- Aggro check. Standing up is only half of it: never INITIATE a sit while
+    -- a mob is on us either, or a healer chain-sits itself to death.
     local aggroUnsafe = iHaveAggro(me, settings)
-    if aggroUnsafe and me.sitting == true and canChangeState(now, settings) then
-        if shouldLog then debugLog('tick: standing due to aggro') end
-        cmdStand(now)
+    if aggroUnsafe then
+        if me.sitting == true and canChangeState(now, settings) then
+            if shouldLog then debugLog('tick: standing due to aggro') end
+            cmdStand(now)
+        end
+        sendNeed(false, nil, 'aggro_hold')
         return
     end
 
@@ -727,6 +775,11 @@ local function mainLoop()
     local wasInGame = lib.isInGame()
 
     while State.running do
+        -- Pump chat events: the combat-damage aggro guard (skmed_hit_me /
+        -- skmed_miss_me) only fires from mq.doevents, and this hand-rolled
+        -- loop is not ModuleBase.run (which pumps automatically).
+        if mq.doevents then pcall(mq.doevents) end
+
         tick()
 
         -- Send heartbeat periodically

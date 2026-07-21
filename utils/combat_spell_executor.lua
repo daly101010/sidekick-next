@@ -15,6 +15,7 @@ local M = {}
 -- Healings are skipped here as healing intelligence handles them
 M.TYPE_PRIORITY = {
     debuff = 1,
+    dispel = 1.5,  -- Strip buffs early so debuffs/damage land better
     buff = 2,
     dot = 3,
     direct_damage = 4,
@@ -428,8 +429,8 @@ local function isEffectOnTarget(spellName, spellId, targetId)
     if spellName then
         local buff = spawn.Buff(spellName)
         if buff and buff() and buff.ID() then
-            local duration = buff.Duration()
-            if duration and duration > 3000 then
+            local duration = tonumber(buff.Duration()) or 0
+            if duration > 3000 then
                 return true
             end
         end
@@ -439,8 +440,8 @@ local function isEffectOnTarget(spellName, spellId, targetId)
     if spellId and spellId > 0 then
         local buff = spawn.Buff(spellId)
         if buff and buff() and buff.ID() then
-            local duration = buff.Duration()
-            if duration and duration > 3000 then
+            local duration = tonumber(buff.Duration()) or 0
+            if duration > 3000 then
                 return true
             end
         end
@@ -528,7 +529,8 @@ function M.getNextSpell()
                             end
                         end
                     end
-                elseif entry.spellType == 'debuff' or entry.spellType == 'dot' then
+                elseif entry.spellType == 'debuff' or entry.spellType == 'dot'
+                    or entry.spellType == 'dispel' then
                     -- Use current target for detrimental spells
                     local target = mq.TLO.Target
                     if target and target() and target.ID() and target.ID() > 0 then

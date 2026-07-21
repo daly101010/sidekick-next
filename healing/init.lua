@@ -26,6 +26,9 @@ local getSettings = lazy.once('sidekick-next.healing.ui.settings')
 -- Lazy-load Proactive module (may not exist yet)
 local getProactive = lazy.once('sidekick-next.healing.proactive')
 
+-- Lazy-load shared lib (Core settings access for combat-mode gating)
+local getSkLib = lazy.once('sidekick-next.sk_lib')
+
 -- Lazy-load HotAnalyzer (HoT trust calculations)
 local getHotAnalyzer = lazy.once('sidekick-next.healing.hot_analyzer')
 
@@ -365,6 +368,31 @@ local function cloneTarget(t)
     return out
 end
 
+local function resolveHealTargetId(targetInfo)
+    local targetId = tonumber(targetInfo and targetInfo.id) or 0
+    if targetId > 0 then return targetId end
+
+    local targetName = tostring(targetInfo and targetInfo.name or '')
+    if targetName == '' then return 0 end
+    local expected = targetName:lower()
+    for _, query in ipairs({
+        'pc =' .. targetName,
+        'mercenary =' .. targetName,
+        'pet =' .. targetName,
+    }) do
+        local ok, spawn = pcall(function() return mq.TLO.Spawn(query) end)
+        if ok and spawn and spawn() then
+            local nameOk, cleanName = pcall(function() return spawn.CleanName() end)
+            local idOk, resolvedId = pcall(function() return spawn.ID() end)
+            resolvedId = idOk and tonumber(resolvedId) or 0
+            if nameOk and tostring(cleanName or ''):lower() == expected and resolvedId > 0 then
+                return resolvedId
+            end
+        end
+    end
+    return 0
+end
+
 local function buildHealingContext()
     local proactive = getProactive()
     local allTargets = {}
@@ -461,9 +489,11 @@ local function buildHealActionForTarget(targetInfo, heal, tier, reason)
         return nil
     end
     if targetInfo.lineOfSight == false then return nil end
+    local targetId = resolveHealTargetId(targetInfo)
+    if targetId <= 0 then return nil end
     return {
         spellName = spellName,
-        targetId = targetInfo.id,
+        targetId = targetId,
         targetName = targetInfo.name,
         tier = tier,
         isHoT = is_hot_spell(spellName),
@@ -494,6 +524,17 @@ local function buildHealAction(opts)
     end
     if not isHealerClass() then
         return nil, 'not_healer'
+    end
+
+    -- A tanking character's job is aggro, not top-offs. Restrict its healing
+    -- to genuine emergencies (below emergencyPct) so hate tools and
+    -- defensives keep the cast/claim budget.
+    if opts.excludeEmergency ~= true then
+        local ok, core = pcall(function() return getSkLib().getSettings() end)
+        if ok and type(core) == 'table'
+            and tostring(core.CombatMode or 'off'):lower() == 'tank' then
+            opts.onlyEmergency = true
+        end
     end
 
     if opts.requireCanHeal and not canHealNow(opts) then
@@ -534,7 +575,7 @@ local function buildHealAction(opts)
     end
 
     -- Group heal
-    local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(ctx.localTargets)
+    local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(ctx.localTargets, situation)
     if useGroup and groupHeal then
         local myId = mq.TLO.Me.ID()
         if myId and myId > 0 then
@@ -995,6 +1036,18 @@ end
 function M.tick(settings)
     if not _initialized then return false end
 
+    -- Keep monolithic compatibility on the same peer/config sensor inputs as
+    -- the coordinated worker's tickSensors() path.
+    if _configReloadPending then
+        _configReloadPending = false
+        Config.load()
+        if TargetMonitor.updateConfig then TargetMonitor.updateConfig(Config) end
+        Logger.info('config', 'Reloaded healing configuration from peer update')
+    end
+    if ActorsCoordinator and ActorsCoordinator.getRemoteCharacters and TargetMonitor.updateActorTargets then
+        TargetMonitor.updateActorTargets(ActorsCoordinator.getRemoteCharacters())
+    end
+
     -- Enable briefly when diagnosing a specific healing stall; file IO here is expensive in combat.
     local _tickDbg = false
     local function tickLog(msg)
@@ -1175,8 +1228,18 @@ function M.tick(settings)
         end
     end
 
+    -- A tanking character stops here: emergencies only (mirrors the
+    -- onlyEmergency gate in buildHealAction for the coordinated path).
+    do
+        local okMode, core = pcall(function() return getSkLib().getSettings() end)
+        if okMode and type(core) == 'table'
+            and tostring(core.CombatMode or 'off'):lower() == 'tank' then
+            return false
+        end
+    end
+
     -- Priority 2: group heal
-    local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(allTargets)
+    local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(allTargets, situation)
     if useGroup and groupHeal then
         local myId = mq.TLO.Me.ID()
         if executeHeal(groupHeal.spell, myId, 'group', false) then

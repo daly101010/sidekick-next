@@ -289,9 +289,12 @@ function M.tick(settings)
     end
 
     local classShort = normalize_class()
-    -- Use epoch seconds so values that round-trip through broadcasts
-    -- (localHots exp, claim TTLs) stay comparable with peer data.
+    -- Actor-visible HoT/claim expirations use epoch seconds, while the local
+    -- decision throttle needs a sub-second monotonic clock. Mixing both onto
+    -- os.time() reduced this path to roughly one decision per second.
     local now = os.time()
+    local decisionMs = mq.gettime and tonumber(mq.gettime()) or nil
+    local decisionNow = decisionMs and (decisionMs / 1000) or os.clock()
     prune_map(_state.localHots, now)
     if ActorsCoordinator and ActorsCoordinator.pruneHealState then
         ActorsCoordinator.pruneHealState()
@@ -302,10 +305,10 @@ function M.tick(settings)
         return false
     end
 
-    if (now - (_state.lastDecisionAt or 0)) < 0.10 then
+    if (decisionNow - (_state.lastDecisionAt or 0)) < 0.10 then
         return _state.priorityActive
     end
-    _state.lastDecisionAt = now
+    _state.lastDecisionAt = decisionNow
 
     local classConfig = load_class_config(classShort)
     local profile = get_profile(classShort, classConfig)

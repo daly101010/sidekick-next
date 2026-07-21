@@ -33,8 +33,9 @@ local function rangedRange()
     return r
 end
 
-local function autoAttackRange()
-    local t = mq.TLO.Target
+local function autoAttackRange(ctx)
+    local targetId = tonumber(ctx and ctx.targetId) or 0
+    local t = targetId > 0 and mq.TLO.Spawn(targetId) or mq.TLO.Target
     if not (t and t() and t.ID() and t.ID() > 0) then return 6 end
     local r = t.MaxRangeTo and t.MaxRangeTo() or 10
     return math.floor(r * 0.9)
@@ -70,7 +71,7 @@ M.Definitions = {
     {
         id = 'AutoAttack',
         displayName = 'Auto Attack',
-        range = function() return autoAttackRange() end,
+        range = function(ctx) return autoAttackRange(ctx) end,
         available = function() return true end,
         execute = function(targetId, ctx)
             mq.cmd('/attack on')
@@ -144,7 +145,7 @@ end
 function M.rangeOf(def, ctx)
     if not def then return 0 end
     if type(def.range) == 'function' then
-        local ok, v = pcall(def.range)
+        local ok, v = pcall(def.range, ctx)
         if ok and type(v) == 'number' then return v end
         return 0
     end

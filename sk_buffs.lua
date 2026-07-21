@@ -31,8 +31,6 @@ local BUFF_CAST_TIMEOUT_MS = 30000         -- Bound a cast that never reports co
 local BUFF_FAILURE_BACKOFF_MS = 5000       -- Retry transient failures promptly
 local BUFF_FAILURE_BACKOFF_MAX_MS = 30000  -- Never hide a needed buff for minutes
 local BUFF_SPELLSET_LEASE_MS = 6000        -- Pause spellset enforcement while hotswapping reserved gem
-local CLAIM_TIMEOUT = 8.0                  -- Claims expire after 8 seconds
-local PENDING_BUFF_WINDOW = 8.0            -- Seconds to treat a buff as present after cast
 local GROUP_CAST_COOLDOWN = 6.0            -- Cooldown to avoid immediate re-cast of group spells
 
 -------------------------------------------------------------------------------
@@ -1443,13 +1441,20 @@ end
 
 local function recordBuffFailure(category, reason)
     if not category or category == '' then return end
+    local now = lib.getTimeMs()
     local previous = _buffFailures[category]
+    -- Preserve escalation across immediate retries, but not across unrelated
+    -- failures separated by ten minutes or more.
+    if previous and (now - (previous.lastFailureAtMs or now)) >= 600000 then
+        previous = nil
+    end
     local count = previous and (previous.count or 0) + 1 or 1
     local multiplier = 2 ^ math.min(count - 1, 4)
     local delayMs = math.min(BUFF_FAILURE_BACKOFF_MS * multiplier, BUFF_FAILURE_BACKOFF_MAX_MS)
     _buffFailures[category] = {
         count = count,
-        retryAtMs = lib.getTimeMs() + delayMs,
+        retryAtMs = now + delayMs,
+        lastFailureAtMs = now,
         reason = reason,
     }
     traceLog('warn', 'failure', 'record_' .. tostring(category), 0,
@@ -1481,9 +1486,6 @@ local function buffFailureActive(category)
     local failure = category and _buffFailures[category] or nil
     if not failure then return false end
     if lib.getTimeMs() >= (failure.retryAtMs or 0) then
-        -- A completed retry window starts a fresh attempt. Keeping the old
-        -- count made failures hours apart compound into multi-minute backoffs.
-        clearBuffFailure(category)
         return false
     end
     return true
@@ -2069,6 +2071,9 @@ module.executeAction = function(self)
 
     -- Check if we're already working on this buff (subsequent tick calls)
     if _activeBuff.category == category and _activeBuff.spellName == spellName then
+        if Buff and Buff.renewClaim then
+            Buff.renewClaim(_activeBuff.targetId, category)
+        end
         if activeBuffTimedOut() then
             local waitReason = _activeBuff.waitReason or _activeBuff.state or 'unknown'
             lib.log('warn', self.name,

@@ -21,7 +21,6 @@ local function k_fidgetPerSec()     return PREFIX .. 'FidgetPerSec' end
 local function k_fidgetKeybind(n)   return PREFIX .. 'FK_' .. n end
 local function k_windowKey(n)       return PREFIX .. 'WK_' .. n end
 local function k_engageMin()        return PREFIX .. 'EngageMinPct' end
-local function k_restickMs()        return PREFIX .. 'RestickAfterMs' end
 local function k_chaseJitter()      return PREFIX .. 'ChaseJitterPct' end
 local function k_profileDist(p, d, f) return string.format('%sP_%s_%s_%s', PREFIX, p, d, f) end
 local function k_profileBuff(p)     return PREFIX .. 'P_' .. p .. '_buffjitter' end
@@ -65,13 +64,17 @@ function M.applyFromSettings(settings)
     local Engagement = getEngagement()
     local Chase      = getChase()
 
-    -- Master flag
+    -- Master flag. Worker processes never run init.lua, so when the flag has
+    -- never been persisted default it to true there to match the UI process
+    -- default — otherwise humanize is silently inert in coordinated workers.
+    _G.SIDEKICK_NEXT_CONFIG = _G.SIDEKICK_NEXT_CONFIG or {}
     if settings[k_master()] ~= nil then
         local b = tobool(settings[k_master()])
         if b ~= nil then
-            _G.SIDEKICK_NEXT_CONFIG = _G.SIDEKICK_NEXT_CONFIG or {}
             _G.SIDEKICK_NEXT_CONFIG.HUMANIZE_BEHAVIOR = b
         end
+    elseif _G.SIDEKICK_NEXT_CONFIG.HUMANIZE_BEHAVIOR == nil then
+        _G.SIDEKICK_NEXT_CONFIG.HUMANIZE_BEHAVIOR = true
     end
 
     -- Subsystems
@@ -86,7 +89,7 @@ function M.applyFromSettings(settings)
 
     -- Fidget weights / interval / persec
     if Fidget then
-        local actions = { 'turn','jump','strafe','window','pitch','face_spawn','med_cycle' }
+        local actions = { 'turn','jump','strafe','window','pitch','med_cycle' }
         for _, a in ipairs(actions) do
             local v = tonum(settings[k_fidgetWeight(a)]); if v then Fidget.setWeight(a, v) end
         end
@@ -109,7 +112,6 @@ function M.applyFromSettings(settings)
     -- Engagement
     if Engagement then
         local v = tonum(settings[k_engageMin()]); if v then Engagement.setEngageMinPct(v) end
-        local v2 = tonum(settings[k_restickMs()]); if v2 then Engagement.setRestickAfterMs(v2) end
     end
 
     -- Chase
@@ -176,9 +178,6 @@ function M.persist(kind, args, value)
     elseif kind == 'engage_min' then
         if Engagement then Engagement.setEngageMinPct(value) end
         set(k_engageMin(), value)
-    elseif kind == 'restick_ms' then
-        if Engagement then Engagement.setRestickAfterMs(value) end
-        set(k_restickMs(), value)
     elseif kind == 'chase_jitter' then
         if Chase and Chase.setChaseJitterPct then Chase.setChaseJitterPct(value) end
         set(k_chaseJitter(), value)

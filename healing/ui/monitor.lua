@@ -116,18 +116,21 @@ end
 -- Draw the Status tab
 local function DrawStatusTab()
     -- Combat state line
-    local state = CombatAssessor and CombatAssessor.getState() or {}
+    local state = CombatAssessor and CombatAssessor.getState()
+        or (_telemetry and _telemetry.combatState) or {}
     local statusColor = state.survivalMode and { 1, 0.3, 0.3, 1 } or { 0.3, 1, 0.3, 1 }
     imgui.TextColored(statusColor[1], statusColor[2], statusColor[3], statusColor[4],
-        string.format('Status: %s | Phase: %s | Survival: %s',
+        string.format('Status: %s | Phase: %s | Survival: %s | Pressure: %s',
             state.inCombat and 'Active' or 'Idle',
             state.fightPhase or 'none',
-            state.survivalMode and 'ON' or 'OFF'))
+            state.survivalMode and 'ON' or 'OFF',
+            state.highPressure and 'HIGH' or 'stable'))
 
     imgui.Separator()
 
     -- Last action display
     local lastAction = HealSelector and HealSelector.getLastAction and HealSelector.getLastAction()
+        or (_telemetry and _telemetry.lastAction)
     if lastAction then
         imgui.Text('Last Action:')
         imgui.SameLine()
@@ -145,22 +148,72 @@ local function DrawStatusTab()
 
     imgui.Separator()
 
+    local lastSelection = HealSelector and HealSelector.getLastTargetScores and HealSelector.getLastTargetScores()
+        or (_telemetry and _telemetry.lastSelection)
+    if lastSelection then
+        local source = tostring(lastSelection.maxHPSource or 'unknown')
+        local known = lastSelection.maxHPKnown == true
+        imgui.Text(string.format('Last Selection: %s on %s (score %.2f)',
+            lastSelection.winner ~= '' and lastSelection.winner or 'none',
+            lastSelection.targetName or '?', tonumber(lastSelection.winnerScore) or 0))
+        if known then
+            imgui.TextColored(0.4, 0.9, 0.4, 1.0, string.format(
+                'Max HP: %s [%s] | Deficit: %s | DPS: %.0f/s',
+                formatK(lastSelection.maxHP or 0), source,
+                formatK(lastSelection.deficit or 0), tonumber(lastSelection.recentDps) or 0))
+        else
+            imgui.TextColored(1.0, 0.65, 0.2, 1.0, string.format(
+                'Max HP: ESTIMATED %s [%s] | Deficit: %s | DPS: %.0f/s',
+                formatK(lastSelection.maxHP or 0), source,
+                formatK(lastSelection.deficit or 0), tonumber(lastSelection.recentDps) or 0))
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Estimated Max HP uses the configured remote fallback. Actor, DanNet, self, and spawn sources are treated as known.')
+        end
+        imgui.Separator()
+    else
+        imgui.TextDisabled('Last Target Selection: None yet')
+        imgui.Separator()
+    end
+
     -- Targets section
     imgui.Text('Targets:')
 
-    if not TargetMonitor then
+    if not TargetMonitor and not (_telemetry and type(_telemetry.targets) == 'table') then
         imgui.TextDisabled('Target monitor not available')
         return
     end
 
-    local ok, injured = pcall(function() return TargetMonitor.getInjuredTargets(100) end)
-    if not ok or not injured or #injured == 0 then
-        imgui.TextDisabled('No targets tracked')
+    local ok, targets
+    if TargetMonitor then
+        ok, targets = pcall(function()
+            local rows = {}
+            for _, target in pairs(TargetMonitor.getAllTargets() or {}) do
+                table.insert(rows, target)
+            end
+            return rows
+        end)
+    else
+        ok, targets = true, _telemetry.targets or {}
+    end
+    if not ok or not targets then
+        imgui.TextDisabled('Target snapshot unavailable')
+        return
+    end
+    if #targets == 0 then
+        imgui.TextDisabled('No target snapshots received yet')
         return
     end
 
-    -- Display targets with HP bars
-    for _, target in ipairs(injured) do
+    table.sort(targets, function(a, b)
+        local ahp = tonumber(a.pctHP) or 100
+        local bhp = tonumber(b.pctHP) or 100
+        if ahp ~= bhp then return ahp < bhp end
+        return tostring(a.name or '') < tostring(b.name or '')
+    end)
+
+    -- Display the complete tracked roster, including full-health characters.
+    for _, target in ipairs(targets) do
         local pctHP = target.pctHP or 100
         local r, g, b, a = getHPColor(pctHP)
 
@@ -200,6 +253,15 @@ local function DrawStatusTab()
             imgui.TextColored(1.0, 0.5, 0.5, 1.0, string.format('-%s', formatK(deficit)))
         else
             imgui.TextColored(0.5, 0.8, 0.5, 1.0, 'Full')
+        end
+
+        imgui.SameLine()
+        local maxSource = tostring(target.maxHPSource or 'unknown')
+        if target.maxHPKnown == true then
+            imgui.TextDisabled(string.format('Max %s [%s]', formatK(target.maxHP or 0), maxSource))
+        else
+            imgui.TextColored(1.0, 0.65, 0.2, 1.0,
+                string.format('Max EST %s [%s]', formatK(target.maxHP or 0), maxSource))
         end
 
         -- Incoming heals and DPS on same line
@@ -948,6 +1010,11 @@ function M.drawContent()
     -- Tab bar (nested tabs within the Healing tab)
         if imgui.BeginTabBar('HealingMonitorTabs##Embedded') then
             if telemetryOnly then
+                if imgui.BeginTabItem('Status') then
+                    _currentTab = 'status'
+                    DrawStatusTab()
+                    imgui.EndTabItem()
+                end
                 if imgui.BeginTabItem('Analytics') then
                     _currentTab = 'analytics'
                     DrawAnalyticsTab()

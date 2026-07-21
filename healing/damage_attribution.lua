@@ -22,8 +22,10 @@ local _targetDamage = {}  -- [targetId] = { sources = {}, sourceCount, totalDps,
 -- AE damage tracking (same mob hitting multiple targets)
 local _aeDamage = {}  -- [mobId] = { targets = {}, isAE, totalDps }
 
--- Mob name-to-ID resolution cache
-local _mobNameCache = {}  -- [mobName] = { id, lastSeen }
+-- Combat text contains only an NPC name. Keep every observed ID for that name
+-- so duplicate NPCs are not silently attributed to the last scanned spawn.
+local _mobNameCache = {}  -- [mobName] = { ids = {[id] = lastSeen}, lastSeen }
+local _lastMobCacheRefresh = 0
 
 -- Cache of findTargetIdByName results (keyed by lowercased attacker/target
 -- name, populated on cache miss). Every damage event passes through this
@@ -41,6 +43,7 @@ function M.init(config)
     _targetDamage = {}
     _aeDamage = {}
     _mobNameCache = {}
+    _lastMobCacheRefresh = 0
     _targetIdCache = {}
     _lastGroupSignature = ''
     _lastDamageEvent = 0
@@ -48,16 +51,23 @@ end
 
 -- Cache TTL in milliseconds (30 seconds)
 local CACHE_TTL_MS = 30000
+local CACHE_REFRESH_MS = 500
 
 -- Refresh mob name cache from XTarget and prune stale entries
 local function refreshMobCache()
     local now = mq.gettime()
+    if (now - _lastMobCacheRefresh) < CACHE_REFRESH_MS then return end
+    _lastMobCacheRefresh = now
     local me = mq.TLO.Me
     if not me or not me() then return end
 
     -- Prune stale entries (older than TTL)
     for name, entry in pairs(_mobNameCache) do
-        if entry.lastSeen and (now - entry.lastSeen) > CACHE_TTL_MS then
+        for id, lastSeen in pairs(entry.ids or {}) do
+            if (now - lastSeen) > CACHE_TTL_MS then entry.ids[id] = nil end
+        end
+        local emptyAndUnclassified = not next(entry.ids or {}) and not entry.ambiguous
+        if emptyAndUnclassified or (entry.lastSeen and (now - entry.lastSeen) > CACHE_TTL_MS) then
             _mobNameCache[name] = nil
         end
     end
@@ -70,7 +80,11 @@ local function refreshMobCache()
             local name = xt.CleanName() or xt.Name()
             local id = xt.ID()
             if name and id then
-                _mobNameCache[name:lower()] = { id = id, lastSeen = now }
+                local key = name:lower()
+                local entry = _mobNameCache[key] or { ids = {} }
+                entry.ids[id] = now
+                entry.lastSeen = now
+                _mobNameCache[key] = entry
             end
         end
     end
@@ -78,23 +92,54 @@ end
 
 -- Resolve attacker name to mob ID
 local function resolveMobId(attackerName)
-    if not attackerName then return nil end
+    if not attackerName then return nil, false end
 
     -- Normalize to lowercase for consistent cache lookup
     local key = attackerName:lower()
     local cached = _mobNameCache[key]
-    if cached then return cached.id end
+    if cached then
+        local found = nil
+        for id in pairs(cached.ids or {}) do
+            local spawn = mq.TLO.Spawn(tonumber(id) or 0)
+            local live = spawn and spawn()
+                and (tonumber(spawn.ID()) or 0) == (tonumber(id) or 0)
+                and tostring(spawn.Type and spawn.Type() or ''):lower() == 'npc'
+                and tostring((spawn.CleanName and spawn.CleanName())
+                    or (spawn.Name and spawn.Name()) or ''):lower() == key
+            if not live then
+                cached.ids[id] = nil
+                goto continue_cached_id
+            end
+            if found then return nil, true end
+            found = id
+            ::continue_cached_id::
+        end
+        if found then return found, false end
+        if cached.ambiguous
+            and (mq.gettime() - (tonumber(cached.lastSeen) or 0)) < CACHE_REFRESH_MS then
+            return nil, true
+        end
+    end
+
+    local query = 'npc ="' .. attackerName .. '"'
+    local count = 0
+    pcall(function() count = tonumber(mq.TLO.SpawnCount(query)()) or 0 end)
+    if count > 1 then
+        _mobNameCache[key] = { ids = {}, lastSeen = mq.gettime(), ambiguous = true }
+        return nil, true
+    end
 
     -- Fallback: direct spawn lookup. Hot path in AE fights — back-fill the
     -- cache so subsequent hits on the same mob don't re-scan spawns.
     local spawn = mq.TLO.Spawn('npc "' .. attackerName .. '"')
     if spawn and spawn() and spawn.ID() > 0 then
         local id = spawn.ID()
-        _mobNameCache[key] = { id = id, lastSeen = mq.gettime() }
-        return id
+        local seen = mq.gettime()
+        _mobNameCache[key] = { ids = { [id] = seen }, lastSeen = seen }
+        return id, false
     end
 
-    return nil
+    return nil, false
 end
 
 -- Refresh the group signature used to key findTargetIdByName cache. Called
@@ -188,14 +233,16 @@ function M.recordDamage(targetName, amount, attackerName, dmgType)
     if not targetId then return end  -- Not a group member we track
 
     -- Resolve mob
-    local mobId = resolveMobId(attackerName)
-    local sourceKey = mobId or ('unknown_' .. (attackerName or '?'))
+    local mobId, ambiguous = resolveMobId(attackerName)
+    local sourcePrefix = ambiguous and 'ambiguous_' or 'unknown_'
+    local sourceKey = mobId or (sourcePrefix .. tostring(attackerName or '?'):lower())
 
     -- Log damage event
     local log = getLogger()
     if log and log.debug then
-        log.debug('attribution', 'DAMAGE: %s hit %s(id=%s) for %d (%s) mobId=%s',
-            tostring(attackerName), tostring(targetName), tostring(targetId), amount, tostring(dmgType), tostring(mobId))
+        log.debug('attribution', 'DAMAGE: %s hit %s(id=%s) for %d (%s) mobId=%s ambiguous=%s',
+            tostring(attackerName), tostring(targetName), tostring(targetId), amount, tostring(dmgType),
+            tostring(mobId), tostring(ambiguous == true))
     end
 
     -- Initialize target tracking
@@ -217,6 +264,7 @@ function M.recordDamage(targetName, amount, attackerName, dmgType)
         targetData.sources[sourceKey] = {
             mobId = mobId,
             mobName = attackerName,
+            ambiguous = ambiguous == true,
             lastHit = now,
             dps = 0,
             entries = {},

@@ -376,6 +376,27 @@ end
 local function get_assist_target()
   local mode = (config.assist_mode or 'group'):lower()
 
+  -- The tank's broadcast primary is authoritative when fresh: it is NPC-only
+  -- and stays pinned to the kill target while the tank momentarily targets
+  -- group members to heal. Game-side assist (GroupAssistTarget) reads the
+  -- tank's LIVE target, which turns PC/nil during those heals and made every
+  -- melee assister drop its target mid-fight.
+  do
+    local okA, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+    local tankState = okA and Actors and Actors.getTankState and Actors.getTankState() or nil
+    local updatedAt = type(tankState) == 'table' and tonumber(tankState.updatedAt) or nil
+    if updatedAt and (os.clock() - updatedAt) <= 5 then
+      local pid = tonumber(tankState.primaryTargetId) or 0
+      if pid > 0 then
+        local spawn = mq.TLO.Spawn(pid)
+        if spawn and is_attackable(spawn) then
+          local dist = (spawn.Distance3D and spawn.Distance3D()) or 0
+          return pid, dist, spawn
+        end
+      end
+    end
+  end
+
   if mode == 'group' then
     local tar = mq.TLO.Me.GroupAssistTarget
     if tar and is_attackable(tar) then

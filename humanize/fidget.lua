@@ -105,6 +105,21 @@ local function blockedByGameState()
     if not isMeValid() then return true, 'no_me' end
     local me = mq.TLO.Me
 
+    -- Never synthesize keypresses while the player is typing. Use only members
+    -- present in mq-definitions; pcall is for transient window absence, not for
+    -- guessing TLO names.
+    local function truthyProbe(fn)
+        local ok, value = pcall(fn)
+        if not ok then return false end
+        if type(value) == 'string' then return value ~= '' and value:lower() ~= 'false' end
+        return value == true or (tonumber(value) or 0) > 0
+    end
+    local chatInput = mq.TLO.Window('ChatWindow').Child('CW_ChatInput')
+    if truthyProbe(function() return chatInput.Highlighted() end)
+        or truthyProbe(function() return chatInput.Text() end) then
+        return true, 'chat_input'
+    end
+
     -- In combat (self).
     local cs = me.CombatState and me.CombatState() or ''
     if cs == 'COMBAT' then return true, 'combat' end
@@ -274,17 +289,38 @@ local function emit(kind)
     end
 end
 
+local function pendingHoldsMovement()
+    local p = Fidget.pending
+    return p and p.releaseKey
+        and (p.kind == 'turn' or p.kind == 'pitch' or p.kind == 'strafe')
+end
+
+function M.releaseHeldKeys()
+    if not pendingHoldsMovement() then return false end
+    local releaseKey = Fidget.pending.releaseKey
+    Fidget.pending = nil
+    mq.cmdf('/keypress %s', releaseKey)
+    return true
+end
+
 -- Drive the fidget state machine. Call once per main-loop tick. No-op when
 -- humanize is disabled or fidget subsystem is off.
 function M.tick()
-    if not flagOn() then return end
-    if not Profiles.subsystemEnabled('fidget') then return end
+    if not flagOn() then M.releaseHeldKeys(); return end
+    if not Profiles.subsystemEnabled('fidget') then M.releaseHeldKeys(); return end
 
     local now = State.now()
+
+    -- A held movement key must always be released, even if chat gained focus
+    -- after the hold began. Starting a chained leg, toggling a window, or
+    -- changing sit state remains blocked while chat owns the keyboard.
+    local blocked, blockedReason = blockedByGameState()
 
     -- Process any pending release first.
     if Fidget.pending and now >= Fidget.pending.releaseAt then
         local p = Fidget.pending
+        local heldMovement = p.kind == 'turn' or p.kind == 'pitch' or p.kind == 'strafe'
+        if blockedReason == 'chat_input' and not heldMovement then return end
         Fidget.pending = nil
         if p.kind == 'med' then
             -- Only stand back up if we're still safe to do so.
@@ -304,7 +340,7 @@ function M.tick()
             -- If this step has a chained second leg (e.g. strafe left -> right),
             -- press the chain key and re-arm pending so tick releases it next.
             -- Carry resitAfter through so the final release re-sits if needed.
-            if p.chainPress then
+            if p.chainPress and blockedReason ~= 'chat_input' then
                 mq.cmdf('/keypress %s hold', p.chainPress)
                 Fidget.pending = {
                     kind       = p.kind,
@@ -322,6 +358,8 @@ function M.tick()
         end
         return
     end
+
+    if blocked and blockedReason == 'chat_input' then return end
 
     -- Don't roll a new fidget while one is in progress.
     if Fidget.pending then return end

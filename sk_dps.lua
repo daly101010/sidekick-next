@@ -14,9 +14,10 @@ local module = ModuleBase.create('dps', lib.Priority.DPS)
 
 local Config = {
     minManaPct = 0,
-    minTargetHpPct = 20,
+    minTargetHpPct = 1,
     spellSetReloadSeconds = 5,
     targetCacheMs = 5000,
+    actorTargetTtlSeconds = 5,
 }
 
 local _lastSpellSetLoadAt = 0
@@ -105,15 +106,50 @@ local function isUtilityGem(config)
     return utility and (utility.combat == true or utility.ooc == true)
 end
 
+-- Coordinated DPS owns offensive and support rotation spells only. Beneficial
+-- buffs are configured/executed by sk_buffs, while pet/other utility spells
+-- require an explicit utility flag and are handled by sk_resources.
+local function dpsOwnsSpellType(spellType)
+    spellType = tostring(spellType or ''):lower()
+    return spellType == 'direct_damage' or spellType == 'dot' or spellType == 'debuff'
+        or spellType == 'dispel'
+end
+
+local function ownerForSpellType(spellType)
+    spellType = tostring(spellType or ''):lower()
+    if spellType == 'buff' then return 'buffs' end
+    if spellType == 'pet' then return 'resources_when_enabled' end
+    if spellType == 'heal' then return 'healing' end
+    return dpsOwnsSpellType(spellType) and 'dps' or 'unassigned'
+end
+
 -------------------------------------------------------------------------------
 -- Target Selection
 -------------------------------------------------------------------------------
 
-local function addCandidate(candidates, seen, id, source)
+local function addCandidate(candidates, seen, id, source, coordinatedCombat)
     id = tonumber(id) or 0
-    if id <= 0 or seen[id] then return end
-    seen[id] = true
-    candidates[#candidates + 1] = { id = id, source = source or 'unknown' }
+    if id <= 0 then return end
+    local existing = seen[id]
+    if existing then
+        if coordinatedCombat == true then existing.coordinatedCombat = true end
+        return
+    end
+    -- Candidates must be live, attackable NPCs. Peer broadcasts advertise
+    -- LIVE targets, so a tank or healer momentarily targeting a group member
+    -- for a heal would otherwise drag assist DPS off the kill target.
+    local spawn = mq.TLO.Spawn(id)
+    if not (spawn and spawn()) then return end
+    local spawnType = tostring(lib.safeTLO(function() return spawn.Type() end, '') or ''):lower()
+    if spawnType ~= 'npc' then return end
+    if lib.safeTLO(function() return spawn.Dead() end, false) == true then return end
+    local candidate = {
+        id = id,
+        source = source or 'unknown',
+        coordinatedCombat = coordinatedCombat == true,
+    }
+    seen[id] = candidate
+    candidates[#candidates + 1] = candidate
 end
 
 local function addSpawnTargetCandidates(candidates, seen, spawn, source)
@@ -122,7 +158,7 @@ local function addSpawnTargetCandidates(candidates, seen, spawn, source)
     addCandidate(candidates, seen, lib.safeNum(function() return spawn.TargetOfTarget.ID() end, 0), source .. '_tot')
 end
 
-local function validateNpcTarget(targetId, source, remember)
+local function validateNpcTarget(targetId, source, remember, coordinatedCombat)
     targetId = tonumber(targetId) or 0
     if targetId <= 0 then return nil end
 
@@ -137,6 +173,7 @@ local function validateNpcTarget(targetId, source, remember)
         id = targetId,
         hp = lib.safeNum(function() return target.PctHPs() end, 100),
         source = source or 'unknown',
+        coordinatedCombat = coordinatedCombat == true,
     }
 
     if remember ~= false then
@@ -144,6 +181,7 @@ local function validateNpcTarget(targetId, source, remember)
             id = result.id,
             hp = result.hp,
             source = result.source,
+            coordinatedCombat = result.coordinatedCombat,
             seenAt = lib.getTimeMs(),
         }
     end
@@ -153,6 +191,10 @@ end
 
 local function isCombatTargetActive(target)
     if not target or not target.id or target.id <= 0 then return false end
+
+    -- A fresh Actor Team/main-assist report that the peer is in combat is
+    -- authoritative for OOG healers that may have no local XTarget hater slot.
+    if target.coordinatedCombat == true then return true end
 
     -- XTarget hater/auto slots are direct evidence that the client is aware of
     -- combat. This is the most reliable local signal for casters/healers.
@@ -193,10 +235,110 @@ local function addXTargetCandidates(candidates, seen)
     end
 end
 
+local function addActorTargetCandidates(candidates, seen, maId)
+    local Actors = module.peerActors
+    if not Actors then return end
+
+    -- Explicit target broadcasts are authoritative and work for Actor Team
+    -- members that are not in this character's EQ group.
+    local tankState = Actors.getTankState and Actors.getTankState() or nil
+    local tankUpdatedAt = type(tankState) == 'table' and tonumber(tankState.updatedAt) or nil
+    if tankUpdatedAt and (os.clock() - tankUpdatedAt) <= Config.actorTargetTtlSeconds then
+        addCandidate(candidates, seen, tankState.currentTargetId, 'actor_current')
+        addCandidate(candidates, seen, tankState.primaryTargetId, 'actor_primary')
+    end
+
+    -- The main SideKick heartbeat also advertises each character's current
+    -- target. Match only the configured/designated main assist; a healer's own
+    -- heal target must never become its DPS target.
+    local assistNames = {}
+    local function rememberName(name)
+        name = tostring(name or '')
+        if name ~= '' then assistNames[name:lower()] = true end
+    end
+
+    local settings = lib.getSettings() or {}
+    rememberName(settings.AssistName)
+    if maId and maId > 0 then
+        local ma = mq.TLO.Spawn(maId)
+        if ma and ma() then
+            rememberName(lib.safeTLO(function() return ma.CleanName() end, ''))
+        end
+    end
+    local groupMA = mq.TLO.Group.MainAssist
+    if groupMA and groupMA() then
+        rememberName(lib.safeTLO(function() return groupMA.CleanName() end, ''))
+    end
+
+    if next(assistNames) and Actors.getRemoteCharacters then
+        for name, data in pairs(Actors.getRemoteCharacters() or {}) do
+            if assistNames[tostring(name):lower()] then
+                local updatedAt = tonumber(data.targetUpdatedAt) or 0
+                if updatedAt > 0 and (os.clock() - updatedAt) <= Config.actorTargetTtlSeconds then
+                    addCandidate(candidates, seen, data.targetId,
+                        'actor_mainassist:' .. tostring(name), data.combat == true)
+                end
+            end
+        end
+    end
+
+    -- Actor Team is the trusted scope for OOG automation. Prefer a named main
+    -- assist or tank-role member, then use a deterministic vote across fresh
+    -- team members currently targeting an NPC.
+    local team = module.state and module.state.team or nil
+    local votes = {}
+    if type(team) == 'table' and team.enabled == true then
+        local myZone = tostring(lib.getZone() or ''):lower()
+        for _, member in ipairs(team.members or {}) do
+            local ageMs = tonumber(member.ageMs) or 0
+            local memberZone = tostring(member.zone or ''):lower()
+            local targetType = tostring(member.targetType or ''):lower()
+            local targetId = tonumber(member.targetId) or 0
+            if member.self ~= true and ageMs <= (Config.actorTargetTtlSeconds * 1000)
+                and memberZone == myZone and targetType == 'npc' and targetId > 0 then
+                local name = tostring(member.character or '')
+                local vote = votes[targetId] or {
+                    id = targetId,
+                    count = 0,
+                    preferred = false,
+                    leader = false,
+                    inCombat = false,
+                    sourceName = name,
+                }
+                vote.count = vote.count + 1
+                vote.preferred = vote.preferred
+                    or assistNames[name:lower()] == true
+                    or tostring(member.role or ''):lower() == 'tank'
+                vote.leader = vote.leader or member.key == team.leaderKey
+                vote.inCombat = vote.inCombat or member.inCombat == true
+                if name ~= '' and (vote.sourceName == '' or name:lower() < vote.sourceName:lower()) then
+                    vote.sourceName = name
+                end
+                votes[targetId] = vote
+            end
+        end
+    end
+
+    local ranked = {}
+    for _, vote in pairs(votes) do ranked[#ranked + 1] = vote end
+    table.sort(ranked, function(a, b)
+        if a.preferred ~= b.preferred then return a.preferred end
+        if a.count ~= b.count then return a.count > b.count end
+        if a.leader ~= b.leader then return a.leader end
+        if a.sourceName ~= b.sourceName then return a.sourceName:lower() < b.sourceName:lower() end
+        return a.id < b.id
+    end)
+    for _, vote in ipairs(ranked) do
+        addCandidate(candidates, seen, vote.id,
+            string.format('actor_team:%s:votes%d', vote.sourceName, vote.count), vote.inCombat)
+    end
+end
+
 local function getMATarget()
     local maId = lib.getMainAssistId()
     local candidates = {}
     local seen = {}
+    addActorTargetCandidates(candidates, seen, maId)
     if maId > 0 then
         local ma = mq.TLO.Spawn(maId)
         addSpawnTargetCandidates(candidates, seen, ma, 'mainassist')
@@ -215,12 +357,13 @@ local function getMATarget()
     addXTargetCandidates(candidates, seen)
 
     for _, candidate in ipairs(candidates) do
-        local target = validateNpcTarget(candidate.id, candidate.source, true)
+        local target = validateNpcTarget(candidate.id, candidate.source, true, candidate.coordinatedCombat)
         if target then return target end
     end
 
     if _lastValidTarget and (lib.getTimeMs() - (_lastValidTarget.seenAt or 0)) <= Config.targetCacheMs then
-        local target = validateNpcTarget(_lastValidTarget.id, 'cache:' .. tostring(_lastValidTarget.source), false)
+        local target = validateNpcTarget(_lastValidTarget.id, 'cache:' .. tostring(_lastValidTarget.source), false,
+            _lastValidTarget.coordinatedCombat)
         if target then return target end
     end
 
@@ -229,7 +372,8 @@ end
 
 local function spellNeedsNpcTarget(entry)
     local spellType = tostring(entry and entry.spellType or ''):lower()
-    if spellType == 'debuff' or spellType == 'dot' or spellType == 'direct_damage' then
+    if spellType == 'debuff' or spellType == 'dot' or spellType == 'direct_damage'
+        or spellType == 'dispel' then
         return true
     end
 
@@ -371,7 +515,7 @@ local function selectSpell()
     local ctx = buildConditionContext(target.id, combatActive)
     local firstSkip = nil
     for _, entry in ipairs(castList) do
-        if entry and entry.slot and not isUtilityGem(entry.config) then
+        if entry and entry.slot and not isUtilityGem(entry.config) and dpsOwnsSpellType(entry.spellType) then
             local targetId = spellNeedsNpcTarget(entry) and target.id or nil
             if isSpellReady(entry.slot, entry.spellName) then
                 local conditionOk = true
@@ -420,11 +564,13 @@ local function debugList()
     local combatActive = target and isCombatTargetActive(target) or false
     local ctx = target and buildConditionContext(target.id, combatActive) or nil
     local castList = CombatExec.getSortedCastList(spellSet)
-    commandEcho('list: activeSet=%s gems=%d target=%s targetSource=%s combatActive=%s path=%s',
+    commandEcho('list: activeSet=%s gems=%d target=%s targetHp=%s targetSource=%s actorCombat=%s combatActive=%s path=%s',
         tostring(Persistence and Persistence.activeSetName or nil),
         #castList,
         target and tostring(target.id) or 'none',
+        target and tostring(target.hp) or 'none',
         target and tostring(target.source) or 'none',
+        tostring(target and target.coordinatedCombat == true),
         tostring(combatActive),
         tostring(_lastSpellSetPath))
 
@@ -435,11 +581,14 @@ local function debugList()
 
     for _, entry in ipairs(castList) do
         local utility = isUtilityGem(entry.config)
+        local routedElsewhere = not dpsOwnsSpellType(entry.spellType)
         local ready = entry and entry.slot and isSpellReady(entry.slot, entry.spellName) or false
         local conditionOk = false
         local conditionReason = ''
         if utility then
             conditionReason = 'utility'
+        elseif routedElsewhere then
+            conditionReason = 'owned_by_' .. ownerForSpellType(entry.spellType)
         elseif not target then
             conditionReason = 'no_target'
         elseif not combatActive then
@@ -471,15 +620,37 @@ local function debugList()
         end
 
         commandEcho(
-            'list: gem=%s spell=%s type=%s priority=%s targetNpc=%s ready=%s condition=%s skip=%s',
+            'list: gem=%s spell=%s type=%s owner=%s priority=%s targetNpc=%s ready=%s condition=%s skip=%s',
             tostring(entry.slot),
             tostring(entry.spellName),
             tostring(entry.spellType),
+            tostring(ownerForSpellType(entry.spellType)),
             tostring(entry.priority),
             tostring(spellNeedsNpcTarget(entry)),
             tostring(ready),
             tostring(conditionOk),
             tostring(conditionReason))
+    end
+end
+
+local function debugActorTargets()
+    local team = module.state and module.state.team or nil
+    if type(team) ~= 'table' then
+        commandEcho('actors: no Actor Team snapshot')
+        return
+    end
+    local settings = lib.getSettings() or {}
+    commandEcho('actors: enabled=%s team=%s leader=%s members=%d assistMode=%s assistName=%s',
+        tostring(team.enabled), tostring(team.label or team.teamId or ''),
+        tostring(team.leader or ''), #(team.members or {}),
+        tostring(settings.AssistMode or 'group'), tostring(settings.AssistName or ''))
+    for _, member in ipairs(team.members or {}) do
+        commandEcho('actors: name=%s self=%s role=%s zone=%s age=%sms combat=%s target=%s type=%s targetName=%s',
+            tostring(member.character or ''), tostring(member.self == true),
+            tostring(member.role or ''),
+            tostring(member.zone or ''), tostring(member.ageMs or 0),
+            tostring(member.inCombat == true), tostring(member.targetId or 0),
+            tostring(member.targetType or ''), tostring(member.targetName or ''))
     end
 end
 
@@ -674,6 +845,10 @@ module:enableUnifiedExecutor({
     end,
 })
 
+-- DPS needs peer target telemetry even on pure casters/healers where the melee
+-- assist worker intentionally does not select or hold a local target.
+module:enablePeerActors()
+
 -------------------------------------------------------------------------------
 -- Command Binding
 -------------------------------------------------------------------------------
@@ -701,7 +876,7 @@ mq.bind('/sk_dps', function(cmd)
         local castOwner = module.state and module.state.castOwner
         local targetOwner = module.state and module.state.targetOwner
         commandEcho(
-            'running=%s hasState=%s priority=%s statePrio=%s castBusy=%s ownsClaim=%s ownsCast=%s ownsTarget=%s claimPending=%s claimType=%s castOwner=%s targetOwner=%s activeSet=%s gems=%d target=%s targetSource=%s combatActive=%s next=%s slot=%s lastReason=%s reason=%s lastExec=%s lastAttempt=%s path=%s',
+            'running=%s hasState=%s priority=%s statePrio=%s castBusy=%s ownsClaim=%s ownsCast=%s ownsTarget=%s claimPending=%s claimType=%s castOwner=%s targetOwner=%s activeSet=%s gems=%d target=%s targetHp=%s targetSource=%s actorCombat=%s combatActive=%s next=%s slot=%s lastReason=%s reason=%s lastExec=%s lastAttempt=%s path=%s',
             tostring(module.running),
             tostring(module:hasValidState()),
             tostring(module:isMyPriority()),
@@ -717,7 +892,9 @@ mq.bind('/sk_dps', function(cmd)
             tostring(Persistence and Persistence.activeSetName or nil),
             gemCount,
             target and tostring(target.id) or 'none',
+            target and tostring(target.hp) or 'none',
             target and tostring(target.source) or 'none',
+            tostring(target and target.coordinatedCombat == true),
             tostring(combatActive),
             action and tostring(action.spellName) or 'none',
             action and tostring(action.slot) or 'none',
@@ -728,10 +905,12 @@ mq.bind('/sk_dps', function(cmd)
             tostring(_lastSpellSetPath))
     elseif cmd == 'list' then
         debugList()
+    elseif cmd == 'actors' then
+        debugActorTargets()
     elseif cmd == 'testcast' then
         directTestCast()
     else
-        commandEcho('Usage: /sk_dps status|list|testcast|reload|stop')
+        commandEcho('Usage: /sk_dps status|list|actors|testcast|reload|stop')
     end
 end)
 

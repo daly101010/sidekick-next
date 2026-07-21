@@ -71,6 +71,9 @@ function M.init(config, healTracker, targetMonitor, incomingHeals, combatAssesso
     TargetMonitor = targetMonitor
     IncomingHeals = incomingHeals
     CombatAssessor = combatAssessor
+    M._lastScores = nil
+    M._lastTargetScores = nil
+    _lastAction = nil
 end
 
 local function getSpellMeta(spellName)
@@ -97,7 +100,8 @@ local function getSpellMeta(spellName)
             end
         end
     end)
-    local castTime = tonumber(rawCastTime) or tonumber(spell.CastTime()) or 0
+    local baseCastTime = tonumber(spell.CastTime()) or 0
+    local castTime = tonumber(rawCastTime) or baseCastTime
 
     -- Get recast time
     local recastTime = tonumber(spell.RecastTime()) or 0
@@ -121,10 +125,22 @@ local function getSpellMeta(spellName)
     return {
         mana = manaCost,
         castTimeMs = castTime,
+        baseCastTimeMs = baseCastTime,
         recastTimeMs = recastTime,
         durationTicks = duration,
         baseHeal = baseHeal,
     }
+end
+
+local function isCompleteHeal(spellName)
+    if Config and Config.excludeCompleteHealFromEfficiency == false then return false end
+    local normalized = tostring(spellName or ''):lower():gsub('[^%a%d]+', ' ')
+    return normalized:find('complete heal', 1, true) ~= nil
+end
+
+local function isFastDirectHeal(meta, category)
+    local maxCastMs = tonumber(Config and Config.fastHealMaxCastMs) or 2000
+    return category == 'fast' or ((tonumber(meta and meta.baseCastTimeMs) or math.huge) <= maxCastMs)
 end
 
 local function isSpellUsable(spellName, meta)
@@ -161,208 +177,84 @@ local function predictedDeficit(deficit, dps, timeSec, maxHP)
     return predicted
 end
 
--- Lazy-load CombatAssessor for centralized scoring weights (includes throttle logic)
-local getCombatAssessor = lazy.once('sidekick-next.healing.combat_assessor')
-
-local function getSingleWeights(config, situation)
-    local defaults = { coverage = 3.0, manaEff = 0.5, overheal = -1.5 }
-
-    -- Try to get weights from combat_assessor (includes adaptive throttle)
-    local ca = getCombatAssessor()
-    if ca and ca.getScoringWeights then
-        local weights = ca.getScoringWeights()
-        if weights then
-            return {
-                coverage = tonumber(weights.coverage) or defaults.coverage,
-                manaEff = tonumber(weights.manaEff) or defaults.manaEff,
-                overheal = tonumber(weights.overheal) or defaults.overheal,
-                preset = weights.preset,
-                throttled = weights.throttled,
-                throttleLevel = weights.throttleLevel,
-            }
-        end
-    end
-
-    -- Fallback: determine weights locally (without throttle)
-    local presets = config and config.scoringPresets or nil
-    local weights = (presets and presets.normal) or defaults
-    local preset = 'normal'
-
-    -- Priority order: emergency > raidFight > lowPressure > normal
-    if situation and (situation.hasEmergency or situation.survivalMode) and presets and presets.emergency then
-        weights = presets.emergency
-        preset = 'emergency'
-    elseif situation and situation.raidFight and presets and presets.raidFight then
-        weights = presets.raidFight
-        preset = 'raidFight'
-    elseif situation and situation.lowPressure and presets and presets.lowPressure then
-        weights = presets.lowPressure
-        preset = 'lowPressure'
-    end
-    return {
-        coverage = tonumber(weights.coverage) or defaults.coverage,
-        manaEff = tonumber(weights.manaEff) or defaults.manaEff,
-        overheal = tonumber(weights.overheal) or defaults.overheal,
-        preset = preset,
-        throttled = false,
-    }
-end
-
-local function formatSingleWeights(weights)
-    local base = string.format('weights=cov%.1f,mana%.1f,overheal%.1f,cast-0.2,recast-0.1',
-        weights.coverage, weights.manaEff, weights.overheal)
-
-    -- Add throttle/preset info if present
-    local extra = ''
-    if weights.preset then
-        extra = extra .. string.format(' preset=%s', weights.preset)
-    end
-    if weights.throttled then
-        extra = extra .. string.format(' throttled=%.2f', weights.throttleLevel or 0)
-    end
-
-    return base .. extra
-end
-
-local function scoreSingle(meta, expected, deficit, dps, maxHP, situation, targetInfo, category)
-    local config = Config or { spells = {} }
-    config.spells = config.spells or {}
-    local tracker = HealTracker
-    -- If mana is 0/unknown, use expected heal as proxy (assumes ~1 heal per mana as baseline)
-    -- This prevents massive manaEff scores when mana data is missing
-    local mana = meta.mana > 0 and meta.mana or expected
-    local castSec = meta.castTimeMs / 1000
-    local recastSec = meta.recastTimeMs / 1000
-    local adjustedDps = dps
-    local burst = false
-
-    -- Scale up if multiple sources (being swarmed = sustained damage)
-    if targetInfo and targetInfo.isMultiSource then
-        local sourceScale = 1 + ((targetInfo.sourceCount or 1) - 1) * 0.1
-        adjustedDps = adjustedDps * math.min(sourceScale, 1.5)
-    end
-
-    -- Burst detection
-    if targetInfo and targetInfo.burstDetected then
-        local scale = config and config.burstDpsScale or 1.5
-        burst = true
-        adjustedDps = adjustedDps * scale
-    end
-    local predicted = predictedDeficit(deficit, adjustedDps, castSec, maxHP)
-    local safeDeficit = math.max(predicted, 1)
-    local coverage = math.min(expected, safeDeficit) / safeDeficit
-    local overheal = math.max(0, expected - safeDeficit) / safeDeficit
-    local manaEff = expected / mana
-
-    -- Underheal preference: reward heals that cover 80-100% without overhealing
-    -- This is the "sweet spot" - enough healing without waste
-    local underhealBonus = 0
-    local minCoveragePct = (config.underhealMinCoveragePct or 80) / 100
-    if config.preferUnderheal ~= false and overheal == 0 and coverage >= minCoveragePct then
-        -- Perfect fit! Bonus for right-sized heals (scales with coverage, max +3.0 at 100%)
-        underhealBonus = coverage * 3.0
-    elseif overheal > 0 then
-        -- Any overheal negates the underheal bonus opportunity
-        underhealBonus = 0
-    end
-
-    local critRate = 0
-    local critOverheal = 0
-    local critPenalty = 0
-    if tracker and tracker.GetHealingGiftCritRate then
-        critRate = tracker.GetHealingGiftCritRate() or 0
-    end
-    if critRate > 0 then
-        local baseHeal = expected / (1 + critRate)
-        local critHeal = baseHeal * 2
-        local critOverhealAmt = math.max(0, critHeal - safeDeficit)
-        critOverheal = critOverhealAmt / safeDeficit
-        local critOverhealThreshold = config and config.critOverhealThreshold or 0.5
-        if critOverheal > critOverhealThreshold then
-            local excessCritOverheal = critOverheal - critOverhealThreshold
-            local critPenaltyWeight = config and config.critOverhealPenalty or -0.8
-            critPenalty = excessCritOverheal * critRate * critPenaltyWeight
-        end
-    end
-
-    local weights = getSingleWeights(config, situation)
-    local categoryPenalty = 0
-    if category == 'small' then
-        categoryPenalty = config.smallHealPenalty or -0.5
-    end
-
-    local score = (coverage * weights.coverage)
-        + (manaEff * weights.manaEff)
-        + (overheal * weights.overheal)
-        + underhealBonus
-        + critPenalty
-        + categoryPenalty
-        - (castSec * 0.2)
-        - (recastSec * 0.1)
+-- Stable healing optimizes effective healing per mana. Unlike the pressure
+-- score, it does not reward a short cast merely for being short. Healing above
+-- the projected deficit is not counted as useful healing.
+local function scoreStableEfficiency(meta, expected, deficit, dps, maxHP)
+    local castSec = (tonumber(meta.castTimeMs) or 0) / 1000
+    local predicted = predictedDeficit(deficit, tonumber(dps) or 0, castSec, maxHP)
+    local effective = math.min(math.max(0, tonumber(expected) or 0), math.max(1, predicted))
+    local mana = tonumber(meta.mana) or 0
+    if mana <= 0 then mana = math.max(1, tonumber(expected) or 1) end
+    local manaEff = effective / mana
+    local overheal = math.max(0, (tonumber(expected) or 0) - predicted)
+    local overhealRatio = overheal / math.max(1, predicted)
+    local score = manaEff - (overhealRatio * 0.25)
     return score, {
-        coverage = coverage,
-        overheal = overheal,
+        coverage = effective / math.max(1, predicted),
+        overheal = overhealRatio,
         manaEff = manaEff,
-        underhealBonus = underhealBonus,
         castSec = castSec,
-        recastSec = recastSec,
         predicted = predicted,
         expected = expected,
-        burst = burst,
-        adjustedDps = adjustedDps,
-        critRate = critRate,
-        critOverheal = critOverheal,
-        critPenalty = critPenalty,
-        categoryPenalty = categoryPenalty,
-    }, formatSingleWeights(weights)
+        effective = effective,
+        selectionMode = 'stable_efficiency',
+    }, 'mode=stable_efficiency effective_hpm'
 end
 
-local function scoreGroup(meta, expectedPerTarget, totalDeficit, hurtCount)
-    local config = Config or { spells = {} }
-    config.spells = config.spells or {}
-    local tracker = HealTracker
-    local mana = math.max(meta.mana, 1)
-    local castSec = meta.castTimeMs / 1000
-    local recastSec = meta.recastTimeMs / 1000
-    local totalExpected = expectedPerTarget * hurtCount
-    local safeDeficit = math.max(totalDeficit, 1)
-    local coverage = math.min(totalExpected, safeDeficit) / safeDeficit
-    local overheal = math.max(0, totalExpected - safeDeficit) / safeDeficit
-    local manaEff = totalExpected / mana
+-- Score a group direct heal on the same effective-healing-per-mana scale as a
+-- stable single-target direct heal. Each target only contributes healing that
+-- will actually fit in its projected deficit when the spell lands.
+local function scoreGroup(meta, expectedPerTarget, targets)
+    local castSec = (tonumber(meta.castTimeMs) or 0) / 1000
+    local totalExpected = 0
+    local totalEffective = 0
+    local totalPredicted = 0
+    local minLandingPct = 100
 
-    local critRate = 0
-    local critOverheal = 0
-    local critPenalty = 0
-    if tracker and tracker.GetHealingGiftCritRate then
-        critRate = tracker.GetHealingGiftCritRate() or 0
-    end
-    if critRate > 0 and hurtCount > 0 then
-        local baseHealPerTarget = expectedPerTarget / (1 + critRate)
-        local critHealPerTarget = baseHealPerTarget * 2
-        local totalCritHeal = critHealPerTarget * hurtCount
-        local critOverhealAmt = math.max(0, totalCritHeal - safeDeficit)
-        critOverheal = critOverhealAmt / safeDeficit
-        local critOverhealThreshold = config and config.critOverhealThreshold or 0.5
-        if critOverheal > critOverhealThreshold then
-            local excessCritOverheal = critOverheal - critOverhealThreshold
-            local critPenaltyWeight = config and config.critOverhealPenalty or -0.8
-            critPenalty = excessCritOverheal * critRate * (critPenaltyWeight * 0.5)
+    for _, t in ipairs(targets or {}) do
+        local maxHP = math.max(1, tonumber(t.maxHP) or 1)
+        local deficit = tonumber(t.deficit) or 0
+        if Config and Config.considerIncomingHot and (tonumber(t.incomingHotRemaining) or 0) > 0 then
+            local dpsPct = ((tonumber(t.recentDps) or 0) / maxHP) * 100
+            if dpsPct <= (tonumber(Config.hotOverrideDpsPct) or 5) then
+                deficit = math.max(0, deficit - (tonumber(t.incomingHotRemaining) or 0))
+            end
         end
+        local predicted = predictedDeficit(
+            deficit,
+            tonumber(t.recentDps) or 0,
+            castSec,
+            maxHP)
+        local effective = math.min(math.max(0, tonumber(expectedPerTarget) or 0), math.max(0, predicted))
+        totalExpected = totalExpected + math.max(0, tonumber(expectedPerTarget) or 0)
+        totalEffective = totalEffective + effective
+        totalPredicted = totalPredicted + predicted
+
+        local currentHP = tonumber(t.currentHP)
+            or (maxHP * ((tonumber(t.pctHP) or 100) / 100))
+        local landingPct = math.max(0, ((currentHP - ((tonumber(t.recentDps) or 0) * castSec)) / maxHP) * 100)
+        minLandingPct = math.min(minLandingPct, landingPct)
     end
 
-    local score = (coverage * 3) + (manaEff * 0.5) - (overheal * 1.5) - (castSec * 0.2) - (recastSec * 0.1) + critPenalty
+    local mana = tonumber(meta.mana) or 0
+    if mana <= 0 then mana = math.max(1, totalExpected) end
+    local manaEff = totalEffective / mana
+    local overheal = math.max(0, totalExpected - totalEffective)
+    local overhealRatio = overheal / math.max(1, totalPredicted)
+    local score = manaEff - (overhealRatio * 0.25)
+
     return score, {
-        coverage = coverage,
-        overheal = overheal,
+        coverage = totalEffective / math.max(1, totalPredicted),
+        overheal = overhealRatio,
         manaEff = manaEff,
         castSec = castSec,
-        recastSec = recastSec,
         expected = totalExpected,
-        predicted = safeDeficit,
-        targets = hurtCount,
-        critRate = critRate,
-        critOverheal = critOverheal,
-        critPenalty = critPenalty,
+        predicted = totalPredicted,
+        effective = totalEffective,
+        targets = #(targets or {}),
+        minLandingPct = minLandingPct,
+        selectionMode = 'stable_efficiency',
     }
 end
 
@@ -524,34 +416,6 @@ local function preFilterSpells(allSpells, deficit, situation, tracker, config)
     return filtered
 end
 
-local function maxHpIsKnown(targetInfo)
-    if not targetInfo then return false end
-    if targetInfo.maxHPKnown == true then return true end
-    local source = tostring(targetInfo.maxHPSource or ''):lower()
-    return source ~= '' and source ~= 'estimate' and source ~= 'unknown'
-end
-
-local function chooseConservativeUnknownMaxHpHeal(candidates, tracker)
-    local best = nil
-    for _, candidate in ipairs(candidates or {}) do
-        local spellName = candidate.name
-        local meta = spellName and getSpellMeta(spellName) or nil
-        if meta and isSpellUsable(spellName, meta) then
-            local expected = candidate.expected or getExpectedWithFallback(tracker, spellName, 1, false) or 0
-            local row = {
-                spell = spellName,
-                expected = expected,
-                category = candidate.cat,
-                details = 'trigger=efficient category=single maxhp_unknown_conservative',
-            }
-            if not best or expected < (best.expected or math.huge) then
-                best = row
-            end
-        end
-    end
-    return best
-end
-
 local function formatComponents(components)
     if not components then
         return ''
@@ -565,6 +429,9 @@ local function formatComponents(components)
     if components.recastSec then table.insert(parts, string.format('recast=%.2f', components.recastSec)) end
     if components.delaySec then table.insert(parts, string.format('delay=%.2f', components.delaySec)) end
     if components.hps then table.insert(parts, string.format('hps=%.1f', components.hps)) end
+    if components.effective then table.insert(parts, string.format('effective=%.0f', components.effective)) end
+    if components.targets then table.insert(parts, string.format('targets=%d', components.targets)) end
+    if components.minLandingPct then table.insert(parts, string.format('landMin=%.1f%%', components.minLandingPct)) end
     if components.critPenalty then table.insert(parts, string.format('crit=%.2f', components.critPenalty)) end
     if components.categoryPenalty then table.insert(parts, string.format('cat=%.2f', components.categoryPenalty)) end
     return table.concat(parts, ' ')
@@ -606,15 +473,26 @@ local function stashScores(kind, targetInfo, scores, winnerSpell, winnerScore)
         })
     end
     table.sort(out, function(a, b) return (a.score or 0) > (b.score or 0) end)
-    M._lastScores = {
+    local snapshot = {
         kind = kind,
         targetName = (targetInfo and (targetInfo.name or targetInfo.targetName)) or '?',
         deficit = (targetInfo and targetInfo.deficit) or 0,
+        pctHP = (targetInfo and targetInfo.pctHP) or 0,
+        maxHP = (targetInfo and targetInfo.maxHP) or 0,
+        maxHPKnown = targetInfo and targetInfo.maxHPKnown == true or false,
+        maxHPSource = (targetInfo and targetInfo.maxHPSource) or 'unknown',
+        recentDps = (targetInfo and targetInfo.recentDps) or 0,
         scores = out,
         winner = winnerSpell,
         winnerScore = winnerScore,
         at = os.time(),
     }
+    M._lastScores = snapshot
+    local targetName = tostring(snapshot.targetName or ''):lower()
+    if targetInfo and tonumber(targetInfo.maxHP) and tonumber(targetInfo.maxHP) > 0
+        and targetName ~= '' and targetName ~= 'group' and targetName ~= 'target' then
+        M._lastTargetScores = snapshot
+    end
 end
 
 local function getHighPressure()
@@ -796,6 +674,44 @@ local function calculateSupplementGap(targetInfo, config)
     return true, targetInfo.deficit, details
 end
 
+local function shouldUseFastCatchup(targetInfo, efficientHeal, situation)
+    if not targetInfo or not efficientHeal then return false, 'no_efficient_heal' end
+
+    local maxHP = math.max(1, tonumber(targetInfo.maxHP) or 1)
+    local dps = math.max(0, tonumber(targetInfo.recentDps) or 0)
+    local dpsPct = (dps / maxHP) * 100
+    local state = situation and situation.combatAssessment or {}
+    local pressure = (situation and situation.survivalMode == true)
+        or state.highPressure == true
+        or targetInfo.burstDetected == true
+        or dpsPct >= (tonumber(Config and Config.fastHealMinDpsPct) or 2)
+    if not pressure then
+        return false, string.format('stable dpsPct=%.2f', dpsPct)
+    end
+
+    local meta = getSpellMeta(efficientHeal.spell)
+    if not meta then return false, 'efficient_meta_missing' end
+    local castSec = math.max(0, (tonumber(meta.castTimeMs) or 0) / 1000)
+    local expected = math.max(0, tonumber(efficientHeal.expected) or 0)
+    local currentHP = tonumber(targetInfo.currentHP)
+        or (maxHP * ((tonumber(targetInfo.pctHP) or 100) / 100))
+    local projectedPctAtLand = ((currentHP - (dps * castSec)) / maxHP) * 100
+    local netCatchup = expected - (dps * castSec)
+    local emergencyFloor = tonumber(Config and Config.emergencyPct) or 25
+    local maxHPKnown = targetInfo.maxHPKnown == true
+    local fallingBehind = targetInfo.burstDetected == true
+        -- Absolute DPS is scaled by the fallback Max HP estimate. It cannot be
+        -- compared to real spell amounts until Max HP is known; percentage
+        -- projection remains valid for estimated targets.
+        or (maxHPKnown and netCatchup <= 0)
+        or projectedPctAtLand <= emergencyFloor
+
+    return fallingBehind, string.format(
+        'pressure=%s dps=%.0f dpsPct=%.2f cast=%.1fs net=%.0f projected=%.1f%% floor=%.1f%% maxKnown=%s',
+        tostring(pressure), dps, dpsPct, castSec, netCatchup, projectedPctAtLand,
+        emergencyFloor, tostring(maxHPKnown))
+end
+
 function M.SelectHeal(targetInfo, situation)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
@@ -814,7 +730,7 @@ function M.SelectHeal(targetInfo, situation)
     local isSelf = targetInfo._isSelf or false
 
     if targetInfo.pctHP < config.emergencyPct then
-        local heal = M.FindFastestHeal(deficit, isSelf)
+        local heal = M.FindFastestHeal(deficit, isSelf, targetInfo)
         if heal then
             heal.details = joinDetails(heal.details, 'trigger=emergency')
         end
@@ -1029,28 +945,6 @@ function M.SelectHeal(targetInfo, situation)
         return nil, 'below_min_pct'
     end
 
-    if targetInfo.isSquishy then
-        local squishyHeal = M.FindHealForSquishy(deficit, not config.quickHealsEmergencyOnly)
-        if squishyHeal then
-            squishyHeal.details = joinDetails(
-                squishyHeal.details,
-                string.format('trigger=squishy deficitPct=%.1f', deficitPct)
-            )
-            return squishyHeal
-        end
-    end
-
-    if not config.quickHealsEmergencyOnly and situation.multipleHurt and deficitPct <= config.quickHealMaxPct then
-        local heal = M.FindFastestHeal(deficit, isSelf)
-        if heal then
-            heal.details = joinDetails(
-                heal.details,
-                string.format('trigger=multi_hurt deficitPct=%.1f', deficitPct)
-            )
-        end
-        return heal
-    end
-
     -- Character-specific minimum deficit check
     -- This prevents overhealing when all available heals are too big for the deficit
     -- The threshold is relative to the target's max HP, not just the raw heal amount
@@ -1084,6 +978,15 @@ function M.SelectHeal(targetInfo, situation)
     if not heal then
         return nil, 'no_efficient_heal'
     end
+    local useFast, catchupDetails = shouldUseFastCatchup(targetInfo, heal, situation)
+    if useFast then
+        local fast = M.FindFastestHeal(deficit, isSelf, targetInfo)
+        if fast then
+            fast.details = joinDetails(fast.details, 'trigger=high_dps_catchup ' .. catchupDetails)
+            return fast
+        end
+    end
+    heal.details = joinDetails(heal.details, 'fast_guard=' .. catchupDetails)
     return heal
 end
 
@@ -1129,7 +1032,7 @@ function M.GetMinExpectedHeal()
     return minExpected
 end
 
-function M.FindFastestHeal(deficit, isSelf)
+function M.FindFastestHeal(deficit, isSelf, targetInfo)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
     local tracker = HealTracker
@@ -1142,7 +1045,7 @@ function M.FindFastestHeal(deficit, isSelf)
     for _, cat in ipairs(categories) do
         for _, spellName in ipairs(config.spells[cat] or {}) do
             local expected = getExpectedHeal(tracker, spellName)
-            if expected then
+            if expected and not isCompleteHeal(spellName) then
                 local meta = getSpellMeta(spellName)
                 if meta and isSpellUsable(spellName, meta) then
                     table.insert(candidates, {
@@ -1157,7 +1060,7 @@ function M.FindFastestHeal(deficit, isSelf)
     end
 
     if #candidates == 0 then
-        stashScores('fastest', { name = isSelf and 'self' or 'target', deficit = deficit }, {}, nil, nil)
+        stashScores('fastest', targetInfo or { name = isSelf and 'self' or 'target', deficit = deficit }, {}, nil, nil)
         return nil
     end
 
@@ -1178,7 +1081,7 @@ function M.FindFastestHeal(deficit, isSelf)
             castTime = c.castTimeMs,
         })
     end
-    stashScores('fastest', { name = isSelf and 'self' or 'target', deficit = deficit },
+    stashScores('fastest', targetInfo or { name = isSelf and 'self' or 'target', deficit = deficit },
         synthScores, fastest.spell, -(fastest.castTimeMs / 1000))
 
     return {
@@ -1189,48 +1092,7 @@ function M.FindFastestHeal(deficit, isSelf)
     }
 end
 
-function M.FindHealForSquishy(deficit, allowFast)
-    local config = Config or { spells = {} }
-    config.spells = config.spells or {}
-    local tracker = HealTracker
-    local minCoverage = deficit * ((config.squishyCoveragePct or 80) / 100)
-
-    if allowFast then
-        for _, spellName in ipairs(config.spells.fast or {}) do
-            local expected = getExpectedHeal(tracker, spellName)
-            if expected and expected >= minCoverage then
-                local meta = getSpellMeta(spellName)
-                if meta and isSpellUsable(spellName, meta) then
-                    return {
-                        spell = spellName,
-                        expected = expected,
-                        category = 'fast',
-                        details = formatScoreDetails('squishy', 'single', nil),
-                    }
-                end
-            end
-        end
-    end
-
-    for _, spellName in ipairs(config.spells.small or {}) do
-        local expected = getExpectedHeal(tracker, spellName)
-        if expected and expected >= minCoverage then
-            local meta = getSpellMeta(spellName)
-            if meta and isSpellUsable(spellName, meta) then
-                return {
-                    spell = spellName,
-                    expected = expected,
-                    category = 'small',
-                    details = formatScoreDetails('squishy', 'single', nil),
-                }
-            end
-        end
-    end
-
-    return M.FindFastestHeal(deficit)
-end
-
-function M.FindEfficientHeal(targetInfo, allowFast, situation)
+local function evaluateEfficientHeals(targetInfo, allowFast, situation)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
     local tracker = HealTracker
@@ -1261,38 +1123,24 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
         end
     end
 
-    local filtered = preFilterSpells(allSpells, deficit, situation, tracker, config)
-    local weights = getSingleWeights(config, situation)
+    local eligibleSpells = {}
+    for _, candidate in ipairs(allSpells) do
+        local meta = getSpellMeta(candidate.name)
+        local fastAllowed = allowFast or not isFastDirectHeal(meta, candidate.cat)
+        if fastAllowed and not isCompleteHeal(candidate.name) then
+            table.insert(eligibleSpells, candidate)
+        end
+    end
+    local filtered = preFilterSpells(eligibleSpells, deficit, situation, tracker, config)
     local best = nil
     local bestScore = -999
     local scores = {}
-
-    if not maxHpIsKnown(targetInfo) and not (situation and situation.hasEmergency) then
-        best = chooseConservativeUnknownMaxHpHeal(filtered, tracker)
-        if best then
-            local log = getLogger()
-            local unknownScores = {}
-            for _, candidate in ipairs(filtered) do
-                table.insert(unknownScores, {
-                    spell = candidate.name,
-                    category = candidate.cat,
-                    expected = candidate.expected,
-                    score = 0,
-                })
-            end
-            stashScores('efficient', targetInfo, unknownScores, best.spell, 0)
-            if log and log.logSpellSelection then
-                log.logSpellSelection(targetInfo, 'single', M._lastScores.scores, best.spell, 0)
-            end
-            return best
-        end
-    end
 
     for _, candidate in ipairs(filtered) do
         local spellName = candidate.name
         local meta = getSpellMeta(spellName)
         if meta and isSpellUsable(spellName, meta) then
-            local score, components, weightText = scoreSingle(meta, candidate.expected, deficit, dps, maxHP, situation, targetInfo, candidate.cat)
+            local score, components, weightText = scoreStableEfficiency(meta, candidate.expected, deficit, dps, maxHP)
             table.insert(scores, {
                 spell = spellName,
                 score = score,
@@ -1309,11 +1157,21 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
                     spell = spellName,
                     expected = candidate.expected,
                     category = candidate.cat,
-                    details = formatScoreDetails('efficient', 'single', components),
+                    score = score,
+                    mana = meta.mana,
+                    castTime = meta.castTimeMs,
+                    components = components,
+                    details = formatScoreDetails('stable_efficiency', 'single', components),
                 }
             end
         end
     end
+
+    return best, scores, bestScore
+end
+
+function M.FindEfficientHeal(targetInfo, allowFast, situation)
+    local best, scores, bestScore = evaluateEfficientHeals(targetInfo, allowFast, situation)
 
     stashScores('efficient', targetInfo, scores, best and best.spell or nil, bestScore)
 
@@ -1322,37 +1180,18 @@ function M.FindEfficientHeal(targetInfo, allowFast, situation)
         log.logSpellSelection(targetInfo, 'single', M._lastScores.scores, best and best.spell or nil, bestScore)
     end
 
-    -- Humanize: occasionally pick rank-2 from this tier when the score gap is small.
-    -- Suppressed during emergency situations and when target HP is critical (caller passes situation.urgency).
-    if best and #scores >= 2 then
-        local sorted = {}
-        for _, s in ipairs(scores) do table.insert(sorted, s) end
-        table.sort(sorted, function(a, b) return a.score > b.score end)
-        local r1, r2 = sorted[1], sorted[2]
-        local gap = math.abs(r1.score) > 0.001 and ((r1.score - r2.score) / math.abs(r1.score)) or 1.0
-        -- Only consider rank-2 swap if rank-2 is within 30% of rank-1's score.
-        if gap >= 0 and gap < 0.30 then
-            local ok, H = pcall(require, 'sidekick-next.humanize')
-            if ok and H and H.perturbChoice then
-                local urgency = (situation and situation.urgency) or nil
-                local picked = H.perturbChoice(
-                    {
-                        { spell = r1.spell, expected = r1.expected, category = r1.category, details = formatScoreDetails('efficient', 'single', r1.components) },
-                        { spell = r2.spell, expected = r2.expected, category = r2.category, details = formatScoreDetails('efficient', 'single', r2.components) },
-                    },
-                    { kind = 'heal', urgency = urgency }
-                )
-                if picked and picked.spell ~= best.spell then
-                    best = picked
-                end
-            end
-        end
-    end
-
     return best
 end
 
-function M.ShouldUseGroupHeal(targets)
+-- Calculate the strongest stable single-target direct-heal alternative without
+-- replacing the dashboard's most recent scoring snapshot. Group selection uses
+-- this to compare like-for-like value instead of automatically winning.
+local function bestSingleDirectScore(targetInfo, situation)
+    local best, _, bestScore = evaluateEfficientHeals(targetInfo, false, situation)
+    return best, best and bestScore or nil
+end
+
+function M.ShouldUseGroupHeal(targets, situation)
     local config = Config or { spells = {} }
     config.spells = config.spells or {}
     local tracker = HealTracker
@@ -1399,20 +1238,25 @@ function M.ShouldUseGroupHeal(targets)
             if meta and isSpellUsable(spellName, meta) then
                 local castSec = meta.castTimeMs / 1000
                 local predictedTotal = 0
-                local eligibleCount = 0
+                local eligibleTargets = {}
                 for _, t in ipairs(hurtTargets) do
                     local predicted = predictedDeficit(t.deficit, t.recentDps, castSec, t.maxHP)
                     if predicted >= expected then
-                        eligibleCount = eligibleCount + 1
+                        table.insert(eligibleTargets, t)
                         predictedTotal = predictedTotal + predicted
                     end
                 end
 
+                local eligibleCount = #eligibleTargets
                 if eligibleCount >= minCount then
                     local totalHealing = expected * eligibleCount
                     local thresholdDeficit = predictedTotal > 0 and predictedTotal or totalHealing
                     if totalHealing >= thresholdDeficit * 0.7 then
-                        local score, components = scoreGroup(meta, expected, thresholdDeficit, eligibleCount)
+                        -- The eligibility gate only needs the sufficiently hurt
+                        -- members, but the spell lands on the entire local group.
+                        -- Score all affected members so incidental useful healing
+                        -- and overheal are both represented in effective HPM.
+                        local score, components = scoreGroup(meta, expected, targets)
                         table.insert(allScores, { name = spellName, score = score, expected = expected, mana = meta.mana, castTime = meta.castTimeMs })
                         if score > bestScore then
                             bestScore = score
@@ -1420,6 +1264,8 @@ function M.ShouldUseGroupHeal(targets)
                                 spell = spellName,
                                 expected = expected,
                                 targets = eligibleCount,
+                                score = score,
+                                components = components,
                                 details = formatScoreDetails('group_score', 'group', components),
                             }
                         end
@@ -1429,12 +1275,69 @@ function M.ShouldUseGroupHeal(targets)
         end
     end
 
+    -- Compare the best group heal with the strongest stable single-target
+    -- direct heal available for any hurt member. High-DPS catch-up remains a
+    -- single-target responsibility: the fast-heal guard in SelectHeal will
+    -- then choose the quickest safe landing rather than an efficient spell.
+    local bestSingle, bestSingleTarget, catchupReason = nil, nil, nil
+    if best then
+        for _, t in ipairs(hurtTargets) do
+            local single, singleScore = bestSingleDirectScore(t, situation)
+            if single and (not bestSingle or singleScore > bestSingle.score) then
+                bestSingle = single
+                bestSingleTarget = t
+            end
+            if single then
+                local needsCatchup, reason = shouldUseFastCatchup(t, single, situation)
+                if needsCatchup then
+                    catchupReason = string.format('%s:%s', tostring(t.name or '?'), tostring(reason or 'high_dps'))
+                end
+            end
+        end
+    end
+
+    local comparisonWinner = best and best.spell or nil
+    local comparisonScore = best and best.score or nil
+    if best then
+        local singleScore = bestSingle and bestSingle.score or -math.huge
+        if bestSingle then
+            table.insert(allScores, {
+                name = 'single:' .. tostring(bestSingle.spell),
+                score = singleScore,
+                expected = bestSingle.expected,
+                mana = bestSingle.mana,
+                castTime = bestSingle.castTime,
+                category = 'single_comparison',
+            })
+        end
+        best.details = joinDetails(best.details, string.format(
+            'compare=group_vs_single groupHpm=%.3f singleHpm=%s single=%s target=%s minLand=%.1f%%',
+            tonumber(best.score) or 0,
+            bestSingle and string.format('%.3f', singleScore) or 'none',
+            tostring(bestSingle and bestSingle.spell or '-'),
+            tostring(bestSingleTarget and bestSingleTarget.name or '-'),
+            tonumber(best.components and best.components.minLandingPct) or 100))
+
+        if catchupReason then
+            best.details = joinDetails(best.details, 'lost=fast_catchup ' .. catchupReason)
+            comparisonWinner = 'fast_catchup:' .. catchupReason
+            comparisonScore = nil
+            best = nil
+        elseif bestSingle and singleScore >= (tonumber(best.score) or -math.huge) then
+            best.details = joinDetails(best.details, 'lost=single_effective_hpm')
+            comparisonWinner = 'single:' .. tostring(bestSingle.spell)
+            comparisonScore = singleScore
+            best = nil
+        end
+    end
+
     stashScores('group', { name = 'group', deficit = 0 },
-        allScores, best and best.spell or nil, bestScore)
+        allScores, comparisonWinner, comparisonScore)
 
     local log = getLogger()
     if log and log.logSpellSelection then
-        log.logSpellSelection({ name = 'group' }, 'group', M._lastScores.scores, best and best.spell or nil, bestScore)
+        log.logSpellSelection({ name = 'group' }, 'group', M._lastScores.scores,
+            comparisonWinner, comparisonScore)
     end
 
     return best ~= nil, best
@@ -1568,6 +1471,12 @@ end
 --- winner won. Returns nil if no scoring has happened this session.
 function M.getLastScores()
     return M._lastScores
+end
+
+--- Most recent target-specific scoring pass. Group probes intentionally do not
+--- replace this snapshot because they have no meaningful Max HP provenance.
+function M.getLastTargetScores()
+    return M._lastTargetScores
 end
 
 return M

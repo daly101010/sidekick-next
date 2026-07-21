@@ -16,6 +16,8 @@ local module = ModuleBase.create('healing', lib.Priority.HEALING)
 local _coreLoaded = false
 local _pendingAction = nil
 local _pendingReason = nil
+local _pendingKey = nil
+local _pendingSinceMs = 0
 local _intent = nil
 local INTENT_REFRESH_MS = 500
 local INTENT_SETTLE_NORMAL_MS = 100
@@ -28,6 +30,12 @@ local MANA_BUFFER_PCT_OF_COST = 0.03
 local MANA_RETRY_BACKOFF_MS = 1500
 local TELEMETRY_INTERVAL_MS = 1000
 local _lastTelemetryAtMs = 0
+
+local function clearPendingAction()
+    _pendingAction = nil
+    _pendingKey = nil
+    _pendingSinceMs = 0
+end
 
 local function commandEcho(fmt, ...)
     local msg
@@ -160,6 +168,80 @@ local function copyAnalyticsStats(stats)
     return snapshot
 end
 
+local function copyHealingTargets()
+    local rows = {}
+    local monitor = Healing.TargetMonitor
+    if not monitor or not monitor.getAllTargets then return rows end
+    for _, target in pairs(monitor.getAllTargets() or {}) do
+        table.insert(rows, {
+            id = tonumber(target.id) or 0,
+            name = tostring(target.name or ''),
+            role = tostring(target.role or ''),
+            pctHP = tonumber(target.pctHP) or 100,
+            currentHP = tonumber(target.currentHP) or 0,
+            maxHP = tonumber(target.maxHP) or 0,
+            maxHPKnown = target.maxHPKnown == true,
+            maxHPSource = tostring(target.maxHPSource or 'unknown'),
+            deficit = tonumber(target.deficit) or 0,
+            incomingTotal = tonumber(target.incomingTotal) or 0,
+            recentDps = tonumber(target.recentDps) or 0,
+        })
+    end
+    table.sort(rows, function(a, b)
+        if a.pctHP ~= b.pctHP then return a.pctHP < b.pctHP end
+        return a.name < b.name
+    end)
+    return rows
+end
+
+local function copyLastSelection()
+    local selector = Healing.HealSelector
+    local selection = selector and selector.getLastTargetScores and selector.getLastTargetScores() or nil
+    if type(selection) ~= 'table' then return nil end
+    local winnerScore = tonumber(selection.winnerScore) or 0
+    if winnerScore ~= winnerScore or winnerScore == math.huge or winnerScore == -math.huge then
+        winnerScore = 0
+    end
+    local copy = {
+        kind = tostring(selection.kind or ''),
+        targetName = tostring(selection.targetName or ''),
+        deficit = tonumber(selection.deficit) or 0,
+        pctHP = tonumber(selection.pctHP) or 0,
+        maxHP = tonumber(selection.maxHP) or 0,
+        maxHPKnown = selection.maxHPKnown == true,
+        maxHPSource = tostring(selection.maxHPSource or 'unknown'),
+        recentDps = tonumber(selection.recentDps) or 0,
+        winner = tostring(selection.winner or ''),
+        winnerScore = winnerScore,
+        at = tonumber(selection.at) or 0,
+        scores = {},
+    }
+    for _, score in ipairs(selection.scores or {}) do
+        table.insert(copy.scores, {
+            spell = tostring(score.spell or ''),
+            score = tonumber(score.score) or 0,
+            category = tostring(score.category or ''),
+            expected = tonumber(score.expected) or 0,
+            mana = tonumber(score.mana) or 0,
+            castTime = tonumber(score.castTime) or 0,
+        })
+    end
+    return copy
+end
+
+local function copyCombatState()
+    local assessor = Healing.CombatAssessor
+    local state = assessor and assessor.getState and assessor.getState() or {}
+    return {
+        inCombat = state.inCombat == true,
+        survivalMode = state.survivalMode == true,
+        highPressure = state.highPressure == true,
+        fightPhase = tostring(state.fightPhase or 'none'),
+        activeMobCount = tonumber(state.activeMobCount) or 0,
+        totalIncomingDps = tonumber(state.totalIncomingDps) or 0,
+    }
+end
+
 local function maybeSendAnalyticsTelemetry(peerActors)
     local now = lib.getTimeMs()
     if (now - _lastTelemetryAtMs) < TELEMETRY_INTERVAL_MS then return end
@@ -175,6 +257,11 @@ local function maybeSendAnalyticsTelemetry(peerActors)
         duration = analytics.getSessionDuration and analytics.getSessionDuration() or 0,
         efficiencyPct = analytics.getEfficiencyPct and analytics.getEfficiencyPct() or 100,
         stats = copyAnalyticsStats(analytics.getStats()),
+        targets = copyHealingTargets(),
+        combatState = copyCombatState(),
+        lastSelection = copyLastSelection(),
+        lastAction = Healing.HealSelector and Healing.HealSelector.getLastAction
+            and Healing.HealSelector.getLastAction() or nil,
     })
 end
 
@@ -292,31 +379,31 @@ module.onTick = function(self)
 
     local settings = syncSettings()
     if not settings then
-        _pendingAction = nil
+        clearPendingAction()
         self:sendNeed(false, nil, 'no_settings')
         return
     end
 
     if settings.UseSpells == false then
-        _pendingAction = nil
+        clearPendingAction()
         self:sendNeed(false, nil, 'spells_disabled')
         return
     end
 
     if settings.DoHeals ~= true then
-        _pendingAction = nil
+        clearPendingAction()
         self:sendNeed(false, nil, 'heals_disabled')
         return
     end
 
     if not isHealerClass() then
-        _pendingAction = nil
+        clearPendingAction()
         self:sendNeed(false, nil, 'not_healer')
         return
     end
 
     if not ensureHealingInitialized(settings) then
-        _pendingAction = nil
+        clearPendingAction()
         self:sendNeed(false, nil, 'init_failed')
         return
     end
@@ -326,12 +413,12 @@ module.onTick = function(self)
 
     if self:ownsCast() then
         if not self:ownsAction() then
-            _pendingAction = nil
+            clearPendingAction()
             self:releaseClaim('partial_ownership')
             self:sendNeed(false, nil, 'partial_ownership')
             return
         end
-        _pendingAction = nil
+        clearPendingAction()
         local ttlMs = 1000
         local ownerAction = self.state and self.state.castOwner and self.state.castOwner.action
         self.priority = actionPriority(ownerAction)
@@ -354,14 +441,14 @@ module.onTick = function(self)
     local needTtlMs = nil
     if needs then
         if lib.getTimeMs() < (_manaBackoffUntilMs or 0) then
-            _pendingAction = nil
+            clearPendingAction()
             _pendingReason = _manaBackoffReason or 'mana_backoff'
             self:sendNeed(false, nil, _pendingReason)
             return
         end
         local manaOk, manaReason = manaReadyForSpell(action.spellName or action.name)
         if not manaOk then
-            _pendingAction = nil
+            clearPendingAction()
             _pendingReason = manaReason
             self:sendNeed(false, nil, manaReason)
             return
@@ -375,7 +462,7 @@ module.onTick = function(self)
         self.priority = actionPriority(action)
         local ready, intentReason = distributedIntentReady(action, needTtlMs)
         if not ready then
-            _pendingAction = nil
+            clearPendingAction()
             _pendingReason = intentReason
             self:sendNeed(false, nil, intentReason)
             return
@@ -383,6 +470,11 @@ module.onTick = function(self)
     else
         _intent = nil
         self.priority = lib.Priority.HEALING
+    end
+    local nextPendingKey = action and intentKey(action) or nil
+    if nextPendingKey ~= _pendingKey then
+        _pendingKey = nextPendingKey
+        _pendingSinceMs = nextPendingKey and lib.getTimeMs() or 0
     end
     _pendingAction = action
     _pendingReason = reason
@@ -410,6 +502,9 @@ module.getAction = function(self)
     local targetIdVal = tonumber(action.targetId) or 0
 
     if not spellName or targetIdVal <= 0 then
+        _pendingReason = not spellName and 'invalid_action_spell' or 'invalid_action_target_id'
+        clearPendingAction()
+        self:sendNeed(false, nil, _pendingReason)
         return nil
     end
 
@@ -437,6 +532,26 @@ module.getAction = function(self)
             priority = action.tier == 'emergency' and lib.Priority.EMERGENCY or lib.Priority.HEALING,
             maxRetries = 0,
         },
+    }
+end
+
+module.getDiagnosticAction = function(self)
+    local action = _pendingAction
+    if not action then return nil end
+    local phase = 'waiting_priority'
+    if self.claimPending then
+        phase = 'claim_pending'
+    elseif self:isMyPriority() then
+        phase = 'awaiting_claim'
+    end
+    return {
+        active = false,
+        phase = phase,
+        kind = lib.ActionKind.CAST_SPELL,
+        name = action.spellName or action.name or '?',
+        targetId = tonumber(action.targetId) or 0,
+        reason = _pendingReason or action.reason or 'heal',
+        elapsedMs = _pendingSinceMs > 0 and (lib.getTimeMs() - _pendingSinceMs) or 0,
     }
 end
 
@@ -676,19 +791,37 @@ mq.bind('/sk_healing', function(cmd)
     elseif cmd == 'status' then
         local settings = Core.Settings or {}
         local action = _pendingAction
-        commandEcho('running=%s hasState=%s priority=%s ownsAction=%s ownsCast=%s useSpells=%s doHeals=%s pending=%s target=%s tier=%s reason=%s manaBackoffMs=%d',
+        commandEcho('running=%s hasState=%s statePrio=%s priority=%s claimPending=%s claimId=%s claimSend=%s claimSendError=%s claimAge=%dms ownsAction=%s ownsCast=%s useSpells=%s doHeals=%s pending=%s target=%s targetId=%s tier=%s pendingMs=%d reason=%s manaBackoffMs=%d',
             tostring(module.running),
             tostring(module:hasValidState()),
+            tostring(module.state and module.state.activePriority),
             tostring(module:isMyPriority()),
+            tostring(module.claimPending),
+            tostring(module.currentClaimId or 'none'),
+            tostring(module.lastClaimSendOk),
+            tostring(module.lastClaimSendError or '-'),
+            module.lastClaimSendAt > 0 and math.max(0, lib.getTimeMs() - module.lastClaimSendAt) or 0,
             tostring(module:ownsAction()),
             tostring(module:ownsCast()),
             tostring(settings.UseSpells ~= false),
             tostring(settings.DoHeals == true),
             tostring(action and action.spellName or 'none'),
             tostring(action and (action.targetName or action.targetId) or 'none'),
+            tostring(action and action.targetId or 'none'),
             tostring(action and action.tier or 'none'),
+            _pendingSinceMs > 0 and math.max(0, lib.getTimeMs() - _pendingSinceMs) or 0,
             tostring(_pendingReason),
             math.max(0, (_manaBackoffUntilMs or 0) - lib.getTimeMs()))
+        local selector = Healing.HealSelector
+        local selection = selector and selector.getLastTargetScores and selector.getLastTargetScores() or nil
+        if selection then
+            commandEcho('selection=%s target=%s hp=%d%% maxHP=%d known=%s source=%s deficit=%d dps=%.0f score=%.2f',
+                tostring(selection.winner or 'none'), tostring(selection.targetName or 'none'),
+                tonumber(selection.pctHP) or 0, tonumber(selection.maxHP) or 0,
+                tostring(selection.maxHPKnown == true), tostring(selection.maxHPSource or 'unknown'),
+                tonumber(selection.deficit) or 0, tonumber(selection.recentDps) or 0,
+                tonumber(selection.winnerScore) or 0)
+        end
     elseif cmd == 'rescan' then
         local config = Healing.Config
         if not config then

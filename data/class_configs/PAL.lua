@@ -126,7 +126,7 @@ M.defaultConditions = {
         return ctx.me.pctHPs < 40 and not ctx.me.activeDisc
     end,
     ['doAEAggroDisc'] = function(ctx)
-        return ctx.me.xTargetCount >= 3 and ctx.mode == 'Tank'
+        return ctx.me.xTargetCount >= 3 and tostring(ctx.mode):lower() == 'tank'
     end,
 
     ['doCrushTimer6'] = function(ctx)
@@ -139,7 +139,7 @@ M.defaultConditions = {
         return ctx.combat and ctx.target.pctHPs > 20 and ctx.group.lowestHP < 85
     end,
     ['doWave'] = function(ctx)
-        return ctx.me.xTargetCount >= 2 and ctx.mode == 'Tank'
+        return ctx.me.xTargetCount >= 2 and tostring(ctx.mode):lower() == 'tank'
     end,
     ['doPreservation'] = function(ctx)
         return ctx.group.lowestHP < 75
@@ -167,6 +167,13 @@ M.defaultConditions = {
     ['doSpireOfPaladin'] = function(ctx)
         return ctx.burn
     end,
+}
+
+M.conditionOrder = {
+    'doLayOnHands', 'doDivineCall', 'doBeacon',
+    'doFortitude', 'doDefenseDisc', 'doGroupArmor',
+    'doAEAggroDisc', 'doWave',
+    'doCrushTimer6', 'doCrushTimer5', 'doStun',
 }
 
 -- Category overrides

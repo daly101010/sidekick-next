@@ -73,7 +73,37 @@ end
 function M.isMezzed(spawn)
     if not spawn or not spawn() then return false end
     local mezzed = spawn.Mezzed
-    return mezzed and mezzed() and mezzed() ~= ''
+    if not mezzed then return false end
+    local value = mezzed()
+    if value == nil then return false end
+    value = tostring(value)
+    return value ~= '' and value ~= 'NULL' and value ~= 'None'
+end
+
+--- True when the current target carries any beneficial (dispellable) buff.
+--- Target.Beneficial alone skips player-cast buffs and depends on the cached
+--- buff data being populated, so also scan the cached buff list for any
+--- beneficial spell — a player-cast buff on an NPC is still strippable.
+-- @return boolean
+function M.targetHasBeneficial()
+    local target = mq.TLO.Target
+    if not (target and target()) then return false end
+    local ok, name = pcall(function() return target.Beneficial() end)
+    if ok and name ~= nil then
+        local s = tostring(name)
+        if s ~= '' and s ~= 'NULL' then return true end
+    end
+    local count = 0
+    pcall(function() count = tonumber(target.BuffCount()) or 0 end)
+    for i = 1, math.min(count, 60) do
+        local isBene = false
+        pcall(function()
+            local buff = target.Buff(i)
+            isBene = buff and buff() and buff.Beneficial() == true
+        end)
+        if isBene then return true end
+    end
+    return false
 end
 
 --- Check if spawn is attacking a group member (not the tank)
@@ -329,7 +359,7 @@ local SKIP_LOG_COOLDOWN = 5.0  -- Only log once per 5 seconds per target
 
 --- Select the best target based on priority
 -- Priority: Named > Attacking group > Lowest HP
--- Falls back to breaking mez on lowest HP if no unmezzed targets
+-- Returns nil when every candidate is mezzed; CC is never broken as fallback.
 -- Skips targets that fail safe targeting check (KS prevention)
 -- @param myId number Tank's spawn ID
 -- @param range number Search radius (default 100)
@@ -391,39 +421,7 @@ function M.selectBestTarget(myId, range, settings)
         end
     end
 
-    -- No unmezzed targets - break mez on lowest HP (still check safe targeting)
-    local mezzed = M.getMezzedTargets(range)
-    if #mezzed > 0 then
-        -- Filter by safe targeting
-        local safeTargets = {}
-        for _, spawn in ipairs(mezzed) do
-            if _isIgnoredSpawn(spawn, ignoreSet) then
-                goto continue2
-            end
-            local spawnId = spawn.ID() or 0
-            local isSafe, reason = M.isSafeTarget(spawnId, settings)
-            if isSafe then
-                table.insert(safeTargets, spawn)
-            elseif reason and reason:find('fighting') then
-                -- Log skipped target (with cooldown)
-                local lastLog = _skippedTargetLog[spawnId] or 0
-                if (now - lastLog) >= SKIP_LOG_COOLDOWN then
-                    _skippedTargetLog[spawnId] = now
-                    local name = spawn.CleanName() or 'Unknown'
-                    -- Echo disabled
-                end
-            end
-            ::continue2::
-        end
-
-        if #safeTargets > 0 then
-            table.sort(safeTargets, function(a, b)
-                return (a.PctHPs() or 100) < (b.PctHPs() or 100)
-            end)
-            return safeTargets[1]
-        end
-    end
-
+    -- Mezzed mobs are deliberate CC and are never fallback kill targets.
     return nil
 end
 

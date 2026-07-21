@@ -156,8 +156,10 @@ function M.logSpellSelection(target, tier, spells, selected, score)
     _lastSpellSelectionLog[cacheKey] = { selected = selected, pctHP = targetHP, time = now }
 
     local lines = { string.format('SPELL SELECTION for %s [%s tier]:', targetName, tier or '?') }
-    table.insert(lines, string.format('  Target: HP:%d%% Deficit:%d EffDeficit:%d',
-        targetHP, target.deficit or 0, target.effectiveDeficit or 0))
+    table.insert(lines, string.format('  Target: HP:%d%% MaxHP:%d source:%s known:%s Deficit:%d EffDeficit:%d DPS:%.0f',
+        targetHP, target.maxHP or 0, target.maxHPSource or 'unknown',
+        tostring(target.maxHPKnown == true), target.deficit or 0,
+        target.effectiveDeficit or 0, target.recentDps or 0))
 
     if spells and #spells > 0 then
         table.insert(lines, '  Candidates:')

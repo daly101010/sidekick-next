@@ -24,6 +24,7 @@ local lazy = require('sidekick-next.utils.lazy_require')
 
 local getNamed        = lazy('sidekick-next.utils.named_detector')
 local getCore         = lazy('sidekick-next.utils.core')
+local getTargeting    = lazy('sidekick-next.utils.targeting')
 
 local M = {}
 
@@ -162,6 +163,9 @@ function M.buildContext()
             named             = isNamed,
             secondaryPctAggro = safeNum(function() return target.SecondaryPctAggro() end, 0),
             body              = safeTLO(function() return target.Body() end, '') or '',
+            -- Any beneficial buff on the NPC (includes player-cast buffs via
+            -- cached-buff scan). Dispel predicates: ctx.target.hasBeneficial
+            hasBeneficial     = getTargeting().targetHasBeneficial(),
             myBuff = function(buffName)
                 if not buffName or buffName == '' then return false end
                 local b = target.MyBuff and target.MyBuff(buffName) or nil
@@ -173,6 +177,7 @@ function M.buildContext()
         -- when no target is selected.
         targetInfo = {
             id = 0, pctHPs = 100, named = false, secondaryPctAggro = 0, body = '',
+            hasBeneficial = false,
             myBuff = function() return false end,
         }
     end
@@ -190,6 +195,11 @@ function M.buildContext()
                 local b = me.Buff(buffName)
                 return b and b() and true or false
             end,
+            song = function(songName)
+                if not songName or songName == '' then return false end
+                local song = me.Song(songName)
+                return song and song() and true or false
+            end,
         },
         combat = inCombat,
         burn   = burnNow,
@@ -198,6 +208,13 @@ function M.buildContext()
         spawn = {
             count = function(query)
                 if not query or query == '' then return 0 end
+                return safeNum(function() return mq.TLO.SpawnCount(query)() end, 0)
+            end,
+            npcRadius = function(radius, zradius)
+                local query = string.format('npc radius %d', tonumber(radius) or 50)
+                if zradius then
+                    query = query .. string.format(' zradius %d', tonumber(zradius) or 50)
+                end
                 return safeNum(function() return mq.TLO.SpawnCount(query)() end, 0)
             end,
         },
@@ -232,10 +249,16 @@ local function isSpellReady(name)
     return safeTLO(function() return mq.TLO.Me.SpellReady(name)() end, false) == true
 end
 
+-- Melee/class skills activated with /doability (Backstab, Kick, Bash, ...)
+local function isSkillReady(name)
+    return safeTLO(function() return mq.TLO.Me.AbilityReady(name)() end, false) == true
+end
+
 local function isReady(kind, name)
     if kind == 'aa'   then return isAAReady(name) end
     if kind == 'disc' then return isDiscReady(name) end
     if kind == 'spell' then return isSpellReady(name) end
+    if kind == 'skill' then return isSkillReady(name) end
     return false
 end
 
@@ -247,6 +270,8 @@ local function abilityLineForKind(config, setName, kind)
         return config.aaLines[setName]
     elseif kind == 'spell' and config.spellLines and config.spellLines[setName] then
         return config.spellLines[setName]
+    elseif kind == 'skill' and config.skillLines and config.skillLines[setName] then
+        return config.skillLines[setName]
     end
 
     -- Legacy configs often keep AAs in AbilitySets with an "AA" suffix
@@ -274,6 +299,9 @@ local function hasAbilityForKind(kind, name)
         if book and book() then return true end
         local spell = mq.TLO.Me.Spell(name)
         return spell and spell() and true or false
+    elseif kind == 'skill' then
+        -- Trained skill check: Me.Skill returns the skill value (0 = untrained)
+        return safeNum(function() return mq.TLO.Me.Skill(name)() end, 0) > 0
     end
     return false
 end
@@ -302,6 +330,7 @@ local function kindCandidates(config, setName, allowKinds)
     add('disc')
     add('aa')
     add('spell')
+    add('skill')
     return candidates
 end
 
@@ -328,6 +357,7 @@ function M.pickReadyAbility(classConfig, ctx, opts)
 
     local allowKinds = (opts and opts.allowKinds) or { aa = true, disc = true, spell = true }
     local excludeConditions = (opts and opts.excludeConditions) or {}
+    local includeCategories = opts and opts.includeCategories or nil
 
     -- Honor an explicit ordering on the class config when supplied. This
     -- lets a config author choose firing priority (e.g. defensive discs
@@ -360,7 +390,10 @@ function M.pickReadyAbility(classConfig, ctx, opts)
     end
 
     for _, condKey in ipairs(keys) do
-        if not excludeConditions[condKey] then
+        local category = classConfig.categoryOverrides and classConfig.categoryOverrides[condKey] or nil
+        local categoryAllowed = not includeCategories
+            or includeCategories[tostring(category or 'combat'):lower()] == true
+        if not excludeConditions[condKey] and categoryAllowed then
             local pred = conditions[condKey]
             if type(pred) == 'function' then
                 local okEval, allow = pcall(pred, ctx)
@@ -404,6 +437,9 @@ function M.fireAbility(action)
         return true
     elseif action.kind == 'spell' then
         mq.cmdf('/cast "%s"', action.name)
+        return true
+    elseif action.kind == 'skill' then
+        mq.cmdf('/doability "%s"', action.name)
         return true
     end
     return false

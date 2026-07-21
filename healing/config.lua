@@ -50,19 +50,13 @@ local M = {
 
     -- Ducking
     duckEnabled = true,
-    duckHpThreshold = 85,
-    duckEmergencyThreshold = 70,
     duckHotThreshold = 92,
-    duckBufferPct = 0.5,
-    duckHysteresisPct = 5,
-    duckHotHysteresisPct = 3,
-    duckEmergencyHysteresisPct = 8,
-    duckMinCastAgeMs = 600,
     duckIncomingGraceMs = 900,
     considerIncomingHot = true,
     hotIncomingCoveragePct = 100,
 
     -- HoT behavior
+    hotOpeningWindowSec = 5,
     -- HoTs start around 80% HP when sustained damage is detected
     hotEnabled = true,
     hotMinDps = 200,             -- Minimum DPS to target for HoT to be considered
@@ -78,6 +72,12 @@ local M = {
     hotLearnIntervalSec = 30,
     quickHealMaxPct = 15,
     quickHealsEmergencyOnly = true,
+    -- Fast direct heals are a catch-up tool, not the routine efficiency winner.
+    -- Outside an emergency they are only eligible when measured incoming DPS
+    -- shows that the selected efficient heal cannot catch the target back up.
+    fastHealMaxCastMs = 2000,
+    fastHealMinDpsPct = 2,
+    excludeCompleteHealFromEfficiency = true,
     hotMinCoverageRatio = 0.3,
     hotUselessRatio = 0.1,
     hotRefreshWindowPct = 0,
@@ -145,7 +145,6 @@ local M = {
 
     -- Self-healing (PAL off-tank use case)
     selfHealEnabled = false,     -- Whether to include selfHeal spells
-    selfHealPct = 60,            -- HP% threshold for self-heal consideration
 
     -- Learning
     learningWeight = 0.1,
@@ -157,7 +156,6 @@ local M = {
     broadcastEnabled = true,
 
     -- Logging (file logging enabled by default for troubleshooting)
-    debugLogging = false,      -- Console debug output
     fileLogging = true,        -- Write detailed logs to file for review
     fileLogLevel = 'info',     -- 'debug', 'info', 'warn', 'error'
     logCategories = {          -- Granular control over what gets logged
@@ -970,7 +968,6 @@ local CLASS_DEFAULTS = {
         groupHealMinCount = 2,   -- Aurora is PAL's strongest heal, use it more
         hotEnabled = false,      -- PAL has no HoTs
         selfHealEnabled = true,  -- PAL needs self-heal while tanking
-        selfHealPct = 60,        -- Matches PAL config doSelfHeal condition
         healPetsEnabled = false, -- Limited heal bandwidth
     },
 }
