@@ -114,7 +114,7 @@ Discipline-specific bar for melee/tank classes. Shows active and available disci
 
 ### Item Bar
 
-Clickable items (clicky gear) with cooldown tracking. Configure its contents under Options > Items and its layout under Options > UI > Item Bar.
+Clickable items (clicky gear) with cooldown tracking. Configure its contents under Options > Items and its layout under Options > UI > Item Bar. In coordinated mode, a click is queued through the item worker and waits for cast ownership, so it cannot collide with a heal, cure, resurrection, or another cast.
 
 ### Skill Bar
 
@@ -125,12 +125,20 @@ Learned combat skills displayed as buttons with readiness and cooldown state. Co
 The SideKick Options window contains top-level Buttons, Options, Spell Set,
 Healing or Resurrection, Items, and Buffs surfaces. The nested Options surface
 contains modular UI, Automation, Resurrection, Integration, Animations,
-Humanize, Pull, Remote, and diagnostic tabs.
+Humanize, Pull, Remote, Logging, and diagnostic tabs.
+
+The Logging tab controls the general logger for the UI host, coordinator, and
+every coordinated worker. Level, file output, and the optional text filter are
+persisted and propagated on the next settings revision. Healing Intelligence's
+detailed healing log remains a separate file under `HealingLogs`.
 
 ### Healing Monitor
 
 Real-time display of the healing intelligence system showing:
-- Current heal targets and predicted incoming heals
+- The complete tracked health roster, including full-health characters, with
+  current HP%, Max HP, provenance, damage rate, and predicted incoming heals
+- Whether each target's Max HP is known (`actor`, `dannet`, `self`, or `spawn`)
+  or is using the visibly labeled `ESTIMATED` remote fallback
 - Combat assessment (fight phase, damage rate, survival risk)
 - Heal efficiency analytics (overhealing %, casts per minute)
 - HoT tracking across characters
@@ -197,6 +205,23 @@ not a second persisted gate.
 | Engage HP | 97% | Target HP% to start attacking when using the HP condition |
 | Assist Range | 100 | Maximum fallback assist range |
 
+**Tank Settings** (shown when Combat Mode is `tank`)
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| Target Mode | auto | Auto keeps a stable live XTarget; manual preserves the selected NPC |
+| AoE Mob Threshold | 3 | Minimum unmezzed haters before an AE hate tool is eligible |
+| Require Aggro Deficit | on | Require at least one XTarget below full tank aggro before AE hate |
+| Safe AE Check | on | Also suppress AE hate when nearby NPCs are not active XTarget haters; active mez is always protected |
+| Moveback Positioning | off | Use tank-facing moveback stick positioning to keep mobs in front |
+| Position Refresh | 5s | Refresh cadence for moveback positioning |
+| Taunt Chase Range | 60 | Maximum distance for a bounded loose-mob Taunt recovery run |
+
+The tank keeps its primary kill target stable for assisters. A loose mob is a
+separate temporary recovery target: the tank may switch to it, approach within
+Taunt range, use Taunt or a hate tool, and then restore the primary target.
+Mezzed mobs are never selected or hit with automatic AE hate abilities.
+
 **Meditation Section**
 | Setting | Default | Purpose |
 |---------|---------|---------|
@@ -238,7 +263,7 @@ OOC and combat behavior are configured separately:
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| Auto-Rez Out of Combat | on | Enable group-corpse rez after combat |
+| Auto-Rez Out of Combat | on | Enable group and Actor Team corpse rez after combat |
 | OOC Method | Auto | Auto, Spell, or configured Item |
 | Auto-Rez In Combat | off | Allow combat rez attempts |
 | Combat Method | Auto | Auto, AA, already-memorized Spell, or Item |
@@ -256,9 +281,18 @@ class battle-rez AA and an already-memorized spell. Out of combat it falls
 back to the best learned spell and may memorize it on demand. SideKick never
 auto-memorizes or starts corpse navigation during combat.
 
-The worker targets and drags only group-member corpses. Its Actor intent is
-short-lived and deterministic, so a failed or disconnected primary rezzer
-automatically yields to the next eligible character.
+Before entering Actor election or requesting coordinator ownership, the worker
+checks the corpse against the selected spell/item/AA range. An out-of-range
+corpse is ignored unless OOC navigation is enabled and the corpse is within the
+configured navigation limit.
+
+The worker prefers group-member corpses, then checks fresh peers from the current
+Actor Team for an exact PC corpse visible in the rezzer's zone. That corpse is
+authoritative even if the peer's Actor death flag is late or the player has
+released to a bind point in another zone. This supports raid-group and
+manual-team OOG resurrection without treating every visible player corpse as
+eligible. Its Actor intent is short-lived and deterministic, so a failed or
+disconnected primary rezzer automatically yields to the next eligible character.
 
 ### Buffs Tab
 
@@ -277,12 +311,24 @@ and later memorized manually or dragged back into any combat gem, its condition,
 priority, buff target, and utility flags are restored. A spell that has never
 been configured receives the normal generated defaults.
 
+Spell-set saves are staged and validated before replacing the live file. The
+previous valid file is retained as a `.bak` recovery copy.
+
+Manual gem adoption detects and displays each spell's functional type. A
+beneficial spell such as Invisibility remains in its physical gem slot but is
+excluded from the DPS worker. Enable it under OOC Buffs if SideKick should
+maintain it automatically; merely memorizing a buff does not opt it into
+automatic recasting.
+
 If the set has OOC buffs, the final gem remains reserved for buff hot-swapping;
 manual changes to that reserved gem are intentionally not adopted.
 
 ### Items Tab
 
-Select which clickable items appear in the Item Bar.
+Select which clickable items appear in the Item Bar. Each slot can be On Demand,
+Combat (optionally below an HP threshold), Out of Combat, or On Condition. The
+automatic modes and manual bar clicks use the same coordinated item worker.
+Saved conditions stay attached to the slot in the item module config.
 
 ### Integration Tab
 
@@ -324,6 +370,18 @@ The Pause button, `/sk pause`, and `/sk resume` control the global
 monolithic runtime. Its old manual/hybrid/auto behavior is not a coordinated
 worker control and is intentionally not shown in the current Automation tab.
 
+Pull runs in its own coordinated worker. The Pull tab or `/sk_pull start` saves
+the configuration through the main SideKick process; scanning is harmless, and
+the character will not navigate, retarget, or fire the selected pull ability
+until the worker owns the pull target. `/sk_pull status`, `camp`, `pulltarget`,
+and `clearignore` are forwarded to that worker. Pull yields normal melee Assist
+for the complete outbound and return-to-camp workflow.
+
+Idle Humanize fidgets also run under a supervised worker in coordinated mode.
+They remain disabled by the Humanize/fidget toggles and are suppressed while
+combat, navigation, casting, group combat, nearby mez, or chat input makes a
+synthetic keypress unsafe.
+
 ## Class-Specific Features
 
 ### Healing Intelligence
@@ -346,11 +404,11 @@ the same non-destructive merge also runs when the healing worker starts.
 
 ### Tank Classes (WAR, PAL, SHD)
 
-- **Tank Mode**: Automatic AoE aggro management
-- **AoE Threshold**: Configurable minimum mob count before using AoE abilities
-- **Safe AE Check**: Skip AoE if mobs are mezzed
-- **Repositioning**: Automatic positioning with cooldown
-- **Dragon Positioning**: Special angle-based positioning for dragon fights
+- **Stable kill target**: The Actor team receives a refreshed primary target while loose-mob recovery remains temporary
+- **Aggro recovery**: Bounded Taunt chase and class hate tools run before normal engagement work
+- **Defensive ordering**: Emergency and defensive abilities use explicit class safety order instead of alphabetical selection
+- **AoE safety**: Configurable mob/aggro thresholds; mez protection is unconditional and the extended check rejects nearby neutral NPCs
+- **Moveback positioning**: Optional RG-style stick positioning with a configurable refresh cooldown
 
 ### Crowd Control (ENC, BRD, NEC)
 
@@ -397,6 +455,11 @@ SideKick uses the **Actors** messaging system for real-time inter-character comm
 | Tank broadcasts | Tank announces primary target to all assisters |
 | Window bounds | Share window positions for UI anchoring |
 | Team presence | Share coordinator state, active action, role, and module readiness |
+
+The generic Actors peer count and Actor Team peer count are different. Generic
+peers are every live SideKick status sender visible through Actors. Actor Team
+peers share the same trusted raid, group, or manual team identity and are the
+only OOG peers eligible for automated resurrection.
 
 ### Setup
 
@@ -454,11 +517,13 @@ SideKick checks targets against raid members and actor peers before engaging, pr
 | `/skassistme` | Broadcast assist request |
 | `/skactors` | Toggle actors debug window |
 | `/sk_assist status\|stop` | Inspect the coordinated melee-assist target, lease owner, priority, and last decision |
+| `/sk_tank status\|stop` | Inspect the tank primary target, pending action, coordinator ownership, hater/deficit counts, and last action |
+| `/sk_items status\|list\|stop` | Inspect queued/manual item work, list each configured clicky's eligibility, or stop the coordinated item worker |
 | `/skspells [sub]` | Spellbook scanner commands |
 | `/skcd [on\|off\|clear\|debug]` | Cooldown debugging |
 | `/sk_next_meditation off\|ooc\|always\|status\|reload\|audit\|stop` | Set, control, and diagnose the SideKick-Next meditation worker without colliding with production SideKick |
 | `/sk_buffs status\|reload\|retry\|dump\|clearcache\|debug on\|debug off\|stop` | Diagnose the buff worker; debug mode mirrors its throttled action trace to the MQ console, while failures always echo |
-| `/sk_rez status\|debug on\|off\|retry\|now [name]\|stop` | Inspect or control the resurrection worker; `now` requests a group-member rez and bypasses the automatic enable/class gates for that attempt |
+| `/sk_rez status\|debug on\|off\|retry\|now [name]\|stop` | Inspect or control the resurrection worker; status includes each Actor Team member's corpse-scan result, and `now` requests a group or Actor Team member rez while bypassing the automatic enable/class gates for that attempt |
 | `/sk_coord team` | Show Actor team mode, identity, elected leader, and live member count |
 
 ### Debug Commands
@@ -471,6 +536,9 @@ SideKick checks targets against raid members and actor peers before engaging, pr
 | `/sidekick debugcombat gems` | Show spell gems and their types |
 | `/sidekick debugcombat state` | Show combat state and target info |
 | `/sidekick debugcombat list` | Show castable spells (non-heal) |
+| `/skloglevel 1-5` | Set and persist the general log level for the UI, coordinator, and workers |
+| `/sklogfilter text\|clear` | Restrict general logs to matching module/message text, or clear the filter |
+| `/sklogfile on\|off` | Enable or disable the shared general log file across SideKick processes |
 | `/sidekick debugooc` | Reports that the legacy executor is retired; use `/sk coordinator` |
 
 ---
@@ -504,6 +572,7 @@ graph TB
         CCWORKER["sk_cc.lua<br/>Priority 3"]
         ASSISTWORKER["sk_assist.lua<br/>Priority 4"]
         DPS["sk_dps.lua<br/>Priority 4"]
+        ITEMS["sk_items.lua<br/>Priority 4/6"]
         RESOURCES["sk_resources.lua<br/>Priority 5"]
         BUFFS["sk_buffs.lua<br/>Priority 6"]
         MED["sk_meditation.lua<br/>Priority 7"]
@@ -554,6 +623,7 @@ graph TB
     SKSTART -->|spawns| CCWORKER
     SKSTART -->|spawns| ASSISTWORKER
     SKSTART -->|spawns| DPS
+    SKSTART -->|spawns| ITEMS
     SKSTART -->|spawns| RESOURCES
     SKSTART -->|spawns| BUFFS
     SKSTART -->|spawns| MED
@@ -576,6 +646,7 @@ graph TB
     EMERG --> BASE
     HEAL --> BASE
     DPS --> BASE
+    ITEMS --> BASE
     BUFFS --> BASE
     MED --> BASE
     BASE --> LIB
@@ -592,6 +663,7 @@ graph TB
     COORD <-->|Actors| EMERG
     COORD <-->|Actors| HEAL
     COORD <-->|Actors| DPS
+    COORD <-->|Actors| ITEMS
     COORD <-->|Actors| BUFFS
     COORD <-->|Actors| MED
 
@@ -610,7 +682,7 @@ flowchart TD
     INIT["init.lua + supervisor"]
     COORD["sk_coordinator.lua<br/>(priority arbiter)"]
     UI["SideKick.lua<br/>(UI, settings, state, Actors)"]
-    WORKERS["Priority workers<br/>(emergency, healing, rez, DPS,<br/>disciplines, buffs, meditation)"]
+    WORKERS["Priority workers<br/>(emergency, healing, rez, tank, DPS,<br/>items, disciplines, buffs, meditation)"]
 
     USER --> INIT
     USER2 --> USER
@@ -765,13 +837,27 @@ flowchart TD
 
 ### How Heal Selector Decides
 
-The heal selector evaluates candidates using a scoring function:
+The heal selector separates routine efficiency from catch-up healing:
 
 1. **Urgency**: How close is the target to death? (HP%, damage rate, incoming damage)
-2. **Efficiency**: Will this heal overheal? (predicted HP after pending heals + HoTs)
-3. **Coverage**: Does a group heal cover more wounded members than a single target heal?
-4. **Speed**: Is a fast heal needed (target dropping fast) or can we use a slow efficient heal?
+2. **Stable efficiency**: Routine direct heals maximize effective healing per
+   mana after projected overheal. Fast direct heals and Complete Heal are
+   excluded from this comparison.
+3. **Group value**: A direct group heal must first meet the configured wounded
+   member threshold (normally three, or two during detected AE damage). Its
+   effective healing across the full local group is then compared on the same
+   effective-healing-per-mana scale as the best stable single-target direct
+   heal. Pending heals and trusted incoming HoT coverage reduce useful healing.
+   The group heal only wins when it is more efficient; a target that needs
+   high-DPS catch-up keeps the decision on the single-target fast-heal path.
+4. **Catch-up speed**: A fast heal is eligible below the emergency threshold,
+   or during high measured pressure when the efficient heal would land below
+   the emergency floor or incoming damage would erase its healing.
 5. **Coordination**: Is another healer already targeting this player? (via Actor claims)
+
+An estimated Max HP no longer forces the smallest heal. The estimated deficit
+and measured damage rate go through the same stable/catch-up policy, while the
+Healing Monitor exposes the estimate and its source.
 
 ## Actors Communication
 
@@ -1022,11 +1108,21 @@ suffixes are:
 | ChaseEnabled | bool | false | Chase toggle |
 | ChaseRole | text | ma | Chase target role |
 | ChaseDistance | int | 30 | Chase distance |
-| AssistMode | text | group | Assist source |
+| AssistMode | text | group | Assist source (`group`, raid assist, or `byname`) |
+| AssistName | text | empty | Required OOG main-assist character when AssistMode is `byname` |
 | AssistAt | int | 97 | Engage HP% |
 | MeditationMode | text | off | off/ooc/always |
 | BurnDuration | int | 30 | Burn duration (seconds) |
 | BuffingEnabled | bool | true | Buff automation |
+
+An Actor Team leader is elected only to give the team a stable coordination
+identity; it is not automatically the combat main assist. For an OOG main
+assist, select **Assist Source: By Name** and enter that SideKick character's
+name. DPS ignores the healer's own Actor Team target when voting, prefers the
+configured main assist or a member in `tank` combat mode, and otherwise uses
+fresh same-zone remote NPC targets. Remote `inCombat` state is accepted as
+engagement evidence because an OOG healer may not receive the same XTarget
+hater slot.
 
 ### Current Healing and Cure Settings
 
@@ -1092,6 +1188,7 @@ Higher priority (lower number) always preempts lower priority. The coordinator i
 | `sk_cc.lua` | Coordinator-owned mez selection and casting (priority 3) |
 | `sk_assist.lua` | Coordinator-owned melee targeting and positioning (priority 4) |
 | `sk_dps.lua` | DPS/combat module (priority 4) |
+| `sk_items.lua` | Configured automatic and queued manual clickies (priority 4 in combat/manual, 6 OOC) |
 | `sk_resources.lua` | Resource conversion module (priority 5) |
 | `sk_buffs.lua` | OOC buff module (priority 6) |
 | `sk_meditation.lua` | Meditation module (priority 7) |

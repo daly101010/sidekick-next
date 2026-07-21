@@ -42,6 +42,17 @@ Removed setting keys:
 - DebuffSelfHealHpThreshold
 - DoCharm
 - TravelBrokerEnabled
+- Humanize_RestickAfterMs
+- Humanize_FW_face_spawn
+- Healing Intelligence: duckHpThreshold
+- Healing Intelligence: duckEmergencyThreshold
+- Healing Intelligence: duckBufferPct
+- Healing Intelligence: duckHysteresisPct
+- Healing Intelligence: duckHotHysteresisPct
+- Healing Intelligence: duckEmergencyHysteresisPct
+- Healing Intelligence: duckMinCastAgeMs
+- Healing Intelligence: selfHealPct
+- Healing Intelligence: debugLogging
 
 Files updated to remove the UI/registry surfaces:
 - sidekick-next/ui/settings.lua
