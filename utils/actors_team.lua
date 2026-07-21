@@ -35,6 +35,8 @@ local _stats = {
     dropped = 0,
     pruned = 0,
     queueOverflow = 0,
+    lastDropReason = '',
+    lastDroppedTeamId = '',
 }
 
 local function clean(value)
@@ -186,7 +188,13 @@ local function sendPacket(id, data, forcedTeamId)
         data = data or {},
     }
     local ok, err = pcall(function()
-        _dropbox:send({ mailbox = lib.Mailbox.TEAM }, packet)
+        -- Route explicitly to the coordinator script's team mailbox. Relying on
+        -- the sender's implicit current-script prefix can split peers when MQ2Lua
+        -- reports equivalent launch aliases differently.
+        _dropbox:send({
+            mailbox = lib.Mailbox.TEAM,
+            script = lib.Scripts.COORDINATOR,
+        }, packet)
     end)
     if ok then
         _stats.sent = _stats.sent + 1
@@ -199,25 +207,30 @@ end
 
 local function processPacket(entry, now)
     local content = entry.content or {}
-    if tonumber(content.protocolVersion) ~= PROTOCOL_VERSION then
+    local function recordDrop(reason)
         _stats.dropped = _stats.dropped + 1
+        _stats.lastDropReason = tostring(reason or 'unknown')
+        _stats.lastDroppedTeamId = clean(content.teamId)
+    end
+    if tonumber(content.protocolVersion) ~= PROTOCOL_VERSION then
+        recordDrop('protocol_mismatch')
         return
     end
 
     local id = normalize(content.id)
     if id ~= 'team:state' and id ~= 'team:leave' then
-        _stats.dropped = _stats.dropped + 1
+        recordDrop('unknown_message')
         return
     end
     if clean(content.teamId) == '' or clean(content.teamId) ~= _teamId then
-        _stats.dropped = _stats.dropped + 1
+        recordDrop('team_id_mismatch')
         return
     end
 
     local character = clean(content.from or entry.sender.character)
     local server = clean(content.server or entry.sender.server)
     if character == '' or server == '' then
-        _stats.dropped = _stats.dropped + 1
+        recordDrop('identity_missing')
         return
     end
 
@@ -233,7 +246,7 @@ local function processPacket(entry, now)
     local sequence = tonumber(content.sequence) or 0
     local previous = _peers[key]
     if previous and previous.sessionId == sessionId and sequence <= (previous.sequence or 0) then
-        _stats.dropped = _stats.dropped + 1
+        recordDrop('stale_sequence')
         return
     end
 
@@ -255,6 +268,9 @@ local function processPacket(entry, now)
         incapacitated = data.incapacitated == true,
         automationPaused = data.automationPaused == true,
         activePriority = tonumber(data.activePriority),
+        targetId = tonumber(data.targetId) or 0,
+        targetType = clean(data.targetType),
+        targetName = clean(data.targetName),
         action = type(data.action) == 'table' and data.action or nil,
         modules = type(data.modules) == 'table' and data.modules or {},
     }
@@ -307,6 +323,9 @@ local function stateSignature(data)
         tostring(data.incapacitated == true),
         tostring(data.automationPaused == true),
         tostring(data.activePriority or ''),
+        tostring(data.targetId or 0),
+        clean(data.targetType),
+        clean(data.targetName),
         clean(action.module),
         clean(action.kind),
         clean(action.name),
@@ -372,6 +391,9 @@ function M.tick(snapshot, settings)
         incapacitated = snapshot.incapacitated == true,
         automationPaused = snapshot.automationPaused == true,
         activePriority = tonumber(snapshot.activePriority),
+        targetId = tonumber(snapshot.targetId) or 0,
+        targetType = clean(snapshot.targetType),
+        targetName = clean(snapshot.targetName),
         action = type(snapshot.action) == 'table' and snapshot.action or nil,
         modules = type(snapshot.modules) == 'table' and snapshot.modules or {},
     }
@@ -443,6 +465,8 @@ function M.getSnapshot()
             dropped = _stats.dropped,
             pruned = _stats.pruned,
             queueOverflow = _stats.queueOverflow,
+            lastDropReason = _stats.lastDropReason,
+            lastDroppedTeamId = _stats.lastDroppedTeamId,
         },
     }
 end

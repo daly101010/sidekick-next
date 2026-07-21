@@ -11,6 +11,31 @@ local M = {}
 
 local debugLogToFile = require('sidekick-next.utils.debug_log').moduleTagged('sk_module_base', 'SK_MODULE_BASE')
 
+-- Action tables are mutable runtime objects and may accumulate values the
+-- Actors post office cannot serialize. Copy only supported scalar/table data.
+local function actorSafeCopy(value, seen)
+    local valueType = type(value)
+    if valueType == 'string' or valueType == 'number' or valueType == 'boolean' then
+        return value
+    end
+    if valueType ~= 'table' then return nil end
+
+    seen = seen or {}
+    if seen[value] then return nil end
+    seen[value] = true
+
+    local out = {}
+    for key, child in pairs(value) do
+        local keyType = type(key)
+        if keyType == 'string' or (keyType == 'number' and key >= 0 and key % 1 == 0) then
+            local safeChild = actorSafeCopy(child, seen)
+            if safeChild ~= nil then out[key] = safeChild end
+        end
+    end
+    seen[value] = nil
+    return out
+end
+
 --- Create a new module instance
 -- @param moduleName string Unique module name
 -- @param priority number Module's priority tier
@@ -23,7 +48,14 @@ function M.create(moduleName, priority)
 
         -- State from Coordinator
         state = nil,
+        coordinatorBootId = nil,
+        retiredCoordinatorBootIds = {},
         stateReceivedAt = 0,
+        awaitingResumeState = false,
+        resumeStateTick = nil,
+        resumeDetectedAt = 0,
+        lastCoordinatorCheckAt = 0,
+        lastCoordinatorStatus = '',
 
         -- Claim tracking
         claimCounter = 0,
@@ -32,6 +64,9 @@ function M.create(moduleName, priority)
         claimPending = false,
         claimRequestedAt = 0,
         claimEpochAtRequest = nil,
+        lastClaimSendOk = nil,
+        lastClaimSendError = nil,
+        lastClaimSendAt = 0,
         lastReleasedClaimId = nil,
         lastReleasedAtMs = 0,
         lastNeedSentAt = 0,
@@ -59,6 +94,7 @@ function M.create(moduleName, priority)
         onTick = nil,          -- Called each tick when active
         shouldAct = nil,       -- Returns true if module needs to act
         getAction = nil,       -- Returns action details for claim
+        getDiagnosticAction = nil, -- Returns side-effect-free pending action status
         executeAction = nil,   -- Executes the action after claim granted
     }
 
@@ -68,7 +104,12 @@ function M.create(moduleName, priority)
 
     function self:hasValidState()
         if not self.state then return false end
-        return not lib.isStale(self.state.sentAtMs, self.state.ttlMs)
+        -- Coordinator and worker run in separate Lua processes. Treat the
+        -- worker-local receipt timestamp as authoritative so clock-domain skew
+        -- or transport latency cannot make a newly delivered snapshot stale.
+        local ttlMs = tonumber(self.state.ttlMs) or lib.Timing.STATE_TTL_MS
+        return self.stateReceivedAt > 0
+            and (lib.getTimeMs() - self.stateReceivedAt) <= ttlMs
     end
 
     function self:isMyPriority()
@@ -198,16 +239,26 @@ function M.create(moduleName, priority)
             castStartTimeoutMs = tonumber(action.castStartTimeoutMs)
                 or lib.Timing.CLAIM_CAST_START_MS,
             reason = action.reason or 'action',
-            action = action,
+            action = actorSafeCopy(action),
         }
 
         self.claimPending = true
         self.claimRequestedAt = lib.getTimeMs()
         self.claimEpochAtRequest = self.state.epoch
 
-        pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.CLAIM, script = lib.Scripts.COORDINATOR }, claim)
+        local ok, result = pcall(function()
+            return self.dropbox:send(
+                { mailbox = lib.Mailbox.CLAIM, script = lib.Scripts.COORDINATOR, character = lib.localCharacter() }, claim)
         end)
+        self.lastClaimSendAt = lib.getTimeMs()
+        self.lastClaimSendOk = ok and result ~= false
+        self.lastClaimSendError = self.lastClaimSendOk and nil or tostring(result)
+        if not self.lastClaimSendOk then
+            self.claimPending = false
+            self.claimEpochAtRequest = nil
+            lib.log('warn', self.name, 'Claim send failed: %s', tostring(self.lastClaimSendError))
+            return false
+        end
 
         lib.log('debug', self.name, 'Claim requested: %s (epoch=%d)', self.currentClaimId, self.state.epoch)
         return true
@@ -230,7 +281,7 @@ function M.create(moduleName, priority)
         }
 
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.RELEASE, script = lib.Scripts.COORDINATOR }, release)
+            self.dropbox:send({ mailbox = lib.Mailbox.RELEASE, script = lib.Scripts.COORDINATOR, character = lib.localCharacter() }, release)
         end)
 
         lib.log('debug', self.name, 'Release sent: %s (%s)', self.currentClaimId, reason)
@@ -240,6 +291,9 @@ function M.create(moduleName, priority)
         self.currentClaimType = nil
         self.claimPending = false
         self.claimEpochAtRequest = nil
+        if self.onClaimReleased then
+            pcall(self.onClaimReleased, self, reason or 'completed')
+        end
     end
 
     function self:requestInterrupt(reason)
@@ -255,7 +309,7 @@ function M.create(moduleName, priority)
         }
 
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.INTERRUPT, script = lib.Scripts.COORDINATOR }, interrupt)
+            self.dropbox:send({ mailbox = lib.Mailbox.INTERRUPT, script = lib.Scripts.COORDINATOR, character = lib.localCharacter() }, interrupt)
         end)
 
         lib.log('debug', self.name, 'Interrupt requested: %s', reason)
@@ -263,15 +317,21 @@ function M.create(moduleName, priority)
 
     function self:sendHeartbeat()
         debugLogToFile(self.name, 'Sending heartbeat to %s', lib.Scripts.COORDINATOR)
+        local action = self.unifiedExecutorEnabled and ActionExecutor.getStatus() or nil
+        if (not action or action.active ~= true) and self.getDiagnosticAction then
+            local ok, diagnostic = pcall(self.getDiagnosticAction, self)
+            if ok and type(diagnostic) == 'table' then action = diagnostic end
+        end
+        local stateReady = self:hasValidState() and not self.awaitingResumeState
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
+            self.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR, character = lib.localCharacter() }, {
                 msgType = 'heartbeat',
                 module = self.name,
                 ownerName = lib.getMyName(),
                 ownerServer = lib.getMyServer(),
                 sentAtMs = lib.getTimeMs(),
-                ready = true,
-                action = self.unifiedExecutorEnabled and ActionExecutor.getStatus() or nil,
+                ready = stateReady,
+                action = action,
             })
         end)
     end
@@ -354,7 +414,7 @@ function M.create(moduleName, priority)
         self.lastNeedSentAt = now
         self.lastNeedReason = reason
         pcall(function()
-            self.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
+            self.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR, character = lib.localCharacter() }, {
                 msgType = 'need',
                 module = self.name,
                 ownerName = lib.getMyName(),
@@ -376,8 +436,55 @@ function M.create(moduleName, priority)
         if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
         if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
 
+        -- tickId is monotonic only within one coordinator process. Accept a
+        -- new boot even when its counter restarted at zero, then tombstone the
+        -- old boot so delayed packets cannot switch us back.
+        local incomingBootId = tostring(content.coordinatorBootId or '')
+        if incomingBootId ~= '' and self.retiredCoordinatorBootIds[incomingBootId] then return end
+        if incomingBootId ~= '' and incomingBootId ~= self.coordinatorBootId then
+            if self.coordinatorBootId and self.coordinatorBootId ~= '' then
+                -- A single delayed packet from a dead boot must never hijack a
+                -- live session: adopting it would tombstone the real boot and
+                -- permanently reject every later broadcast. Require a second
+                -- sighting within 2s — a genuinely restarted coordinator
+                -- rebroadcasts every STATE_BROADCAST_MS so it confirms at
+                -- once; a stray from a dead boot never repeats.
+                if self.candidateBootId ~= incomingBootId
+                    or (lib.getTimeMs() - (self.candidateBootSeenAt or 0)) > 2000 then
+                    self.candidateBootId = incomingBootId
+                    self.candidateBootSeenAt = lib.getTimeMs()
+                    return
+                end
+                self.retiredCoordinatorBootIds[self.coordinatorBootId] = true
+            end
+            self.candidateBootId = nil
+            if self.cancelUnifiedAction then
+                self:cancelUnifiedAction('coordinator_restarted')
+            end
+            self.coordinatorBootId = incomingBootId
+            self.state = nil
+            self.claimPending = false
+            self.currentClaimId = nil
+            self.currentClaimType = nil
+            self.claimEpochAtRequest = nil
+            self.awaitingResumeState = false
+            self.resumeStateTick = nil
+        end
+
+        -- Actors delivery is asynchronous. Within one coordinator boot, never
+        -- let an older snapshot replace newer ownership or freshness.
+        local incomingTick = tonumber(content.tickId)
+        local currentTick = tonumber(self.state and self.state.tickId)
+        if incomingTick and currentTick and incomingTick < currentTick then return end
+
         self.state = content
         self.stateReceivedAt = lib.getTimeMs()
+        if self.awaitingResumeState
+            and (not self.resumeStateTick or (incomingTick and incomingTick > self.resumeStateTick)) then
+            self.awaitingResumeState = false
+            self.resumeStateTick = nil
+            self.resumeDetectedAt = 0
+        end
 
         -- Start warmup on first state
         if not self.initialized then
@@ -424,6 +531,21 @@ function M.create(moduleName, priority)
             return
         end
 
+        -- A foreground/background transition can suspend every Lua coroutine
+        -- while wall-clock time continues. Do not cancel a valid in-flight job
+        -- on the first resumed worker tick; wait for a newer coordinator tick.
+        if self.awaitingResumeState then
+            local resumeAge = lib.getTimeMs() - (self.resumeDetectedAt or 0)
+            if resumeAge <= lib.Timing.COORDINATOR_ABSENCE_MS then
+                local active = self.currentClaimId ~= nil
+                    or (self.unifiedExecutorEnabled and ActionExecutor.hasActiveJob())
+                self:sendNeed(active, active and 5000 or nil, 'scheduler_resume_wait')
+                return
+            end
+            self.awaitingResumeState = false
+            self.resumeStateTick = nil
+        end
+
         -- Reload shared settings only when the UI-published revision changes.
         -- This replaces the former 500ms all-INI polling in every worker.
         local revision = tonumber(self.state and self.state.settingsRevision)
@@ -431,6 +553,19 @@ function M.create(moduleName, priority)
             lib.refreshSettings(revision)
             self.settingsRevision = revision
             if self.onSettingsReload then pcall(self.onSettingsReload, self, revision) end
+        end
+
+        -- Humanize override (/skboss, /skfullbore) is transient UI state relayed
+        -- through the coordinator snapshot. Apply it to this process's humanize
+        -- instance; stays pending until the module actually loads humanize
+        -- (some workers only require it lazily on first cast).
+        local desiredOverride = self.state and self.state.humanizeOverride
+        if desiredOverride ~= nil and desiredOverride ~= self.appliedHumanizeOverride then
+            local H = package.loaded['sidekick-next.humanize']
+            if H and H.setOverride then
+                pcall(H.setOverride, desiredOverride ~= 'auto' and desiredOverride or nil)
+                self.appliedHumanizeOverride = desiredOverride
+            end
         end
 
         -- Global automation pause. Keep the worker alive and heartbeating, but
@@ -491,6 +626,9 @@ function M.create(moduleName, priority)
                 lib.log('warn', self.name, 'State stale, releasing claim')
                 self:releaseClaim('state_stale')
             end
+            self.claimPending = false
+            self.claimEpochAtRequest = nil
+            self:sendNeed(false, nil, 'state_stale')
             return
         end
 
@@ -613,9 +751,13 @@ function M.create(moduleName, priority)
         -- liveness. If MQ2Lua still has the coordinator process, preserve this
         -- worker and start a fresh absence window. Unknown status is handled
         -- non-destructively as well.
+        if (now - (self.lastCoordinatorCheckAt or 0)) < 1000 then
+            return self.lastCoordinatorStatus == 'EXITED'
+        end
         local status = lib.getLuaScriptStatus(lib.Scripts.COORDINATOR)
+        self.lastCoordinatorCheckAt = now
+        self.lastCoordinatorStatus = status
         if status ~= 'EXITED' then
-            self.stateReceivedAt = now
             debugLogToFile(self.name,
                 'WATCHDOG: coordinator actor state stale but Lua status=%s; keeping worker',
                 status ~= '' and status or 'UNKNOWN')
@@ -632,8 +774,22 @@ function M.create(moduleName, priority)
         local lastHeartbeat = 0
         local _coordinatorAbsentLogged = false
         local wasInGame = lib.isInGame()
+        local lastLoopAt = lib.getTimeMs()
 
         while self.running do
+            local loopStartedAt = lib.getTimeMs()
+            local loopGap = loopStartedAt - lastLoopAt
+            lastLoopAt = loopStartedAt
+            if self.state and loopGap > lib.Timing.STATE_TTL_MS then
+                self.awaitingResumeState = true
+                self.resumeStateTick = tonumber(self.state.tickId)
+                self.resumeDetectedAt = loopStartedAt
+                if ActionExecutor.rebaseTimers then ActionExecutor.rebaseTimers(loopGap) end
+                if self.onSchedulerResume then pcall(self.onSchedulerResume, self, loopGap) end
+                debugLogToFile(self.name,
+                    'Scheduler resumed after %dms; awaiting coordinator tick newer than %s',
+                    loopGap, tostring(self.resumeStateTick or '-'))
+            end
             if self.peerActors and self.peerActors.tick then
                 self.peerActors.tick()
             end

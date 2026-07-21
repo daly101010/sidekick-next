@@ -3,6 +3,12 @@ local Core = require('sidekick-next.utils.core')
 
 local M = {}
 
+local function safeValue(fn, fallback)
+    local ok, value = pcall(fn)
+    if not ok or value == nil then return fallback end
+    return value
+end
+
 local function safeNum(fn, fallback)
     local ok, v = pcall(fn)
     if not ok then return fallback end
@@ -173,6 +179,10 @@ function M.buildStatusPayload(opts)
     local mana = safeNum(function() return me.PctMana() end, 0)
     local endur = safeNum(function() return me.PctEndurance() end, 0)
     local level = safeNum(function() return me.Level() end, 0)
+    local target = mq.TLO.Target
+    local targetId = safeNum(function() return target.ID() end, 0)
+    local targetType = targetId > 0 and safeValue(function() return target.Type() end, '') or ''
+    local targetName = targetId > 0 and safeValue(function() return target.CleanName() end, '') or ''
     local class = ''
     if me.Class and me.Class.ShortName then
         class = tostring(me.Class.ShortName() or ''):upper()
@@ -196,6 +206,11 @@ function M.buildStatusPayload(opts)
         endur = endur,
         level = level,
         class = class,
+        targetId = targetId,
+        targetType = targetType,
+        targetName = targetName,
+        combat = safeBool(function() return me.Combat() end, false)
+            or safeNum(function() return me.XTHaterCount() end, 0) > 0,
         sitting = me.Sitting and me.Sitting() == true or false,
         follow = following,
         chase = opts.chase == true,

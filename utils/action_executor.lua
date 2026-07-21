@@ -580,6 +580,12 @@ function M.tick(context)
             finish(job, M.PHASE.FAILED, dispatchReason or 'dispatch_failed')
             return publicStatus(job)
         end
+        -- Monitor modes: 'none' (complete immediately), 'custom' (handler
+        -- onTick drives phases), 'settle' / 'cast_or_settle' (complete after
+        -- settleMs; the latter treats an observed cast as the completion
+        -- signal instead), 'spell_engine' (track the spell_engine job), and
+        -- 'cast' (raw /cast issued outside spell_engine: wait for the cast bar
+        -- until startDeadlineMs, complete when it finishes).
         job.monitor = type(monitor) == 'string' and monitor
             or (type(monitor) == 'table' and monitor.monitor)
             or (job.kind == 'cast_spell' and 'spell_engine' or 'settle')
@@ -639,6 +645,8 @@ function M.tick(context)
         finish(job, M.PHASE.COMPLETED, 'completed_instant')
     elseif job.monitor == 'spell_engine' and not engineBusy and phaseAge >= job.settleMs then
         finish(job, M.PHASE.FAILED, 'cast_did_not_start')
+    elseif job.monitor == 'cast' and now >= job.startDeadlineMs then
+        finish(job, M.PHASE.FAILED, 'cast_start_timeout')
     elseif job.monitor ~= 'custom' and now >= job.startDeadlineMs then
         abortSpellEngine()
         finish(job, M.PHASE.FAILED, 'cast_start_timeout')
@@ -663,6 +671,20 @@ end
 
 function M.getStatus()
     return publicStatus(_job) or _lastResult
+end
+
+--- Rebase active lifecycle timers after the host Lua coroutine was suspended.
+--- No action work occurred during the gap, so wall-clock deadline expiry would
+--- be a false timeout on the first resumed frame.
+function M.rebaseTimers(gapMs)
+    gapMs = math.max(0, tonumber(gapMs) or 0)
+    if gapMs <= 0 or not _job or TERMINAL[_job.phase] then return false end
+    for _, field in ipairs({
+        'submittedAtMs', 'phaseAtMs', 'startedAtMs', 'startDeadlineMs', 'deadlineMs',
+    }) do
+        if tonumber(_job[field]) then _job[field] = _job[field] + gapMs end
+    end
+    return true
 end
 
 function M.consumeResult()

@@ -114,8 +114,11 @@ function M.load()
     f:close()
     if not content or content == '' then return end
 
-    local data = SafeLoad.tableLiteral(content, path)
-    if type(data) ~= 'table' then return end
+    local data, err = SafeLoad.tableLiteral(content, path)
+    if type(data) ~= 'table' then
+        print(string.format('\ar[ClaimLedger]\ax load failed: %s', tostring(err or 'invalid data')))
+        return
+    end
 
     M.history = data.history or {}
     -- Don't restore an in-progress session — it will be initialized fresh. The

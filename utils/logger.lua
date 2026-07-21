@@ -95,6 +95,26 @@ function M.setScriptLabel(label)
     _scriptLabel = label or 'SK'
 end
 
+--- Apply persisted SideKick logging settings in the current Lua process.
+--- Each coordinated worker has its own module globals, so this must run after
+--- that process reloads Core settings rather than only in the UI host.
+---@param settings table|nil
+function M.configure(settings)
+    settings = settings or {}
+    M.setLevel(settings.SideKickLogLevel or 3)
+    M.setFileLogging(settings.SideKickLogFile == true)
+    local filter = tostring(settings.SideKickLogFilter or '')
+    M.setFilter(filter ~= '' and filter or nil)
+end
+
+function M.getConfiguration()
+    return {
+        level = _globalLevel,
+        fileLogging = _fileLogging,
+        filter = _filter or '',
+    }
+end
+
 -- ============================================================
 -- INTERNAL HELPERS
 -- ============================================================
@@ -202,6 +222,17 @@ local function writeLog(levelName, moduleName, depthOffset, fmt, ...)
     if not levelDef then return end
 
     local levelNum = levelDef.num
+
+    -- Cheap suppression check BEFORE formatting: suppressed debug/verbose
+    -- calls sit on hot paths (per drained actor message in the coordinator)
+    -- and must cost next to nothing when no sink would accept the line.
+    local suppressConsoleMin = _consoleLevel or _globalLevel
+    local suppressFileMin = _fileLevel or _globalLevel
+    if levelNum > suppressConsoleMin
+        and (not _fileLogging or levelNum > suppressFileMin) then
+        return
+    end
+
     local message = formatMessage(fmt, ...)
 
     -- Check filter

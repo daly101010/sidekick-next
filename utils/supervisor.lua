@@ -7,6 +7,11 @@ local M = {}
 local dropbox = nil
 local started = false
 local lastHeartbeatAt = 0
+local lastCoordinatorCheckAt = 0
+local coordinatorRecoveryAt = 0
+local coordinatorRecoveryAttempts = 0
+local coordinatorStableSince = 0
+local coordinatorRecoveryExhaustedLogged = false
 local sessionId = nil
 local lastGameState = ''
 local latestState = {}
@@ -49,6 +54,15 @@ local function identity()
     return lib.getMyName(), lib.getMyServer()
 end
 
+-- Current humanize override as a wire string. Overrides are transient UI-side
+-- state (/skboss, /skfullbore), so the heartbeat samples them live rather than
+-- requiring binds to push through the supervisor.
+local function humanizeOverride()
+    local H = package.loaded['sidekick-next.humanize']
+    local o = H and H.getOverride and H.getOverride() or nil
+    return o or 'auto'
+end
+
 local function send(msgType)
     if not dropbox then return false end
     local ownerName, ownerServer = identity()
@@ -61,9 +75,11 @@ local function send(msgType)
         sentAtMs = lib.getTimeMs(),
         automationPaused = latestState.automationPaused == true,
         settingsRevision = tonumber(latestState.settingsRevision) or 0,
+        humanizeOverride = humanizeOverride(),
     }
     return pcall(function()
-        dropbox:send({ mailbox = lib.Mailbox.SUPERVISOR, script = lib.Scripts.COORDINATOR }, payload)
+        dropbox:send({ mailbox = lib.Mailbox.SUPERVISOR, script = lib.Scripts.COORDINATOR,
+            character = lib.localCharacter() }, payload)
     end)
 end
 
@@ -93,12 +109,51 @@ function M.start()
     end
     send('supervisor_heartbeat')
     lastHeartbeatAt = lib.getTimeMs()
+    lastCoordinatorCheckAt = lastHeartbeatAt
 end
 
 function M.tick(state)
     if not started then return end
     if type(state) == 'table' then latestState = state end
     local now = lib.getTimeMs()
+
+    -- The parent owns coordinator lifetime. MQ2Lua stop/run commands complete
+    -- asynchronously, so a manual reload can otherwise race and leave every
+    -- worker alive but permanently state-stale. Detect that condition before
+    -- the workers' longer coordinator-absence watchdog expires.
+    if (now - lastCoordinatorCheckAt) >= lib.Timing.SUPERVISOR_HEARTBEAT_MS then
+        lastCoordinatorCheckAt = now
+        local coordinatorRunning = isRunning(lib.Scripts.COORDINATOR)
+        if coordinatorRunning then
+            coordinatorStableSince = coordinatorStableSince > 0 and coordinatorStableSince or now
+            if (now - coordinatorStableSince) >= lib.Timing.RESTART_STABLE_MS then
+                coordinatorRecoveryAttempts = 0
+                coordinatorRecoveryExhaustedLogged = false
+            end
+        else
+            coordinatorStableSince = 0
+        end
+        if not coordinatorRunning
+            and coordinatorRecoveryAttempts < lib.MAX_MODULE_RESTARTS
+            and (coordinatorRecoveryAttempts == 0
+                or (now - coordinatorRecoveryAt) >= lib.Timing.RESTART_COOLDOWN_MS) then
+            coordinatorRecoveryAt = now
+            coordinatorRecoveryAttempts = coordinatorRecoveryAttempts + 1
+            printf('\ay[SK Supervisor]\ax Coordinator exited; restarting it')
+            if startScript(lib.Scripts.COORDINATOR, 3000) then
+                send('supervisor_heartbeat')
+                lastHeartbeatAt = lib.getTimeMs()
+            else
+                printf('\ar[SK Supervisor]\ax Coordinator restart failed')
+            end
+        elseif not coordinatorRunning
+            and coordinatorRecoveryAttempts >= lib.MAX_MODULE_RESTARTS
+            and not coordinatorRecoveryExhaustedLogged then
+            coordinatorRecoveryExhaustedLogged = true
+            printf('\ar[SK Supervisor]\ax Coordinator restart limit reached (%d)',
+                lib.MAX_MODULE_RESTARTS)
+        end
+    end
 
     -- Do not wait for the normal interval after a zone transition. An
     -- immediate heartbeat gives the coordinator a fresh post-zone liveness
@@ -133,6 +188,11 @@ function M.stop()
     dropbox = nil
     started = false
     lastGameState = ''
+    lastCoordinatorCheckAt = 0
+    coordinatorRecoveryAt = 0
+    coordinatorRecoveryAttempts = 0
+    coordinatorStableSince = 0
+    coordinatorRecoveryExhaustedLogged = false
     latestState = {}
 end
 

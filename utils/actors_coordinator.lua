@@ -31,6 +31,7 @@ local M = {}
 
 local _actors = nil
 local _dropbox = nil
+local _statusDropbox = nil
 local _selfName = ''
 local _selfServer = ''
 local _selfZone = ''
@@ -316,22 +317,37 @@ function M.init(opts)
             local charName = tostring(content.from or sender.character or '')
             if charName == '' then return end
 
+            -- Several workers on one character can publish status:update. Merge
+            -- partial payloads so the lightweight healing heartbeat cannot erase
+            -- target telemetry sent by the primary SideKick process.
+            local previous = _remoteCharacters[charName] or {}
+            local targetWasIncluded = content.targetId ~= nil
+            local function update(value, oldValue)
+                if value ~= nil then return value end
+                return oldValue
+            end
             _remoteCharacters[charName] = {
                 server = tostring(content.server or sender.server or ''),
-                zone = tostring(content.zone or ''),
-                class = content.class or '',
-                id = tonumber(content.characterId or content.spawnId or content.charId) or 0,
-                currentHP = tonumber(content.currentHP) or 0,
-                maxHP = tonumber(content.maxHP) or 0,
-                dead = content.dead == true,
-                hovering = content.hovering == true,
-                role = content.role,
-                abilities = content.abilities or {},
-                buffs = content.buffs or {},  -- What buffs this character currently has
-                chase = content.chase,
-                hp = content.hp,
-                mana = content.mana,
-                endur = content.endur,
+                zone = tostring(content.zone or previous.zone or ''),
+                class = content.class or previous.class or '',
+                id = tonumber(content.characterId or content.spawnId or content.charId) or previous.id or 0,
+                currentHP = tonumber(content.currentHP) or previous.currentHP or 0,
+                maxHP = tonumber(content.maxHP) or previous.maxHP or 0,
+                dead = update(content.dead, previous.dead) == true,
+                hovering = update(content.hovering, previous.hovering) == true,
+                role = content.role or previous.role,
+                abilities = content.abilities or previous.abilities or {},
+                buffs = content.buffs or previous.buffs or {},  -- What buffs this character currently has
+                chase = update(content.chase, previous.chase),
+                hp = update(content.hp, previous.hp),
+                mana = update(content.mana, previous.mana),
+                endur = update(content.endur, previous.endur),
+                targetId = targetWasIncluded and (tonumber(content.targetId) or 0) or previous.targetId or 0,
+                targetType = targetWasIncluded and tostring(content.targetType or '') or previous.targetType or '',
+                targetName = targetWasIncluded and tostring(content.targetName or '') or previous.targetName or '',
+                targetUpdatedAt = targetWasIncluded and os.clock() or previous.targetUpdatedAt,
+                combat = update(content.combat, previous.combat) == true,
+                script = tostring(content.script or previous.script or ''),
                 lastSeen = os.clock(),
             }
             return
@@ -805,6 +821,30 @@ function M.init(opts)
         }
     end)
 
+    -- Stable request/response endpoint for companion UIs. The main SideKick
+    -- mailbox deliberately queues messages for the yieldable tick, which loses
+    -- the original RPC reply handle. This small endpoint only reads the cached
+    -- status payload and replies directly from the actor callback.
+    local okStatus, statusDropbox = pcall(function()
+        return _actors.register('sidekick_status', function(message)
+            local content = message and message()
+            if type(content) ~= 'table' or content.id ~= 'eq_ui:automation:req' then return end
+            local last = type(_lastStatusPayload) == 'table' and _lastStatusPayload or {}
+            local paused, chase = nil, nil
+            if type(last.automationPaused) == 'boolean' then paused = last.automationPaused end
+            if type(last.chase) == 'boolean' then chase = last.chase end
+            message:reply(0, {
+                id = 'eq_ui:automation:rep',
+                script = 'sidekick-next',
+                from = _selfName,
+                server = _selfServer,
+                paused = paused,
+                chase = chase,
+            })
+        end)
+    end)
+    if okStatus then _statusDropbox = statusDropbox end
+
     return _dropbox
 end
 
@@ -892,6 +932,7 @@ function M.tick(opts)
             or (opts.status.combat) ~= (prev.combat)
             or (opts.status.casting or '') ~= (prev.casting or '')
             or (opts.status.automationPaused == true) ~= (prev.automationPaused == true)
+            or (opts.status.chase == true) ~= (prev.chase == true)
             or (now - _lastStatusSendAt) >= 2.0  -- Force send every 2s as heartbeat
         if changed then
             _lastStatusSendAt = now
@@ -916,6 +957,21 @@ function M.getRemoteCharacters()
         end
     end
     return _remoteCharacters
+end
+
+--- Return the number of live SideKick status peers currently known to this UI.
+--- This is the generic Actor network count, not the narrower coordinator-owned
+--- Actor Team count used for trusted OOG automation such as resurrection.
+function M.getPeerCount(sameZoneOnly)
+    local peers = M.getRemoteCharacters()
+    local currentZone = sameZoneOnly == true and safeZone() or nil
+    local count = 0
+    for _, data in pairs(peers) do
+        if currentZone == nil or tostring(data.zone or '') == currentZone then
+            count = count + 1
+        end
+    end
+    return count
 end
 
 pruneHealTables = function()
@@ -1140,6 +1196,24 @@ function M.sendToLocalScript(scriptName, msgId, payload)
             script = scriptName,
             character = _selfName,
             server = _selfServer,
+        }, payload)
+    end)
+end
+
+--- Send to a specific character's logical mailbox for a specific Lua script.
+function M.sendToCharacter(scriptName, character, server, msgId, payload)
+    if not _dropbox or not scriptName or scriptName == ''
+        or not character or character == '' then return false end
+    payload = payload or {}
+    payload.id = msgId
+    payload.from = payload.from or _selfName
+    payload.server = payload.server or _selfServer
+    return pcall(function()
+        _dropbox:send({
+            mailbox = 'sidekick',
+            script = scriptName,
+            character = character,
+            server = server,
         }, payload)
     end)
 end

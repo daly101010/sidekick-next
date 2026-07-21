@@ -75,6 +75,8 @@ local _lastResult = M.RESULT.NONE
 local _lastResultTime = 0
 local _lastResistSpell = nil
 local _lastResistTarget = nil
+local _eventsRegistered = false
+local _registrationRefs = 0
 
 -- Callback for external notification
 local _onResultCallback = nil
@@ -164,6 +166,11 @@ end
 
 --- Register all spell-related events
 function M.registerEvents()
+    _registrationRefs = _registrationRefs + 1
+    if _eventsRegistered then return true end
+    -- Mark first so a registration path that re-enters through a lazy module
+    -- cannot attempt to create the same global event names twice.
+    _eventsRegistered = true
     -- ============================================
     -- SUCCESS EVENTS (cast started)
     -- ============================================
@@ -443,10 +450,14 @@ function M.registerEvents()
             pcall(M.onMemAbort)
         end
     end)
+    return true
 end
 
 --- Unregister all spell-related events
 function M.unregisterEvents()
+    if _registrationRefs > 0 then _registrationRefs = _registrationRefs - 1 end
+    if not _eventsRegistered or _registrationRefs > 0 then return false end
+    _eventsRegistered = false
     -- Success events
     mq.unevent('sk_cast_begin1')
     mq.unevent('sk_cast_begin2')
@@ -533,6 +544,11 @@ function M.unregisterEvents()
     mq.unevent('sk_mem_begin')
     mq.unevent('sk_mem_end')
     mq.unevent('sk_mem_abort')
+    return true
+end
+
+function M.eventsRegistered()
+    return _eventsRegistered
 end
 
 -- Memorization callbacks (optional listeners)

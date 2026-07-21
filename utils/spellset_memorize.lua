@@ -642,13 +642,42 @@ local function adoptManualGemChanges()
                 local newName = currentId and (getSpellName(currentId) or tostring(currentId)) or '(empty)'
                 local restoredProfile = currentId and SpellSetData.getSpellProfile
                     and SpellSetData.getSpellProfile(spellSet, currentId) or nil
+                local detectedType = nil
 
                 if currentId then
                     local condition = restoredProfile and restoredProfile.condition or nil
+                    local ConditionDefaults = getConditionDefaults()
+                    if ConditionDefaults and ConditionDefaults.getSpellTypeCategory then
+                        local ok, result = pcall(ConditionDefaults.getSpellTypeCategory, currentId)
+                        if ok then
+                            detectedType = result
+                        else
+                            print(string.format(
+                                '\ay[SpellSetMemorize] Unable to classify manually memorized spell %s: %s\ax',
+                                newName, tostring(result)))
+                        end
+                    end
                     if not restoredProfile then
-                        local ConditionDefaults = getConditionDefaults()
-                        if ConditionDefaults and ConditionDefaults.shouldGenerateDefaults(currentId) then
-                            condition = ConditionDefaults.generateCombatCondition(currentId)
+                        local shouldGenerate = false
+                        if ConditionDefaults and ConditionDefaults.shouldGenerateDefaults then
+                            local ok, result = pcall(ConditionDefaults.shouldGenerateDefaults, currentId)
+                            if ok then
+                                shouldGenerate = result == true
+                            else
+                                print(string.format(
+                                    '\ay[SpellSetMemorize] Unable to inspect default condition for %s: %s\ax',
+                                    newName, tostring(result)))
+                            end
+                        end
+                        if shouldGenerate and ConditionDefaults.generateCombatCondition then
+                            local ok, result = pcall(ConditionDefaults.generateCombatCondition, currentId)
+                            if ok then
+                                condition = result
+                            else
+                                print(string.format(
+                                    '\ay[SpellSetMemorize] Unable to generate default condition for %s: %s\ax',
+                                    newName, tostring(result)))
+                            end
                         end
                     end
                     SpellSetData.setGem(spellSet, slot, currentId, condition,
@@ -662,8 +691,9 @@ local function adoptManualGemChanges()
                 changed = changed + 1
                 _manualGemObservations[slot] = nil
                 print(string.format(
-                    '\ag[SpellSetMemorize]\ax Adopted manual gem %d: %s -> %s%s',
+                    '\ag[SpellSetMemorize]\ax Adopted manual gem %d: %s -> %s type=%s%s',
                     slot, oldName, newName,
+                    tostring(detectedType or 'empty'),
                     restoredProfile and ' (restored saved condition/settings)' or ''))
             end
         end

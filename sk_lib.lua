@@ -18,6 +18,9 @@ M.Priority = {
     HEALING = 1,
     RESURRECTION = 2,
     DEBUFF = 3,
+    PULL = 3.5,       -- Movement/target ownership before normal DPS assist
+    TANK_RECOVERY = 2.5, -- Loose-mob taunt/aggro recovery
+    TANK_AGGRO = 3.25,   -- Routine tank hate tools
     DPS = 4,
     IDLE = 5,
     BUFF = 6,        -- OOC buffs
@@ -31,7 +34,10 @@ M.InterruptThreshold = {
     [0] = 0.0,   -- Emergency: immediate
     [1] = 0.5,   -- Healing: 0.5s
     [2] = 1.0,   -- Resurrection: 1.0s
+    [2.5] = 0.25, -- Tank recovery: interrupt quickly for a loose mob
     [3] = 1.0,   -- Debuff: 1.0s
+    [3.25] = 0.5, -- Routine tank aggro
+    [3.5] = 999, -- Pull owns movement/target only
     [4] = 999,   -- DPS: never interrupt (lowest combat priority)
     [5] = 999,   -- Idle: never interrupt
     [6] = 1.0,   -- Buff: can be interrupted (OOC, higher priorities like DPS can interrupt)
@@ -60,12 +66,16 @@ M.Scripts = {
         'sidekick-next/sk_cures',
         'sidekick-next/sk_cc',
         'sidekick-next/sk_assist',
+        'sidekick-next/sk_tank',
+        'sidekick-next/sk_pull',
         'sidekick-next/sk_dps',
+        'sidekick-next/sk_items',
         'sidekick-next/sk_resources',
         'sidekick-next/sk_buffs',
         'sidekick-next/sk_meditation',
         'sidekick-next/sk_resurrection',
         'sidekick-next/sk_disciplines',
+        'sidekick-next/sk_fidget',
     },
     LEGACY_WORKERS = {
         'sidekick-next/sk_healing_emergency',
@@ -76,7 +86,10 @@ M.Scripts = {
 M.Timing = {
     COORDINATOR_TICK_MS = 50,
     STATE_BROADCAST_MS = 200,
-    STATE_TTL_MS = 750,
+    -- Background EQ clients can advance Lua at roughly one frame per second.
+    -- Keep snapshots valid across that expected cadence; the separate 10s
+    -- coordinator watchdog remains the hard failure boundary.
+    STATE_TTL_MS = 5000,
     MODULE_HEARTBEAT_MS = 500,
     SUPERVISOR_HEARTBEAT_MS = 500,
     SUPERVISOR_ABSENCE_MS = 10000,
@@ -210,8 +223,18 @@ function M.refreshSettings(revision)
         if ok and core then
             _Core = core
             if core.load then pcall(core.load) end
+            local loggerOk, Logger = pcall(require, 'sidekick-next.utils.logger')
+            if loggerOk and Logger and Logger.configure then
+                Logger.configure(core.Settings)
+            end
             _coreLoadedAtMs = M.getTimeMs()
             _settingsRevision = revision
+            -- Humanize applies its persisted knobs (master flag, subsystem
+            -- toggles, profile tuning) only once at load. Re-apply after every
+            -- settings reload so /sk_humanize on|off and subsystem changes made
+            -- in the UI process reach workers at runtime, not just at startup.
+            local H = package.loaded['sidekick-next.humanize']
+            if H and H.applySettings then pcall(H.applySettings) end
         end
     end
     return _Core and _Core.Settings or nil
@@ -249,27 +272,61 @@ end
 
 local _cachedMyName = ''
 local _cachedMyServer = ''
+local _myNameRefreshedAt = 0
+local _myServerRefreshedAt = 0
+local IDENTITY_TTL_MS = 5000
 
 --- Get my character name. Preserve the last valid identity while zoning so
 --- Actors heartbeats remain attributable to this character.
+--- Memoized: identity is session-stable, and these getters sit on per-message
+--- hot paths (isLocalModuleMessage runs for every drained actor message) where
+--- per-call TLO reads measurably dominate coordinator tick time.
 -- @return string
+-- Diagnostic: hit/miss counts for the identity memo (read via /sk_coord bench).
+M._identityStats = { hits = 0, misses = 0 }
+
 function M.getMyName()
+    local now = mq.gettime()
+    if _cachedMyName ~= '' and (now - _myNameRefreshedAt) < IDENTITY_TTL_MS then
+        M._identityStats.hits = M._identityStats.hits + 1
+        return _cachedMyName
+    end
+    M._identityStats.misses = M._identityStats.misses + 1
     if M.isMeValid() then
         local name = M.safeTLO(function() return mq.TLO.Me.CleanName() end, '') or ''
         if name ~= '' and name ~= 'NULL' then
             _cachedMyName = tostring(name)
+            _myNameRefreshedAt = now
         end
     end
     return _cachedMyName
 end
 
+--- Character field for local-only actor addresses. The launcher's post office
+--- fans script-addressed messages out to EVERY client running that script;
+--- adding the local character name keeps coordinator<->worker control traffic
+--- on this client only. Returns nil (= leave unaddressed) while identity is
+--- unknown so early messages still deliver rather than silently matching
+--- nothing.
+-- @return string|nil
+function M.localCharacter()
+    local name = M.getMyName()
+    if name ~= '' then return name end
+    return nil
+end
+
 --- Get current server name. Preserve the last valid value while zoning for
---- the same reason as getMyName().
+--- the same reason as getMyName(). Memoized like getMyName.
 -- @return string
 function M.getMyServer()
+    local now = mq.gettime()
+    if _cachedMyServer ~= '' and (now - _myServerRefreshedAt) < IDENTITY_TTL_MS then
+        return _cachedMyServer
+    end
     local server = M.safeTLO(function() return mq.TLO.EverQuest.Server() end, '') or ''
     if server ~= '' and server ~= 'NULL' then
         _cachedMyServer = tostring(server)
+        _myServerRefreshedAt = now
     end
     return _cachedMyServer
 end

@@ -53,6 +53,33 @@ local _state = M.STATE.IDLE
 local _castData = nil
 local _initialized = false
 local _stateEnteredAt = os.clock()
+local _resistLogReady = false
+
+local function resolveTargetName(targetId)
+    targetId = tonumber(targetId) or 0
+    if targetId <= 0 then return '' end
+    local spawn = mq.TLO.Spawn(targetId)
+    if not (spawn and spawn()) then return '' end
+    return tostring((spawn.CleanName and spawn.CleanName()) or (spawn.Name and spawn.Name()) or '')
+end
+
+local function ensureResistLog()
+    if _resistLogReady then return end
+    local ResistLog = getResistLog()
+    local SpellEvents = getSpellEvents()
+    if not (ResistLog and SpellEvents and SpellEvents.addResultListener) then return end
+    if ResistLog.load then ResistLog.load() end
+    SpellEvents.addResultListener(function(result, extra)
+        if result ~= SpellEvents.RESULT.RESISTED then return end
+        local cast = _castData
+        local spellName = tostring((extra and extra.spell) or (cast and cast.spellName) or '')
+        local targetName = tostring((extra and extra.target) or resolveTargetName(cast and cast.targetId) or '')
+        if spellName ~= '' and targetName ~= '' and ResistLog.recordResist then
+            ResistLog.recordResist(spellName, targetName)
+        end
+    end)
+    _resistLogReady = true
+end
 
 -- Maximum time any non-IDLE state can persist before forced reset (seconds)
 local MAX_CASTING_TIME = 15.0   -- Longest EQ spell is ~12s, add buffer
@@ -89,6 +116,7 @@ function M.init()
     if SpellEvents then
         SpellEvents.registerEvents()
     end
+    ensureResistLog()
     _initialized = true
     setState(M.STATE.IDLE)
     _castData = nil
@@ -96,6 +124,8 @@ end
 
 --- Shutdown spell engine
 function M.shutdown()
+    local ResistLog = getResistLog()
+    if ResistLog and ResistLog.save then ResistLog.save() end
     local SpellEvents = getSpellEvents()
     if SpellEvents then
         SpellEvents.unregisterEvents()
@@ -255,16 +285,18 @@ local function shouldRecordResistCast(opts)
 end
 
 local function recordResistCast(spellName, targetId, opts)
-    if not shouldRecordResistCast(opts) then return end
+    if not shouldRecordResistCast(opts) then return false end
     targetId = tonumber(targetId) or 0
-    if targetId <= 0 then return end
+    if targetId <= 0 then return false end
     local ResistLog = getResistLog()
-    if not (ResistLog and ResistLog.recordCast) then return end
+    if not (ResistLog and ResistLog.recordCast) then return false end
     local target = mq.TLO.Spawn(targetId)
     local targetName = target and target() and target.CleanName and target.CleanName() or ''
     if spellName and spellName ~= '' and targetName ~= '' then
         ResistLog.recordCast(spellName, targetName)
+        return true, targetName
     end
+    return false
 end
 
 --- Main cast function (blocking pre-checks, then transitions to state machine)
@@ -380,7 +412,7 @@ function M.cast(spellName, targetId, opts)
 
     -- Issue cast command
     mq.cmdf('/cast "%s"', spellName)
-    recordResistCast(spellName, targetId, opts)
+    local resistTracked, resistTargetName = recordResistCast(spellName, targetId, opts)
 
     -- Set up cast tracking
     _castData = {
@@ -393,6 +425,8 @@ function M.cast(spellName, targetId, opts)
         retries = opts.maxRetries or getSetting('SpellMaxRetries', 3),
         opts = opts,
         spellCategory = opts.spellCategory or opts.category or 'unknown',
+        resistTracked = resistTracked == true,
+        resistTargetName = resistTargetName,
     }
     setState(M.STATE.WAITING_START)
 
@@ -494,6 +528,13 @@ local function handleResult(result)
 
     local buffLog = (_castData and _castData.spellCategory == 'buff') and getBuffLogger() or nil
 
+    if result == SpellEvents.RESULT.SUCCESS and _castData and _castData.resistTracked then
+        local ResistLog = getResistLog()
+        if ResistLog and ResistLog.recordSuccess then
+            ResistLog.recordSuccess(_castData.spellName, _castData.resistTargetName)
+        end
+    end
+
     -- Check if retriable
     if SpellEvents.isRetriable(result) and _castData and _castData.retries > 0 then
         -- Retry the cast
@@ -519,6 +560,9 @@ end
 
 --- Non-blocking tick (called each frame)
 function M.tick()
+    ensureResistLog()
+    local ResistLog = getResistLog()
+    if ResistLog and ResistLog.tick then ResistLog.tick() end
     if _state == M.STATE.IDLE then
         return
     end

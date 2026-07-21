@@ -58,17 +58,19 @@ end
 function M.tick()
     local now = os.clock()
 
-    -- Light update (every 50ms) — self + target snapshot
-    if (now - _lastLightUpdate) >= LIGHT_INTERVAL then
-        _lastLightUpdate = now
-        M.updateLight()
-        return  -- Stagger: only one update type per tick to spread TLO load
-    end
-
-    -- Heavy update (every 100ms) — group HP, xtarget, positions
+    -- One update type per tick to spread TLO load, with heavy taking
+    -- precedence when due. Heavy must be checked FIRST: callers ticking at
+    -- >=LIGHT_INTERVAL cadence (the 50ms worker loops) qualify for a light
+    -- update on every call, and a light-first early return would starve the
+    -- heavy update forever — leaving xtarget/group snapshots permanently
+    -- empty (tank saw 0 haters mid-combat).
     if (now - _lastHeavyUpdate) >= HEAVY_INTERVAL then
         _lastHeavyUpdate = now
         M.updateHeavy()
+    elseif (now - _lastLightUpdate) >= LIGHT_INTERVAL then
+        -- Light update (every 50ms) — self + target snapshot
+        _lastLightUpdate = now
+        M.updateLight()
     end
 
     -- Periodic buffState prune (keeps the table from growing unbounded as mobs
@@ -317,6 +319,7 @@ function M.updateHeavy()
             distance = tonumber(xt.Distance()) or 999,
             aggro = aggro,
             targetingMe = totId == myId,
+            targetId = totId,
             mezzed = isMezzed,
             targetType = targetType,
         }

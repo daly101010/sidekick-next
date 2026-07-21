@@ -54,6 +54,7 @@ local _consecutive = {}
 local _lastSaveAt = 0
 local _dirty = false
 local _disabled = false
+local _loaded = false
 
 -- ---------------------------------------------------------------------------
 -- Storage
@@ -91,16 +92,21 @@ local function serialize(tbl, indent)
 end
 
 function M.load()
+    if _loaded then return true end
+    _loaded = true
     local path = getPath()
     local f = io.open(path, 'r')
-    if not f then return end
+    if not f then return true end
     local content = f:read('*all')
     f:close()
-    if not content or content == '' then return end
-    local data = SafeLoad.tableLiteral(content, path)
+    if not content or content == '' then return true end
+    local data, err = SafeLoad.tableLiteral(content, path)
     if type(data) == 'table' and type(data.zones) == 'table' then
         M.data = data
+        return true
     end
+    print(string.format('\ar[ResistLog]\ax load failed: %s', tostring(err or 'invalid data')))
+    return false, err or 'invalid data'
 end
 
 function M.save()
@@ -191,8 +197,17 @@ function M.recordCast(spellName, targetName)
     local zone = currentZone()
     local bucket = ensureBucket(zone, targetName, spellName)
     bucket.casts = (bucket.casts or 0) + 1
-    bumpConsecutive(zone, targetName, spellName, false)
     _dirty = true
+end
+
+--- Record a completed non-resisted cast so the current-fight consecutive
+--- resist streak is broken without changing persisted cast totals.
+function M.recordSuccess(spellName, targetName)
+    if _disabled then return end
+    spellName = tostring(spellName or '')
+    targetName = tostring(targetName or '')
+    if spellName == '' or targetName == '' then return end
+    bumpConsecutive(currentZone(), targetName, spellName, false)
 end
 
 --- Record that a cast was resisted by the named target. Bumps both the

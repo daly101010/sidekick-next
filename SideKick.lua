@@ -88,6 +88,7 @@ end
 local Healing = nil  -- Will be set dynamically by getHealingModule()
 
 local getCures = lazy.init('sidekick-next.automation.cures')
+local getPull = lazy('sidekick-next.automation.pull')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 local Supervisor = require('sidekick-next.utils.supervisor')
 local SkLib = require('sidekick-next.sk_lib')
@@ -99,7 +100,7 @@ local getSpecialBar = lazy('sidekick-next.ui.special_bar_animated')
 local getDiscBar = lazy('sidekick-next.ui.disc_bar_animated')
 local getItemBar = lazy('sidekick-next.ui.item_bar_animated')
 local getSkillBar = lazy('sidekick-next.ui.skill_bar_animated')
-local iam = require('ImAnim')
+local iam = require('sidekick-next.utils.imanim')
 
 -- Cached spring ease descriptors (iam.EaseSpring may be nil in some builds)
 local _ezSpringHover = (function()
@@ -254,6 +255,36 @@ local function enqueue(fn)
     if type(fn) == 'function' then
         table.insert(State.actionQueue, fn)
     end
+end
+
+local _itemManualRequestCounter = 0
+local function queueItemActivation(entry)
+    local itemName = tostring(entry and entry.itemName or '')
+    if itemName == '' then return end
+    local slotKey = tostring(entry and entry.slotKey or '')
+    _itemManualRequestCounter = _itemManualRequestCounter + 1
+    local requestId = string.format('ui:%d:%d', mq.gettime(), _itemManualRequestCounter)
+
+    enqueue(function()
+        local coordinated = _G.SIDEKICK_NEXT_CONFIG
+            and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
+        if coordinated then
+            local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_items', 'item:manual', {
+                requestId = requestId,
+                requestedAtMs = mq.gettime(),
+                itemName = itemName,
+                slotKey = slotKey,
+            })
+            if not sent then
+                print(string.format('\ar[SideKick Items]\ax Could not queue %s: item worker transport unavailable', itemName))
+            end
+        else
+            Items.useItem(itemName, {
+                throttleKey = slotKey ~= '' and slotKey or itemName,
+                minInterval = 0.25,
+            })
+        end
+    end)
 end
 
 local function drainQueue()
@@ -1218,9 +1249,11 @@ local function draw()
         imgui.PushStyleVar(ImGuiStyleVar.WindowRounding, 6)
         imgui.PushStyleVar(ImGuiStyleVar.WindowPadding, 8, 8)
 
-        local open = imgui.Begin('SideKick Options##SettingsPopup', true, sFlags)
+        local optionsOpen, shown = imgui.Begin('SideKick Options##SettingsPopup', true, sFlags)
+        if shown == nil then shown, optionsOpen = optionsOpen, true end
+        if optionsOpen == false then State.settingsOpen = false end
         local _popupOk, _popupErr = true, nil
-        if open then _popupOk, _popupErr = pcall(function()
+        if shown then _popupOk, _popupErr = pcall(function()
             local closeIcon2 = (Icons and (Icons.FA_TIMES or Icons.MD_CLOSE)) or 'X'
             local availWidth = imgui.GetContentRegionAvail()
             if type(availWidth) ~= 'number' then availWidth = availWidth.x or availWidth[1] or mainW end
@@ -1395,47 +1428,58 @@ local function draw()
                         imgui.Separator()
                     end
 
-                    SettingsUI.draw(
-                        Core.Settings,
-                        themeNames,
-                        function(key, value)
-                            log.debug('onChange: key=%s value=%s', tostring(key), tostring(value))
-                            if tostring(key) == 'SideKickTheme' then
-                                State._themeLocalSetAt = os.clock()
-                                log.debug('Theme change, holdUntil=%.2f', State._themeLocalSetAt + 5.0)
+                    local settingsOk, settingsErr = pcall(function()
+                        SettingsUI.draw(
+                            Core.Settings,
+                            themeNames,
+                            function(key, value)
+                                log.debug('onChange: key=%s value=%s', tostring(key), tostring(value))
+                                if tostring(key) == 'SideKickTheme' then
+                                    State._themeLocalSetAt = os.clock()
+                                    log.debug('Theme change, holdUntil=%.2f', State._themeLocalSetAt + 5.0)
+                                end
+                                Core.set(key, value)
+                                local settingKey = tostring(key)
+                                if settingKey:match('^Meditation') or settingKey:match('^Chase')
+                                    or settingKey:match('^Rez') or settingKey:match('^AutoRez')
+                                    or settingKey == 'AutoAcceptRez' or settingKey == 'CombatMode' then
+                                    enqueue(function() Core.forceSave() end)
+                                end
+                                log.debug('Core.set done, new=%s', tostring(Core.Settings[tostring(key)]))
                             end
-                            Core.set(key, value)
-                            local settingKey = tostring(key)
-                            if settingKey:match('^Meditation') or settingKey:match('^Chase')
-                                or settingKey:match('^Rez') or settingKey:match('^AutoRez')
-                                or settingKey == 'AutoAcceptRez' or settingKey == 'CombatMode' then
-                                enqueue(function() Core.forceSave() end)
-                            end
-                            log.debug('Core.set done, new=%s', tostring(Core.Settings[tostring(key)]))
-                        end
-                    )
-
-                    -- Remote Abilities settings section
-                    imgui.Separator()
-                    if imgui.CollapsingHeader('Remote Abilities') then
-                        local RemoteAbilities = getRemoteAbilities()
-                        if RemoteAbilities then
-                            local raOpen = RemoteAbilities.isOpen()
-                            local changed
-                            raOpen, changed = imgui.Checkbox('Show Remote Ability Bar', raOpen)
-                            if changed then
-                                RemoteAbilities.setOpen(raOpen)
-                            end
-                            if imgui.Button('Configure Remote Abilities') then
-                                RemoteAbilities.toggleSettings()
-                            end
-                        end
+                        )
+                    end)
+                    if not settingsOk then
+                        imgui.TextColored(1, 0.3, 0.3, 1, 'Options error: ' .. tostring(settingsErr))
                     end
 
-                    -- Aggro Warning settings section
-                    if imgui.CollapsingHeader('Warnings') then
-                        local AggroWarning = getAggroWarning()
-                        if AggroWarning then AggroWarning.drawSettings() end
+                    local extrasOk, extrasErr = pcall(function()
+                        -- Remote Abilities settings section
+                        imgui.Separator()
+                        if imgui.CollapsingHeader('Remote Abilities') then
+                            local RemoteAbilities = getRemoteAbilities()
+                            if RemoteAbilities then
+                                local raOpen = RemoteAbilities.isOpen()
+                                local changed
+                                raOpen, changed = imgui.Checkbox('Show Remote Ability Bar', raOpen)
+                                if changed then
+                                    RemoteAbilities.setOpen(raOpen)
+                                end
+                                if imgui.Button('Configure Remote Abilities') then
+                                    RemoteAbilities.toggleSettings()
+                                end
+                            end
+                        end
+
+                        -- Aggro Warning settings section
+                        if imgui.CollapsingHeader('Warnings') then
+                            local AggroWarning = getAggroWarning()
+                            if AggroWarning then AggroWarning.drawSettings() end
+                        end
+                    end)
+                    if not extrasOk then
+                        imgui.TextColored(1, 0.3, 0.3, 1,
+                            'Options extras error: ' .. tostring(extrasErr))
                     end
 
                     imgui.EndTabItem()
@@ -1924,6 +1968,7 @@ end
 
 local function main()
     Core.load()
+    Logger.configure(Core.Settings)
 
     if _G.SIDEKICK_NEXT_CONFIG then
         _G.SIDEKICK_NEXT_CONFIG.DEBUG_SETTINGS = Core.Settings.SideKickDebugSettings == true
@@ -1937,6 +1982,12 @@ local function main()
             State.showAutostartPrompt = true
         end
     end
+
+    -- Humanize binds (/sk_humanize, /skboss, /skfullbore) register when the
+    -- module loads in the UI process. Require it here so coordinated mode gets
+    -- the binds deterministically instead of depending on which settings tab
+    -- first pulls the module in.
+    pcall(require, 'sidekick-next.humanize')
 
     ActorsCoordinator.init()
     getRezAccept()
@@ -1955,6 +2006,17 @@ local function main()
             if debugUi and debugUi.setRezTelemetry then
                 debugUi.setRezTelemetry(content)
             end
+            return true
+        end)
+        ActorsCoordinator.registerMessageCallback('pull:telemetry', function(content)
+            _G.SK_PULL_TELEMETRY = {
+                state = tostring(content.state or ''),
+                reason = tostring(content.reason or ''),
+                pullId = tonumber(content.pullId) or 0,
+                campSet = content.campSet == true,
+                ownsTarget = content.ownsTarget == true,
+                receivedAt = mq.gettime(),
+            }
             return true
         end)
     end
@@ -2262,6 +2324,28 @@ local function main()
     _bindCmd('/SideKick', handleSideKickCommand)
     _bindCmd('/sk', handleSideKickCommand)
 
+    -- Pull settings are written only by this primary UI process. Manual
+    -- movement requests are sent to the coordinated worker, which must acquire
+    -- target ownership before advancing from READY.
+    _bindCmd('/sk_pull', function(sub, arg, arg2)
+        local Pull = getPull()
+        if not Pull then return end
+        local command = tostring(sub or 'status'):lower()
+        if command == 'pulltarget' or command == 'clearignore' or command == 'camp' or command == 'status' then
+            local targetId = command == 'pulltarget' and (tonumber(mq.TLO.Target.ID()) or 0) or 0
+            local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_pull', 'pull:manual', {
+                command = command,
+                targetId = targetId,
+            })
+            if not sent then
+                mq.cmd('/echo \\ar[SK Pull]\\ax worker transport unavailable')
+            end
+            return
+        end
+        Pull.handleCommand(command, arg, arg2)
+        Core.forceSave()
+    end)
+
     -- Internal single-writer endpoint used by the standalone meditation
     -- worker. All main INI writes must execute in this UI Lua state.
     _bindCmd('/sk_next_set_meditation', function(rawMode)
@@ -2415,34 +2499,60 @@ local function main()
     _bindCmd('/skloglevel', function(level)
         level = tonumber(level)
         if level and level >= 1 and level <= 5 then
-            Logger.setLevel(level)
+            local saved, saveErr = Core.set('SideKickLogLevel', level, { save = true, source = 'command' })
+            if not saved then
+                print(string.format('\ar[SideKick Logging]\ax failed to save level: %s', tostring(saveErr)))
+                return
+            end
+            Logger.configure(Core.Settings)
             local names = { 'error', 'warn', 'info', 'debug', 'verbose' }
-            log.info('Log level set to %d (%s)', level, names[level] or '?')
+            print(string.format('\ag[SideKick Logging]\ax level=%d (%s), propagated to workers', level, names[level] or '?'))
         else
-            log.info('Usage: /skloglevel <1-5> (1=error 2=warn 3=info 4=debug 5=verbose) Current: %d', Logger.getLevel())
+            print(string.format('\ay[SideKick Logging]\ax Usage: /skloglevel <1-5> (1=error 2=warn 3=info 4=debug 5=verbose) Current: %d', Logger.getLevel()))
         end
     end)
 
     _bindCmd('/sklogfilter', function(...)
         local pattern = table.concat({ ... }, ' ')
         if pattern == '' or pattern == 'clear' then
-            Logger.setFilter(nil)
-            log.info('Log filter cleared')
+            local saved, saveErr = Core.set('SideKickLogFilter', '', { save = true, source = 'command' })
+            if not saved then
+                print(string.format('\ar[SideKick Logging]\ax failed to clear filter: %s', tostring(saveErr)))
+                return
+            end
+            Logger.configure(Core.Settings)
+            print('\ag[SideKick Logging]\ax filter cleared and propagated to workers')
         else
-            Logger.setFilter(pattern)
-            log.info('Log filter set: %s', pattern)
+            local saved, saveErr = Core.set('SideKickLogFilter', pattern, { save = true, source = 'command' })
+            if not saved then
+                print(string.format('\ar[SideKick Logging]\ax failed to save filter: %s', tostring(saveErr)))
+                return
+            end
+            Logger.configure(Core.Settings)
+            print(string.format('\ag[SideKick Logging]\ax filter="%s", propagated to workers', pattern))
         end
     end)
 
     _bindCmd('/sklogfile', function(toggle)
         if toggle == 'on' then
-            Logger.setFileLogging(true)
-            log.info('File logging enabled')
+            local saved, saveErr = Core.set('SideKickLogFile', true, { save = true, source = 'command' })
+            if not saved then
+                print(string.format('\ar[SideKick Logging]\ax failed to enable file logging: %s', tostring(saveErr)))
+                return
+            end
+            Logger.configure(Core.Settings)
+            print('\ag[SideKick Logging]\ax general file logging enabled for all workers')
         elseif toggle == 'off' then
-            Logger.setFileLogging(false)
-            log.info('File logging disabled')
+            local saved, saveErr = Core.set('SideKickLogFile', false, { save = true, source = 'command' })
+            if not saved then
+                print(string.format('\ar[SideKick Logging]\ax failed to disable file logging: %s', tostring(saveErr)))
+                return
+            end
+            Logger.configure(Core.Settings)
+            print('\ag[SideKick Logging]\ax general file logging disabled for all workers')
         else
-            log.info('Usage: /sklogfile on|off')
+            local cfg = Logger.getConfiguration()
+            print(string.format('\ay[SideKick Logging]\ax Usage: /sklogfile on|off (current=%s)', tostring(cfg.fileLogging)))
         end
     end)
 
@@ -2507,6 +2617,7 @@ local function main()
                 animItems = animItems,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
+                onActivate = queueItemActivation,
             }) end
         end
 

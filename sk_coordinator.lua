@@ -16,6 +16,9 @@ local debugLog = require('sidekick-next.utils.debug_log').module('sk_coordinator
 
 -- Internal state
 local State = {
+    coordinatorBootId = string.format('%s:%s:%d:%d',
+        tostring(lib.getMyServer() or ''), tostring(lib.getMyName() or ''),
+        os.time(), tonumber(lib.getTimeMs()) or 0),
     -- Monotonic counters
     tickId = 0,
     epoch = 0,
@@ -61,6 +64,17 @@ local State = {
     lastBroadcastAt = 0,
     lastEpochChangeAt = 0,
     pendingBroadcast = false,
+    stateSendAttempts = 0,
+    stateSendFailures = 0,
+    lastStateSendError = nil,
+    claimRequests = 0,
+    claimGrants = 0,
+    claimRejects = 0,
+    lastClaimModule = nil,
+    lastClaimId = nil,
+    lastClaimResult = nil,
+    lastClaimAtMs = 0,
+    seedBroadcastUntilMs = 0,
 
     -- Running flag
     running = true,
@@ -74,11 +88,14 @@ local State = {
     supervisorShutdownRequested = false,
     automationPaused = false,
     settingsRevision = 0,
+    humanizeOverride = 'auto',   -- 'auto' | 'boss' | 'off' (relayed UI -> workers)
 }
 
 -- Actor dropbox
 local dropbox = nil
 local mailboxDropboxes = {}
+local pendingActorMessages = {}
+local MAX_PENDING_ACTOR_MESSAGES = 2000
 local _teamSettingsRevision = nil
 local _teamSettings = {}
 
@@ -108,13 +125,15 @@ local function buildTeamTickSnapshot()
     end
 
     local action = nil
-    if State.castOwner then
-        local hb = State.moduleHeartbeats[State.castOwner.module]
-        local lifecycle = hb and hb.action or nil
-        local requested = State.castOwner.action or {}
+    local castOwner = State.castOwner
+    if type(castOwner) == 'table' then
+        local ownerModule = tostring(castOwner.module or '')
+        local hb = ownerModule ~= '' and State.moduleHeartbeats[ownerModule] or nil
+        local lifecycle = hb and type(hb.action) == 'table' and hb.action or nil
+        local requested = type(castOwner.action) == 'table' and castOwner.action or {}
         action = {
-            module = tostring(State.castOwner.module or ''),
-            claimId = tostring(State.castOwner.claimId or ''),
+            module = ownerModule,
+            claimId = tostring(castOwner.claimId or ''),
             kind = tostring((lifecycle and lifecycle.kind) or requested.kind or ''),
             name = tostring((lifecycle and lifecycle.name)
                 or requested.spellName or requested.itemName or requested.discName or requested.name or ''),
@@ -124,6 +143,8 @@ local function buildTeamTickSnapshot()
     end
 
     local settings = refreshTeamSettings()
+    local currentTarget = mq.TLO.Target
+    local currentTargetId = tonumber(lib.safeTLO(function() return currentTarget.ID() end, 0)) or 0
     return {
         zone = lib.getZone(),
         class = tostring(lib.safeTLO(function() return mq.TLO.Me.Class.ShortName() end, '') or ''),
@@ -134,12 +155,28 @@ local function buildTeamTickSnapshot()
         incapacitated = State.worldState.incapacitated == true,
         automationPaused = State.automationPaused == true,
         activePriority = State.activePriority,
+        targetId = currentTargetId,
+        targetType = currentTargetId > 0
+            and tostring(lib.safeTLO(function() return currentTarget.Type() end, '') or '') or '',
+        targetName = currentTargetId > 0
+            and tostring(lib.safeTLO(function() return currentTarget.CleanName() end, '') or '') or '',
         action = action,
         modules = modules,
     }
 end
 
+local _lastTeamTickAt = 0
+local TEAM_TICK_INTERVAL_MS = 250
+
 local function tickActorsTeam()
+    -- Presence data doesn't need the 50ms loop cadence, and the team tick is
+    -- TLO/lib-call heavy: group/raid discovery, identity reads, snapshot and
+    -- signature construction every call. 250ms keeps member staleness far
+    -- below the multi-second presence TTLs while cutting the cost 5x.
+    -- os.clock for the gate: it is free, while lib calls are not.
+    local now = os.clock() * 1000
+    if (now - _lastTeamTickAt) < TEAM_TICK_INTERVAL_MS then return end
+    _lastTeamTickAt = now
     ActorsTeam.tick(buildTeamTickSnapshot(), refreshTeamSettings())
 end
 
@@ -155,6 +192,47 @@ local function parseSenderScript(senderMailbox)
     return senderMailbox:match('^(.-):')
 end
 
+local MODULE_SCRIPT_FALLBACK = {}
+for _, scriptPath in ipairs((lib.Scripts and lib.Scripts.WORKERS) or {}) do
+    local moduleName = tostring(scriptPath):match('/sk_(.+)$')
+    if moduleName and moduleName ~= '' then
+        MODULE_SCRIPT_FALLBACK[moduleName] = scriptPath
+    end
+end
+-- The meditation worker keeps its historical coordinator module name.
+MODULE_SCRIPT_FALLBACK.next_meditation = MODULE_SCRIPT_FALLBACK.meditation
+
+local function resolveSenderScript(content, sender)
+    sender = type(sender) == 'table' and sender or {}
+    -- Prefer the canonical supervised-worker route: it is the exact name the
+    -- seed broadcast provably delivers on. Envelope-derived script names can
+    -- differ from the /lua run name, and a mismatched route silently starves
+    -- that worker of state the moment the seed window closes.
+    local moduleName = tostring(content and content.module or '')
+    local canonical = MODULE_SCRIPT_FALLBACK[moduleName]
+    if canonical then return canonical end
+
+    local senderScript = tostring(sender.script or '')
+    if senderScript ~= '' then return senderScript end
+
+    local parsed = parseSenderScript(sender.mailbox)
+    -- A shared mailbox such as "sk:hb" parses to "sk", which is not a Lua
+    -- script route.
+    if parsed and parsed:find('/', 1, true) then return parsed end
+    return parsed
+end
+
+-- Local identity snapshot, refreshed once per drain batch rather than read
+-- per message: lib.getMyName/getMyServer measure ~0.4ms per call in this
+-- process, and this predicate runs for every drained actor message.
+local _localIdentityName = ''
+local _localIdentityServer = ''
+
+local function refreshLocalIdentity()
+    _localIdentityName = tostring(lib.getMyName() or '')
+    _localIdentityServer = tostring(lib.getMyServer() or '')
+end
+
 local function isLocalModuleMessage(content)
     if type(content) ~= 'table' then return false end
     local ownerName = tostring(content.ownerName or '')
@@ -166,10 +244,11 @@ local function isLocalModuleMessage(content)
     if ownerName == '' or ownerServer == '' then
         return false
     end
-    if ownerName ~= '' and ownerName ~= tostring(lib.getMyName() or '') then
+    if _localIdentityName == '' then refreshLocalIdentity() end
+    if ownerName ~= _localIdentityName then
         return false
     end
-    if ownerServer ~= '' and ownerServer ~= tostring(lib.getMyServer() or '') then
+    if ownerServer ~= _localIdentityServer then
         return false
     end
     return true
@@ -255,7 +334,8 @@ end
 local function hasFreshHeartbeat(moduleName)
     local hb = State.moduleHeartbeats[moduleName]
     if not hb or not hb.receivedAtMs then return false end
-    return (lib.getTimeMs() - hb.receivedAtMs) <= lib.Timing.MODULE_CRASH_MS
+    return hb.ready ~= false
+        and (lib.getTimeMs() - hb.receivedAtMs) <= lib.Timing.MODULE_CRASH_MS
 end
 
 -------------------------------------------------------------------------------
@@ -466,14 +546,24 @@ end
 
 local function processClaim(content, sender)
     local now = lib.getTimeMs()
+    State.claimRequests = State.claimRequests + 1
+    State.lastClaimModule = tostring(content.module or '')
+    State.lastClaimId = tostring(content.claimId or '')
+    State.lastClaimAtMs = now
+    local function reject(reason)
+        State.claimRejects = State.claimRejects + 1
+        State.lastClaimResult = tostring(reason or 'rejected')
+        return false
+    end
     debugLog('processClaim: module=%s type=%s priority=%d epochSeen=%d currentEpoch=%d activePriority=%d',
-        content.module, content.type or 'nil', content.priority, content.epochSeen, State.epoch, State.activePriority)
+        tostring(content.module), tostring(content.type or 'nil'), tonumber(content.priority) or -1,
+        tonumber(content.epochSeen) or -1, State.epoch, State.activePriority)
 
     if State.worldState.selfDead or State.worldState.incapacitated or State.worldState.inGame == false then
         debugLog('CLAIM REJECTED: local character unavailable (%s)',
             tostring(State.worldState.incapacitationReason
                 or (State.worldState.selfDead and 'self_dead') or 'not_ingame'))
-        return false
+        return reject('local_character_unavailable')
     end
 
     -- Validate epochSeen (allow small drift from async message delivery)
@@ -486,7 +576,7 @@ local function processClaim(content, sender)
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (very stale epoch): %s saw %d, current %d',
             content.module, content.epochSeen, State.epoch)
         debugLog('CLAIM REJECTED: very stale epoch (saw=%d, current=%d, drift=%d)', content.epochSeen, State.epoch, epochDrift)
-        return false
+        return reject('stale_epoch')
     elseif epochDrift > 0 then
         debugLog('CLAIM epoch drift: module=%s saw=%d current=%d drift=%d (allowed)',
             content.module, content.epochSeen, State.epoch, epochDrift)
@@ -497,7 +587,7 @@ local function processClaim(content, sender)
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (wrong priority): %s has %d, active %d',
             content.module, content.priority, State.activePriority)
         debugLog('CLAIM REJECTED: wrong priority (has=%d, active=%d)', content.priority, State.activePriority)
-        return false
+        return reject('wrong_priority')
     end
 
     -- Determine what resources are requested
@@ -521,17 +611,17 @@ local function processClaim(content, sender)
     -- external/manual; workers must wait for that cast bar to clear.
     if wantsCast and State.castBusy and not State.castOwner then
         debugLog('CLAIM REJECTED: unowned/manual cast is active')
-        return false
+        return reject('manual_cast_busy')
     end
     if wantsTarget and not canGrantResource(State.targetOwner, content.priority) then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (target not available): %s', content.module)
         debugLog('CLAIM REJECTED: target not available (owner=%s)', State.targetOwner and State.targetOwner.module or 'nil')
-        return false
+        return reject('target_unavailable')
     end
     if wantsCast and not canGrantResource(State.castOwner, content.priority) then
         lib.log('debug', M.MODULE_NAME, 'Claim rejected (cast not available): %s', content.module)
         debugLog('CLAIM REJECTED: cast not available (owner=%s)', State.castOwner and State.castOwner.module or 'nil')
-        return false
+        return reject('cast_unavailable')
     end
     debugLog('processClaim: Resources available, granting claim')
 
@@ -575,6 +665,8 @@ local function processClaim(content, sender)
     debugLog('CLAIM GRANTED: module=%s type=%s claimId=%s epoch=%d ttlMs=%d',
         content.module, content.type or 'action', content.claimId, State.epoch, content.ttlMs or 0)
 
+    State.claimGrants = State.claimGrants + 1
+    State.lastClaimResult = 'granted'
     State.pendingBroadcast = true
     return true
 end
@@ -688,7 +780,8 @@ local function buildStatePayload()
         local hb = State.moduleHeartbeats[moduleName]
         local need = State.moduleNeeds[moduleName]
         local heartbeatAge = hb and (now - (hb.receivedAtMs or 0)) or 0
-        local heartbeatFresh = hb ~= nil and heartbeatAge <= lib.Timing.MODULE_CRASH_MS
+        local heartbeatFresh = hb ~= nil and hb.ready ~= false
+            and heartbeatAge <= lib.Timing.MODULE_CRASH_MS
         local needValid = false
         local needAge = 0
         if need then
@@ -711,6 +804,7 @@ local function buildStatePayload()
     end
 
     return {
+        coordinatorBootId = State.coordinatorBootId,
         tickId = State.tickId,
         epoch = State.epoch,
         ownerName = lib.getMyName(),
@@ -726,6 +820,7 @@ local function buildStatePayload()
         team = ActorsTeam.getSnapshot(),
         automationPaused = State.automationPaused == true,
         settingsRevision = tonumber(State.settingsRevision) or 0,
+        humanizeOverride = tostring(State.humanizeOverride or 'auto'),
     }
 end
 
@@ -735,41 +830,52 @@ local function broadcastState()
     State.tickId = State.tickId + 1
     local payload = buildStatePayload()
 
+    -- moduleDiag is UI-dashboard data only — no worker reads it, and it is
+    -- the bulk of the payload. Stripping it from worker sends cuts the
+    -- per-send actors serialization cost, which dominates broadcast time.
+    local workerPayload = {}
+    for k, v in pairs(payload) do
+        if k ~= 'moduleDiag' then workerPayload[k] = v end
+    end
+
     local sent = {}
     local heartbeatCount = 0
     for _ in pairs(State.moduleHeartbeats) do heartbeatCount = heartbeatCount + 1 end
     debugLog('broadcastState: tickId=%d epoch=%d priority=%d heartbeatCount=%d',
         State.tickId, State.epoch, State.activePriority, heartbeatCount)
 
-    local function sendToScript(scriptName)
-        if not scriptName or scriptName == '' then return end
-        if sent[scriptName] then return end
-        sent[scriptName] = true
-        debugLog('broadcastState: Sending to script=%s', scriptName)
-        pcall(function()
-            dropbox:send({ mailbox = lib.Mailbox.STATE, script = scriptName }, payload)
-        end)
-    end
-
-    local function sendToMailbox(mailbox)
-        if not mailbox or mailbox == '' then return end
-        if sent[mailbox] then return end
-        sent[mailbox] = true
-        pcall(function()
-            dropbox:send({ mailbox = mailbox, absolute_mailbox = true }, payload)
-        end)
-    end
-
-    for _, hb in pairs(State.moduleHeartbeats) do
-        if hb then
-            if hb.script then
-                sendToScript(hb.script)
-            elseif hb.mailbox then
-                sendToMailbox(hb.mailbox)
-            end
+    local function send(address, key, description, body)
+        if sent[key] then return true end
+        sent[key] = true
+        State.stateSendAttempts = State.stateSendAttempts + 1
+        local ok, result = pcall(function() return dropbox:send(address, body or payload) end)
+        if not ok or result == false then
+            State.stateSendFailures = State.stateSendFailures + 1
+            State.lastStateSendError = string.format('%s: %s', description, tostring(result))
+            debugLog('broadcastState: send failed %s', State.lastStateSendError)
+            return false
         end
+        return true
     end
 
+    local function sendToScript(scriptName, body)
+        if not scriptName or scriptName == '' then return false end
+        debugLog('broadcastState: Sending to script=%s', scriptName)
+        return send({ mailbox = lib.Mailbox.STATE, script = scriptName,
+            character = lib.localCharacter() },
+            'script:' .. scriptName, 'script=' .. scriptName, body)
+    end
+
+    local function sendToMailbox(mailbox, body)
+        if not mailbox or mailbox == '' then return false end
+        return send({ mailbox = mailbox, absolute_mailbox = true },
+            'mailbox:' .. mailbox, 'mailbox=' .. mailbox, body)
+    end
+
+    -- UI first, with the FULL payload: worker sends are slim (no moduleDiag)
+    -- and the sent-key dedupe means whoever reaches a script first wins — the
+    -- UI process must not lose dashboard data to a worker module that happens
+    -- to share its script (spell_memorize).
     if lib.Scripts and lib.Scripts.UI then
         if type(lib.Scripts.UI) == 'table' then
             for _, scriptName in ipairs(lib.Scripts.UI) do
@@ -777,6 +883,44 @@ local function broadcastState()
             end
         else
             sendToScript(lib.Scripts.UI)
+        end
+    end
+
+    -- Bootstrap after coordinator startup without waiting on the reverse
+    -- heartbeat route. This lets still-running workers receive fresh state
+    -- immediately after coordinator recovery; the sent-key map avoids sending
+    -- twice to workers already discovered by heartbeat.
+    if lib.getTimeMs() <= (tonumber(State.seedBroadcastUntilMs) or 0) then
+        for _, scriptName in ipairs((lib.Scripts and lib.Scripts.WORKERS) or {}) do
+            sendToScript(scriptName, workerPayload)
+        end
+    end
+
+    -- Actors sends cost ~1ms+ apiece on this client, so the send count is the
+    -- broadcast budget. Modules that are active (needing action or owning a
+    -- resource) get every broadcast; idle modules only need state fresh
+    -- enough to keep hasValidState() alive (TTL 5000ms), so they get a 2s
+    -- cadence.
+    local sendNowMs = lib.getTimeMs()
+    State.lastWorkerStateSendAt = State.lastWorkerStateSendAt or {}
+    for moduleName, hb in pairs(State.moduleHeartbeats) do
+        if hb then
+            local need = State.moduleNeeds[moduleName]
+            local active = (need and need.needsAction == true)
+                or (State.castOwner and State.castOwner.module == moduleName)
+                or (State.targetOwner and State.targetOwner.module == moduleName)
+            local lastAt = State.lastWorkerStateSendAt[moduleName] or 0
+            if active or (sendNowMs - lastAt) >= 2000 then
+                State.lastWorkerStateSendAt[moduleName] = sendNowMs
+                if hb.script then
+                    -- Every worker registers the script-scoped state mailbox.
+                    -- This route is independent of the module's logical name
+                    -- and is the canonical coordinator snapshot channel.
+                    sendToScript(hb.script, workerPayload)
+                elseif hb.mailbox then
+                    sendToMailbox(hb.mailbox, workerPayload)
+                end
+            end
         end
     end
 
@@ -791,14 +935,16 @@ local _pendingReload = nil  -- { module, script, restartAtMs } — deferred relo
 local _wasInGame = true
 
 --- Reset restart counter for a module when it sends a fresh heartbeat
---- (called from onMessage heartbeat handler)
-local function onModuleHeartbeatReceived(scriptPath)
+--- (called from the drained heartbeat message handler)
+local RESTART_STABLE_MS = lib.Timing.RESTART_STABLE_MS
+
+local function onModuleHeartbeatReceived(scriptPath, nowMs)
     local tracker = scriptPath and _restartTracker[scriptPath] or nil
     if not tracker then return end
-    local now = lib.getTimeMs()
+    local now = nowMs or lib.getTimeMs()
     tracker.gaveUp = false
     tracker.stableSinceMs = tracker.stableSinceMs or now
-    if (now - tracker.stableSinceMs) >= lib.Timing.RESTART_STABLE_MS then
+    if (now - tracker.stableSinceMs) >= RESTART_STABLE_MS then
         tracker.count = 0
         tracker.stableSinceMs = now
     end
@@ -808,13 +954,12 @@ end
 -- Message Handlers
 -------------------------------------------------------------------------------
 
-local function onMessage(message)
-    local content = message()
+local function processMessage(content, sender, nowMs)
     if type(content) ~= 'table' then return end
-
-    local sender = message.sender or {}
+    nowMs = nowMs or lib.getTimeMs()
+    sender = type(sender) == 'table' and sender or {}
     local mailbox = sender.mailbox or ''
-    local senderScript = parseSenderScript(mailbox)
+    local senderScript = resolveSenderScript(content, sender)
     local msgType = content.msgType
 
     if not msgType then
@@ -839,14 +984,18 @@ local function onMessage(message)
         -- an older SideKick session replace the current supervisor session.
         if sentAtMs < State.supervisorLastSentAt then return end
         State.supervisorSeen = true
-        State.supervisorLastSeenAt = lib.getTimeMs()
+        State.supervisorLastSeenAt = nowMs
         State.supervisorLastSentAt = sentAtMs
         State.supervisorSessionId = content.sessionId
         local nextPaused = content.automationPaused == true
         local nextRevision = tonumber(content.settingsRevision) or 0
-        if State.automationPaused ~= nextPaused or State.settingsRevision ~= nextRevision then
+        local nextOverride = tostring(content.humanizeOverride or 'auto')
+        if State.automationPaused ~= nextPaused
+            or State.settingsRevision ~= nextRevision
+            or State.humanizeOverride ~= nextOverride then
             State.automationPaused = nextPaused
             State.settingsRevision = nextRevision
+            State.humanizeOverride = nextOverride
             State.pendingBroadcast = true
         end
     elseif msgType == 'supervisor_shutdown' then
@@ -878,7 +1027,7 @@ local function onMessage(message)
             debugLog('HEARTBEAT received: module=%s script=%s mailbox=%s',
                 tostring(content.module), tostring(senderScript), tostring(mailbox))
             State.moduleHeartbeats[content.module] = {
-                receivedAtMs = lib.getTimeMs(),  -- Use coordinator-local time for staleness (not sender time)
+                receivedAtMs = nowMs,  -- Use coordinator-local time for staleness (not sender time)
                 sentAtMs = content.sentAtMs,      -- Keep sender time for diagnostics only
                 ready = content.ready ~= false,
                 action = type(content.action) == 'table' and content.action or nil,
@@ -889,7 +1038,7 @@ local function onMessage(message)
                 State.moduleScripts[content.module] = senderScript
             end
             -- Reset restart counter — module is alive
-            onModuleHeartbeatReceived(senderScript)
+            onModuleHeartbeatReceived(senderScript, nowMs)
         end
     elseif msgType == 'need' then
         if not isLocalModuleMessage(content) then return end
@@ -900,7 +1049,7 @@ local function onMessage(message)
                 priority = content.priority,
                 needsAction = content.needsAction,
                 ttlMs = content.ttlMs or 250,
-                receivedAtMs = lib.getTimeMs(),
+                receivedAtMs = nowMs,
                 reason = content.reason,
             }
             debugLog('NEED received: module=%s priority=%d needsAction=%s ttlMs=%d reason=%s',
@@ -1043,6 +1192,102 @@ local function checkModuleHealth()
     end
 end
 
+-- Latest queued entry per coalescing key (heartbeat/need per module+owner).
+local pendingLatestByKey = {}
+
+-- Heartbeats and needs are last-write-wins per module: replace any queued copy
+-- in place instead of appending. Without this, one slow tick queues thousands
+-- of redundant copies and the next drain takes even longer — a self-sustaining
+-- backlog (observed: drain ratcheting 0.8s → 6.4s pinned at the queue cap).
+local COALESCE_TYPES = { heartbeat = true, need = true }
+
+local function enqueueActorMessage(message)
+    local content = message()
+    if type(content) ~= 'table' then return end
+    -- One-shot probe: is a delivered content table a plain Lua table with
+    -- cheap field access, or does each access pay a deserialization tax?
+    if not State.contentProbeDone then
+        State.contentProbeDone = true
+        local t0 = os.clock()
+        local fieldCount = 0
+        for _ in pairs(content) do fieldCount = fieldCount + 1 end
+        local t1 = os.clock()
+        for k in pairs(content) do local _ = content[k] end
+        local t2 = os.clock()
+        printf('\ay[SK-Coordinator]\ax contentProbe: type=%s fields=%d pairsMs=%.3f rereadMs=%.3f',
+            tostring(content.msgType), fieldCount, (t1 - t0) * 1000, (t2 - t1) * 1000)
+    end
+    local sender = message.sender or {}
+    local senderCopy = {
+        mailbox = tostring(sender.mailbox or ''),
+        script = tostring(sender.script or ''),
+        character = tostring(sender.character or ''),
+        server = tostring(sender.server or ''),
+    }
+
+    local msgType = tostring(content.msgType or '?')
+    State.enqueueTypeCounts = State.enqueueTypeCounts or {}
+    State.enqueueTypeCounts[msgType] = (State.enqueueTypeCounts[msgType] or 0) + 1
+
+    local entry = { content = content, sender = senderCopy }
+    if COALESCE_TYPES[msgType] and content.module ~= nil then
+        local key = string.format('%s|%s|%s|%s', msgType, tostring(content.module),
+            tostring(content.ownerName or ''), tostring(content.ownerServer or ''))
+        local existing = pendingLatestByKey[key]
+        if existing then
+            existing.content = content
+            existing.sender = senderCopy
+            return
+        end
+        entry.key = key
+        pendingLatestByKey[key] = entry
+    end
+
+    if #pendingActorMessages >= MAX_PENDING_ACTOR_MESSAGES then
+        local dropped = table.remove(pendingActorMessages, 1)
+        if dropped and dropped.key then pendingLatestByKey[dropped.key] = nil end
+    end
+    pendingActorMessages[#pendingActorMessages + 1] = entry
+end
+
+local function drainActorMessages()
+    if #pendingActorMessages == 0 then return end
+    local pending = pendingActorMessages
+    pendingActorMessages = {}
+    pendingLatestByKey = {}
+    State.lastDrainCount = #pending
+    refreshLocalIdentity()
+    -- One timestamp per batch: calls into lib cost ~0.4ms+ apiece in this
+    -- process (MQ turbo slicing tax), so per-message reads are the enemy.
+    local typeMs = {}
+    local batchNowMs = lib.getTimeMs()
+    local maxMs, maxType = 0, '-'
+    for _, entry in ipairs(pending) do
+        local t0 = os.clock()
+        processMessage(entry.content, entry.sender, batchNowMs)
+        local dt = (os.clock() - t0) * 1000
+        local mt = tostring(entry.content.msgType or entry.sender.mailbox or '?')
+        typeMs[mt] = (typeMs[mt] or 0) + dt
+        if dt > maxMs then maxMs, maxType = dt, mt end
+    end
+    State.lastDrainTypeMs = typeMs
+    State.lastDrainMaxMs = maxMs
+    State.lastDrainMaxType = maxType
+end
+
+-- Phase timing: record how long each named section of tick() takes so a slow
+-- tick names its culprit instead of just its total.
+local function timedPhase(name, fn, ...)
+    local t0 = lib.getTimeMs()
+    local a, b, c = fn(...)
+    local dt = lib.getTimeMs() - t0
+    State.phaseMs = State.phaseMs or {}
+    State.phaseMaxMs = State.phaseMaxMs or {}
+    State.phaseMs[name] = dt
+    if dt > (State.phaseMaxMs[name] or 0) then State.phaseMaxMs[name] = dt end
+    return a, b, c
+end
+
 -------------------------------------------------------------------------------
 -- Main Loop
 -------------------------------------------------------------------------------
@@ -1051,15 +1296,16 @@ local function initialize()
     lib.log('info', M.MODULE_NAME, 'Initializing Coordinator v%s', lib.VERSION)
 
     -- Register actor
-    dropbox = actors.register(M.MODULE_NAME, onMessage)
+    dropbox = actors.register(M.MODULE_NAME, enqueueActorMessage)
 
     -- Also listen on specific mailboxes
-    mailboxDropboxes.claim = actors.register(lib.Mailbox.CLAIM, onMessage)
-    mailboxDropboxes.release = actors.register(lib.Mailbox.RELEASE, onMessage)
-    mailboxDropboxes.interrupt = actors.register(lib.Mailbox.INTERRUPT, onMessage)
-    mailboxDropboxes.heartbeat = actors.register(lib.Mailbox.HEARTBEAT, onMessage)
-    mailboxDropboxes.need = actors.register(lib.Mailbox.NEED, onMessage)
-    mailboxDropboxes.supervisor = actors.register(lib.Mailbox.SUPERVISOR, onMessage)
+    mailboxDropboxes.claim = actors.register(lib.Mailbox.CLAIM, enqueueActorMessage)
+    mailboxDropboxes.release = actors.register(lib.Mailbox.RELEASE, enqueueActorMessage)
+    mailboxDropboxes.interrupt = actors.register(lib.Mailbox.INTERRUPT, enqueueActorMessage)
+    mailboxDropboxes.heartbeat = actors.register(lib.Mailbox.HEARTBEAT, enqueueActorMessage)
+    mailboxDropboxes.need = actors.register(lib.Mailbox.NEED, enqueueActorMessage)
+    mailboxDropboxes.supervisor = actors.register(lib.Mailbox.SUPERVISOR, enqueueActorMessage)
+    State.seedBroadcastUntilMs = lib.getTimeMs() + lib.Timing.STATE_TTL_MS
     ActorsTeam.init()
     refreshTeamSettings()
 
@@ -1070,8 +1316,45 @@ local function initialize()
 end
 
 local _lastStatusLog = 0
+local _lastCoordinatorTickAt = lib.getTimeMs()
+
+local function rebaseSchedulerPause(gapMs)
+    if gapMs <= lib.Timing.STATE_TTL_MS then return end
+    if State.supervisorSeen then
+        State.supervisorLastSeenAt = State.supervisorLastSeenAt + gapMs
+    end
+    for _, heartbeat in pairs(State.moduleHeartbeats) do
+        if heartbeat and heartbeat.receivedAtMs then
+            heartbeat.receivedAtMs = heartbeat.receivedAtMs + gapMs
+        end
+    end
+    for _, need in pairs(State.moduleNeeds) do
+        if need and need.receivedAtMs then
+            need.receivedAtMs = need.receivedAtMs + gapMs
+        end
+    end
+    local function rebaseOwner(owner)
+        if not owner then return end
+        if owner.claimedAtMs then owner.claimedAtMs = owner.claimedAtMs + gapMs end
+        if owner.castStartedAtMs then owner.castStartedAtMs = owner.castStartedAtMs + gapMs end
+        if owner.castStartDeadlineMs then owner.castStartDeadlineMs = owner.castStartDeadlineMs + gapMs end
+    end
+    rebaseOwner(State.castOwner)
+    rebaseOwner(State.targetOwner)
+    _lastWatchdogCheck = _lastWatchdogCheck + gapMs
+    State.pendingBroadcast = true
+    debugLog('SCHEDULER: resumed after %dms; rebased live leases and presence timestamps', gapMs)
+end
 
 local function tick()
+    local loopNow = lib.getTimeMs()
+    local loopGap = loopNow - _lastCoordinatorTickAt
+    _lastCoordinatorTickAt = loopNow
+    rebaseSchedulerPause(loopGap)
+    -- Actor callbacks are non-yieldable and may run between normal coordinator
+    -- operations. Apply every state mutation here so a snapshot cannot observe
+    -- half of a claim/release transition.
+    timedPhase('drain', drainActorMessages)
     local now = lib.getTimeMs()
 
     -- An explicit shutdown remains authoritative even if it arrives during a
@@ -1191,8 +1474,13 @@ local function tick()
             end)())
     end
 
-    -- Update world state
-    updateWorldState()
+    -- Update world state. TLO-heavy (~30 reads); the safety gates it feeds
+    -- (self-dead, incapacitation, cast-busy) tolerate 150ms staleness, so
+    -- don't pay for it on every 50ms loop.
+    if (now - (State.lastWorldStateAt or 0)) >= 150 then
+        State.lastWorldStateAt = now
+        timedPhase('world', updateWorldState)
+    end
 
     if clearOwnersForSelfDead() then
         State.epoch = State.epoch + 1
@@ -1205,7 +1493,7 @@ local function tick()
     end
 
     -- Compute active priority
-    local newPriority = computeActivePriority()
+    local newPriority = timedPhase('priority', computeActivePriority)
     if newPriority ~= State.activePriority then
         debugLog('Priority CHANGE: %d -> %d (castBusy=%s, castOwner=%s)',
             State.activePriority, newPriority,
@@ -1225,11 +1513,11 @@ local function tick()
     end
 
     -- Watchdog: check for crashed modules
-    checkModuleHealth()
+    timedPhase('health', checkModuleHealth)
 
     -- Cross-character team presence is advanced from the coordinator coroutine.
     -- Its Actor callback only enqueues packets and never reads TLOs or yields.
-    tickActorsTeam()
+    timedPhase('team', tickActorsTeam)
 
     -- Broadcast state
     local timeSinceBroadcast = now - State.lastBroadcastAt
@@ -1244,7 +1532,7 @@ local function tick()
     end
 
     if shouldBroadcast then
-        broadcastState()
+        timedPhase('broadcast', broadcastState)
         if State.pendingBroadcast then
             State.lastEpochChangeAt = now
         end
@@ -1254,8 +1542,41 @@ end
 local function mainLoop()
     initialize()
 
+    local lastWakeAt = lib.getTimeMs()
     while State.running do
+        local tickStartAt = lib.getTimeMs()
+        -- Gap between wakeups minus our own tick cost = scheduler/frame lag.
+        -- mq.delay resumes on frame boundaries, so low game FPS stretches
+        -- every script's cadence; this separates "our tick is slow" from
+        -- "the frame loop is slow".
+        State.loopGapMs = tickStartAt - lastWakeAt
         tick()
+        local tickDur = lib.getTimeMs() - tickStartAt
+        State.lastTickMs = tickDur
+        if tickDur > (State.maxTickMs or 0) then State.maxTickMs = tickDur end
+        State.slowTickCount = tickDur > 500 and (State.slowTickCount or 0) + 1
+            or (State.slowTickCount or 0)
+        -- Console warning only for genuinely pathological ticks. Routine
+        -- 500-800ms ticks are turbo frame-slicing spreading the tick across
+        -- game frames, not a fault; the per-phase numbers stay available via
+        -- /sk_coord status (lastTickMs / maxTickMs / phaseMax / slowTicks).
+        if tickDur > 2000 then
+            local parts = {}
+            for name, ms in pairs(State.phaseMs or {}) do
+                if ms >= 50 then parts[#parts + 1] = string.format('%s=%dms', name, ms) end
+            end
+            table.sort(parts)
+            local typeParts = {}
+            for mt, ms in pairs(State.lastDrainTypeMs or {}) do
+                if ms >= 25 then typeParts[#typeParts + 1] = string.format('%s=%dms', mt, ms) end
+            end
+            table.sort(typeParts)
+            printf('\ar[SK-Coordinator]\ax SLOW TICK: %dms (loop gap %dms) drained=%d %s [drainTypes: %s] maxMsg=%s:%.1fms',
+                tickDur, State.loopGapMs or 0, tonumber(State.lastDrainCount) or 0,
+                table.concat(parts, ' '), table.concat(typeParts, ' '),
+                tostring(State.lastDrainMaxType or '-'), tonumber(State.lastDrainMaxMs) or 0)
+        end
+        lastWakeAt = lib.getTimeMs()
         mq.delay(lib.Timing.COORDINATOR_TICK_MS)
     end
 
@@ -1272,14 +1593,133 @@ mq.bind('/sk_coord', function(cmd, arg1)
             State.epoch, State.activePriority,
             State.castOwner and State.castOwner.module or 'nil',
             State.targetOwner and State.targetOwner.module or 'nil')
+        printf('\ay[SK-Coordinator]\ax tick=%d broadcastAge=%dms sends=%d failures=%d lastError=%s',
+            tonumber(State.tickId) or 0, lib.getTimeMs() - (tonumber(State.lastBroadcastAt) or 0),
+            tonumber(State.stateSendAttempts) or 0, tonumber(State.stateSendFailures) or 0,
+            tostring(State.lastStateSendError or '-'))
+        printf('\ay[SK-Coordinator]\ax lastTickMs=%d maxTickMs=%d loopGapMs=%d (target %dms) slowTicks=%d',
+            tonumber(State.lastTickMs) or 0, tonumber(State.maxTickMs) or 0,
+            tonumber(State.loopGapMs) or 0, lib.Timing.COORDINATOR_TICK_MS,
+            tonumber(State.slowTickCount) or 0)
+        local phaseParts = {}
+        for name, ms in pairs(State.phaseMaxMs or {}) do
+            phaseParts[#phaseParts + 1] = string.format('%s=%dms', name, ms)
+        end
+        table.sort(phaseParts)
+        printf('\ay[SK-Coordinator]\ax phaseMax: %s',
+            #phaseParts > 0 and table.concat(phaseParts, ' ') or '-')
+        local typeParts = {}
+        for msgType, count in pairs(State.enqueueTypeCounts or {}) do
+            typeParts[#typeParts + 1] = string.format('%s=%d', msgType, count)
+        end
+        table.sort(typeParts)
+        printf('\ay[SK-Coordinator]\ax msgTotals: %s',
+            #typeParts > 0 and table.concat(typeParts, ' ') or '-')
+        printf('\ay[SK-Coordinator]\ax boot=%s', tostring(State.coordinatorBootId or '-'))
+        printf('\ay[SK-Coordinator]\ax claims received=%d granted=%d rejected=%d last=%s:%s id=%s age=%dms',
+            tonumber(State.claimRequests) or 0, tonumber(State.claimGrants) or 0,
+            tonumber(State.claimRejects) or 0, tostring(State.lastClaimModule or '-'),
+            tostring(State.lastClaimResult or '-'), tostring(State.lastClaimId or '-'),
+            State.lastClaimAtMs > 0 and math.max(0, lib.getTimeMs() - State.lastClaimAtMs) or 0)
+        local nowMs = lib.getTimeMs()
+        for moduleName, hb in pairs(State.moduleHeartbeats) do
+            printf('  \at%s\ax route=%s hbAge=%dms ready=%s',
+                tostring(moduleName), tostring(hb.script or hb.mailbox or '-'),
+                math.max(0, nowMs - (tonumber(hb.receivedAtMs) or 0)), tostring(hb.ready))
+        end
+    elseif cmd == 'bench' then
+        -- Micro-benchmark of the primitives the hot paths lean on, so per-op
+        -- costs come from data instead of inference. os.clock is the timing
+        -- reference (C runtime, no MQ involvement).
+        local function benchOp(label, n, fn)
+            local t0 = os.clock()
+            for _ = 1, n do fn() end
+            local perMs = (os.clock() - t0) * 1000 / n
+            printf('\ay[SK-Bench]\ax %-24s %.3f ms/op (n=%d)', label, perMs, n)
+        end
+        benchOp('os.clock', 10000, function() return os.clock() end)
+        benchOp('mq.gettime', 1000, function() return mq.gettime() end)
+        benchOp('TLO Me.CleanName', 200, function() return mq.TLO.Me.CleanName() end)
+        benchOp('TLO SpawnCount(npc)', 20, function() return mq.TLO.SpawnCount('npc')() end)
+        benchOp('actors send (small)', 20, function()
+            if dropbox then
+                dropbox:send({ mailbox = lib.Mailbox.STATE,
+                    script = lib.Scripts.COORDINATOR,
+                    character = lib.localCharacter() }, { msgType = 'bench' })
+            end
+        end)
+        local hbContent = { msgType = 'heartbeat', module = 'tank',
+            ownerName = lib.getMyName(), ownerServer = lib.getMyServer(),
+            sentAtMs = lib.getTimeMs(), ready = true }
+        local hbSender = { mailbox = 'sk:hb', script = 'sidekick-next/sk_tank',
+            character = '', server = '' }
+        benchOp('processMessage(hb)', 100, function()
+            processMessage(hbContent, hbSender)
+        end)
+        benchOp('isLocalModuleMessage', 1000, function()
+            return isLocalModuleMessage(hbContent)
+        end)
+        benchOp('resolveSenderScript', 1000, function()
+            return resolveSenderScript(hbContent, hbSender)
+        end)
+        benchOp('debugLog(suppressed)', 500, function()
+            debugLog('bench %s %s %s', 'a', 'b', 'c')
+        end)
+        benchOp('lib.log(debug)', 500, function()
+            lib.log('debug', 'bench', 'x %s', 'y')
+        end)
+        printf('\ay[SK-Bench]\ax gettime=%s name=%s server=%s heapKB=%d',
+            tostring(mq.gettime()), tostring(lib.getMyName()),
+            tostring(lib.getMyServer()), math.floor(collectgarbage('count')))
+        local stats = lib._identityStats or { hits = -1, misses = -1 }
+        local hitsBefore, missesBefore = stats.hits, stats.misses
+        benchOp('lib.getMyName', 1000, function() return lib.getMyName() end)
+        benchOp('lib.getMyServer', 1000, function() return lib.getMyServer() end)
+        printf('\ay[SK-Bench]\ax identity memo (getMyName x1000): +%d hits, +%d misses',
+            (stats.hits or 0) - (hitsBefore or 0), (stats.misses or 0) - (missesBefore or 0))
+        local nameInfo = debug.getinfo(lib.getMyName, 'S')
+        printf('\ay[SK-Bench]\ax getMyName defined at %s:%d',
+            tostring(nameInfo and nameInfo.source or '?'),
+            tonumber(nameInfo and nameInfo.linedefined) or -1)
+        local replicaName = 'Bench'
+        local replicaAt = mq.gettime()
+        local function memoReplica()
+            local now = mq.gettime()
+            if replicaName ~= '' and (now - replicaAt) < 5000 then return replicaName end
+            return replicaName
+        end
+        benchOp('memoReplica(pureLua)', 1000, memoReplica)
+        collectgarbage('stop')
+        benchOp('processMessage(hb) gc-off', 100, function()
+            processMessage(hbContent, hbSender)
+        end)
+        benchOp('isLocalModuleMsg gc-off', 1000, function()
+            return isLocalModuleMessage(hbContent)
+        end)
+        collectgarbage('restart')
     elseif cmd == 'team' then
         local team = ActorsTeam.getSnapshot()
+        local stats = team.stats or {}
         printf('\ay[SK-Team]\ax enabled=%s ready=%s mode=%s team=%s leader=%s members=%d peers=%d reason=%s',
             tostring(team.enabled), tostring(team.ready), tostring(team.mode),
             tostring(team.label ~= '' and team.label or team.teamId),
             tostring(team.leader ~= '' and team.leader or '-'),
             tonumber(team.memberCount) or 0, tonumber(team.peerCount) or 0,
             tostring(team.reason or '-'))
+        printf('\ay[SK-Team]\ax packets sent=%d received=%d dropped=%d pruned=%d overflow=%d error=%s',
+            tonumber(stats.sent) or 0, tonumber(stats.received) or 0,
+            tonumber(stats.dropped) or 0, tonumber(stats.pruned) or 0,
+            tonumber(stats.queueOverflow) or 0, tostring(team.lastError or '-'))
+        printf('\ay[SK-Team]\ax lastDrop=%s droppedTeam=%s localTeam=%s',
+            tostring(stats.lastDropReason ~= '' and stats.lastDropReason or '-'),
+            tostring(stats.lastDroppedTeamId ~= '' and stats.lastDroppedTeamId or '-'),
+            tostring(team.teamId or '-'))
+        for _, member in ipairs(team.members or {}) do
+            printf('  \at%s\ax server=%s zone=%s self=%s age=%dms dead=%s',
+                tostring(member.character or '-'), tostring(member.server or '-'),
+                tostring(member.zone or '-'), tostring(member.self == true),
+                tonumber(member.ageMs) or 0, tostring(member.dead == true))
+        end
     elseif cmd == 'reload' then
         -- Reload a module by name: /sk_coord reload <modulename>
         if not arg1 or arg1 == '' then

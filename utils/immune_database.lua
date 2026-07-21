@@ -48,11 +48,12 @@ function M.loadDatabase()
     file:close()
 
     if content and content ~= '' then
-        local data = SafeLoad.tableLiteral(content, path)
+        local data, err = SafeLoad.tableLiteral(content, path)
         if type(data) == 'table' then
             M.database = data
             return
         end
+        print(string.format('\ar[ImmuneDatabase]\ax load failed: %s', tostring(err or 'invalid data')))
     end
 
     M.database = {}

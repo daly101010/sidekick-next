@@ -37,6 +37,74 @@ local function fileExists(path)
     return false
 end
 
+local function readAll(path)
+    local f, err = io.open(path, 'r')
+    if not f then return nil, err end
+    local content = f:read('*all')
+    f:close()
+    return content
+end
+
+-- Serialize to a sibling staging file, validate the serialized table, then
+-- promote it. The previous live file remains as .bak so load() can recover if
+-- the client or machine exits between the two same-directory renames.
+local function atomicPickle(path, data)
+    local stagePath = path .. '.stage'
+    local backupPath = path .. '.bak'
+    os.remove(stagePath)
+
+    local ok, err = pcall(mq.pickle, stagePath, data)
+    if not ok then
+        os.remove(stagePath)
+        return false, 'stage_write_failed: ' .. tostring(err)
+    end
+
+    local staged, readErr = readAll(stagePath)
+    if not staged then
+        os.remove(stagePath)
+        return false, 'stage_read_failed: ' .. tostring(readErr)
+    end
+    local parsed, parseErr = SafeLoad.tableLiteral(staged, stagePath)
+    if type(parsed) ~= 'table' or type(parsed.sets) ~= 'table' then
+        os.remove(stagePath)
+        return false, 'stage_validation_failed: ' .. tostring(parseErr or 'missing sets table')
+    end
+
+    local hadLive = fileExists(path)
+    if hadLive then
+        if fileExists(backupPath) then
+            local removed, removeErr = os.remove(backupPath)
+            if not removed then
+                os.remove(stagePath)
+                return false, 'backup_remove_failed: ' .. tostring(removeErr)
+            end
+        end
+        local backedUp, backupErr = os.rename(path, backupPath)
+        if not backedUp then
+            os.remove(stagePath)
+            return false, 'backup_promote_failed: ' .. tostring(backupErr)
+        end
+    end
+
+    local promoted, promoteErr = os.rename(stagePath, path)
+    if not promoted then
+        if hadLive then os.rename(backupPath, path) end
+        os.remove(stagePath)
+        return false, 'stage_promote_failed: ' .. tostring(promoteErr)
+    end
+
+    local installed, installedReadErr = readAll(path)
+    local installedData, installedErr
+    if installed then installedData, installedErr = SafeLoad.tableLiteral(installed, path) end
+    if type(installedData) ~= 'table' or type(installedData.sets) ~= 'table' then
+        os.remove(path)
+        if hadLive then os.rename(backupPath, path) end
+        return false, 'installed_validation_failed: ' .. tostring(installedErr or installedReadErr or 'missing sets table')
+    end
+
+    return true
+end
+
 local function countSets(t)
     local n = 0
     for _ in pairs(t or {}) do n = n + 1 end
@@ -203,7 +271,7 @@ end
 --- Save all spell sets to disk
 --- Creates data table with version=3, activeSet, sets
 --- For each spell set, serializes gems, oocBuffs, and per-spell profiles
---- Uses mq.pickle(path, data) to write
+--- Uses a validated staging file and retains the previous file as .bak
 function M.save()
     local path = M.getConfigPath()
     if not path or M.pathError then
@@ -301,26 +369,7 @@ function M.save()
         data.sets[name] = setData
     end
 
-    -- Keep a last-known-good backup before overwriting. This is intentionally
-    -- best-effort; failure to copy the backup should not block normal saves.
-    if fileExists(path) then
-        pcall(function()
-            local src = io.open(path, 'r')
-            if not src then return end
-            local content = src:read('*all')
-            src:close()
-            local dst = io.open(path .. '.bak', 'w')
-            if not dst then return end
-            dst:write(content or '')
-            dst:close()
-        end)
-    end
-
-    -- Write to file using mq.pickle
-    local ok, err = pcall(function()
-        mq.pickle(path, data)
-    end)
-
+    local ok, err = atomicPickle(path, data)
     if not ok then
         print(string.format('\ar[SpellSetPersistence]\ax Save failed: %s', tostring(err)))
         return false
@@ -355,15 +404,27 @@ function M.load()
     -- Probe for file existence before dofile so the normal "first-run, no
     -- saved sets" case stays silent. A red error should only fire for actual
     -- parse/format problems, not for the expected absence of the file.
+    local data = nil
     local fh = io.open(path, 'r')
     if not fh then
+        -- Atomic promotion may have stopped after live -> .bak but before
+        -- stage -> live. Recover that backup instead of bootstrapping defaults.
+        if fileExists(path .. '.bak') then
+            local backupContent = readAll(path .. '.bak')
+            local backupResult, backupErr = SafeLoad.tableLiteral(backupContent, path .. '.bak')
+            if type(backupResult) == 'table' then
+                print('\ay[SpellSetPersistence]\ax Live file missing; recovered spell sets from backup')
+                data = backupResult
+            else
+                M.loadError = 'backup_load_failed: ' .. tostring(backupErr)
+            end
+        end
         -- No file yet — treat as "no sets saved". Fall through to the
         -- default-set bootstrap below.
     else
         fh:close()
     end
 
-    local data = nil
     if fh then
         local content
         do
