@@ -704,6 +704,12 @@ local function renderHealAvailability()
     end
 end
 
+--- Latest coordinator state snapshot received by the UI process. Shared with
+--- other diagnostic tabs (Activity) so they don't need their own receive path.
+function M.getLastState()
+    return State.last
+end
+
 function M.init()
     if M._initialized then return end
     M._initialized = true

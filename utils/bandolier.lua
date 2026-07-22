@@ -134,6 +134,9 @@ function M.activateSet(name)
         if M.isSetWorn(name) then return false end
         _lastActivateAt = now()
         _lastBlindSet = nil
+        pcall(function()
+            require('sidekick-next.utils.action_counters').bump('weapon_swap')
+        end)
         -- Direct method call on modern MQ Lua; /invoke fallback for builds
         -- where datatype methods are not callable from Lua.
         local invoked = pcall(function() band.Activate() end)

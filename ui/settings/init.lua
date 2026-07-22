@@ -147,8 +147,12 @@ local function loadTabs()
             drawFn = 'drawContent',
         },
         {
-            name = 'Rotation',
-            module = 'sidekick-next.ui.rotation_debug',
+            -- Replaced the dead monolithic-era Rotation debug tab: in
+            -- coordinated mode the rotation engine data it displayed never
+            -- populates in the UI process. Activity shows live per-module
+            -- action counters instead (heals cast/ducked, taunts, swaps...).
+            name = 'Activity',
+            module = 'sidekick-next.ui.activity_debug',
             drawFn = 'drawContent',
         },
     }

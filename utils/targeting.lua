@@ -106,6 +106,25 @@ function M.targetHasBeneficial()
     return false
 end
 
+--- True when MY position lies in the spawn's rear arc (backstab position).
+--- The mob's facing vs the mob-to-me bearing must differ by more than 120
+--- degrees: directly behind = 180, directly in front = 0.
+-- @param spawn userdata Spawn TLO
+-- @return boolean
+function M.isBehindSpawn(spawn)
+    if not spawn or not spawn() then return false end
+    local ok, behind = pcall(function()
+        local mobHeading = spawn.Heading.DegreesCCW()
+        local toMob = spawn.HeadingTo.DegreesCCW()
+        if mobHeading == nil or toMob == nil then return false end
+        local mobToMe = (tonumber(toMob) + 180) % 360
+        local diff = math.abs(tonumber(mobHeading) - mobToMe) % 360
+        if diff > 180 then diff = 360 - diff end
+        return diff >= 120
+    end)
+    return ok and behind == true
+end
+
 --- Check if spawn is attacking a group member (not the tank)
 -- @param spawn userdata Spawn TLO
 -- @param myId number Tank's spawn ID

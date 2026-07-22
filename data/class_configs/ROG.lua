@@ -45,7 +45,10 @@ M.defaultConditions = {
     end,
 
     ['doBackstab'] = function(ctx)
-        return ctx.combat
+        -- Positional gate: only attempt while actually in the rear arc.
+        -- Backstab auto-fails from the front (without Chaotic Stab), so
+        -- firing early just wastes the skill's cooldown.
+        return ctx.combat and ctx.target.behind
     end,
     ['doPoisonDisc'] = function(ctx)
         return ctx.combat

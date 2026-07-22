@@ -991,7 +991,20 @@ local function draw()
                 Core.forceSave()
             end)
         end, btnScale)
-        if imgui.IsItemHovered() then imgui.SetTooltip('Pause all automation') end
+        -- Right-click: apply the same explicit state to the whole group over
+        -- DanNet (explicit pause/resume rather than toggle, so characters
+        -- whose states drifted apart all land in the same state).
+        if imgui.IsItemClicked(1) then
+            local newPaused = not pausedOn
+            enqueue(function()
+                Core.set('AutomationPaused', newPaused)
+                Core.forceSave()
+                mq.cmdf('/squelch /dgae %s', newPaused and '/skpause' or '/skunpause')
+            end)
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('Pause all automation\nRight-click: pause/resume the entire group (DanNet)')
+        end
 
         imgui.SameLine()
         toggleButton('Assist##sk', assistOn, function()
@@ -2667,6 +2680,19 @@ local function main()
     end)
 
     _healingWarmupStart = os.clock()  -- Start warmup timer (defers heavy CLR healing load)
+
+    -- Camp detection: any running Lua worker issuing commands (sit, stand,
+    -- casts, sticks) aborts the camp countdown. Shut the whole SideKick fleet
+    -- down instead — State.isRunning=false ends this loop, and init.lua's
+    -- Supervisor.stop() then /lua-stops every worker without moving the
+    -- character, letting the camp complete.
+    mq.event('sk_camp_shutdown', 'It will take#*#prepare your camp#*#', function()
+        if not State.isRunning then return end
+        print('\ay[SideKick]\ax Camp detected — pausing automation and shutting down so the camp completes.')
+        pcall(function() Core.set('AutomationPaused', true) end)
+        pcall(function() Core.forceSave() end)
+        State.isRunning = false
+    end)
 
     while State.isRunning do
         Supervisor.tick({

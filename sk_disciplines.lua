@@ -25,6 +25,7 @@ local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local lazy = require('sidekick-next.utils.lazy_require')
+local Cache = require('sidekick-next.utils.runtime_cache')
 
 local Engine = require('sidekick-next.utils.discipline_engine')
 local getConfigLoader = lazy('sidekick-next.utils.class_config_loader')
@@ -285,6 +286,10 @@ end
 -------------------------------------------------------------------------------
 
 module.onTick = function(self)
+    -- Per-process runtime cache: the 'mez_target' selector resolves through
+    -- CC.getBestMezTarget, which reads Cache.xtarget.haters in THIS process
+    -- — empty forever unless someone ticks it.
+    Cache.tick()
     -- Send need hints so the coordinator knows whether disciplines can act.
     if not disciplinesEnabled() then
         self:sendNeed(false, nil, 'disabled')
