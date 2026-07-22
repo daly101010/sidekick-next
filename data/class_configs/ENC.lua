@@ -11,6 +11,10 @@ M.spellLines = {
     ['SingleMez'] = {
         "Flummox", "Addle", "Deceive", "Delude", "Bewilder", "Confound",
         "Mislead", "Baffle", "Befuddle", "Mystify", "Bewilderment",
+        -- Classic/emu era
+        "Euphoria", "Felicity", "Bliss", "Sleep", "Apathy",
+        "Ancient: Eternal Rapture", "Rapture", "Glamour of Kintaz",
+        "Enthrall", "Mesmerize",
     },
 
     -- Fast Mez
@@ -23,12 +27,18 @@ M.spellLines = {
     ['AEMez'] = {
         "Neutralizing Wave", "Perplexing Wave", "Deadening Wave",
         "Slackening Wave", "Peaceful Wave", "Serene Wave",
+        -- Classic/emu era
+        "Wake of Felicity", "Bliss of the Nihil", "Fascination",
+        "Mesmerization", "Bewildering Wave", "Stupefying Wave",
     },
 
     -- PBAE Mez
     ['PBAEMez'] = {
         "Neutralize", "Perplex", "Bafflement", "Disorientation",
         "Confusion", "Serenity", "Docility",
+        -- Classic/emu era
+        "Visions of Kirathas", "Dreams of Veldyn", "Circle of Dreams",
+        "Word of Morell", "Entrancing Lights", "Wonderment",
     },
 
     -- Slow
@@ -100,12 +110,19 @@ M.spellLines = {
     ['ColorStun'] = {
         "Color Calibration", "Color Conflagration", "Color Cascade",
         "Color Congruence", "Color Concourse", "Color Conflux",
+        -- Classic/emu era
+        "Color Collapse", "Color Cataclysm", "Color Shift", "Color Skew",
+        "Color Flux",
     },
 
     -- Charm
     ['Charm'] = {
         "Clamoring Command", "Grating Command", "Imposing Command",
         "Compelling Command", "Crushing Command", "Chaotic Command",
+        -- Classic/emu era
+        "Ancient: Voice of Muram", "True Name", "Compel",
+        "Command of Druzzil", "Beckon", "Dictate", "Boltran's Agacerie",
+        "Ordinance", "Allure", "Cajoling Whispers", "Beguile", "Charm",
     },
 
     -- DoT
@@ -319,6 +336,9 @@ M.AbilitySets = {
         "Flummox", "Addle", "Deceive", "Delude", "Bewilder", "Confound",
         "Mislead", "Baffle", "Befuddle", "Mystify", "Bewilderment",
         "Euphoria", "Felicity", "Bliss", "Sleep",
+        -- Classic/emu era
+        "Apathy", "Ancient: Eternal Rapture", "Rapture",
+        "Glamour of Kintaz", "Enthrall", "Mesmerize",
     },
 
     -- Fast Mez
@@ -340,7 +360,7 @@ M.AbilitySets = {
         "Slackening Wave", "Peaceful Wave", "Serene Wave",
         "Ensorcelling Wave", "Quelling Wave", "Wake of Subdual",
         "Wake of Felicity", "Bliss of the Nihil", "Fascination",
-        "Mesmerization", "Bewildering Wave",
+        "Mesmerization", "Bewildering Wave", "Stupefying Wave",
     },
 
     -- PBAE Mez
@@ -348,6 +368,7 @@ M.AbilitySets = {
         "Neutralize", "Perplex", "Bafflement", "Disorientation",
         "Confusion", "Serenity", "Docility", "Visions of Kirathas",
         "Dreams of Veldyn", "Circle of Dreams", "Word of Morell",
+        "Entrancing Lights", "Wonderment",
     },
 
     -- Slow
@@ -439,6 +460,7 @@ M.AbilitySets = {
         "Color Calibration", "Color Conflagration", "Color Cascade",
         "Color Congruence", "Color Concourse", "Color Conflux",
         "Color Collapse", "Color Cataclysm", "Color Shift", "Color Skew",
+        "Color Flux",
     },
 
     -- Charm
@@ -446,6 +468,10 @@ M.AbilitySets = {
         "Clamoring Command", "Grating Command", "Imposing Command",
         "Compelling Command", "Crushing Command", "Chaotic Command",
         "Astonishing Command", "Beguiling Command", "Captivating Command",
+        -- Classic/emu era
+        "Ancient: Voice of Muram", "True Name", "Compel",
+        "Command of Druzzil", "Beckon", "Dictate", "Boltran's Agacerie",
+        "Ordinance", "Allure", "Cajoling Whispers", "Beguile", "Charm",
     },
 
     -- DoT

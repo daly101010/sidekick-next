@@ -143,6 +143,12 @@ local function addCandidate(candidates, seen, id, source, coordinatedCombat)
     local spawnType = tostring(lib.safeTLO(function() return spawn.Type() end, '') or ''):lower()
     if spawnType ~= 'npc' then return end
     if lib.safeTLO(function() return spawn.Dead() end, false) == true then return end
+    -- The group's broadcast charm pet (or a just-broken one mid-recovery)
+    -- must never become a DPS target.
+    do
+        local okA, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+        if okA and Actors and Actors.isCharmPet and Actors.isCharmPet(id) then return end
+    end
     local candidate = {
         id = id,
         source = source or 'unknown',

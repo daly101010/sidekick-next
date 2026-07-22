@@ -312,6 +312,8 @@ function M.updateHeavy()
 
         local mezVal = xt.Mezzed and xt.Mezzed() or nil
         local isMezzed = mezVal ~= nil and mezVal ~= '' and mezVal ~= 'NULL'
+        local classShort = ''
+        pcall(function() classShort = tostring(xt.Class.ShortName() or '') end)
         haters[#haters + 1] = {
             id = xtId,
             name = xt.CleanName() or '',
@@ -322,6 +324,8 @@ function M.updateHeavy()
             targetId = totId,
             mezzed = isMezzed,
             targetType = targetType,
+            level = tonumber(xt.Level and xt.Level() or 0) or 0,
+            classShort = classShort,
         }
 
         if aggro < 100 then
@@ -425,6 +429,21 @@ function M.hasAnyMezzedOnXTarget()
         end
     end
 
+    return false
+end
+
+--- Check if a mezzer has CLAIMED this mob (mez cast incoming but not yet
+--- landed). The tank consults this so it doesn't declare/engage a mob the
+--- enchanter is a cast-bar away from mezzing. cc:claim broadcasts land in
+--- every process's remoteClaims, so this works outside the sk_cc worker.
+-- @param mobId number Mob spawn ID
+-- @return boolean True if claimed by a mezzer
+function M.isMobMezClaimed(mobId)
+    local ok, CC = pcall(require, 'sidekick-next.automation.cc')
+    if ok and CC and CC.isTargetClaimed then
+        local claimed = CC.isTargetClaimed(tonumber(mobId) or 0)
+        return claimed == true
+    end
     return false
 end
 

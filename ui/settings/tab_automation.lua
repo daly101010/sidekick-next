@@ -63,7 +63,7 @@ function M.draw(settings, themeNames, onChange)
             if safeChanged and onChange then onChange('TankSafeAECheck', safeVal) end
 
             local reposition = settings.TankRepositionEnabled == true
-            local repoVal, repoChanged = Components.CheckboxRow.draw('Moveback Positioning', 'TankRepositionEnabled', reposition, nil, {
+            local repoVal, repoChanged = Components.CheckboxRow.draw('Drag Mobs To Camp', 'TankRepositionEnabled', reposition, nil, {
                 tooltip = 'Use a tank-facing moveback stick so engaged mobs remain in front of the tank.',
             })
             if repoChanged and onChange then onChange('TankRepositionEnabled', repoVal) end
@@ -81,6 +81,18 @@ function M.draw(settings, themeNames, onChange)
                 tooltip = 'Only haters within this distance can become the primary kill target',
             })
             if engChanged and onChange then onChange('TankEngageRange', newEngRange) end
+
+            local breakMez = settings.TankBreakMez ~= false
+            local bmVal, bmChanged = Components.CheckboxRow.draw('Break Mez When Camp Clear', 'TankBreakMez', breakMez, nil, {
+                tooltip = 'When no unmezzed haters remain, engage the next mezzed add (one-at-a-time camp consumption)',
+            })
+            if bmChanged and onChange then onChange('TankBreakMez', bmVal) end
+
+            local holdRadius = tonumber(settings.TankHoldRadius) or 50
+            local hrChanged, newHold = Components.SliderRow.int('Hold Radius', 'TankHoldRadius', holdRadius, 15, 125, nil, {
+                tooltip = 'Stand and let inbound mobs come to you beyond this distance.\nOnly chase (via nav pathfinding) when the mob stops closing.',
+            })
+            if hrChanged and onChange then onChange('TankHoldRadius', newHold) end
         end, { id = 'tank_settings', defaultOpen = true })
     end
 
@@ -160,6 +172,91 @@ function M.draw(settings, themeNames, onChange)
             end
         end, { id = 'stick_settings', defaultOpen = false })
     end
+
+    -- ========== CROWD CONTROL SECTION ==========
+    -- Mez + charm (ENC/BRD). Harmless on non-CC classes: the cc worker
+    -- gates on class before acting on any of these.
+    imgui.Spacing()
+    Components.SettingGroup.section('Crowd Control', themeName)
+
+    Components.SettingGroup.draw('Mez', function()
+        local mezOn = settings.MezzingEnabled == true
+        local mezVal, mezChanged = Components.CheckboxRow.draw('Mezzing Enabled', 'MezzingEnabled', mezOn, nil, {
+            tooltip = 'Automatically mez extra unmezzed adds (ENC/BRD).',
+        })
+        if mezChanged and onChange then onChange('MezzingEnabled', mezVal) end
+
+        local maxTargets = tonumber(settings.MezMaxTargets) or 3
+        local mtChanged, mtVal = Components.SliderRow.int('Max Mobs to Mez', 'MezMaxTargets', maxTargets, 1, 8, nil, {
+            tooltip = 'Stop mezzing new adds once this many are already mezzed.',
+        })
+        if mtChanged and onChange then onChange('MezMaxTargets', mtVal) end
+
+        local fastOn = settings.UseFastMez ~= false
+        local fastVal, fastChanged = Components.CheckboxRow.draw('Use Fast Mez', 'UseFastMez', fastOn, nil, {
+            tooltip = 'Prefer the short-duration fast mez line over the main line.',
+        })
+        if fastChanged and onChange then onChange('UseFastMez', fastVal) end
+
+        local aeOn = settings.UseAEMez == true
+        local aeVal, aeChanged = Components.CheckboxRow.draw('Use AE Mez', 'UseAEMez', aeOn, nil, {
+            tooltip = 'Cast the AE mez line when enough unmezzed adds cluster together.',
+        })
+        if aeChanged and onChange then onChange('UseAEMez', aeVal) end
+
+        local aeMin = tonumber(settings.AEMezMinTargets) or 3
+        local aeMinChanged, aeMinVal = Components.SliderRow.int('AE Mez Min Targets', 'AEMezMinTargets', aeMin, 2, 8, nil, {
+            tooltip = 'Minimum unmezzed adds within AE range before AE mez is used.',
+        })
+        if aeMinChanged and onChange then onChange('AEMezMinTargets', aeMinVal) end
+
+        local refresh = tonumber(settings.MezRefreshWindow) or 6
+        local rfChanged, rfVal = Components.SliderRow.int('Mez Refresh Window (sec)', 'MezRefreshWindow', refresh, 2, 15, nil, {
+            tooltip = 'Remez a target when its mez has this many seconds left.',
+        })
+        if rfChanged and onChange then onChange('MezRefreshWindow', rfVal) end
+    end, { id = 'cc_mez_settings', defaultOpen = false })
+
+    Components.SettingGroup.draw('Charm Pet', function()
+        local charmOn = settings.CharmEnabled == true
+        local chVal, chChanged = Components.CheckboxRow.draw('Charm Pet Enabled', 'CharmEnabled', charmOn, nil, {
+            tooltip = 'Keep an NPC charmed as a DPS pet (ENC). Target cap comes from the charm spell itself; named mobs are never charmed.',
+        })
+        if chChanged and onChange then onChange('CharmEnabled', chVal) end
+
+        local blacklist = tostring(settings.CharmClassBlacklist or 'CLR SHM')
+        local blBuf = Settings.labeledInputText('Class Blacklist', blacklist)
+        if blBuf ~= blacklist and onChange then
+            onChange('CharmClassBlacklist', blBuf)
+        end
+        if imgui.IsItemHovered() then
+            imgui.SetTooltip('NPC class short-names never charmed (space/pipe separated).\nHealer pets waste their time healing the camp.')
+        end
+
+        local preTashOn = settings.CharmPreTash ~= false
+        local ptVal, ptChanged = Components.CheckboxRow.draw('Tash Before First Charm', 'CharmPreTash', preTashOn, nil, {
+            tooltip = 'Tash the charm candidate before the first charm attempt (damageless, mez-safe).',
+        })
+        if ptChanged and onChange then onChange('CharmPreTash', ptVal) end
+
+        local tashOn = settings.CharmBreakTash ~= false
+        local tashVal, tashChanged = Components.CheckboxRow.draw('Tash Before Recharm', 'CharmBreakTash', tashOn, nil, {
+            tooltip = 'On charm break, tash the loose pet first (if not already tashed).',
+        })
+        if tashChanged and onChange then onChange('CharmBreakTash', tashVal) end
+
+        local stunOn = settings.CharmBreakStun ~= false
+        local stunVal, stunChanged = Components.CheckboxRow.draw('AE Stun On Charm Break', 'CharmBreakStun', stunOn, nil, {
+            tooltip = 'Color Stun the loose pet before recharming (damageless — safe near mezzed mobs).',
+        })
+        if stunChanged and onChange then onChange('CharmBreakStun', stunVal) end
+
+        local holdAt = tonumber(settings.CharmHoldUnmezzed) or 3
+        local holdChanged, holdVal = Components.SliderRow.int('Hold Recharm If Unmezzed >', 'CharmHoldUnmezzed', holdAt, 0, 8, nil, {
+            tooltip = 'On charm break, defer recharming while more than this many\nunmezzed mobs are in camp — mez gets the camp under control first.',
+        })
+        if holdChanged and onChange then onChange('CharmHoldUnmezzed', holdVal) end
+    end, { id = 'cc_charm_settings', defaultOpen = false })
 
     -- ========== CHASE SECTION ==========
     imgui.Spacing()

@@ -174,6 +174,13 @@ local function is_attackable(spawn)
   if t ~= 'NPC' and t ~= 'Pet' then return false end
   local dead = spawn.Dead and spawn.Dead()
   if dead then return false end
+  -- The group's charm pet (including a just-broken one the enchanter is
+  -- recovering) is broadcast via actors and must never be attacked.
+  local okA, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+  if okA and Actors and Actors.isCharmPet then
+    local id = tonumber(spawn.ID and spawn.ID() or 0) or 0
+    if Actors.isCharmPet(id) then return false end
+  end
   return true
 end
 
@@ -282,6 +289,17 @@ end
 
 local function build_stick_command(id, spawn)
   local cmd = (config.stick_cmd or ''):gsub('%%%%', '%%'):gsub('^%s+', ''):gsub('%s+$', '')
+
+  -- Rogues live behind mobs: a configured stick without a behind variant
+  -- (e.g. an imported '/stick front') silently makes backstabbing impossible.
+  -- Ignore such commands and fall through to the behind default.
+  if cmd ~= '' then
+    local myClass = ''
+    pcall(function() myClass = tostring(mq.TLO.Me.Class.ShortName() or '') end)
+    if myClass == 'ROG' and not cmd:lower():find('behind') then
+      cmd = ''
+    end
+  end
 
   if cmd ~= '' and cmd:lower() ~= 'off' then
     if cmd:sub(1,6):lower() == '/stick' then

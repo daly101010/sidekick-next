@@ -190,10 +190,13 @@ M.defaults = {
     TankAoEThreshold = { type = 'number', Default = 3, Category = 'Combat', DisplayName = 'AoE Mob Threshold' },
     TankRequireAggroDeficit = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Require Aggro Deficit for AoE' },
     TankSafeAECheck = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Extended Safe AE Check' },
-    TankRepositionEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Tank Moveback Positioning' },
-    TankRepositionCooldown = { type = 'number', Default = 5, Category = 'Combat', DisplayName = 'Position Refresh (sec)' },
+    TankRepositionEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Drag Mobs To Camp' },
+    TankRepositionCooldown = { type = 'number', Default = 5, Category = 'Combat', DisplayName = 'Drag Step Interval (sec)' },
     TankTauntChaseRange = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Taunt Chase Range' },
     TankEngageRange = { type = 'number', Default = 125, Category = 'Combat', DisplayName = 'Engage Range' },
+    TankBreakMez = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Break Mez When Camp Clear' },
+    TankAnnounce = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Announce Target Choices (console)' },
+    TankHoldRadius = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Hold Radius' },
 
     -- Assist Settings (when in assist combat mode)
     AssistTargetMode = { type = 'text', Default = 'sticky', Category = 'Combat', DisplayName = 'Assist Target Mode (sticky/follow)', Options = { 'sticky', 'follow' } },
@@ -286,6 +289,16 @@ M.defaults = {
     AEMezMinTargets = { type = 'number', Default = 3, Category = 'CC', DisplayName = 'AE Mez Min Targets' },
     UseFastMez = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Use Fast Mez' },
     MezRefreshWindow = { type = 'number', Default = 6, Category = 'CC', DisplayName = 'Mez Refresh Window (sec)' },
+
+    -- Charm (DPS charm pet, ENC). Target cap comes from the charm spell's own
+    -- MaxLevel; the blacklist keeps healer-class NPCs (useless pets) off the
+    -- menu. Break response: tash if needed -> AE stun -> recharm.
+    CharmEnabled = { type = 'bool', Default = false, Category = 'CC', DisplayName = 'Charm Pet Enabled' },
+    CharmClassBlacklist = { type = 'text', Default = 'CLR SHM', Category = 'CC', DisplayName = 'Charm Class Blacklist' },
+    CharmBreakTash = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Tash Before Recharm' },
+    CharmPreTash = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Tash Before First Charm' },
+    CharmBreakStun = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'AE Stun On Charm Break' },
+    CharmHoldUnmezzed = { type = 'number', Default = 3, Category = 'CC', DisplayName = 'Hold Recharm If Unmezzed Mobs Exceed' },
 
     -- Spell Engine Settings
     SpellRole = { type = 'text', Default = 'default', Category = 'Spells', DisplayName = 'Spell Role' },
@@ -507,7 +520,7 @@ local MODULE_KEYS = {
     combat = [[
         CombatMode TankTargetMode TankAoEThreshold TankRequireAggroDeficit TankSafeAECheck
         TankRepositionEnabled TankRepositionCooldown TankTauntChaseRange TankEngageRange
-        BandolierEnabled StickCommand SoftPauseStick DragonPositioning
+        TankBreakMez TankAnnounce TankHoldRadius BandolierEnabled StickCommand SoftPauseStick DragonPositioning
         DragonPositionAngle IgnorePCPets EmergencyHpThreshold DefenseHpThreshold
         TankDefenseHpThreshold UseSpells UseAAs UseDiscs CasterUseStick CasterEscapeRange
         CasterSafeZoneRadius PreferredResistType SafeTargetingEnabled SafeTargetingCheckRaid
@@ -532,6 +545,7 @@ local MODULE_KEYS = {
     cc = [[
         MezImmunePersistEnabled MezzingEnabled MezMinLevel MezMaxTargets UseAEMez
         AEMezMinTargets UseFastMez MezRefreshWindow
+        CharmEnabled CharmClassBlacklist CharmBreakTash CharmPreTash CharmBreakStun CharmHoldUnmezzed
     ]],
     disciplines = [[ DisciplinesEnabled SideKickBERDiscDefaultsApplied ]],
     buffs = [[ BuffingEnabled ]],
