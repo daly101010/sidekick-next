@@ -13,6 +13,7 @@ local Targeting = require('sidekick-next.utils.targeting')
 local Aggro = require('sidekick-next.utils.aggro')
 local Engine = require('sidekick-next.utils.discipline_engine')
 local Actors = require('sidekick-next.utils.actors_coordinator')
+local Counters = require('sidekick-next.utils.action_counters')
 
 local module = ModuleBase.create('tank', lib.Priority.DPS)
 module:enablePeerActors()
@@ -36,6 +37,31 @@ local _lastAction = 'none'
 -- primary gets all attention until Taunt is ready again.
 local _recovery = { mobId = 0, spent = false }
 local _forceEngage = false
+-- Mezzed adds we already pre-taunted (hate secured without breaking mez).
+local _mezPrepped = {}
+local _lastInterruptReqAt = 0
+-- Peel futility tracking: taunting a mob that refuses to come back (rooted
+-- mobs attack by proximity, ignoring hate) just spams Taunt on cooldown.
+-- After 2 peels that didn't bring the mob to us, back off for 30s.
+local _peelState = {}  -- [mobId] = { count, lastAt, blockedUntil }
+local PEEL_MAX_ATTEMPTS = 2
+local PEEL_BLOCK_MS = 30000
+-- Set when a granted taunt found the ability on true cooldown; suppresses
+-- the "pending while casting" pathway briefly so we don't keep interrupting
+-- DPS casts for a taunt that cannot fire yet.
+local _tauntNotReadyUntil = 0
+local MEZ_PREP_TTL_MS = 120000
+
+-- Camp anchor: where the tank idles between fights. Mobs pinned on walls
+-- block backstabs; repositioning drags the primary toward this point.
+local _anchor = { x = 0, y = 0, z = 0, setAt = 0 }
+local _lastAnchorSampleAt = 0
+local _lastRepositionAt = 0
+local _dragBlocked = {}          -- mobId -> time; mobs that would not follow
+local _backHeld = false          -- backpedal key currently held (drag step)
+local DRAG_BLOCK_TTL_MS = 30000
+local REPO_STEP_SIZE = 15        -- units per drag step toward camp
+local REPO_CAMP_RADIUS = 25      -- mob within this of camp = good enough
 
 local function safe(fn, fallback)
     local ok, value = pcall(fn)
@@ -46,6 +72,14 @@ end
 local function echo(fmt, ...)
     local ok, text = pcall(string.format, fmt, ...)
     print(string.format('\ag[SK Tank]\ax %s', ok and text or tostring(fmt)))
+end
+
+-- In-game announcements for target choices and taunt peels. Change-gated by
+-- the callers, so this stays chatty-but-not-spammy; TankAnnounce=false in
+-- settings silences it entirely.
+local function announce(fmt, ...)
+    if _settings.TankAnnounce == false then return end
+    echo(fmt, ...)
 end
 
 --- Stop navigation only when a path is actually active. Taunts inside melee
@@ -119,8 +153,12 @@ local function choosePrimary()
     -- unmezzed hater. Aggro recovery uses a separate target and never replaces
     -- it. Grace of 1.5x engage range so a mob drifting at the boundary doesn't
     -- thrash the primary; beyond that the fight has genuinely moved away.
+    -- Cache.isMobMezzed here: validNpc's TLO mez check only works reliably
+    -- for the current target; the broadcast list is the source of truth for
+    -- a mez that landed AFTER we declared this primary (e.g. the enchanter
+    -- mezzed our pick) — drop it and re-select rather than break the mez.
     local current = validNpc(_primaryId, false)
-    if current then
+    if current and not Cache.isMobMezzed(_primaryId) then
         local row = haterRow(_primaryId)
         if row and (tonumber(row.distance) or 999) <= engageRange * 1.5 then
             return current
@@ -135,19 +173,79 @@ local function choosePrimary()
         end
     end
 
+    -- Kill-order scoring: enemy healers first (they prolong every fight),
+    -- then higher level, then finish what's hurt; named get a bump. No bonus
+    -- for mobs targeting the tank — a mob on the tank is the SAFE case, and
+    -- mobs beating on squishies are the recovery-taunt branch's job.
+    local HEALER_CLASSES = { CLR = true, DRU = true, SHM = true }
     local best, bestScore = nil, -math.huge
     for _, row in ipairs(Cache.xtarget.haters or {}) do
         -- Cache.isMobMezzed consults the mezzer's broadcast mez list; the
         -- row.mezzed flag and Spawn.Mezzed only work for the current target.
         -- Engage range keeps the tank from sticking off toward a hater that
         -- aggroed from across the camp.
+        -- Actors.isCharmPet: the group's charm pet (and a just-broken one in
+        -- its recovery window) is never a kill target — the tank protects the
+        -- enchanter with damageless aggro only (loose-mob Taunt path).
+        -- isMobMezClaimed: a mezzer claimed this mob and the mez is a
+        -- cast-bar away — engaging it now just breaks the incoming mez.
         if not row.mezzed and not Cache.isMobMezzed(row.id)
+            and not Cache.isMobMezClaimed(row.id)
+            and not Actors.isCharmPet(row.id)
             and (tonumber(row.distance) or 999) <= engageRange then
             local spawn = validNpc(row.id, false)
             if spawn then
-                local score = (row.targetingMe and 500 or 0) + (100 - (tonumber(row.hp) or 100))
+                local score = (100 - (tonumber(row.hp) or 100))
+                    + (tonumber(row.level) or 0) * 3
+                if HEALER_CLASSES[tostring(row.classShort or ''):upper()] then
+                    score = score + 400
+                end
                 if safe(function() return spawn.Named() end, false) == true then score = score + 100 end
                 if score > bestScore then
+                    best, bestScore = spawn, score
+                end
+            end
+        end
+    end
+
+    -- Declare-only fallback: nothing inside engage range yet, but haters are
+    -- inbound (mid-pull). Declare the pick NOW so the broadcast reaches the
+    -- mezzer before the mobs cross into its 200-unit mez range — the mezzer
+    -- excludes our primary and spends its mezzes on the others. Engage itself
+    -- stays gated on TankEngageRange (see computePending's inbound hold), so
+    -- this never sends the tank running out to meet the pull.
+    if not best then
+        local declareRange = math.max(engageRange, 200)
+        for _, row in ipairs(Cache.xtarget.haters or {}) do
+            if not row.mezzed and not Cache.isMobMezzed(row.id)
+                and not Cache.isMobMezClaimed(row.id)
+                and not Actors.isCharmPet(row.id)
+                and (tonumber(row.distance) or 999) <= declareRange then
+                local spawn = validNpc(row.id, false)
+                if spawn then
+                    local score = (100 - (tonumber(row.hp) or 100))
+                        + (tonumber(row.level) or 0) * 3
+                    if HEALER_CLASSES[tostring(row.classShort or ''):upper()] then
+                        score = score + 400
+                    end
+                    if safe(function() return spawn.Named() end, false) == true then score = score + 100 end
+                    if score > bestScore then
+                        best, bestScore = spawn, score
+                    end
+                end
+            end
+        end
+    end
+
+    -- No unmezzed hater left: deliberately break the next mez (one-at-a-time
+    -- camp consumption). Without this the tank idles while mezzed adds remain.
+    -- Recovery taunts still never touch mezzed mobs.
+    if not best and _settings.TankBreakMez ~= false then
+        for _, row in ipairs(Cache.xtarget.haters or {}) do
+            local spawn = not Actors.isCharmPet(row.id) and validNpc(row.id, true) or nil
+            if spawn and (tonumber(row.distance) or 999) <= engageRange then
+                local score = (100 - (tonumber(row.hp) or 100)) - (tonumber(row.distance) or 0)
+                if not best or score > bestScore then
                     best, bestScore = spawn, score
                 end
             end
@@ -184,6 +282,10 @@ local function chooseLooseMob()
         -- Cache.isMobMezzed consults the mezzer's broadcast mez list — the
         -- only mez signal that works for non-targeted mobs; taunting a mezzed
         -- mob breaks the mez.
+        if row.targetingMe then
+            -- Mob is on us: any peel worked (or was never needed) — reset.
+            _peelState[tonumber(row.id) or 0] = nil
+        end
         if not row.mezzed and not row.targetingMe
             and not Cache.isMobMezzed(row.id) then
             local spawn = validNpc(row.id, false)
@@ -318,15 +420,43 @@ local function computePending()
             'defense:' .. defensive.setName
     end
 
-    if _primaryId <= 0 then return nil, lib.Priority.DPS, 'no_target' end
-
+    -- Loose-mob taunt runs BEFORE the no-primary bail: normally any unmezzed
+    -- hater becomes the primary, but the group's charm pet is excluded from
+    -- primary selection — when a broken pet is the only hater left it's loose
+    -- on the enchanter and the tank must still peel it with (damageless) Taunt.
     local loose = chooseLooseMob()
     -- A ready Taunt ends the previous recovery cycle: the add is eligible for
     -- a fresh taunt attempt again.
     if _recovery.mobId > 0 and Aggro.isTauntReady() then
         _recovery.mobId, _recovery.spent = 0, false
     end
-    if loose and Aggro.canTaunt() and Aggro.isTauntReady() then
+    -- NOTE both taunt gates: AbilityReady('Taunt') reads FALSE while we are
+    -- casting (ability lockout), so a casting tank would never even advertise
+    -- the taunt. Treat "unready only because we're mid-cast" as ready — the
+    -- claim path interrupts the cast (see onTick) and dispatch re-verifies.
+    local tauntUsable = Aggro.isTauntReady()
+        or (lib.isCasting() and lib.getTimeMs() >= _tauntNotReadyUntil)
+    if loose and Aggro.canTaunt() and tauntUsable then
+        local id = tonumber(safe(function() return loose.ID() end, 0)) or 0
+        local nowMs = lib.getTimeMs()
+        local peel = _peelState[id]
+        -- A mob we're already targeting that's ROOTED cannot be peeled:
+        -- rooted mobs attack by proximity regardless of hate. (Root state is
+        -- only readable off the current target.)
+        local rooted = false
+        if id == (tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0) then
+            rooted = safe(function()
+                local r = mq.TLO.Target.Rooted()
+                return r ~= nil and tostring(r) ~= 'NULL' and tostring(r) ~= ''
+            end, false) == true
+        end
+        if peel and peel.blockedUntil and nowMs < peel.blockedUntil then
+            loose = nil
+        elseif rooted then
+            loose = nil
+        end
+    end
+    if loose and Aggro.canTaunt() and tauntUsable then
         local id = tonumber(safe(function() return loose.ID() end, 0)) or 0
         return {
             kind = lib.ActionKind.USE_SKILL,
@@ -342,12 +472,113 @@ local function computePending()
         }, lib.Priority.TANK_RECOVERY, 'taunt:' .. tostring(id)
     end
 
-    if Cache.inCombat() and (loose or Cache.aggroLeadLow()) then
-        local looseId = loose and (tonumber(safe(function() return loose.ID() end, 0)) or 0) or 0
-        if looseId > 0 and looseId ~= _recovery.mobId then
+    if _primaryId <= 0 then return nil, lib.Priority.DPS, 'no_target' end
+
+    -- Primary taunt: we're fighting our target but no longer top hate
+    -- (PctAggro < 100 — someone outaggroed us or is being handed the mob).
+    -- Taunt sets us to top hate +1, so it DOES work here; it's only wasted
+    -- at 100%. This was lost when "loose" was redefined to exclude mobs
+    -- targeting us — hate discs/AAs covered the gap only while one was
+    -- ready. PctAggro is only meaningful for the current target, so require
+    -- the primary to actually be targeted.
+    if Aggro.canTaunt() and tauntUsable and Cache.inCombat() then
+        local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+        local pctAggro = tonumber(Cache.me and Cache.me.pctAggro) or 100
+        if currentId == _primaryId and pctAggro < 100 then
+            local row = haterRow(_primaryId)
+            local dist = row and tonumber(row.distance) or 999
+            if dist <= Aggro.TAUNT_RANGE and validNpc(_primaryId, false) then
+                return {
+                    kind = lib.ActionKind.USE_SKILL,
+                    tankAction = 'taunt',
+                    name = 'Taunt',
+                    abilityName = 'Taunt',
+                    targetId = _primaryId,
+                    restorePrimaryId = _primaryId,
+                    expectsCastStart = false,
+                    timeoutMs = TAUNT_TIMEOUT_MS + 1500,
+                    idempotencyKey = string.format('tank:taunt:%d:%d', _primaryId, lib.getTimeMs()),
+                    reason = 'primary_taunt',
+                }, lib.Priority.TANK_RECOVERY, 'primary_taunt:' .. tostring(_primaryId)
+            end
+        end
+    end
+
+    -- Reposition: drag a wall-pinned primary toward the camp anchor so melee
+    -- (rogues) can get behind it. Strict safety gates: mob must be glued to
+    -- the tank (targeting me at 100% aggro), unmezzed, previously willing to
+    -- follow, and the anchor must be fresh. Root is re-checked at dispatch.
+    if _settings.TankRepositionEnabled == true and Cache.inCombat() and _primaryId > 0 then
+        local nowMs = lib.getTimeMs()
+        local cooldownMs = math.max(3, tonumber(_settings.TankRepositionCooldown) or 5) * 1000
+        local row = haterRow(_primaryId)
+        if row and row.targetingMe and (tonumber(row.aggro) or 0) >= 100
+            and not row.mezzed
+            and _anchor.setAt > 0
+            and (nowMs - _lastRepositionAt) >= cooldownMs
+            and (nowMs - (_dragBlocked[_primaryId] or 0)) > DRAG_BLOCK_TTL_MS then
+            local spawn = validNpc(_primaryId, false)
+            local mobX = spawn and tonumber(safe(function() return spawn.X() end, nil)) or nil
+            local mobY = spawn and tonumber(safe(function() return spawn.Y() end, nil)) or nil
+            if mobX and mobY then
+                local dx, dy = _anchor.x - mobX, _anchor.y - mobY
+                local mobDistFromCamp = math.sqrt(dx * dx + dy * dy)
+                if mobDistFromCamp > REPO_CAMP_RADIUS then
+                    return {
+                        kind = 'tank_reposition',
+                        tankAction = 'reposition',
+                        name = 'Reposition',
+                        targetId = _primaryId,
+                        restorePrimaryId = _primaryId,
+                        expectsCastStart = false,
+                        timeoutMs = 8000,
+                        idempotencyKey = string.format('tank:repo:%d:%d', _primaryId, nowMs),
+                        reason = 'reposition_to_camp',
+                    }, lib.Priority.TANK_AGGRO, 'reposition:' .. tostring(_primaryId)
+                end
+            end
+        end
+    end
+
+    -- Pre-taunt mezzed adds: Taunt deals no damage so mez holds, but the tank
+    -- tops the mob's hate list — the eventual mez-breaking swing brings it to
+    -- us instead of the mezzer. Runs mid-fight only within melee taunt range
+    -- (never nav away from the current fight); free movement when OOC.
+    if _settings.TankBreakMez ~= false and Aggro.canTaunt() and Aggro.isTauntReady() then
+        local nowMs = lib.getTimeMs()
+        for _, row in ipairs(Cache.xtarget.haters or {}) do
+            if (row.mezzed or Cache.isMobMezzed(row.id))
+                and (nowMs - (_mezPrepped[row.id] or 0)) > MEZ_PREP_TTL_MS then
+                local dist = tonumber(row.distance) or 999
+                if (dist <= Aggro.TAUNT_RANGE or not Cache.inCombat())
+                    and validNpc(row.id, true) then
+                    return {
+                        kind = lib.ActionKind.USE_SKILL,
+                        tankAction = 'taunt',
+                        name = 'Taunt',
+                        abilityName = 'Taunt',
+                        targetId = row.id,
+                        restorePrimaryId = _primaryId,
+                        expectsCastStart = false,
+                        timeoutMs = TAUNT_TIMEOUT_MS + 1500,
+                        idempotencyKey = string.format('tank:mezprep:%d:%d', row.id, nowMs),
+                        reason = 'mez_pretaunt',
+                    }, lib.Priority.TANK_AGGRO, 'mezprep:' .. tostring(row.id)
+                end
+            end
+        end
+    end
+
+    -- The charm pet may be taunted (damageless, handled by the loose-mob
+    -- Taunt branch above) but never fed hate discs/AAs — some of those deal
+    -- damage, and the recharm is coming.
+    local looseId = loose and (tonumber(safe(function() return loose.ID() end, 0)) or 0) or 0
+    local loosePet = looseId > 0 and Actors.isCharmPet(looseId)
+    if Cache.inCombat() and ((loose and not loosePet) or Cache.aggroLeadLow()) then
+        if looseId > 0 and not loosePet and looseId ~= _recovery.mobId then
             _recovery.mobId, _recovery.spent = looseId, false
         end
-        local recoveryActive = looseId > 0 and not _recovery.spent
+        local recoveryActive = looseId > 0 and not loosePet and not _recovery.spent
         local hate = pickClassAction({ aggro = true })
         if hate then
             local targetId = recoveryActive and looseId or _primaryId
@@ -360,18 +591,31 @@ local function computePending()
         end
     end
 
+    -- Inbound hold: a declare-only primary (picked beyond engage range so the
+    -- mezzer gets the exclusion broadcast early) is watched, not chased. The
+    -- moment it crosses TankEngageRange the engage below fires on the next
+    -- 50ms tick.
+    do
+        local row = haterRow(_primaryId)
+        local primaryDist = row and tonumber(row.distance) or nil
+        if not primaryDist then
+            local spawn = spawnById(_primaryId)
+            primaryDist = spawn and tonumber(safe(function() return spawn.Distance3D() end,
+                safe(function() return spawn.Distance() end, nil))) or nil
+        end
+        local engageRange = tonumber(_settings.TankEngageRange) or 125
+        if primaryDist and primaryDist > engageRange then
+            return nil, lib.Priority.TANK_ENGAGE, 'primary_inbound'
+        end
+    end
+
     local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
     local attacking = safe(function() return mq.TLO.Me.Combat() end, false) == true
     local now = lib.getTimeMs()
-    -- Re-engage only when target or attack state drifted. The periodic refresh
-    -- exists solely to reapply the moveback stick, so it runs only while
-    -- repositioning is enabled; otherwise a healthy engaged state claims no
-    -- action resource and issues no /stick spam.
-    local engageRefreshMs = math.max(1000, (tonumber(_settings.TankRepositionCooldown) or 5) * 1000)
+    -- Re-engage only when target or attack state drifted (or a taunt
+    -- excursion forced a re-stick). Repositioning is its own claim-based
+    -- drag action now; no periodic stick refresh needed.
     local needEngage = currentId ~= _primaryId or not attacking or _forceEngage
-    if not needEngage and _settings.TankRepositionEnabled == true then
-        needEngage = (now - _lastEngageAt) >= engageRefreshMs
-    end
     if needEngage then
         return {
             kind = 'tank_engage',
@@ -381,16 +625,19 @@ local function computePending()
             restorePrimaryId = _primaryId,
             expectsCastStart = false,
             settleMs = 75,
-            timeoutMs = 2000,
-            idempotencyKey = string.format('tank:engage:%d:%d', _primaryId, math.floor(now / engageRefreshMs)),
+            -- Covers hold-for-inbound plus the nav walk: the engage_approach
+            -- phase runs its own 12s deadline; the executor's hard deadline
+            -- must not kill the job first.
+            timeoutMs = 15000,
+            idempotencyKey = string.format('tank:engage:%d:%d', _primaryId, math.floor(now / 5000)),
             reason = 'primary_engage',
-        }, lib.Priority.DPS, 'engage:' .. tostring(_primaryId)
+        }, lib.Priority.TANK_ENGAGE, 'engage:' .. tostring(_primaryId)
     end
     return nil, lib.Priority.DPS, 'holding_primary'
 end
 
-local function ensureTarget(id)
-    local spawn = validNpc(id, false)
+local function ensureTarget(id, allowMezzed)
+    local spawn = validNpc(id, allowMezzed == true)
     if not spawn then return false end
     local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
     if currentId == tonumber(id) then return true end
@@ -429,12 +676,60 @@ module.onTick = function(self)
     end
 
     if self.currentClaimId or self.claimPending then
+        -- Keep the primary broadcast warm while a claim executes (engage
+        -- approaches can run 10s+): the mezzer's exclusion has a freshness
+        -- window and must not expire mid-fight.
+        if _primaryId > 0 then broadcastPrimary(false) end
         self:sendNeed(true, 1000, _lastReason)
         return
     end
 
+    -- Camp anchor maintenance while idle (no haters, standing still).
+    -- Deadband keeps the anchor stable against combat drift (rgmercs solves
+    -- this with an explicit /camp; we infer it):
+    --   < 30 from anchor: refresh it (fine-tuning position)
+    --   30-100:           drift from fighting/drags — walk back to camp
+    --   > 100 (or unset): deliberate relocation — re-anchor here
+    do
+        local nowMs = lib.getTimeMs()
+        if (Cache.xtarget.count or 0) == 0 and (nowMs - _lastAnchorSampleAt) >= 5000 then
+            _lastAnchorSampleAt = nowMs
+            local moving = safe(function() return mq.TLO.Me.Moving() end, false) == true
+            local navActive = safe(function() return mq.TLO.Navigation.Active() end, false) == true
+            if not moving and not navActive then
+                local x = tonumber(safe(function() return mq.TLO.Me.X() end, nil))
+                local y = tonumber(safe(function() return mq.TLO.Me.Y() end, nil))
+                local z = tonumber(safe(function() return mq.TLO.Me.Z() end, nil))
+                if x and y and z then
+                    local dx, dy = _anchor.x - x, _anchor.y - y
+                    local fromAnchor = _anchor.setAt > 0
+                        and math.sqrt(dx * dx + dy * dy) or math.huge
+                    if fromAnchor < 30 or fromAnchor > 100 or _anchor.setAt == 0 then
+                        _anchor.x, _anchor.y, _anchor.z, _anchor.setAt = x, y, z, nowMs
+                    elseif _settings.TankRepositionEnabled == true
+                        and tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+                        -- Return to camp after combat (rgmercs ReturnToCamp).
+                        mq.cmdf('/nav locyxz %.1f %.1f %.1f', _anchor.y, _anchor.x, _anchor.z)
+                    end
+                end
+            end
+        end
+    end
+
     local primary = choosePrimary()
-    setPrimary(primary)
+    local primaryChanged = setPrimary(primary)
+    if primaryChanged and _primaryId > 0 then
+        local row = haterRow(_primaryId)
+        local dist = row and tonumber(row.distance) or nil
+        local engageRange = tonumber(_settings.TankEngageRange) or 125
+        local cls = row and tostring(row.classShort or '') or ''
+        announce('Target: \aw%s\ax (%d)%s%s%s', _primaryName, _primaryId,
+            dist and string.format(' dist=%.0f', dist) or '',
+            cls ~= '' and (' [' .. cls .. ']') or '',
+            (dist and dist > engageRange) and ' \ay- declared inbound, holding\ax' or '')
+    elseif primaryChanged and _primaryId <= 0 then
+        announce('Target cleared')
+    end
     if _primaryId > 0 then broadcastPrimary(false) end
 
     local action, priority, reason = computePending()
@@ -442,6 +737,22 @@ module.onTick = function(self)
     _pending = action
     self.priority = priority
     _lastReason = reason
+
+    -- Aggro control outranks DPS casting: if a taunt is pending while some
+    -- other module's cast is in flight (our own DPS spells included), ask the
+    -- coordinator to interrupt it. The coordinator applies the
+    -- TANK_RECOVERY InterruptThreshold (lets a nearly-finished cast land),
+    -- and without this request the cast owner's claim is undisplacable and
+    -- the taunt waits out the full cast.
+    if action and (action.reason == 'primary_taunt' or action.reason == 'loose_mob_taunt')
+        and lib.isCasting() and not self:ownsCast() then
+        local nowMs = lib.getTimeMs()
+        if (nowMs - _lastInterruptReqAt) >= 1000 then
+            _lastInterruptReqAt = nowMs
+            self:requestInterrupt('taunt_pending')
+        end
+    end
+
     self:sendNeed(action ~= nil, action and 500 or nil, reason)
 end
 
@@ -464,6 +775,21 @@ module.getDiagnosticAction = function()
     }
 end
 
+-- End a drag step: release the held backpedal key, resume normal combat
+-- stick, release assisters from their soft-pause. The key release MUST run
+-- on every exit path — a stuck movement key is far worse than any drag.
+local function endDragStep(action)
+    if _backHeld then
+        mq.cmd('/keypress back')
+        _backHeld = false
+    end
+    if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto'
+        and action and tonumber(action.targetId) then
+        mq.cmdf('/squelch /stick 10 id %d uw', action.targetId)
+    end
+    Actors.broadcastTankSettled()
+end
+
 module:enableUnifiedExecutor({
     preflight = function(action)
         _pending = nil
@@ -474,29 +800,142 @@ module:enableUnifiedExecutor({
             end
             return true
         end
-        return ensureTarget(action.targetId), 'target_lost'
+        -- Engage may deliberately target a mezzed primary (break-mez), and a
+        -- mez pre-taunt targets a mezzed add by design.
+        local allowMezzed = action.tankAction == 'engage' or action.reason == 'mez_pretaunt'
+        return ensureTarget(action.targetId, allowMezzed), 'target_lost'
     end,
     dispatch = function(action, _, job)
         if action.tankAction == 'engage' then
             _lastEngageAt = lib.getTimeMs()
             _forceEngage = false
-            mq.cmd('/attack on')
-            if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
-                local moveback = _settings.TankRepositionEnabled == true and ' moveback' or ''
-                mq.cmdf('/stick 10 id %d%s uw', action.targetId, moveback)
-            end
             broadcastPrimary(true)
             _lastAction = 'engage:' .. tostring(action.targetId)
-            return true, 'engaged', 'none'
+            local dist = tonumber(safe(function() return mq.TLO.Target.Distance3D() end, 999)) or 999
+            local melee = tonumber(safe(function() return mq.TLO.Target.MaxRangeTo() end, 14)) or 14
+            local los = safe(function() return mq.TLO.Target.LineOfSight() end, false) == true
+            if dist <= melee and los then
+                if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+                    mq.cmdf('/stick 10 id %d uw', action.targetId)
+                end
+                mq.cmd('/attack on')
+                return true, 'engaged', 'none'
+            end
+            -- Not in melee yet: the approach phase decides between waiting
+            -- for an inbound mob, pathfinding via nav (LOS-safe), and the
+            -- final stick handoff. No blind /stick from range: stick is
+            -- straight-line chasing and runs the tank into walls without LOS.
+            job.tank = {
+                phase = 'engage_approach',
+                deadline = lib.getTimeMs() + 12000,
+                lastDist = dist,
+                progressAt = lib.getTimeMs(),
+            }
+            return true, 'engage_approach', 'custom'
+        elseif action.tankAction == 'reposition' then
+            _lastRepositionAt = lib.getTimeMs()
+            -- Root check at dispatch time (needs the mob targeted for cached
+            -- buffs). Unknown reads as not-rooted; the follow-check below
+            -- catches invisible roots anyway.
+            local rooted = false
+            pcall(function()
+                local r = mq.TLO.Target.Rooted()
+                rooted = r ~= nil and tostring(r) ~= 'NULL' and tostring(r) ~= ''
+            end)
+            if rooted then
+                _dragBlocked[tonumber(action.targetId) or 0] = lib.getTimeMs()
+                return false, 'target_rooted'
+            end
+            local myX = tonumber(safe(function() return mq.TLO.Me.X() end, nil))
+            local myY = tonumber(safe(function() return mq.TLO.Me.Y() end, nil))
+            if not (myX and myY) then return false, 'no_position' end
+            local mobSpawn = spawnById(action.targetId)
+            local mobX = mobSpawn and tonumber(safe(function() return mobSpawn.X() end, nil)) or nil
+            local mobY = mobSpawn and tonumber(safe(function() return mobSpawn.Y() end, nil)) or nil
+            if not (mobX and mobY) then return false, 'no_mob_position' end
+
+            -- NEVER turn our back on the mob (riposte/parry/block only work
+            -- facing). The drag is a BACKPEDAL while facing the mob, so it
+            -- only runs when camp lies in the rear cone: the angle between
+            -- the mob bearing and the camp bearing must exceed ~115 degrees.
+            local toMobX, toMobY = mobX - myX, mobY - myY
+            local toCampX, toCampY = _anchor.x - myX, _anchor.y - myY
+            local mobLen = math.sqrt(toMobX * toMobX + toMobY * toMobY)
+            local campLen = math.sqrt(toCampX * toCampX + toCampY * toCampY)
+            if campLen < 5 then return false, 'already_at_camp' end
+            if mobLen > 0.1 then
+                local dot = (toMobX * toCampX + toMobY * toCampY) / (mobLen * campLen)
+                if dot > -0.42 then
+                    return false, 'bad_geometry'
+                end
+            end
+
+            -- Assisters soft-pause their sticks while the tank drags.
+            Actors.broadcastTankRepositioning()
+            mq.cmd('/squelch /stick off')
+            mq.cmdf('/squelch /face fast id %d', action.targetId)
+            mq.cmd('/keypress back hold')
+            _backHeld = true
+            job.tank = {
+                phase = 'drag_step',
+                deadline = lib.getTimeMs() + 2500,
+                startX = myX,
+                startY = myY,
+                startDist = tonumber(safe(function() return mobSpawn.Distance3D() end, 0)) or 0,
+            }
+            _lastAction = 'reposition:' .. tostring(action.targetId)
+            Counters.bump('reposition_step')
+            return true, 'drag_step', 'custom'
         elseif action.tankAction == 'taunt' then
             -- Readiness was checked at decision time, but the claim grant can
-            -- lag; never start the approach unless Taunt is usable right now.
-            if not Aggro.isTauntReady() then return false, 'taunt_not_ready' end
-            _recovery.mobId = tonumber(action.targetId) or 0
-            _recovery.spent = false
+            -- lag — and when this taunt preempted a cast (selection treats
+            -- our own mid-cast as "usable"), the ability lockout takes a
+            -- beat to release after the interrupt. Brief wait, then verdict.
+            if not Aggro.isTauntReady() then
+                local readyDeadline = lib.getTimeMs() + 1000
+                repeat
+                    mq.delay(50)
+                until Aggro.isTauntReady() or lib.getTimeMs() >= readyDeadline
+                if not Aggro.isTauntReady() then
+                    _tauntNotReadyUntil = lib.getTimeMs() + 4000
+                    return false, 'taunt_not_ready'
+                end
+            end
+            do
+                local tSpawn = spawnById(action.targetId)
+                local tName = tSpawn and tostring(safe(function() return tSpawn.CleanName() end, '?') or '?') or '?'
+                local why = action.reason == 'mez_pretaunt' and 'pre-taunting mezzed add'
+                    or action.reason == 'primary_taunt' and 'losing aggro on primary'
+                    or 'peeling loose mob'
+                announce('Taunt: \aw%s\ax (%d) - %s', tName, tonumber(action.targetId) or 0, why)
+            end
+            if action.reason == 'mez_pretaunt' then
+                -- Hate secured without breaking mez. Never open a recovery
+                -- cycle for it: follow-up hate tools would break the mez.
+                _mezPrepped[tonumber(action.targetId) or 0] = lib.getTimeMs()
+                Counters.bump('mez_pretaunt')
+            else
+                _recovery.mobId = tonumber(action.targetId) or 0
+                _recovery.spent = false
+                if action.reason == 'loose_mob_taunt' then
+                    local pid = tonumber(action.targetId) or 0
+                    local peel = _peelState[pid] or { count = 0 }
+                    peel.count = peel.count + 1
+                    peel.lastAt = lib.getTimeMs()
+                    if peel.count >= PEEL_MAX_ATTEMPTS then
+                        -- Two peels and it still won't come to us (rooted, or
+                        -- proximity-locked): stop wasting Taunt for a while.
+                        peel.blockedUntil = lib.getTimeMs() + PEEL_BLOCK_MS
+                        peel.count = 0
+                        announce('Peel futile on %d - backing off %ds',
+                            pid, math.floor(PEEL_BLOCK_MS / 1000))
+                    end
+                    _peelState[pid] = peel
+                end
+            end
             Actors.broadcastTauntRun()
             job.tank = { phase = 'approach', deadline = lib.getTimeMs() + TAUNT_TIMEOUT_MS }
-            local spawn = validNpc(action.targetId, false)
+            local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt')
             local distance = spawn and tonumber(safe(function() return spawn.Distance3D() end,
                 safe(function() return spawn.Distance() end, 999))) or 999
             if distance > Aggro.TAUNT_RANGE then mq.cmdf('/nav id %d', action.targetId) end
@@ -513,9 +952,95 @@ module:enableUnifiedExecutor({
         return false, 'unsupported_tank_action'
     end,
     onTick = function(action, _, job)
+        if action.tankAction == 'reposition' then
+            local runtime = job.tank or {}
+            if runtime.phase ~= 'drag_step' then return true end
+            local spawn = validNpc(action.targetId, false)
+            if not spawn then return true, 'target_lost', 'failed' end
+            -- Abort instantly if the mob peels off the tank mid-step.
+            local row = haterRow(action.targetId)
+            if not (row and row.targetingMe) then
+                return true, 'aggro_wobble', 'failed'
+            end
+            local dist = tonumber(safe(function() return spawn.Distance3D() end, 999)) or 999
+            -- Mob not following (unseen root, parked caster): blacklist it so
+            -- we stop backing away from our own target.
+            if dist > (runtime.startDist or 0) + 12 then
+                _dragBlocked[tonumber(action.targetId) or 0] = lib.getTimeMs()
+                return true, 'mob_not_following', 'failed'
+            end
+            -- Step complete once we've backpedaled far enough, or on timeout.
+            local myX = tonumber(safe(function() return mq.TLO.Me.X() end, nil))
+            local myY = tonumber(safe(function() return mq.TLO.Me.Y() end, nil))
+            if myX and myY then
+                local dx, dy = myX - (runtime.startX or myX), myY - (runtime.startY or myY)
+                if (dx * dx + dy * dy) >= REPO_STEP_SIZE * REPO_STEP_SIZE then
+                    return true, 'step_done', 'completed'
+                end
+            end
+            if lib.getTimeMs() >= (runtime.deadline or 0) then
+                return true, 'step_done', 'completed'
+            end
+            return true, 'dragging'
+        end
+        if action.tankAction == 'engage' then
+            local runtime = job.tank or {}
+            if runtime.phase ~= 'engage_approach' then return true end
+            local now = lib.getTimeMs()
+            -- allowMezzed: a break-mez engage approaches a still-mezzed mob.
+            local spawn = validNpc(action.targetId, true)
+            if not spawn then
+                navStop()
+                return true, 'target_lost', 'failed'
+            end
+            local dist = tonumber(safe(function() return spawn.Distance3D() end, 999)) or 999
+            local melee = tonumber(safe(function() return mq.TLO.Target.MaxRangeTo() end, 14)) or 14
+            local los = safe(function() return spawn.LineOfSight() end, false) == true
+
+            -- Arrived: hand off from nav to stick and start swinging.
+            if dist <= melee and los then
+                navStop()
+                if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+                    mq.cmdf('/stick 10 id %d uw', action.targetId)
+                end
+                mq.cmd('/attack on')
+                return true, 'engaged', 'completed'
+            end
+
+            if now >= (runtime.deadline or 0) then
+                -- Couldn't close (pathing, evasive mob). Flip attack so an
+                -- arriving mob is met swinging, and let drift detection retry.
+                navStop()
+                mq.cmd('/attack on')
+                return true, 'engage_approach_timeout', 'completed'
+            end
+
+            -- Track whether the gap is closing (mob inbound to us).
+            if dist < (runtime.lastDist or math.huge) - 1 then
+                runtime.progressAt = now
+            end
+            runtime.lastDist = dist
+
+            -- Hold position while a distant hater is inbound: haters path to
+            -- the tank, and standing at camp beats running out to meet them.
+            -- Chase only when the gap stops closing (parked caster, rooted
+            -- mob) for a moment.
+            local holdRadius = tonumber(_settings.TankHoldRadius) or 50
+            if dist > holdRadius and (now - (runtime.progressAt or 0)) < 2500 then
+                return true, 'waiting_inbound'
+            end
+
+            -- Close the gap with NAV (pathfinding, LOS-safe) — never blind
+            -- /stick from range. Re-issue at most every 2s.
+            if (now - (runtime.navIssuedAt or 0)) >= 2000 then
+                runtime.navIssuedAt = now
+                mq.cmdf('/nav id %d', action.targetId)
+            end
+            return true, 'approaching'
+        end
         if action.tankAction ~= 'taunt' then return true end
         local runtime = job.tank or {}
-        local spawn = validNpc(action.targetId, false)
+        local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt')
         if not spawn then return true, 'target_lost', 'failed' end
         if lib.getTimeMs() >= (runtime.deadline or 0) then
             navStop()
@@ -526,7 +1051,9 @@ module:enableUnifiedExecutor({
         if runtime.phase == 'approach' then
             if distance > Aggro.TAUNT_RANGE then return true, 'approaching' end
             navStop()
-            if not ensureTarget(action.targetId) then return true, 'target_lost', 'failed' end
+            if not ensureTarget(action.targetId, action.reason == 'mez_pretaunt') then
+                return true, 'target_lost', 'failed'
+            end
             if not Aggro.isTauntReady() then return true, 'taunt_not_ready', 'failed' end
             mq.cmd('/doability "Taunt"')
             runtime.phase = 'verify'
@@ -537,16 +1064,22 @@ module:enableUnifiedExecutor({
             local myId = tonumber(safe(function() return mq.TLO.Me.ID() end, 0)) or 0
             local targetOfTarget = tonumber(safe(function() return spawn.TargetOfTarget.ID() end, 0)) or 0
             if targetOfTarget > 0 then
-                return true, targetOfTarget == myId and 'taunt_acquired' or 'taunt_not_confirmed', 'completed'
+                local landed = targetOfTarget == myId
+                Counters.bump(landed and 'taunt_landed' or 'taunt_missed')
+                return true, landed and 'taunt_acquired' or 'taunt_not_confirmed', 'completed'
             end
             -- ToT can resolve NULL on plain spawn references. The mob is still
             -- our current target here, so 100% aggro is an equivalent signal.
             local aggro = tonumber(safe(function() return mq.TLO.Me.PctAggro() end, 0)) or 0
+            Counters.bump(aggro >= 100 and 'taunt_landed' or 'taunt_unverified')
             return true, aggro >= 100 and 'taunt_acquired' or 'taunt_unverified', 'completed'
         end
         return true, 'taunt_wait'
     end,
     onComplete = function(action)
+        if action.tankAction == 'reposition' then
+            endDragStep(action)
+        end
         if action.tankAction == 'taunt' then
             navStop()
             Actors.broadcastTauntDone()
@@ -565,6 +1098,10 @@ module:enableUnifiedExecutor({
             navStop()
             Actors.broadcastTauntDone()
             _forceEngage = true
+        elseif action and action.tankAction == 'engage' then
+            navStop()
+        elseif action and action.tankAction == 'reposition' then
+            endDragStep(action)
         end
         restorePrimary(action)
     end,
@@ -573,6 +1110,10 @@ module:enableUnifiedExecutor({
             navStop()
             Actors.broadcastTauntDone()
             _forceEngage = true
+        elseif action and action.tankAction == 'engage' then
+            navStop()
+        elseif action and action.tankAction == 'reposition' then
+            endDragStep(action)
         end
         restorePrimary(action)
     end,

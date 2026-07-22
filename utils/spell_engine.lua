@@ -222,8 +222,11 @@ local function preCastChecks(spellName, targetId, opts)
             if target.Dead() and not opts.allowDead then
                 return false, 'target_dead'
             end
-            -- Range check
+            -- Range check. MyRange() returns 0 for some spells on emu
+            -- builds — 0 is truthy in Lua, so `or 200` never applied and a
+            -- zero range failed/interrupted every cast. Treat <=0 as unknown.
             local range = tonumber(spell.MyRange()) or 200
+            if range <= 0 then range = 200 end
             local distance = tonumber(target.Distance()) or 999
             if distance > range then
                 return false, 'out_of_range'
@@ -358,6 +361,10 @@ function M.cast(spellName, targetId, opts)
     local spell = mq.TLO.Spell(spellName)
     local castTime = spell and tonumber(spell.MyCastTime()) or 0
     local range = spell and tonumber(spell.MyRange()) or 200
+    -- 0 = "unknown" on some emu builds; a literal zero here makes the
+    -- out-of-range auto-interrupt fire at ANY distance (chain-interrupting
+    -- every cast of the affected spell).
+    if not range or range <= 0 then range = 200 end
 
     -- Reset event state
     local SpellEvents = getSpellEvents()
@@ -467,8 +474,10 @@ function M.shouldInterrupt()
             end
         end
 
-        -- Check out of range
-        if settings.InterruptOnOutOfRange ~= false then
+        -- Check out of range (range <= 0 means unknown — never interrupt
+        -- on a range we couldn't read).
+        if settings.InterruptOnOutOfRange ~= false
+            and (tonumber(_castData.range) or 0) > 0 then
             local target = mq.TLO.Spawn(_castData.targetId)
             if target and target() then
                 local distance = tonumber(target.Distance()) or 999

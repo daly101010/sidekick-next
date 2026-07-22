@@ -48,6 +48,10 @@ local getConditionContext = lazy('sidekick-next.utils.condition_context')
 ---@field spellName string|nil Cached spell name for casting
 ---@field spellId number Spell ID
 
+-- Per-spellId cache of "is this a mez/charm spell" (CC-owned; excluded from
+-- the generic cast pipeline). Spell SPAs are static for a session.
+local _ccOwnedCache = {}
+
 --- Build a sorted list of spells to cast based on the active spell set
 --- Skips heals (handled by healing intelligence)
 ---@param spellSet SpellSet|nil The spell set to process (uses active if nil)
@@ -97,8 +101,26 @@ function M.getSortedCastList(spellSet)
                 end
             end
 
+            -- Skip mez (SPA 31) and charm (SPA 22): those are owned by the
+            -- cc worker, which picks its OWN victim via the claim system. The
+            -- generic pipeline fires detrimentals at the current NPC target —
+            -- for a mez that means mezzing the kill target mid-fight.
+            -- Verdict cached per spellId (SPAs are static; this list is
+            -- rebuilt every evaluation).
+            local ccOwned = _ccOwnedCache[config.spellId]
+            if ccOwned == nil then
+                ccOwned = false
+                pcall(function()
+                    local sp = mq.TLO.Spell(config.spellId)
+                    if sp and sp() then
+                        ccOwned = sp.HasSPA(31)() == true or sp.HasSPA(22)() == true
+                    end
+                end)
+                _ccOwnedCache[config.spellId] = ccOwned
+            end
+
             -- Skip heals - healing intelligence handles them
-            if spellType ~= 'heal' then
+            if spellType ~= 'heal' and not ccOwned then
                 -- Calculate priority
                 local priority
                 if config.priority and config.priority > 0 then

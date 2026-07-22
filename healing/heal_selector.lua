@@ -1171,6 +1171,22 @@ local function evaluateEfficientHeals(targetInfo, allowFast, situation)
 end
 
 function M.FindEfficientHeal(targetInfo, allowFast, situation)
+    -- Pet override: Complete Heal is the ideal pet heal — full heal for its
+    -- mana, and the CH drawbacks (10s cast, overheal risk on players getting
+    -- spot-healed) don't apply to a pet. Always use it when memorized and
+    -- ready; otherwise fall through to normal scoring.
+    if targetInfo and targetInfo.role == 'pet' then
+        local chName = 'Complete Heal'
+        local meta = getSpellMeta(chName)
+        if meta and isSpellUsable(chName, meta) then
+            return {
+                spell = chName,
+                expected = tonumber(targetInfo.deficit) or tonumber(targetInfo.maxHP) or 0,
+                details = 'pet_complete_heal_override',
+            }
+        end
+    end
+
     local best, scores, bestScore = evaluateEfficientHeals(targetInfo, allowFast, situation)
 
     stashScores('efficient', targetInfo, scores, best and best.spell or nil, bestScore)

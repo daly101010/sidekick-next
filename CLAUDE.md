@@ -27,6 +27,40 @@ Parent: `F:\lua\CLAUDE.md` for shared mq/ImGui/actors patterns.
   - `DEBUG_SETTINGS` — log ImGui setting interactions (dev-only).
 - When adding a redesign experiment, gate it behind a new flag rather than replacing the existing path. The whole point of this tree is being able to A/B against the original.
 
+## Coordination invariants (learned the hard way)
+
+- **Actors addressing:** `{ mailbox = 'sidekick' }` with no `script` routes to
+  `currentScript:sidekick` — it reaches the SAME script on other characters
+  only, never sibling scripts. Cross-script state (tank primary, mez list,
+  charm pet) must go through `Actors.broadcastFleet()` (explicit fan-out to
+  every fleet script, ~16 sends ≈1ms each). `M.broadcast()` keeps same-script
+  semantics for intra-role claim traffic (healer↔healer, mezzer↔mezzer).
+- **The runtime cache is per-process.** `Cache.xtarget.haters` etc. are empty
+  forever in any worker that doesn't call `Cache.tick()` in its onTick. If a
+  worker consults haters (directly or via automation/cc), it must tick.
+- **CC priority order** (sk_cc, all at DEBUFF tier, preempts DPS casts via
+  interrupt requests): charm break ladder (tash → AE stun → recharm; defers
+  to mez while >CharmHoldUnmezzed mobs are loose) → charm acquisition
+  (pretash → charm; pet FIRST on an incoming pull) → mez. Charm pet ID is
+  broadcast fleet-wide (`cc:charmpet`); DPS/assist never attack it and the
+  tank protects the enchanter with damageless Taunt only.
+- **Spell resolution** (automation/cc): checks BOTH `spellLines` and
+  `AbilitySets` vocabularies, memorized-gems-only, normalizes EQ backtick
+  names (Boltran`s → Boltran's), and charm additionally falls back to a
+  SPA-22 gem scan. Class-config spell lists must include classic/emu-era
+  names, not just live-era.
+- **Never gate on `AbilityReady`/interrupt while casting without care:**
+  AbilityReady reads false during our own casts (tank taunt gates treat
+  "unready only because casting" as usable), and an interrupt request from
+  the current cast owner is treated as an owner self-cancel by the
+  coordinator (guard with `self.currentClaimId`).
+- **Detrimental rotation casts** (discipline engine) require a live NPC
+  current target unless the condition declares a `targetSelector`; the
+  spellset executor excludes mez/charm SPAs entirely (CC owns those).
+- **Orphan watchdog:** every worker + coordinator self-terminates ~10s after
+  the parent UI script stops (`lib.isUiRunning()` poll) — a forced
+  `/lua stop sidekick-next` takes the whole fleet down with it.
+
 ## Hard rules
 
 - **Don't touch `F:\lua\sidekick`** (the production tree) from this branch. Cross-references should be read-only and ideally avoided.

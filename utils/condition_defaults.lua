@@ -152,6 +152,17 @@ function M.getSpellTypeCategory(spellEntry)
 
         -- Check for detrimental spells
         if not beneficial then
+            -- SPA-based debuff detection FIRST: emu category/subcategory
+            -- strings are unreliable (mez/cripple often carry none of the
+            -- keywords below), and the duration>0 net further down was
+            -- misfiling every durationed debuff as a DoT.
+            if spell and spell() then
+                local debuffType = M.detectDebuffType(spell)
+                if debuffType then
+                    return 'debuff'
+                end
+            end
+
             -- Check for specific debuff keywords
             if category:find('debuff') or subcategory:find('debuff')
                 or subcategory:find('slow') or subcategory:find('tash')
@@ -161,9 +172,19 @@ function M.getSpellTypeCategory(spellEntry)
                 return 'debuff'
             end
 
-            -- Check for DoT
-            if duration > 0 or subcategory:find('dot') or subcategory:find('over time') then
+            -- Check for DoT. A real DoT deals HP damage over time (SPA 0
+            -- plus a duration) — duration alone is NOT a DoT signal; fear,
+            -- blind, and unlisted debuffs all carry durations.
+            if subcategory:find('dot') or subcategory:find('over time') then
                 return 'dot'
+            end
+            if duration > 0 then
+                if spell and spell() then
+                    local okHp, hasHp = pcall(function() return spell.HasSPA(0)() end)
+                    if okHp and hasHp == true then return 'dot' end
+                    return 'debuff'
+                end
+                return 'dot'  -- no TLO to consult; keep the old heuristic
             end
 
             -- Default detrimental = direct damage
@@ -210,9 +231,16 @@ function M.getSpellTypeCategory(spellEntry)
                 return 'debuff'
             end
 
-            -- Check for DoT
-            if duration > 0 or subcategoryLower:find('dot') then
+            -- Check for DoT: require HP damage (SPA 0) alongside the
+            -- duration — duration alone misfiles fear/blind/unlisted
+            -- debuffs as DoTs.
+            if subcategoryLower:find('dot') then
                 return 'dot'
+            end
+            if duration > 0 then
+                local okHp, hasHp = pcall(function() return spell.HasSPA(0)() end)
+                if okHp and hasHp == true then return 'dot' end
+                return 'debuff'
             end
 
             -- Default = direct damage

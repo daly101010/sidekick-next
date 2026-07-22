@@ -858,6 +858,9 @@ local function monitorDuck(opts)
 
     local duck, reason, threshold = shouldDuck(castInfo)
     if duck then
+        pcall(function()
+            require('sidekick-next.utils.action_counters').bump('heal_ducked')
+        end)
         -- Log duck decision with details
         local targetInfo = TargetMonitor.getTarget(castInfo.targetId)
         local hotRemaining = 0

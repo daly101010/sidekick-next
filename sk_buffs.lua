@@ -1048,6 +1048,11 @@ end
 local function pickBuffTarget(buffDef, spellName, category, rebuffWindow, isGroup, myId)
     local spellId = buffDef and buffDef.spellId or getSpellId(spellName)
     for _, candidate in ipairs(groupBuffCandidates(myId)) do
+        -- NOTE: invis candidates are NOT skipped — buffs land on invis group
+        -- members as long as the buffer can see them (see-invis), and
+        -- Spawn.Invis only reports their state, not our visibility of them.
+        -- A truly unseeable target fails the cast and the normal
+        -- buff_not_observed_after_cast backoff handles it.
         if targetMatchesBuffTarget(candidate, buffDef and buffDef.buffTarget)
             and conditionPassesForTarget(buffDef, candidate) then
             local hasBuff = candidateHasBuff(candidate, spellName, spellId, category, rebuffWindow)
@@ -1530,9 +1535,13 @@ local function canBuffNow()
     -- Check if hovering (dead)
     if me.Hovering and me.Hovering() then return false, 'dead' end
 
-    -- Check if stunned/mezzed
+    -- Check if stunned/mezzed. me.Mezzed is a Spell TLO that stringifies to
+    -- "NULL" on some builds when not mezzed — always truthy; gate on its ID
+    -- instead (same fix as cc.lua's selectMezAction).
     if me.Stunned and me.Stunned() then return false, 'stunned' end
-    if me.Mezzed and me.Mezzed() then return false, 'mezzed' end
+    if me.Mezzed and me.Mezzed.ID and (tonumber(me.Mezzed.ID()) or 0) > 0 then
+        return false, 'mezzed'
+    end
 
     -- Check SpellEngine availability
     local SpellEngine = getSpellEngine()
@@ -2113,6 +2122,22 @@ module.executeAction = function(self)
         end
 
         if _activeBuff.state == 'waiting_ready' then
+            -- Invis re-check at the last gate before the cast. canBuffNow()
+            -- blocks SELECTION while invis, but the memorize/gem-swap workflow
+            -- can run for many seconds — an invis applied mid-workflow (e.g.
+            -- the group invises up to travel) would be silently broken by the
+            -- cast. Abort without a category backoff: it's not the spell's
+            -- fault, and selection stays blocked until invis drops.
+            if mq.TLO.Me.Invis and mq.TLO.Me.Invis() then
+                traceLog('info', 'action', 'invis_hold_' .. tostring(category), 0,
+                    'Buff cast aborted: we are invis; spell=%s category=%s target=%d',
+                    tostring(spellName), tostring(category), targetId)
+                _pendingAction = nil
+                _pendingReason = nil
+                maybeRestoreBuffGem()
+                clearActiveBuff()
+                return true, 'invis_hold'
+            end
             -- Memorization completed; wait for the gem refresh separately so
             -- we do not keep treating a ready-delay as another mem request.
             local canCast, castWaitReason = canCastAfterMemorize(spellName)

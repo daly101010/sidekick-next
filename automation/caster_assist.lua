@@ -75,9 +75,15 @@ local function findRootedMobHittingMe()
     for i = 1, xtCount do
         local xt = mq.TLO.Me.XTarget(i)
         if xt and xt() and xt.ID() and xt.ID() > 0 then
-            -- Check if this mob is targeting me and is rooted
+            -- Targeting me, rooted, AND actually within melee reach. A
+            -- rooted mob glaring from 100 units away can't hit us — escaping
+            -- from it (with its /stopcast) chain-interrupted every cast
+            -- while the escape state machine spun.
             if isTargetingMe(xt) and isRooted(xt) then
-                return xt
+                local dist = tonumber(xt.Distance and xt.Distance()) or 999
+                if dist <= 20 then
+                    return xt
+                end
             end
         end
     end
@@ -228,12 +234,14 @@ function M.tick(settings)
         return
     end
 
-    -- Stay-put caster mode: check for escape conditions
-    M.checkEscapeCondition(settings)
-
-    -- Handle ongoing escape navigation
+    -- Escape-from-rooted-mob logic deliberately removed: being targeted by
+    -- a mob is not an emergency (the tank's recovery taunt handles peels),
+    -- and the escape sequence stopcast whatever the caster was doing —
+    -- chain-interrupting mezzes. The state machine below is retained but
+    -- never entered. Clear any leftover state from an older session.
     if M.escapeState.phase ~= 'idle' then
-        M.tickEscape(settings)
+        M.escapeState.phase = 'idle'
+        mq.cmd('/squelch /nav stop')
     end
 end
 
@@ -243,23 +251,22 @@ function M.checkEscapeCondition(settings)
     -- Already escaping? Don't re-check
     if M.escapeState.phase ~= 'idle' then return end
 
-    -- Check if currently casting a mez or heal (don't interrupt these)
+    -- Never interrupt CC or beneficial casts. Detection is SPA-based, not
+    -- name-based: classic mez names ("Glamour of Kintaz", "Enthrall",
+    -- "Rapture") contain no 'mez' substring, so the old name match let the
+    -- escape stopcast every mez on emu.
     local casting = mq.TLO.Me.Casting
     if casting and casting() then
-        local spellName = casting.Name and casting.Name() or ''
-        local targetType = casting.TargetType and casting.TargetType() or ''
-        local category = casting.Category and casting.Category() or ''
-
-        -- Check for mez (category or spell name patterns)
-        local isMez = category:lower():find('mesmerize') or
-                      spellName:lower():find('mez') or
-                      spellName:lower():find('mesmer')
-
-        -- Check for heal (beneficial + HP-related)
-        local isHeal = (targetType == 'Single' or targetType == 'Group') and
-                       (category:lower():find('heal') or spellName:lower():find('heal'))
-
-        if isMez or isHeal then
+        local protect = false
+        pcall(function()
+            local sp = mq.TLO.Spell(casting.ID())
+            if sp and sp() then
+                if sp.Beneficial() == true then protect = true end     -- heals/runes
+                if sp.HasSPA(31)() == true then protect = true end     -- mez
+                if sp.HasSPA(22)() == true then protect = true end     -- charm
+            end
+        end)
+        if protect then
             -- Let the cast complete
             return
         end

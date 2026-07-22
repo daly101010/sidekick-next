@@ -408,6 +408,13 @@ function M.tick(settings)
             end
         end
 
+        -- Pets always prefer Complete Heal when memorized: full heal, ideal
+        -- mana efficiency, and the CH-delay drawback doesn't matter on a pet.
+        if not spellName and target and target.kind == 'pet' then
+            local gem = mq.TLO.Me.Gem('Complete Heal')
+            if gem and gem() then spellName = 'Complete Heal' end
+        end
+
         if not spellName then
             if tier == 'pet' then
             spellName = choose_spell_for_lines(classConfig, profile.pet, settings) or choose_spell_for_lines(classConfig, profile.main, settings)

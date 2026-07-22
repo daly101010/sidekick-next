@@ -166,10 +166,29 @@ function M.buildContext()
             -- Any beneficial buff on the NPC (includes player-cast buffs via
             -- cached-buff scan). Dispel predicates: ctx.target.hasBeneficial
             hasBeneficial     = getTargeting().targetHasBeneficial(),
+            -- Positional: am I in the target's rear arc (backstab position)?
+            behind            = getTargeting().isBehindSpawn(target),
             myBuff = function(buffName)
                 if not buffName or buffName == '' then return false end
+                -- Exact-name hit first (cheap).
                 local b = target.MyBuff and target.MyBuff(buffName) or nil
-                return b and b() and true or false
+                if b and b() then return true end
+                -- Substring fallback: class configs pass rank-agnostic
+                -- fragments ('Deeds', 'Tashan', 'Cripple') to cover whole
+                -- spell lines, but MyBuff only matches exact names — the
+                -- miss made doSlow/doTash recast endlessly on a debuffed
+                -- target. Any caster's matching debuff counts (a slow is a
+                -- slow regardless of who landed it).
+                local needle = buffName:lower()
+                local count = safeNum(function() return target.BuffCount() end, 0)
+                for i = 1, count do
+                    local name = ''
+                    pcall(function() name = tostring(target.Buff(i).Name() or '') end)
+                    if name ~= '' and name:lower():find(needle, 1, true) then
+                        return true
+                    end
+                end
+                return false
             end,
         }
     else
@@ -178,6 +197,7 @@ function M.buildContext()
         targetInfo = {
             id = 0, pctHPs = 100, named = false, secondaryPctAggro = 0, body = '',
             hasBeneficial = false,
+            behind = false,
             myBuff = function() return false end,
         }
     end
@@ -346,6 +366,38 @@ end
 ---            exclude spell-based predicates so the dispatcher doesn't
 ---            steal heal/nuke ownership from dedicated rotation modules.
 --- Returns: { name, kind, setName, condKey } or nil.
+-- A detrimental cast fired at the current target lands on WHOEVER is
+-- targeted — a healer self-targeting between heals gets slowed/dotted by
+-- their own rotation. Class-config conditions (ctx.combat + myBuff checks)
+-- don't validate the target's type, so enforce it in both selection
+-- (pickReadyAbility) and dispatch (fireAbility).
+local function detrimentalTargetOk(spellName)
+    if not spellName or spellName == '' then return true end
+    local detrimental = false
+    pcall(function()
+        local sp = mq.TLO.Spell(spellName)
+        detrimental = sp and sp() and sp.Beneficial() == false
+    end)
+    if not detrimental then return true end
+    local ok, valid = pcall(function()
+        local t = mq.TLO.Target
+        return t and t() and t.Type() == 'NPC' and not t.Dead()
+    end)
+    return ok and valid == true
+end
+
+-- Resolve the effective spell behind an ability for the detrimental check.
+local function abilityTargetOk(kind, resolved)
+    if kind == 'spell' then
+        return detrimentalTargetOk(resolved)
+    elseif kind == 'aa' then
+        local aaSpell = nil
+        pcall(function() aaSpell = mq.TLO.Me.AltAbility(resolved).Spell.Name() end)
+        return detrimentalTargetOk(aaSpell)
+    end
+    return true  -- discs/skills act on the engaged target; melee has one
+end
+
 function M.pickReadyAbility(classConfig, ctx, opts)
     if not classConfig then return nil end
     local conditions = classConfig.defaultConditions
@@ -402,8 +454,14 @@ function M.pickReadyAbility(classConfig, ctx, opts)
                     -- ("doFortitude" -> "Fortitude", "doStandDisc" -> "StandDisc").
                     local setName = condKey:gsub('^do', '')
                     for _, kind in ipairs(kindCandidates(classConfig, setName, allowKinds)) do
+                        -- Conditions with a targetSelector (e.g. 'mez_target')
+                        -- retarget before casting — the current target is
+                        -- irrelevant to them, so skip the detrimental gate.
+                        local hasSelector = classConfig.targetSelector
+                            and classConfig.targetSelector[condKey] ~= nil
                         local resolved = resolveAbilityForKind(classConfig, setName, kind)
-                        if resolved and isReady(kind, resolved) then
+                        if resolved and isReady(kind, resolved)
+                            and (hasSelector or abilityTargetOk(kind, resolved)) then
                             return {
                                 name    = resolved,
                                 kind    = kind,
@@ -427,6 +485,9 @@ end
 --- Fire the action by kind. Returns true if a command was issued.
 function M.fireAbility(action)
     if not (action and action.name and action.kind) then return false end
+    -- Last-line detrimental target check (selection also filters via
+    -- abilityTargetOk, but the target can change between claim and dispatch).
+    if not abilityTargetOk(action.kind, action.name) then return false end
     if action.kind == 'aa' then
         local id = safeNum(function() return mq.TLO.Me.AltAbility(action.name).ID() end, 0)
         if id <= 0 then return false end
