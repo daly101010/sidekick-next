@@ -20,6 +20,11 @@ M.Priority = {
     DEBUFF = 3,
     PULL = 3.5,       -- Movement/target ownership before normal DPS assist
     TANK_RECOVERY = 2.5, -- Loose-mob taunt/aggro recovery
+    TANK_ENGAGE = 2.75,  -- Engaging the next kill target. Queues only behind
+                         -- emergency/heals/rez-cures/recovery taunts; must
+                         -- outrank the tank's own DPS rotation, or a stun
+                         -- mid-cast holds the target resource and delays the
+                         -- turn to the next mob by a full cast time.
     TANK_AGGRO = 3.25,   -- Routine tank hate tools
     DPS = 4,
     IDLE = 5,
@@ -35,6 +40,7 @@ M.InterruptThreshold = {
     [1] = 0.5,   -- Healing: 0.5s
     [2] = 1.0,   -- Resurrection: 1.0s
     [2.5] = 0.25, -- Tank recovery: interrupt quickly for a loose mob
+    [2.75] = 0.5, -- Tank engage: brief grace for an in-flight cast, then take over
     [3] = 1.0,   -- Debuff: 1.0s
     [3.25] = 0.5, -- Routine tank aggro
     [3.5] = 999, -- Pull owns movement/target only
@@ -158,6 +164,18 @@ end
 function M.isLuaScriptRunning(scriptName)
     local status = M.getLuaScriptStatus(scriptName)
     return status == 'STARTING' or status == 'RUNNING' or status == 'PAUSED'
+end
+
+--- True if the parent SideKick UI script is running (under either name it
+--- can be launched as). Workers use this as an orphan watchdog: a forced
+--- `/lua stop sidekick-next` kills the parent at its current mq.delay, so
+--- init.lua's post-main Supervisor.stop() never runs and the fleet would
+--- otherwise live on headless.
+function M.isUiRunning()
+    for _, name in ipairs(M.Scripts.UI or {}) do
+        if M.isLuaScriptRunning(name) then return true end
+    end
+    return false
 end
 
 --- Check if a timestamp is stale

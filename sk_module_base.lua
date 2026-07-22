@@ -6,6 +6,7 @@ local mq = require('mq')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
 local ActionExecutor = require('sidekick-next.utils.action_executor')
+local ActionCounters = require('sidekick-next.utils.action_counters')
 
 local M = {}
 
@@ -114,7 +115,14 @@ function M.create(moduleName, priority)
 
     function self:isMyPriority()
         if not self:hasValidState() then return false end
-        return self.state.activePriority == self.priority or self.priority == lib.Priority.EMERGENCY
+        -- Better-or-equal tier may act (lower number = higher priority).
+        -- Exact-match gating forced every higher-priority action — heals,
+        -- tank engage after a kill — to wait a full need -> scheduler
+        -- priority-flip -> broadcast round trip (~0.5-2s wall under turbo
+        -- slicing) before its claim could even be SENT. Ownership arbitration
+        -- in the coordinator (canGrantResource) still enforces ordering.
+        return self.priority <= self.state.activePriority
+            or self.priority == lib.Priority.EMERGENCY
     end
 
     function self:isWarmingUp()
@@ -332,6 +340,7 @@ function M.create(moduleName, priority)
                 sentAtMs = lib.getTimeMs(),
                 ready = stateReady,
                 action = action,
+                counters = ActionCounters.snapshot(),
             })
         end)
     end
@@ -390,6 +399,13 @@ function M.create(moduleName, priority)
         local result = ActionExecutor.consumeResult()
         if result then
             self.lastActionResult = result
+            -- Activity counters: every unified action funnels through here,
+            -- so one bump site covers heals, nukes, buffs, taunts, items...
+            if result.phase == 'completed' then
+                ActionCounters.bump('done:' .. tostring(result.kind or 'action'))
+            elseif result.phase == 'failed' then
+                ActionCounters.bump('failed')
+            end
             local reason = string.format('executor:%s:%s',
                 tostring(result.phase or 'unknown'), tostring(result.reason or 'unknown'))
             lib.log(result.phase == 'completed' and 'debug' or 'warn', self.name,
@@ -775,6 +791,12 @@ function M.create(moduleName, priority)
         local _coordinatorAbsentLogged = false
         local wasInGame = lib.isInGame()
         local lastLoopAt = lib.getTimeMs()
+        -- Orphan watchdog: a forced /lua stop of the parent UI skips
+        -- init.lua's Supervisor.stop(), leaving workers running headless.
+        -- Poll the parent every 5s; two consecutive misses (10s — rides out
+        -- a fast /lua restart of the UI) means we self-terminate.
+        local lastParentCheckAt = lib.getTimeMs()
+        local parentMisses = 0
 
         while self.running do
             local loopStartedAt = lib.getTimeMs()
@@ -798,6 +820,25 @@ function M.create(moduleName, priority)
             -- the unified executor can advance without module-specific event
             -- plumbing.
             if mq.doevents then pcall(mq.doevents) end
+
+            do
+                local nowMs = lib.getTimeMs()
+                if (nowMs - lastParentCheckAt) >= 5000 then
+                    lastParentCheckAt = nowMs
+                    if lib.isUiRunning() then
+                        parentMisses = 0
+                    else
+                        parentMisses = parentMisses + 1
+                        if parentMisses >= 2 then
+                            lib.log('info', self.name,
+                                'Parent SideKick script stopped; shutting down worker')
+                            self:stop()
+                            break
+                        end
+                    end
+                end
+            end
+
             self:tick()
 
             -- Send heartbeat periodically

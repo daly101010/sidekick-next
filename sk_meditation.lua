@@ -6,6 +6,7 @@
 local mq = require('mq')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
+local ActionCounters = require('sidekick-next.utils.action_counters')
 
 local M = {}
 
@@ -351,6 +352,7 @@ local function canChangeState(now, settings)
 end
 
 local function cmdSit(now)
+    ActionCounters.bump('sit')
     mq.cmd('/squelch /sit')
     State.lastCmdAt = now
     State.lastStateChangeAt = now
@@ -401,6 +403,7 @@ local function sendHeartbeat()
             ownerServer = lib.getMyServer(),
             sentAtMs = lib.getTimeMs(),
             ready = true,
+            counters = ActionCounters.snapshot(),
         })
     end)
 end
@@ -585,6 +588,7 @@ local function tick()
     if aggroUnsafe then
         if me.sitting == true and canChangeState(now, settings) then
             if shouldLog then debugLog('tick: standing due to aggro') end
+            ActionCounters.bump('aggro_stand')
             cmdStand(now)
         end
         sendNeed(false, nil, 'aggro_hold')
@@ -773,12 +777,34 @@ local function mainLoop()
     local tickDelayMs = 100  -- Meditation can tick slower
     local _coordinatorAbsentLogged = false
     local wasInGame = lib.isInGame()
+    -- Orphan watchdog (mirrors ModuleBase.run): self-terminate when the
+    -- parent UI script is force-stopped and never ran Supervisor.stop().
+    local lastParentCheckAt = lib.getTimeMs()
+    local parentMisses = 0
 
     while State.running do
         -- Pump chat events: the combat-damage aggro guard (skmed_hit_me /
         -- skmed_miss_me) only fires from mq.doevents, and this hand-rolled
         -- loop is not ModuleBase.run (which pumps automatically).
         if mq.doevents then pcall(mq.doevents) end
+
+        do
+            local nowMs = lib.getTimeMs()
+            if (nowMs - lastParentCheckAt) >= 5000 then
+                lastParentCheckAt = nowMs
+                if lib.isUiRunning() then
+                    parentMisses = 0
+                else
+                    parentMisses = parentMisses + 1
+                    if parentMisses >= 2 then
+                        lib.log('info', 'meditation',
+                            'Parent SideKick script stopped; shutting down worker')
+                        State.running = false
+                        break
+                    end
+                end
+            end
+        end
 
         tick()
 

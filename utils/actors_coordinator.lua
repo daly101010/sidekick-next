@@ -77,6 +77,17 @@ local _tankState = {
     updatedAt = 0,
 }
 
+-- Charm-pet protection state. The charming enchanter broadcasts its pet's
+-- spawn ID so every worker in the group treats that mob as off-limits: DPS
+-- must not kill it (even mid charm-break, when it briefly reappears as a
+-- hater) and the tank protects the enchanter with damageless aggro only.
+local _charmState = {
+    petId = 0,
+    petName = '',
+    ownerName = '',
+    updatedAt = 0,
+}
+
 local function safeMeName()
     if mq.TLO.Me and mq.TLO.Me.CleanName then
         return mq.TLO.Me.CleanName() or ''
@@ -467,9 +478,10 @@ function M.init(opts)
             return
         end
 
-        -- Tank coordination: primary kill target
+        -- Tank coordination: primary kill target. NOT gated on fromMe: the
+        -- tank's own sibling workers (its sk_dps, sk_cc, ...) receive this
+        -- via the fleet fan-out and need it too. Idempotent last-write-wins.
         if id == 'target:primary' then
-            if fromMe then return end
             -- Only respond if we're in the same zone (if zone info provided)
             local senderZone = tostring(content.zone or '')
             local myZone = safeZone()
@@ -584,9 +596,11 @@ function M.init(opts)
             return
         end
 
-        -- CC coordination: receive mez list from mezzer
+        -- CC coordination: receive mez list from mezzer. NOT gated on fromMe:
+        -- the mezzer's own sibling workers (its sk_tank/sk_dps) need mez
+        -- state too; in the mezzer's own cc process the entries just mirror
+        -- localMezzes (merged by max-expiry — harmless).
         if id == 'cc:mezlist' then
-            if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             local CC = package.loaded['sidekick-next.automation.cc']
             if CC and CC.receiveMezList then
@@ -595,14 +609,38 @@ function M.init(opts)
             return
         end
 
-        -- CC coordination: receive mez claim from another mezzer
+        -- CC coordination: receive mez claim. NOT gated on fromMe — the
+        -- claimant's own sk_tank needs it (isMobMezClaimed). The claimant's
+        -- own cc process guards against self-poisoning inside receiveClaim
+        -- (it skips claims it holds locally).
         if id == 'cc:claim' then
-            if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             local CC = package.loaded['sidekick-next.automation.cc']
             if CC and CC.receiveClaim then
                 CC.receiveClaim(content)
             end
+            return
+        end
+
+        -- CC coordination: charm-pet protection state from the charming
+        -- enchanter. NOT gated on fromMe — sibling workers on the enchanter's
+        -- own character (its sk_dps, etc.) need this too, or the enchanter
+        -- would nuke its own pet during a charm break. Idempotent last-write-
+        -- wins, so accepting our own loopback is harmless.
+        if id == 'cc:charmpet' then
+            if not senderInSameZone(content, sender) then return end
+            local petId = tonumber(content.petId) or 0
+            local owner = tostring(content.owner or '')
+            -- petId == 0 is an explicit release; only honor it from the same
+            -- owner that set the current pet (a second enchanter's release
+            -- must not clear the first one's protection).
+            if petId == 0 and owner ~= '' and owner ~= _charmState.ownerName then
+                return
+            end
+            _charmState.petId = petId
+            _charmState.petName = tostring(content.petName or '')
+            _charmState.ownerName = owner
+            _charmState.updatedAt = os.clock()
             return
         end
 
@@ -1151,7 +1189,13 @@ function M.registerMessageCallback(msgType, callback)
     table.insert(_messageCallbacks[msgType], callback)
 end
 
---- Generic broadcast to all SideKick instances
+--- Generic broadcast to all SideKick instances.
+-- IMPORTANT addressing caveat: an address of { mailbox = 'sidekick' } with no
+-- script routes to "currentScript:sidekick" — it reaches the SAME script on
+-- other characters only. Same-script fan-out is correct for intra-role
+-- coordination (healer<->healer claims, mezzer<->mezzer claims). For state
+-- that OTHER scripts must see (tank primary, mez list, charm pet), use
+-- M.broadcastFleet instead.
 -- @param msgId string Message ID (e.g., 'cc:mezlist')
 -- @param payload table Message payload
 function M.broadcast(msgId, payload)
@@ -1163,6 +1207,46 @@ function M.broadcast(msgId, payload)
         _dropbox:send({ mailbox = 'sidekick' }, payload)
     end)
     -- Tally self-fired claims into the ledger.
+    local cat = CLAIM_CATEGORIES[msgId]
+    if cat then
+        local L = ledger()
+        if L then L.record(payload.from, cat) end
+    end
+end
+
+-- Scripts whose 'sidekick' mailbox should see fleet-wide state. Built lazily
+-- from sk_lib's canonical lists.
+local _fleetScripts = nil
+local function fleetScripts()
+    if _fleetScripts then return _fleetScripts end
+    local lib = require('sidekick-next.sk_lib')
+    local list = {}
+    for _, s in ipairs(lib.Scripts.WORKERS or {}) do list[#list + 1] = s end
+    local ui = lib.Scripts.UI
+    if type(ui) == 'table' then
+        for _, s in ipairs(ui) do list[#list + 1] = s end
+    elseif type(ui) == 'string' then
+        list[#list + 1] = ui
+    end
+    _fleetScripts = list
+    return list
+end
+
+--- Broadcast to EVERY SideKick script on every connected character (~16
+--- sends, ≈1ms each — reserve for low-frequency state, not per-tick data).
+--- Needed because plain { mailbox = 'sidekick' } never crosses script names.
+-- @param msgId string Message ID
+-- @param payload table Message payload
+function M.broadcastFleet(msgId, payload)
+    if not _dropbox then return end
+    payload = payload or {}
+    payload.id = msgId
+    payload.from = payload.from or _selfName
+    for _, script in ipairs(fleetScripts()) do
+        pcall(function()
+            _dropbox:send({ mailbox = 'sidekick', script = script }, payload)
+        end)
+    end
     local cat = CLAIM_CATEGORIES[msgId]
     if cat then
         local L = ledger()
@@ -1226,74 +1310,67 @@ function M.broadcastTargetPrimary(targetId, targetName)
     local tankId = (me and me() and me.ID and me.ID()) or nil
     -- Update zone before broadcast
     _selfZone = safeZone()
-    pcall(function()
-        _dropbox:send({ mailbox = 'sidekick' }, {
-            id = 'target:primary',
-            targetId = targetId,
-            targetName = targetName,
-            tankId = tankId,
-            tankName = _selfName,
-            zone = _selfZone,
-            from = _selfName,
-        })
-    end)
+    -- Fleet fan-out: mezzers (sk_cc/sk_disciplines), assisters, and charm
+    -- upkeep all live in OTHER scripts; a plain mailbox send would only reach
+    -- other characters' sk_tank.
+    M.broadcastFleet('target:primary', {
+        targetId = targetId,
+        targetName = targetName,
+        tankId = tankId,
+        tankName = _selfName,
+        zone = _selfZone,
+    })
 end
 
 --- Broadcast that tank is repositioning (assisters enter soft-pause)
 function M.broadcastTankRepositioning()
     if not _dropbox then return end
     _selfZone = safeZone()
-    pcall(function()
-        _dropbox:send({ mailbox = 'sidekick' }, {
-            id = 'tank:repositioning',
-            from = _selfName,
-            zone = _selfZone,
-        })
-    end)
+    M.broadcastFleet('tank:repositioning', { zone = _selfZone })
 end
 
 --- Broadcast that tank has settled (assisters exit soft-pause)
 function M.broadcastTankSettled()
     if not _dropbox then return end
     _selfZone = safeZone()
-    pcall(function()
-        _dropbox:send({ mailbox = 'sidekick' }, {
-            id = 'tank:settled',
-            from = _selfName,
-            zone = _selfZone,
-        })
-    end)
+    M.broadcastFleet('tank:settled', { zone = _selfZone })
 end
 
 --- Broadcast that tank is doing a taunt run (assisters enter soft-pause)
 function M.broadcastTauntRun()
     if not _dropbox then return end
     _selfZone = safeZone()
-    pcall(function()
-        _dropbox:send({ mailbox = 'sidekick' }, {
-            id = 'tank:taunt_run',
-            from = _selfName,
-            zone = _selfZone,
-        })
-    end)
+    M.broadcastFleet('tank:taunt_run', { zone = _selfZone })
 end
 
 --- Broadcast that tank's taunt run completed (assisters exit soft-pause)
 function M.broadcastTauntDone()
     if not _dropbox then return end
     _selfZone = safeZone()
-    pcall(function()
-        _dropbox:send({ mailbox = 'sidekick' }, {
-            id = 'tank:taunt_done',
-            from = _selfName,
-            zone = _selfZone,
-        })
-    end)
+    M.broadcastFleet('tank:taunt_done', { zone = _selfZone })
 end
 
 --- Get the current tank state (for assisters to read)
 function M.getTankState()
     return _tankState
+end
+
+--- Get the protected charm-pet state (for target selection to read)
+function M.getCharmState()
+    return _charmState
+end
+
+--- True if this spawn ID is a group charm pet (or a just-broken one still
+--- under the owner's recovery window) and must never be attacked.
+-- @param id number Spawn ID to check
+function M.isCharmPet(id)
+    id = tonumber(id) or 0
+    if id <= 0 or _charmState.petId <= 0 then return false end
+    if id ~= _charmState.petId then return false end
+    -- The owner rebroadcasts every few seconds while the pet (or its
+    -- recovery window) is live; a long-silent entry means the owner's
+    -- worker died — fail open so the mob can be killed.
+    return (os.clock() - (_charmState.updatedAt or 0)) < 30
 end
 
 --- Get current zone for comparison

@@ -582,11 +582,16 @@ local function processClaim(content, sender)
             content.module, content.epochSeen, State.epoch, epochDrift)
     end
 
-    -- Validate priority
-    if content.priority ~= State.activePriority and content.priority ~= lib.Priority.EMERGENCY then
-        lib.log('debug', M.MODULE_NAME, 'Claim rejected (wrong priority): %s has %d, active %d',
+    -- Validate priority: accept claims at OR ABOVE the active tier
+    -- (numerically <=). Requiring exact equality forced every high-priority
+    -- action (heals, tank engage) through a need -> priority-flip ->
+    -- broadcast round trip (~0.5-2s wall) before its claim could land.
+    -- canGrantResource below still arbitrates ownership: better priority
+    -- displaces a worse owner, and in-flight casts stay protected.
+    if content.priority > State.activePriority and content.priority ~= lib.Priority.EMERGENCY then
+        lib.log('debug', M.MODULE_NAME, 'Claim rejected (below active priority): %s has %d, active %d',
             content.module, content.priority, State.activePriority)
-        debugLog('CLAIM REJECTED: wrong priority (has=%d, active=%d)', content.priority, State.activePriority)
+        debugLog('CLAIM REJECTED: below active priority (has=%d, active=%d)', content.priority, State.activePriority)
         return reject('wrong_priority')
     end
 
@@ -800,6 +805,7 @@ local function buildStatePayload()
             needTtl = need and need.ttlMs or 0,
             reason = need and need.reason or nil,
             action = hb and hb.action or nil,
+            counters = hb and hb.counters or nil,
         }
     end
 
@@ -1031,6 +1037,7 @@ local function processMessage(content, sender, nowMs)
                 sentAtMs = content.sentAtMs,      -- Keep sender time for diagnostics only
                 ready = content.ready ~= false,
                 action = type(content.action) == 'table' and content.action or nil,
+                counters = type(content.counters) == 'table' and content.counters or nil,
                 script = senderScript,
                 mailbox = mailbox,
             }
@@ -1543,8 +1550,27 @@ local function mainLoop()
     initialize()
 
     local lastWakeAt = lib.getTimeMs()
+    -- Orphan watchdog: a forced /lua stop of the parent UI skips the
+    -- supervisor's fleet teardown; the coordinator self-terminates so the
+    -- workers' own coordinator-absence handling can wind them down too.
+    local lastParentCheckAt = lib.getTimeMs()
+    local parentMisses = 0
     while State.running do
         local tickStartAt = lib.getTimeMs()
+        if (tickStartAt - lastParentCheckAt) >= 5000 then
+            lastParentCheckAt = tickStartAt
+            if lib.isUiRunning() then
+                parentMisses = 0
+            else
+                parentMisses = parentMisses + 1
+                if parentMisses >= 2 then
+                    lib.log('info', M.MODULE_NAME,
+                        'Parent SideKick script stopped; shutting down coordinator')
+                    State.running = false
+                    break
+                end
+            end
+        end
         -- Gap between wakeups minus our own tick cost = scheduler/frame lag.
         -- mq.delay resumes on frame boundaries, so low game FPS stretches
         -- every script's cadence; this separates "our tick is slow" from
