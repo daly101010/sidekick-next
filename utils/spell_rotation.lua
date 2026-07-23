@@ -179,7 +179,11 @@ function M.selectNextSpell(spells, settings, targetId)
                 if category == 'nuke' then
                     local ms = spell.MyCastTime and tonumber(spell.MyCastTime()) or nil
                     local castSec = ms and (ms / 1000) or nil
-                    if not DpsIntel.nukeViable(targetId, castSec, spellName) then
+                    if DpsIntel.isRainSpell and DpsIntel.isRainSpell(spell) then
+                        if not DpsIntel.rainViable(targetId, castSec) then
+                            goto continue
+                        end
+                    elseif not DpsIntel.nukeViable(targetId, castSec, spellName) then
                         goto continue
                     end
                 elseif category == 'dot' then

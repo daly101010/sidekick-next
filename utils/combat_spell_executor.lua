@@ -485,8 +485,14 @@ local function shouldSkipDamageCast(spellType, spellName, targetId)
                 local ms = tonumber(spell.MyCastTime())
                 castSec = ms and (ms / 1000) or nil
             end
+            if DpsIntel.isRainSpell and DpsIntel.isRainSpell(spell) then
+                -- Rains need the longer wave-payoff horizon; no single-target
+                -- overkill check (damage spreads over waves and targets)
+                if not DpsIntel.rainViable(targetId, castSec) then
+                    return true
+                end
             -- Includes the overkill check via spellName (learned damage vs est HP)
-            if not DpsIntel.nukeViable(targetId, castSec, spellName) then
+            elseif not DpsIntel.nukeViable(targetId, castSec, spellName) then
                 return true
             end
         end

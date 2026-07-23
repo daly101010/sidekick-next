@@ -139,6 +139,31 @@ function M.nukeViable(mobId, castTimeSec, spellName)
     return M.overkillOk(mobId, spellName)
 end
 
+--- Is this spell a rain? (waves of targeted-AE damage at the target's location)
+-- Detected via EQ's Rain subcategory, falling back to Targeted AE + AE duration.
+-- @param spellNameOrObj string|userdata Spell name or MQ Spell object
+-- @return boolean
+function M.isRainSpell(spellNameOrObj)
+    local spell = spellNameOrObj
+    if type(spellNameOrObj) == 'string' then
+        spell = mq.TLO.Spell(spellNameOrObj)
+    end
+    if not spell then return false end
+    local okV, valid = pcall(function() return spell() end)
+    if not okV or not valid then return false end
+
+    local okS, sub = pcall(function() return spell.Subcategory() end)
+    if okS and tostring(sub or ''):lower() == 'rain' then return true end
+
+    local okT, tt = pcall(function() return spell.TargetType() end)
+    if okT and tostring(tt or '') == 'Targeted AE' then
+        local okA, aeDur = pcall(function() return tonumber(spell.AEDuration()) end)
+        if okA and (aeDur or 0) > 0 then return true end
+    end
+
+    return false
+end
+
 --- Is a rain spell worth starting on this mob's location?
 -- Rains deliver damage in waves over several seconds AFTER landing, so their
 -- horizon is cast + margin + a payoff window for the waves to connect.
