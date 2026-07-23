@@ -302,7 +302,7 @@ local SKIP_LOG_COOLDOWN = 5.0  -- Only log once per 5 seconds per target
 -- @param range number Search radius (default 100)
 -- @param settings table Optional settings for safe targeting
 -- @return userdata|nil Best target spawn or nil
-function M.selectBestTarget(myId, range, settings)
+function M.selectBestTarget(myId, range, settings, excludeId)
     settings = settings or M.settings or {}
     local unmezzed = M.getUnmezzedTargets(range)
     local now = os.clock()
@@ -311,6 +311,9 @@ function M.selectBestTarget(myId, range, settings)
         -- Filter and score targets, logging skipped ones
         local scoredTargets = {}
         for _, spawn in ipairs(unmezzed) do
+            if excludeId and excludeId > 0 and spawn.ID() == excludeId then
+                goto skip
+            end
             local score, reason = M.scoreTarget(spawn, myId, settings)
             if score >= 0 then
                 table.insert(scoredTargets, { spawn = spawn, score = score })
@@ -324,6 +327,7 @@ function M.selectBestTarget(myId, range, settings)
                     -- Echo disabled
                 end
             end
+            ::skip::
         end
 
         -- Sort by score descending

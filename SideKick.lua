@@ -137,6 +137,9 @@ local getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
 local getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
 local getSpellDamageTracker = lazy.init('sidekick-next.utils.spell_damage_tracker')
 local getMobIntel = lazy.init('sidekick-next.utils.mob_intel')
+local getDeathForensics = lazy.init('sidekick-next.utils.death_forensics')
+local getSessionStats = lazy.init('sidekick-next.utils.session_stats')
+local getReadiness = lazy('sidekick-next.utils.readiness')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -2056,6 +2059,30 @@ local function main()
         end
     end)
 
+    _bindCmd('/skready', function()
+        local Readiness = getReadiness()
+        if Readiness and Readiness.printStatus then
+            Readiness.printStatus()
+        end
+    end)
+
+    _bindCmd('/sksession', function(sub)
+        local Stats = getSessionStats()
+        if not Stats then
+            log.info('Session stats module not available')
+            return
+        end
+        sub = tostring(sub or ''):lower()
+        if sub == 'export' then
+            Stats.exportCSV()
+        elseif sub == 'reset' then
+            Stats.reset()
+            log.info('Session stats reset')
+        else
+            Stats.printSummary()
+        end
+    end)
+
     _bindCmd('/skmobintel', function(sub, arg)
         local MobIntel = getMobIntel()
         if not MobIntel then
@@ -2220,6 +2247,15 @@ local function main()
         -- Mob intel: CC results, NPC cast observation, consolidated knowledge base
         do local M = getMobIntel() if M then M.loadZone() M.tick() end end
 
+        -- Death forensics: rolling combat black box + death reports
+        do local M = getDeathForensics() if M then M.tick() end end
+
+        -- Session stats: XP/kills/DPS tracking
+        do local M = getSessionStats() if M then M.tick() end end
+
+        -- Group readiness coordinator (actors-based, opt-in)
+        do local M = getReadiness() if M then M.tick() end end
+
         -- Update aggro warning state
         do local M = getAggroWarning() if M and M.update then M.update() end end
 
@@ -2284,6 +2320,9 @@ local function main()
 
     -- Shutdown: save mob intel (CC results, NPC casts)
     do local M = getMobIntel() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: session stats events
+    do local M = getSessionStats() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

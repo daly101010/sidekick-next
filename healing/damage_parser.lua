@@ -5,6 +5,7 @@ local M = {}
 
 local Config = nil
 local _handlers = {}
+local _listeners = {}  -- external observers of incoming damage (death forensics, etc.)
 local _damageWindow = {}  -- [targetId] = { {time, amount, source}, ... }
 local WINDOW_DURATION = 6  -- seconds (default, overridden by Config.damageWindowSec)
 local WINDOW_DURATION_MS = WINDOW_DURATION * 1000
@@ -52,6 +53,14 @@ function M.registerEvents()
     end)
 end
 
+--- Register an external observer of incoming damage (called for every recorded hit)
+-- Listener signature: fn(targetId, targetName, amount, source, dmgType)
+function M.addListener(fn)
+    if type(fn) == 'function' then
+        table.insert(_listeners, fn)
+    end
+end
+
 function M.recordDamage(targetName, amount, source, dmgType)
     if amount <= 0 then return end
 
@@ -68,6 +77,10 @@ function M.recordDamage(targetName, amount, source, dmgType)
         source = source,
         dmgType = dmgType,
     })
+
+    for _, fn in ipairs(_listeners) do
+        pcall(fn, targetId, targetName, amount, source, dmgType)
+    end
 end
 
 function M.findTargetIdByName(name)

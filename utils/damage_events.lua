@@ -28,12 +28,13 @@ function M.addListener(fn)
     end
 end
 
-local function dispatch(target, amount, mine, kind, spell)
+local function dispatch(target, amount, mine, kind, spell, attacker)
     amount = tonumber(amount) or 0
     if amount <= 0 then return end
     if not target or target == '' then return end
 
-    local event = { target = target, amount = amount, mine = mine, kind = kind, spell = spell }
+    local event = { target = target, amount = amount, mine = mine, kind = kind, spell = spell,
+        attacker = mine and 'me' or (attacker or '') }
     for _, fn in ipairs(_listeners) do
         pcall(fn, event)
     end
@@ -70,7 +71,7 @@ function M.registerEvents()
     mq.event('sk_de_other_nuke', "#1# hit #2# for #3# points of non-melee damage#*#", function(_, attacker, target, amount)
         -- My own line also matches with attacker "You" - handled by sk_de_my_nuke
         if tostring(attacker):lower() ~= 'you' then
-            dispatch(target, amount, false, 'nuke')
+            dispatch(target, amount, false, 'nuke', nil, attacker)
         end
     end)
 
@@ -82,7 +83,7 @@ function M.registerEvents()
     end)
 
     mq.event('sk_de_other_dot', "#1# has taken #2# damage from #3# by #4#.#*#", function(_, target, amount, caster, spell)
-        dispatch(target, amount, false, 'dot', spell)
+        dispatch(target, amount, false, 'dot', spell, caster)
     end)
 
     -- ============================================
@@ -100,7 +101,7 @@ function M.registerEvents()
     for _, verb in ipairs(MELEE_VERBS) do
         local plural = pluralVerb(verb)
         mq.event('sk_de_ot_' .. verb, string.format("#1# %s #2# for #3# points of damage.#*#", plural), function(_, attacker, target, amount)
-            dispatch(target, amount, false, 'melee')
+            dispatch(target, amount, false, 'melee', nil, attacker)
         end)
     end
 
