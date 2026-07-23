@@ -1576,6 +1576,13 @@ local function mainLoop()
         -- every script's cadence; this separates "our tick is slow" from
         -- "the frame loop is slow".
         State.loopGapMs = tickStartAt - lastWakeAt
+        -- A large wakeup gap means the whole client's game thread stalled
+        -- (every Lua script freezes together). Name the moment so lockups
+        -- can be correlated with user actions and other scripts' logs.
+        if State.loopGapMs > 1500 then
+            printf('\ay[SK-Coordinator]\ax game-thread stall: %.1fs ending at %s',
+                State.loopGapMs / 1000, os.date('%H:%M:%S'))
+        end
         tick()
         local tickDur = lib.getTimeMs() - tickStartAt
         State.lastTickMs = tickDur
