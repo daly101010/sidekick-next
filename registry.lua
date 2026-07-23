@@ -565,6 +565,10 @@ local MODULE_KEYS = {
     ]],
     dps = [[
         BurnActive BurnDuration BurnNow SpellRotationEnabled RotationResetWindow
+        UseDpsIntelligence DpsNukeLandMargin DpsDotBreakevenPct DpsDefaultNukeCastTime
+        DpsDefaultDotDuration DpsOverkillFactor DpsRainPayoffSec DpsRainSafetyMode
+        DpsRainSafetyRadius UseResistTracker ResistAvoidPct ResistMinSamples
+        ResistMinEfficiencyPct
     ]],
     combat = [[
         CombatMode TankTargetMode TankAoEThreshold TankRequireAggroDeficit TankSafeAECheck
@@ -576,6 +580,11 @@ local MODULE_KEYS = {
         SafeTargetingCheckPeers TargetingForcedTargetName TargetingIgnoredTargetNames
         NamedDetectionUseSpawnMaster NamedDetectionUseAlertMaster NamedDetectionMinLevel
         NamedDetectionCustomNames NamedDetectionForceNamed
+        CasterStandoffEnabled CasterStandoffMin CasterStandoffMax
+        TankAutoPeel TankPeelMinPriority TankFleeHandoff TankFleeHpThreshold
+        TankFleeHandoffWindowSec TankFleeMinAdds
+        DamageObserver DeathForensicsEnabled
+        ReadinessEnabled ReadinessAnnounce ReadyHpPct ReadyManaPct ReadyEndPct
     ]],
     debuff = [[ DebuffAllTask ]],
     spells = [[
@@ -589,7 +598,7 @@ local MODULE_KEYS = {
         HealThreshold HealPetsEnabled DoHeals PriorityHealing HealBreakInvisOOC MainHealPoint
         BigHealPoint GroupHealPoint GroupInjureCnt DoPetHeals PetHealPoint HealWatchMA
         HealXTargetEnabled HealXTargetSlots HealUseHoTs HealHoTMinSeconds HealCoordinateActors
-        HealTrackHoTsViaActors
+        HealTrackHoTsViaActors PrePullHotEnabled PrePullHotEtaSec PrePullHotBigMult
     ]],
     cc = [[
         MezImmunePersistEnabled MezzingEnabled MezMinLevel MezMaxTargets UseAEMez
@@ -598,7 +607,7 @@ local MODULE_KEYS = {
     ]],
     disciplines = [[ DisciplinesEnabled SideKickBERDiscDefaultsApplied ]],
     buffs = [[ BuffingEnabled ]],
-    integration = [[ ActorsEnabled ActorsTeamEnabled ActorsTeamMode ActorsTeamName SideKickLaunchGroup ]],
+    integration = [[ ActorsEnabled ActorsTeamEnabled ActorsTeamMode ActorsTeamName SideKickLaunchGroup VitalsHubEnabled ]],
     cures = [[ DoCures CurePrioritySelf CureInCombat ]],
     resurrection = [[
         AutoRezOOC AutoRezInCombat AutoAcceptRez RezOOCMethod RezCombatMethod
