@@ -412,3 +412,22 @@ all yielding work.
 6. Add the script to `sk_lib.lua`, the coordinator debug ordering, and this
    document.
 7. Confirm the UI host does not also initialize or tick the subsystem.
+
+## Actors message contracts
+
+### `vitals:group` (v1) — tank → UI scripts
+
+The designated tank (`CombatMode == 'tank'`, gate `VitalsHubEnabled`) publishes
+one consolidated group-vitals message at ≤5Hz (change-driven, 2s heartbeat)
+from `utils/vitals_hub.lua` via `ActorsCoordinator.sendVitalsGroup`. Fan-out is
+script-addressed: `{ mailbox = 'grouptarget', script = 'group' }` and
+`{ mailbox = 'medley_remote', script = 'eq_ui_rebuild_classic' }`.
+
+Payload: `{ id='vitals:group', v=1, seq, from, server, zone, members }` where
+`members[name] = { id, level, class, hp, mana, endur, petHp, dead, sitting,
+casting, present }`. `present` is from the TANK's perspective; when false the
+volatile fields are absent. `casting` is only populated for the publisher.
+Consumers treat every field as optional, use the feed only while fresh (<2s),
+and keep their own TLO polling as fallback. Distance / LineOfSight / viewer
+zone logic must stay locally polled (relative to the viewer, not the tank).
+Healing decisions never consume this feed (latency).
