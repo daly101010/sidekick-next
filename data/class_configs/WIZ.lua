@@ -116,8 +116,10 @@ M.defaultConditions = {
     ['doEtherealNuke'] = function(ctx)
         return ctx.combat and ctx.target.named and ctx.target.nukeViable(1.5)
     end,
+    -- Rains deliver waves for several seconds after landing - rainViable uses a
+    -- longer horizon so the waves actually connect before the mobs die
     ['doRainSpell'] = function(ctx)
-        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40 and ctx.target.nukeViable(3.0)
+        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40 and ctx.target.rainViable(3.0)
     end,
     ['doAEFire'] = function(ctx)
         return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40 and ctx.target.nukeViable(3.0)

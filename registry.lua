@@ -167,11 +167,14 @@ M.defaults = {
     DpsDotBreakevenPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'DoT Breakeven (% of duration)' },
     DpsDefaultNukeCastTime = { type = 'number', Default = 3.0, Category = 'Combat', DisplayName = 'Default Nuke Cast Time (sec)' },
     DpsDefaultDotDuration = { type = 'number', Default = 24, Category = 'Combat', DisplayName = 'Default DoT Duration (sec)' },
+    DpsOverkillFactor = { type = 'number', Default = 1.5, Category = 'Combat', DisplayName = 'Nuke Overkill Factor (x remaining HP)' },
+    DpsRainPayoffSec = { type = 'number', Default = 4, Category = 'Combat', DisplayName = 'Rain Wave Payoff Window (sec)' },
 
     -- Resist Tracker (per-mob element resist learning)
     UseResistTracker = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Learn Mob Resists' },
     ResistAvoidPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Avoid Element At Resist %' },
     ResistMinSamples = { type = 'number', Default = 4, Category = 'Combat', DisplayName = 'Resist Min Samples' },
+    ResistMinEfficiencyPct = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Avoid Element Below Efficiency %' },
 
     -- Spell Lineup Settings
     SpellRescanOnZone = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Rescan Gems on Zone' },

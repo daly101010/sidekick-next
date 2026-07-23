@@ -48,6 +48,7 @@ local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
 local getImmuneDB = lazy('sidekick-next.utils.immune_database')
 local getResistTracker = lazy('sidekick-next.utils.resist_tracker')
+local getDpsIntel = lazy('sidekick-next.utils.dps_intelligence')
 local getSpellLineup = lazy('sidekick-next.utils.spell_lineup')
 local getCache = lazy('sidekick-next.utils.runtime_cache')
 
@@ -167,6 +168,30 @@ function M.selectNextSpell(spells, settings, targetId)
                 if RT and RT.shouldAvoid then
                     local resistType = spell.ResistType and spell.ResistType() or ''
                     if resistType ~= '' and RT.shouldAvoid(targetName, resistType:lower(), settings) then
+                        goto continue
+                    end
+                end
+            end
+
+            -- Time-to-die viability + overkill check (fails open when no data)
+            local DpsIntel = getDpsIntel()
+            if DpsIntel and targetId and targetId > 0 then
+                if category == 'nuke' then
+                    local ms = spell.MyCastTime and tonumber(spell.MyCastTime()) or nil
+                    local castSec = ms and (ms / 1000) or nil
+                    if not DpsIntel.nukeViable(targetId, castSec, spellName) then
+                        goto continue
+                    end
+                elseif category == 'dot' then
+                    local ticks = 0
+                    local mySpell = mq.TLO.Me.Spell(spellName)
+                    if mySpell and mySpell() and mySpell.MyDuration then
+                        ticks = tonumber(mySpell.MyDuration()) or 0
+                    end
+                    if ticks <= 0 and spell.Duration then
+                        ticks = tonumber(spell.Duration()) or 0
+                    end
+                    if not DpsIntel.dotViable(targetId, ticks > 0 and (ticks * 6) or nil) then
                         goto continue
                     end
                 end

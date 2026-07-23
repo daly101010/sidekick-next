@@ -485,7 +485,8 @@ local function shouldSkipDamageCast(spellType, spellName, targetId)
                 local ms = tonumber(spell.MyCastTime())
                 castSec = ms and (ms / 1000) or nil
             end
-            if not DpsIntel.nukeViable(targetId, castSec) then
+            -- Includes the overkill check via spellName (learned damage vs est HP)
+            if not DpsIntel.nukeViable(targetId, castSec, spellName) then
                 return true
             end
         end

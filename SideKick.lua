@@ -133,6 +133,9 @@ local getBuff = lazy.init('sidekick-next.automation.buff')
 local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
 local getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
+local getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
+local getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
+local getSpellDamageTracker = lazy.init('sidekick-next.utils.spell_damage_tracker')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -2175,6 +2178,11 @@ local function main()
         -- Resist tracker: zone change check + resolve pending cast attempts
         do local M = getResistTracker() if M then M.loadZone() M.tick() end end
 
+        -- Outgoing damage observation (mob HP estimation, spell damage learning)
+        getDamageEvents()  -- first access registers the damage events
+        do local M = getMobHpEstimator() if M then M.loadZone() M.tick() end end
+        do local M = getSpellDamageTracker() if M and M.tick then M.tick() end end
+
         -- Update aggro warning state
         do local M = getAggroWarning() if M and M.update then M.update() end end
 
@@ -2231,6 +2239,11 @@ local function main()
 
     -- Shutdown: save resist tracker
     do local M = getResistTracker() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: save mob HP estimates and learned spell damage
+    do local M = getMobHpEstimator() if M and M.shutdown then M.shutdown() end end
+    do local M = getSpellDamageTracker() if M and M.shutdown then M.shutdown() end end
+    do local M = getDamageEvents() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

@@ -124,6 +124,21 @@ function M.getResistTrackerPath()
     return M.getDataDir() .. '/resist_tracker.lua'
 end
 
+--- Get the mob HP estimator database path
+-- Path: SideKick/data/mob_hp_estimates.lua
+function M.getMobHpEstimatorPath()
+    M.ensureDir(M.getDataDir())
+    return M.getDataDir() .. '/mob_hp_estimates.lua'
+end
+
+--- Get the spell damage tracker path (per character - damage depends on gear/level)
+-- Path: SideKick/data/spell_damage_<Server>_<CharName>.lua
+function M.getSpellDamagePath()
+    local char, server = getCharInfo()
+    M.ensureDir(M.getDataDir())
+    return string.format('%s/spell_damage_%s_%s.lua', M.getDataDir(), server, char)
+end
+
 -------------------------------------------------------------------------------
 -- Log File Paths
 -------------------------------------------------------------------------------

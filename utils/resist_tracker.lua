@@ -11,6 +11,12 @@
 -- that spell arrives within the grace window the attempt counts as resisted,
 -- otherwise it counts as landed. Casts that fail with RESISTED directly (detected
 -- mid-cast) are counted immediately and create no pending attempt.
+--
+-- Partial resists: when my nuke's damage message arrives (via damage_events), the
+-- observed amount is compared against the spell's learned baseline
+-- (spell_damage_tracker). Hits landing far below baseline on a specific mob mean
+-- the mob partially resists that element - tracked as an efficiency average per
+-- mob/element and folded into shouldAvoid().
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
@@ -46,6 +52,8 @@ local DAMAGE_CATEGORIES = {
 
 local getPaths = lazy('sidekick-next.utils.paths')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
+local getSpellDamage = lazy('sidekick-next.utils.spell_damage_tracker')
+local getDamageEvents = lazy('sidekick-next.utils.damage_events')
 
 local function getDbPath()
     local Paths = getPaths()
@@ -177,6 +185,19 @@ function M.recordResisted(mobName, element)
     M.dirty = true
 end
 
+--- Record how efficiently a landed hit came through (partial-resist signal)
+-- @param mobName string Mob clean name
+-- @param element string Resist type
+-- @param efficiency number 0..1 (observed damage / spell baseline)
+function M.recordEfficiency(mobName, element, efficiency)
+    local stats = getStats(mobName, element, true)
+    if not stats then return end
+    efficiency = math.max(0, math.min(1, tonumber(efficiency) or 1))
+    stats.effSum = (stats.effSum or 0) + efficiency
+    stats.effCount = (stats.effCount or 0) + 1
+    M.dirty = true
+end
+
 -------------------------------------------------------------------------------
 -- Queries
 -------------------------------------------------------------------------------
@@ -196,21 +217,45 @@ function M.getResistRate(mobName, element)
     return resisted / samples, samples
 end
 
---- Should spell selection avoid this element on this mob?
--- True once we have enough samples and the resist rate is at/above threshold.
+--- Get the average landing efficiency for a mob/element (partial-resist signal)
 -- @param mobName string Mob clean name
 -- @param element string Resist type
--- @param settings table|nil Settings (ResistMinSamples, ResistAvoidPct)
+-- @return number|nil avgEfficiency 0..1 (nil if no data)
+-- @return number samples Efficiency observations
+function M.getEfficiency(mobName, element)
+    local stats = getStats(mobName, element, false)
+    if not stats or (stats.effCount or 0) == 0 then return nil, 0 end
+    return stats.effSum / stats.effCount, stats.effCount
+end
+
+--- Should spell selection avoid this element on this mob?
+-- True once we have enough samples and either the full-resist rate is at/above
+-- threshold, or landed hits average far below the spell baseline (partial resist).
+-- @param mobName string Mob clean name
+-- @param element string Resist type
+-- @param settings table|nil Settings (ResistMinSamples, ResistAvoidPct, ResistMinEfficiencyPct)
 -- @return boolean
 function M.shouldAvoid(mobName, element, settings)
     settings = settings or {}
-    local rate, samples = M.getResistRate(mobName, element)
-    if not rate then return false end
-
     local minSamples = tonumber(settings.ResistMinSamples) or 4
-    local avoidPct = tonumber(settings.ResistAvoidPct) or 50
 
-    return samples >= minSamples and (rate * 100) >= avoidPct
+    local rate, samples = M.getResistRate(mobName, element)
+    if rate and samples >= minSamples then
+        local avoidPct = tonumber(settings.ResistAvoidPct) or 50
+        if (rate * 100) >= avoidPct then
+            return true
+        end
+    end
+
+    local eff, effSamples = M.getEfficiency(mobName, element)
+    if eff and effSamples >= minSamples then
+        local minEffPct = tonumber(settings.ResistMinEfficiencyPct) or 35
+        if (eff * 100) <= minEffPct then
+            return true
+        end
+    end
+
+    return false
 end
 
 -------------------------------------------------------------------------------
@@ -278,6 +323,36 @@ local function onResistEvent(spellName)
     end
 end
 
+--- Called when one of my nuke damage messages lands (via damage_events).
+-- Claims the matching pending attempt as landed and records partial-resist
+-- efficiency against the spell's learned baseline.
+-- @param mobName string Mob name from the damage message
+-- @param amount number Damage dealt
+function M.onOwnSpellDamage(mobName, amount)
+    if not mobName or mobName == '' then return end
+    amount = tonumber(amount) or 0
+    if amount <= 0 then return end
+
+    for i, p in ipairs(_pending) do
+        if p.mob == mobName then
+            table.remove(_pending, i)
+            M.recordLanded(p.mob, p.element)
+
+            local SpellDamage = getSpellDamage()
+            if SpellDamage then
+                if SpellDamage.record then
+                    SpellDamage.record(p.spell, amount)
+                end
+                local baseline = SpellDamage.getBaseline and SpellDamage.getBaseline(p.spell)
+                if baseline and baseline > 0 then
+                    M.recordEfficiency(p.mob, p.element, amount / baseline)
+                end
+            end
+            return
+        end
+    end
+end
+
 --- Resolve expired pending attempts as landed; throttled periodic save
 function M.tick()
     local now = mq.gettime()
@@ -323,6 +398,16 @@ function M.init()
             if prev then pcall(prev, castData, result) end
             M.onCastComplete(castData, result)
         end
+    end
+
+    -- Listen for my own nuke damage (landed confirmation + partial-resist signal)
+    local DamageEvents = getDamageEvents()
+    if DamageEvents and DamageEvents.addListener then
+        DamageEvents.addListener(function(event)
+            if event.mine and event.kind == 'nuke' then
+                M.onOwnSpellDamage(event.target, event.amount)
+            end
+        end)
     end
 end
 

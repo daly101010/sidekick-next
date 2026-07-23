@@ -186,6 +186,23 @@ function M.build()
                 local ok, res = pcall(dps.dotViable, targetId, durationSec)
                 return not ok or res == true
             end,
+
+            -- Is a rain spell worth starting? (rains deliver waves over several
+            -- seconds after landing, so they need a longer horizon than nukes)
+            rainViable = function(castTimeSec)
+                local dps = getDpsIntel()
+                if not dps then return true end
+                local ok, res = pcall(dps.rainViable, targetId, castTimeSec)
+                return not ok or res == true
+            end,
+
+            -- Estimated remaining absolute HP (nil until enough damage observed)
+            estHP = function()
+                local dps = getDpsIntel()
+                if not dps or not dps.getRemainingHP then return nil end
+                local ok, hp = pcall(dps.getRemainingHP, targetId)
+                return ok and hp or nil
+            end,
         },
 
         pet = {
