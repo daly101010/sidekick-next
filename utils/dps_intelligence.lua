@@ -178,6 +178,77 @@ function M.rainViable(mobId, castTimeSec)
     return M.willLive(mobId, castTimeSec + margin + payoff)
 end
 
+--- Is it SAFE to rain on this mob? (mez protection)
+-- Rain waves hit everything in their footprint at the target's location, so a
+-- careless rain breaks mez. Modes (DpsRainSafetyMode):
+--   'mezzed' (default) - block only when a MEZZED XTarget mob is inside the
+--                        rain radius of the target; raining unmezzed packs is fine
+--   'solo'             - MuleAssist parity: block unless the target is the ONLY
+--                        NPC within the radius (SpawnCount npc radius N loc == 1)
+--   'off'              - no safety check
+-- @param mobId number Spawn ID of the rain target
+-- @param spellOrRadius userdata|number|nil MQ Spell (uses AERange) or explicit radius
+-- @return boolean True if raining is safe
+function M.rainSafe(mobId, spellOrRadius)
+    local mode = tostring(getSetting('DpsRainSafetyMode', 'mezzed')):lower()
+    if mode == 'off' then return true end
+    mobId = tonumber(mobId) or 0
+    if mobId <= 0 then return true end
+
+    local spawn = mq.TLO.Spawn(mobId)
+    if not spawn or not spawn() then return true end
+    local okL, loc = pcall(function()
+        return { x = spawn.X(), y = spawn.Y(), z = spawn.Z() }
+    end)
+    if not okL or not loc or not loc.x or not loc.y then return true end
+
+    -- Radius: explicit number > spell AERange > setting default
+    local radius
+    if type(spellOrRadius) == 'number' then
+        radius = spellOrRadius
+    elseif spellOrRadius ~= nil then
+        local okR, ae = pcall(function() return tonumber(spellOrRadius.AERange()) end)
+        radius = okR and ae or nil
+    end
+    if not radius or radius <= 0 then
+        radius = tonumber(getSetting('DpsRainSafetyRadius', 35)) or 35
+    end
+
+    if mode == 'solo' then
+        local okC, count = pcall(function()
+            return tonumber(mq.TLO.SpawnCount(string.format('npc radius %d loc %.2f %.2f %.2f',
+                radius, loc.x, loc.y, loc.z or 0))())
+        end)
+        if okC and count then
+            return count <= 1  -- the target itself is the 1
+        end
+        return true
+    end
+
+    -- 'mezzed' mode: any mezzed XTarget mob inside the footprint blocks the rain
+    local okX, unsafe = pcall(function()
+        local xtCount = tonumber(mq.TLO.Me.XTarget()) or 0
+        for i = 1, xtCount do
+            local xt = mq.TLO.Me.XTarget(i)
+            if xt and xt() and xt.ID() and xt.ID() > 0 and xt.ID() ~= mobId then
+                local mezzed = xt.Mezzed and xt.Mezzed()
+                if mezzed and mezzed ~= '' then
+                    local mx, my = xt.X(), xt.Y()
+                    if mx and my then
+                        local dx, dy = mx - loc.x, my - loc.y
+                        if (dx * dx + dy * dy) <= (radius * radius) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+        return false
+    end)
+    if okX and unsafe then return false end
+    return true
+end
+
 --- Is a DoT worth applying to this mob?
 -- Viable when the mob will live at least DpsDotBreakevenPct% of the DoT's duration
 -- (a DoT that ticks for under half its duration usually loses to a nuke).

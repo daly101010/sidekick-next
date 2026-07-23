@@ -196,6 +196,15 @@ function M.build()
                 return not ok or res == true
             end,
 
+            -- Is it safe to rain here? (blocks rains that would splash mezzed
+            -- mobs; DpsRainSafetyMode 'solo' = strict MuleAssist parity)
+            rainSafe = function(radius)
+                local dps = getDpsIntel()
+                if not dps or not dps.rainSafe then return true end
+                local ok, res = pcall(dps.rainSafe, targetId, radius)
+                return not ok or res == true
+            end,
+
             -- Estimated remaining absolute HP (nil until enough damage observed)
             estHP = function()
                 local dps = getDpsIntel()

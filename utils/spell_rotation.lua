@@ -183,6 +183,10 @@ function M.selectNextSpell(spells, settings, targetId)
                         if not DpsIntel.rainViable(targetId, castSec) then
                             goto continue
                         end
+                        -- Never break mez with rain splash
+                        if DpsIntel.rainSafe and not DpsIntel.rainSafe(targetId, spell) then
+                            goto continue
+                        end
                     elseif not DpsIntel.nukeViable(targetId, castSec, spellName) then
                         goto continue
                     end

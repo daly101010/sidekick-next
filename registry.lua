@@ -172,6 +172,23 @@ M.defaults = {
     DpsDefaultDotDuration = { type = 'number', Default = 24, Category = 'Combat', DisplayName = 'Default DoT Duration (sec)' },
     DpsOverkillFactor = { type = 'number', Default = 1.5, Category = 'Combat', DisplayName = 'Nuke Overkill Factor (x remaining HP)' },
     DpsRainPayoffSec = { type = 'number', Default = 4, Category = 'Combat', DisplayName = 'Rain Wave Payoff Window (sec)' },
+    DpsRainSafetyMode = { type = 'text', Default = 'mezzed', Category = 'Combat', DisplayName = 'Rain Mez Safety (mezzed/solo/off)' },
+    DpsRainSafetyRadius = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Rain Safety Radius' },
+
+    -- Death Forensics
+    DeathForensicsEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Death Reports (Black Box)' },
+
+    -- Tank: auto-peel and flee-handoff
+    TankAutoPeel = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Peel (Protect Squishies First)' },
+    TankFleeHandoff = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Hand Off Fleeing Mobs to DPS' },
+    TankFleeHpThreshold = { type = 'number', Default = 20, Category = 'Combat', DisplayName = 'Flee Handoff HP %' },
+
+    -- Group readiness coordinator (opt-in; needs actors)
+    ReadinessEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Group Readiness Coordinator' },
+    ReadinessAnnounce = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Announce READY in Group Chat' },
+    ReadyHpPct = { type = 'number', Default = 90, Category = 'Combat', DisplayName = 'Ready HP %' },
+    ReadyManaPct = { type = 'number', Default = 80, Category = 'Combat', DisplayName = 'Ready Mana %' },
+    ReadyEndPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Ready Endurance %' },
 
     -- Resist Tracker (per-mob element resist learning)
     UseResistTracker = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Learn Mob Resists' },

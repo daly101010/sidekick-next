@@ -487,8 +487,12 @@ local function shouldSkipDamageCast(spellType, spellName, targetId)
             end
             if DpsIntel.isRainSpell and DpsIntel.isRainSpell(spell) then
                 -- Rains need the longer wave-payoff horizon; no single-target
-                -- overkill check (damage spreads over waves and targets)
+                -- overkill check (damage spreads over waves and targets).
+                -- rainSafe blocks rains that would splash mezzed mobs.
                 if not DpsIntel.rainViable(targetId, castSec) then
+                    return true
+                end
+                if DpsIntel.rainSafe and not DpsIntel.rainSafe(targetId, spellOk and spell or nil) then
                     return true
                 end
             -- Includes the overkill check via spellName (learned damage vs est HP)
