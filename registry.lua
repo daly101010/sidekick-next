@@ -178,6 +178,9 @@ M.defaults = {
     -- Death Forensics
     DeathForensicsEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Death Reports (Black Box)' },
 
+    -- Damage observer scope (chat event pattern matching)
+    DamageObserver = { type = 'text', Default = 'auto', Category = 'Combat', DisplayName = 'Damage Observer (auto/always/never)' },
+
     -- Tank: auto-peel and flee-handoff
     TankAutoPeel = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Peel (Protect Squishies First)' },
     TankPeelMinPriority = { type = 'number', Default = 1, Category = 'Combat', DisplayName = 'Peel Min Victim Priority (1=any, 4=casters+, 5=healers)' },

@@ -61,8 +61,50 @@ function M.tick(abilities, settings)
     if not me or not me() then return end
     local myId = me.ID()
 
+    -- The tank owns pull monitoring for the group (healers consume via actors)
+    M.tickPullBroadcast(M.settings)
+
     -- Run state machine
     M.runStateMachine(myId, abilities, settings)
+end
+
+-- Pull monitor broadcast state
+local _pullBroadcast = { lastSent = 0, lastPhase = 'idle' }
+
+--- Tick the pull monitor and broadcast inbound pulls to the group.
+-- Runs only on the tank, so the rest of the group doesn't need its own
+-- XTarget pull scanning.
+function M.tickPullBroadcast(settings)
+    if settings.PrePullHotEnabled == false then return end
+
+    local ok, PullMonitor = pcall(require, 'sidekick-next.healing.pull_monitor')
+    if not ok or not PullMonitor then return end
+    PullMonitor.tick()
+
+    local now = mq.gettime()
+    local inbound = PullMonitor.getInbound()
+    if inbound then
+        -- 1/sec refreshes while inbound (distance/ETA change)
+        if (now - _pullBroadcast.lastSent) >= 1000 then
+            _pullBroadcast.lastSent = now
+            _pullBroadcast.lastPhase = 'inbound'
+            Actors.broadcastPullState({
+                phase = 'inbound',
+                mobId = inbound.mobId,
+                mobName = inbound.mobName,
+                eta = inbound.eta,
+                mult = inbound.mult,
+                dist = inbound.dist,
+            })
+        end
+    elseif _pullBroadcast.lastPhase == 'inbound' then
+        -- Pull landed or was dropped: clear once
+        _pullBroadcast.lastPhase = 'idle'
+        _pullBroadcast.lastSent = now
+        Actors.broadcastPullState({
+            phase = 'idle', mobId = 0, mobName = '', eta = 0, mult = 1.0, dist = 0,
+        })
+    end
 end
 
 function M.runStateMachine(myId, abilities, settings)

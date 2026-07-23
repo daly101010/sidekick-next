@@ -1045,10 +1045,39 @@ function M.tick(settings)
     end)
     local skSettings = (okCore and CoreSettings) or {}
     if skSettings.PrePullHotEnabled ~= false then
-        local okPM, PullMonitor = pcall(require, 'sidekick-next.healing.pull_monitor')
-        if okPM and PullMonitor then
-            PullMonitor.tick()
-            local inbound = PullMonitor.getInbound()
+        -- Pull detection: prefer the tank's broadcast (one monitor per group).
+        -- Fall back to scanning locally only when no sidekick tank is active
+        -- (tankless groups / solo healer) or when I am the tank myself.
+        local inbound = nil
+        local okAct, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+        local remotePull = okAct and Actors and Actors.getPullState and Actors.getPullState() or nil
+        if remotePull then
+            if remotePull.phase == 'inbound' then
+                inbound = {
+                    mobId = remotePull.mobId, mobName = remotePull.mobName,
+                    eta = remotePull.eta, mult = remotePull.mult, dist = remotePull.dist,
+                }
+            end
+        else
+            local iAmTank = skSettings.CombatMode == 'tank'
+            local tankActive = false
+            if not iAmTank and okAct and Actors and Actors.getTankState then
+                local ts = Actors.getTankState()
+                tankActive = ts and ts.tankName and ts.tankName ~= ''
+                    and ts.updatedAt and (os.clock() - (ts.updatedAt or 0)) < 15
+            end
+            local okPM, PullMonitor = pcall(require, 'sidekick-next.healing.pull_monitor')
+            if okPM and PullMonitor then
+                if iAmTank then
+                    -- tank.tickPullBroadcast already ticks the monitor; just read
+                    inbound = PullMonitor.getInbound()
+                elseif not tankActive then
+                    PullMonitor.tick()
+                    inbound = PullMonitor.getInbound()
+                end
+            end
+        end
+        do
             if inbound then
                 local tank = nil
                 for _, t in ipairs(allTargets) do

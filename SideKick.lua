@@ -2289,8 +2289,10 @@ local function main()
         -- Resist tracker: zone change check + resolve pending cast attempts
         do local M = getResistTracker() if M then M.loadZone() M.tick() end end
 
-        -- Outgoing damage observation (mob HP estimation, spell damage learning)
-        getDamageEvents()  -- first access registers the damage events
+        -- Outgoing damage observation (mob HP estimation, spell damage learning).
+        -- ensureScope re-registers lean/full pattern sets if DamageObserver or
+        -- CombatMode changed (the tank runs the full observer set).
+        do local M = getDamageEvents() if M and M.ensureScope then M.ensureScope() end end
         do local M = getMobHpEstimator() if M then M.loadZone() M.tick() end end
         do local M = getSpellDamageTracker() if M and M.tick then M.tick() end end
 

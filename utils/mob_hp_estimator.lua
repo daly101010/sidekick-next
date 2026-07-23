@@ -51,6 +51,10 @@ local SAVE_INTERVAL_MS = 60000
 
 local getPaths = lazy('sidekick-next.utils.paths')
 local getDamageEvents = lazy('sidekick-next.utils.damage_events')
+local getActors = lazy('sidekick-next.utils.actors_coordinator')
+
+local _lastShare = 0
+local SHARE_INTERVAL_MS = 2000
 
 local function getDbPath()
     local Paths = getPaths()
@@ -311,7 +315,20 @@ function M.getMaxHP(mobNameOrId)
         local totalW = liveW + storedW
         return (liveEst * liveW + storedEst * storedW) / totalW, totalW
     end
-    return liveEst or storedEst, liveEst and liveW or storedW
+    if liveEst or storedEst then
+        return liveEst or storedEst, liveEst and liveW or storedW
+    end
+
+    -- No local data: fall back to the group's damage observer (the tank sees
+    -- everyone's damage; lean-scope characters only see their own)
+    local Actors = getActors()
+    if Actors and Actors.getRemoteMobHp then
+        local ok, remoteEst, remoteW = pcall(Actors.getRemoteMobHp, name)
+        if ok and remoteEst then
+            return remoteEst, remoteW or 0
+        end
+    end
+    return nil, 0
 end
 
 --- Get the estimated REMAINING HP for a mob
@@ -339,9 +356,44 @@ end
 -- Maintenance
 -------------------------------------------------------------------------------
 
+--- Share current estimates for engaged mobs (observer-side; throttled)
+local function shareEstimates(now)
+    local de = getDamageEvents()
+    if not de or de.getScope() ~= 'full' then return end
+    if (now - _lastShare) < SHARE_INTERVAL_MS then return end
+    _lastShare = now
+
+    local Actors = getActors()
+    if not Actors or not Actors.broadcastMobHp then return end
+
+    local estimates = {}
+    local found = false
+    local ok = pcall(function()
+        local xtCount = tonumber(mq.TLO.Me.XTarget()) or 0
+        for i = 1, xtCount do
+            local xt = mq.TLO.Me.XTarget(i)
+            if xt and xt() and xt.ID() and xt.ID() > 0 then
+                local name = (xt.CleanName and xt.CleanName()) or ''
+                if name ~= '' and not estimates[name] then
+                    local maxHP, weight = M.getMaxHP(name)
+                    if maxHP then
+                        estimates[name] = { maxHP = maxHP, weight = weight }
+                        found = true
+                    end
+                end
+            end
+        end
+    end)
+    if ok and found then
+        pcall(Actors.broadcastMobHp, estimates)
+    end
+end
+
 --- Expire stale live entries (merging their learning) and periodic save
 function M.tick()
     local now = mq.gettime()
+
+    shareEstimates(now)
 
     for name, live in pairs(_live) do
         if (now - (live.lastSeen or now)) > LIVE_TTL_MS then
