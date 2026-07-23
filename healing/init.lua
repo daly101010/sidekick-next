@@ -1039,7 +1039,12 @@ function M.tick(settings)
     -- Priority 1.5: pre-pull HoT - a pull is inbound, get a HoT ticking on the
     -- tank BEFORE the mob arrives so the first hits land on top of healing.
     -- Detection is XTarget-based only (works with a non-sidekick puller).
-    if Config.prePullHotEnabled ~= false then
+    -- Settings (registry): PrePullHotEnabled / PrePullHotEtaSec / PrePullHotBigMult
+    local okCore, CoreSettings = pcall(function()
+        return require('sidekick-next.utils.core').Settings
+    end)
+    local skSettings = (okCore and CoreSettings) or {}
+    if skSettings.PrePullHotEnabled ~= false then
         local okPM, PullMonitor = pcall(require, 'sidekick-next.healing.pull_monitor')
         if okPM and PullMonitor then
             PullMonitor.tick()
@@ -1049,11 +1054,12 @@ function M.tick(settings)
                 for _, t in ipairs(allTargets) do
                     if t.role == 'tank' then tank = t break end
                 end
-                local etaWindow = Config.prePullHotEtaSec or 8
+                local etaWindow = tonumber(skSettings.PrePullHotEtaSec) or 8
                 if tank and inbound.eta <= etaWindow
                     and not (proactive and proactive.HasActiveHot and proactive.HasActiveHot(tank.name)) then
                     -- Big HoT for raid/named-tier inbound mobs, light HoT for trash
-                    local useLight = (inbound.mult or 1.0) < 2.0
+                    local bigMult = tonumber(skSettings.PrePullHotBigMult) or 2.0
+                    local useLight = (inbound.mult or 1.0) < bigMult
                     local bestHot = HealSelector.SelectBestHot
                         and HealSelector.SelectBestHot(tank, useLight, true)
                     if bestHot and bestHot.spell then

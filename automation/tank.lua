@@ -151,10 +151,11 @@ function M.checkFleeHandoff(settings)
     if pct > threshold or not receding then return end
 
     -- Only hand off when there's another add to open up on
-    if (Cache.unmezzedHaterCount() or 0) < 2 then return end
+    local minAdds = tonumber(settings.TankFleeMinAdds) or 2
+    if (Cache.unmezzedHaterCount() or 0) < minAdds then return end
 
     flee.runnerId = id
-    flee.runnerUntil = now + 15000
+    flee.runnerUntil = now + ((tonumber(settings.TankFleeHandoffWindowSec) or 15) * 1000)
     -- Force reselection this tick: selectBestTarget excludes the runner below
     M.primaryTargetId = nil
 end
@@ -253,12 +254,15 @@ function M.handleAggro(myId, abilities, settings)
     if _state.current == STATE.IDLE then
         if Aggro.canTaunt() and Aggro.isTauntReady() then
             -- Auto-peel: prioritize mobs beating on fragile members
-            -- (healer > caster > melee) instead of just the nearest loose mob
+            -- (healer > caster > melee) instead of just the nearest loose mob.
+            -- With TankPeelMinPriority > 1 only those victims trigger a peel
+            -- (e.g. 4 = casters and up, 5+ = healers only - no fallback).
             local looseMob
+            local minPriority = tonumber(settings.TankPeelMinPriority) or 1
             if settings.TankAutoPeel ~= false and Aggro.findPriorityPeelTarget then
-                looseMob = Aggro.findPriorityPeelTarget(myId)
+                looseMob = Aggro.findPriorityPeelTarget(myId, minPriority)
             end
-            if not (looseMob and looseMob()) then
+            if not (looseMob and looseMob()) and minPriority <= 1 then
                 looseMob = Aggro.findMobAttackingGroup(myId)
             end
             if looseMob and looseMob() then

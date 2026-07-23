@@ -180,8 +180,16 @@ M.defaults = {
 
     -- Tank: auto-peel and flee-handoff
     TankAutoPeel = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Peel (Protect Squishies First)' },
+    TankPeelMinPriority = { type = 'number', Default = 1, Category = 'Combat', DisplayName = 'Peel Min Victim Priority (1=any, 4=casters+, 5=healers)' },
     TankFleeHandoff = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Hand Off Fleeing Mobs to DPS' },
     TankFleeHpThreshold = { type = 'number', Default = 20, Category = 'Combat', DisplayName = 'Flee Handoff HP %' },
+    TankFleeHandoffWindowSec = { type = 'number', Default = 15, Category = 'Combat', DisplayName = 'Flee Handoff Window (sec)' },
+    TankFleeMinAdds = { type = 'number', Default = 2, Category = 'Combat', DisplayName = 'Flee Handoff Min Haters (incl. runner)' },
+
+    -- Healer: pull-landing pre-heal
+    PrePullHotEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Pre-Pull HoT on Tank' },
+    PrePullHotEtaSec = { type = 'number', Default = 8, Category = 'Combat', DisplayName = 'Pre-Pull HoT ETA Window (sec)' },
+    PrePullHotBigMult = { type = 'number', Default = 2.0, Category = 'Combat', DisplayName = 'Big HoT At Mob Multiplier >=' },
 
     -- Group readiness coordinator (opt-in; needs actors)
     ReadinessEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Group Readiness Coordinator' },

@@ -56,9 +56,11 @@ M.PEEL_PRIORITY = {
 -- Like findMobAttackingGroup, but ranks candidates by how fragile their victim
 -- is (healer > caster > hybrid > melee) instead of taking the nearest.
 -- @param myId number My spawn ID
+-- @param minPriority number|nil Only peel for victims at/above this priority
+--        (1 = anyone, 4 = casters and up, 5+ = healers only)
 -- @return userdata|nil Best peel target spawn
 -- @return number score Victim priority score (0 if none)
-function M.findPriorityPeelTarget(myId)
+function M.findPriorityPeelTarget(myId, minPriority)
     local range = M.TAUNT_CHASE_RANGE
     local count = mq.TLO.SpawnCount('npc xtarhater radius ' .. range)() or 0
     if count == 0 then return nil, 0 end
@@ -76,6 +78,8 @@ function M.findPriorityPeelTarget(myId)
         end
     end
 
+    minPriority = tonumber(minPriority) or 1
+
     local best, bestScore = nil, 0
     for i = 1, count do
         local spawn = mq.TLO.NearestSpawn(i, 'npc xtarhater radius ' .. range)
@@ -84,7 +88,7 @@ function M.findPriorityPeelTarget(myId)
             local totId = (tot and tot() and tot.ID()) or 0
             if totId > 0 and totId ~= myId and memberClass[totId] then
                 local score = M.PEEL_PRIORITY[memberClass[totId]] or 1
-                if score > bestScore then
+                if score >= minPriority and score > bestScore then
                     best, bestScore = spawn, score
                 end
             end

@@ -2059,6 +2059,56 @@ local function main()
         end
     end)
 
+    _bindCmd('/skset', function(key, ...)
+        key = tostring(key or '')
+        if key == '' then
+            log.info('Usage: /skset <SettingKey> [value] - bools toggle when value omitted')
+            log.info('Examples: /skset TankFleeHandoff off | /skset PrePullHotEtaSec 6 | /skset ReadinessEnabled')
+            return
+        end
+
+        local okReg, Registry = pcall(require, 'sidekick-next.registry')
+        local def = okReg and Registry and Registry.defaults and Registry.defaults[key]
+        if not def then
+            log.info('Unknown setting: %s', key)
+            return
+        end
+
+        local raw = table.concat({ ... }, ' ')
+        local value
+        if def.type == 'bool' then
+            local lower = raw:lower()
+            if raw == '' or lower == 'toggle' then
+                value = not (Core.Settings[key] == true or (Core.Settings[key] == nil and def.Default == true))
+            elseif lower == 'on' or lower == 'true' or lower == '1' or lower == 'yes' then
+                value = true
+            elseif lower == 'off' or lower == 'false' or lower == '0' or lower == 'no' then
+                value = false
+            else
+                log.info('%s is a bool - use on/off/toggle', key)
+                return
+            end
+        elseif def.type == 'number' then
+            value = tonumber(raw)
+            if not value then
+                log.info('%s needs a number (current: %s, default: %s)', key,
+                    tostring(Core.Settings[key]), tostring(def.Default))
+                return
+            end
+        else
+            if raw == '' then
+                log.info('%s = %s (default: %s)', key, tostring(Core.Settings[key]), tostring(def.Default))
+                return
+            end
+            value = raw
+        end
+
+        enqueue(function()
+            Core.set(key, value)
+            log.info('%s = %s', key, tostring(value))
+        end)
+    end)
+
     _bindCmd('/skready', function()
         local Readiness = getReadiness()
         if Readiness and Readiness.printStatus then
