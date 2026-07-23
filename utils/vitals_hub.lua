@@ -135,6 +135,9 @@ function M.tick()
     _lastSendAt = now
     _lastMembers = members
     _seq = _seq + 1
+    if _seq == 1 then
+        print('\ag[SideKick]\ax vitals hub: publishing consolidated group vitals (vitals:group v1)')
+    end
 
     Actors.sendVitalsGroup({
         id = 'vitals:group',
