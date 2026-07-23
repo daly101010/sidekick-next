@@ -1120,9 +1120,13 @@ local function attemptRestart(moduleName, scriptPath)
 
     debugLog('WATCHDOG: Restarting %s (attempt %d/%d)',
         scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS)
-    -- print(string.format(
-    --     '\ay[SK-Watchdog]\ax Restarting crashed module: %s (attempt %d/%d)',
-    --     scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS))
+    -- Loud on purpose: each restart synchronously compiles the worker's
+    -- require tree on the game thread (multi-second client freeze). A
+    -- restart CYCLE is the prime suspect whenever "the client keeps
+    -- locking up every ~15s" — this line names the churning module.
+    print(string.format(
+        '\ay[SK-Watchdog]\ax Restarting crashed module: %s (attempt %d/%d) — expect a brief client freeze',
+        scriptPath, tracker.count, lib.MAX_MODULE_RESTARTS))
 
     mq.cmdf('/lua run %s', scriptPath)
     return true
@@ -1151,9 +1155,9 @@ local function checkModuleHealth()
     for _, entry in ipairs(staleModules) do
         debugLog('WATCHDOG: Module %s heartbeat stale (%dms), presumed crashed',
             entry.name, entry.age)
-        -- print(string.format(
-        --     '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
-        --     entry.name, entry.age / 1000))
+        print(string.format(
+            '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
+            entry.name, entry.age / 1000))
 
         -- Revoke any claims this module held
         revokeCrashedModuleClaims(entry.name)
