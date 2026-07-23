@@ -14,7 +14,10 @@ local mq = require('mq')
 local M = {}
 
 local SEND_MIN_INTERVAL = 0.2   -- 5Hz cap
-local HEARTBEAT_SEC = 2.0       -- force a resend even when nothing changed
+-- Must be comfortably below the consumers' 3s freshness window: at 2.0/2.0
+-- the idle heartbeat raced the staleness check and the source flapped
+-- feed<->TLO every couple of seconds while vitals were static.
+local HEARTBEAT_SEC = 1.0       -- force a resend even when nothing changed
 
 local _lastSendAt = 0
 local _lastMembers = nil
