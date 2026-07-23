@@ -21,7 +21,11 @@ local Burn = require('sidekick-next.automation.burn')
 local Tank = require('sidekick-next.automation.tank')
 local HealerClasses = require('sidekick-next.utils.healer_classes')
 local RezData = require('sidekick-next.utils.rez_data')
-local getLegacyHealing = lazy.once('sidekick-next.automation.healing')
+-- Lazy getters bundled into one table: the main function was at LuaJIT's
+-- hard limit of 60 upvalues per function, and each bare `local getX` it
+-- referenced cost one upvalue. One table = one upvalue for all of them.
+local LZ = {}
+LZ.getLegacyHealing = lazy.once('sidekick-next.automation.healing')
 local NewHealing = nil  -- Lazy-loaded for supported healer classes
 
 -- Phased healing module loader: spreads the healing module load
@@ -38,10 +42,10 @@ local HEALING_WARMUP_SEC = 3.0  -- Seconds before starting phased load
 
 local function getHealingModule()
     local me = mq.TLO.Me
-    if not me or not me() then return getLegacyHealing() end
+    if not me or not me() then return LZ.getLegacyHealing() end
     local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
     local upper = classShort:upper()
-    if not HealerClasses.isSupported(upper) then return getLegacyHealing() end
+    if not HealerClasses.isSupported(upper) then return LZ.getLegacyHealing() end
 
     -- Advance one phase per call until complete
     if not _healLoadComplete then
@@ -82,24 +86,24 @@ local function getHealingModule()
         end
     end
 
-    return NewHealing or getLegacyHealing()
+    return NewHealing or LZ.getLegacyHealing()
 end
 
 local Healing = nil  -- Will be set dynamically by getHealingModule()
 
-local getCures = lazy.init('sidekick-next.automation.cures')
-local getPull = lazy('sidekick-next.automation.pull')
+LZ.getCures = lazy.init('sidekick-next.automation.cures')
+LZ.getPull = lazy('sidekick-next.automation.pull')
 local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 local Supervisor = require('sidekick-next.utils.supervisor')
 local SkLib = require('sidekick-next.sk_lib')
 local SharedData = require('sidekick-next.actors.shareddata')
-local getGrids = lazy('sidekick-next.ui.grids')
+LZ.getGrids = lazy('sidekick-next.ui.grids')
 local SettingsUI = require('sidekick-next.ui.settings.init')
-local getBar = lazy('sidekick-next.ui.bar_animated')
-local getSpecialBar = lazy('sidekick-next.ui.special_bar_animated')
-local getDiscBar = lazy('sidekick-next.ui.disc_bar_animated')
-local getItemBar = lazy('sidekick-next.ui.item_bar_animated')
-local getSkillBar = lazy('sidekick-next.ui.skill_bar_animated')
+LZ.getBar = lazy('sidekick-next.ui.bar_animated')
+LZ.getSpecialBar = lazy('sidekick-next.ui.special_bar_animated')
+LZ.getDiscBar = lazy('sidekick-next.ui.disc_bar_animated')
+LZ.getItemBar = lazy('sidekick-next.ui.item_bar_animated')
+LZ.getSkillBar = lazy('sidekick-next.ui.skill_bar_animated')
 local iam = require('sidekick-next.utils.imanim')
 
 -- Cached spring ease descriptors (iam.EaseSpring may be nil in some builds)
@@ -126,40 +130,40 @@ local Loader = require('sidekick-next.ui.loader')
 local PerfMonitor = require('sidekick-next.ui.perf_monitor')
 
 -- New enhancement modules (lazy-loaded: only used in UI callbacks and commands)
-local getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
-local getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
-local getActorsDebug = lazy('sidekick-next.ui.actors_debug')
-local getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
+LZ.getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
+LZ.getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
+LZ.getActorsDebug = lazy('sidekick-next.ui.actors_debug')
+LZ.getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
 
 -- Runtime cache, action executor, rotation engine, CC, and spell engine (lazy-loaded)
-local getRuntimeCache = lazy.init('sidekick-next.utils.runtime_cache')
-local getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
-local getRotationEngine = lazy('sidekick-next.utils.rotation_engine')
-local getCC = lazy.init('sidekick-next.automation.cc')
-local getBuff = lazy.init('sidekick-next.automation.buff')
-local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
-local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
-local getRezAccept = lazy.init('sidekick-next.utils.rez_accept')
-local getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
-local getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
-local getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
-local getSpellDamageTracker = lazy.init('sidekick-next.utils.spell_damage_tracker')
-local getMobIntel = lazy.init('sidekick-next.utils.mob_intel')
-local getDeathForensics = lazy.init('sidekick-next.utils.death_forensics')
-local getSessionStats = lazy.init('sidekick-next.utils.session_stats')
-local getReadiness = lazy('sidekick-next.utils.readiness')
-local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
-local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
-local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
-local getSpellSetEditor = lazy.init('sidekick-next.ui.spell_set_editor')
+LZ.getRuntimeCache = lazy.init('sidekick-next.utils.runtime_cache')
+LZ.getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
+LZ.getRotationEngine = lazy('sidekick-next.utils.rotation_engine')
+LZ.getCC = lazy.init('sidekick-next.automation.cc')
+LZ.getBuff = lazy.init('sidekick-next.automation.buff')
+LZ.getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
+LZ.getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
+LZ.getRezAccept = lazy.init('sidekick-next.utils.rez_accept')
+LZ.getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
+LZ.getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
+LZ.getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
+LZ.getSpellDamageTracker = lazy.init('sidekick-next.utils.spell_damage_tracker')
+LZ.getMobIntel = lazy.init('sidekick-next.utils.mob_intel')
+LZ.getDeathForensics = lazy.init('sidekick-next.utils.death_forensics')
+LZ.getSessionStats = lazy.init('sidekick-next.utils.session_stats')
+LZ.getReadiness = lazy('sidekick-next.utils.readiness')
+LZ.getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
+LZ.getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
+LZ.getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
+LZ.getSpellSetEditor = lazy.init('sidekick-next.ui.spell_set_editor')
 
-local getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
-local getCombatSpellExecutor = lazy('sidekick-next.utils.combat_spell_executor')
-local getThrottledLog = lazy('sidekick-next.utils.throttled_log')
-local getHealingMonitor = lazy('sidekick-next.healing.ui.monitor')
-local getHealingSettingsTab = lazy('sidekick-next.ui.settings.tab_healing')
-local getItemsTab = lazy('sidekick-next.ui.settings.tab_items')
-local getBuffsTab = lazy('sidekick-next.ui.settings.tab_buffs')
+LZ.getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
+LZ.getCombatSpellExecutor = lazy('sidekick-next.utils.combat_spell_executor')
+LZ.getThrottledLog = lazy('sidekick-next.utils.throttled_log')
+LZ.getHealingMonitor = lazy('sidekick-next.healing.ui.monitor')
+LZ.getHealingSettingsTab = lazy('sidekick-next.ui.settings.tab_healing')
+LZ.getItemsTab = lazy('sidekick-next.ui.settings.tab_items')
+LZ.getBuffsTab = lazy('sidekick-next.ui.settings.tab_buffs')
 
 -- Debug logging flags for main automation loop
 local debugAutomationLogging = false
@@ -1311,7 +1315,7 @@ local function draw()
 
                     if sub == 'aas' then
                         local ok, err = pcall(function()
-                            local Grids = getGrids()
+                            local Grids = LZ.getGrids()
                             local aas = {}
                             for _, def in ipairs(State.abilities or {}) do
                                 if tostring(def.kind or 'aa') ~= 'disc' then table.insert(aas, def) end
@@ -1330,7 +1334,7 @@ local function draw()
                         if not ok then imgui.TextColored(1, 0.3, 0.3, 1, 'AA section error: ' .. tostring(err)) end
                     elseif sub == 'discs' then
                         local ok, err = pcall(function()
-                            local Grids = getGrids()
+                            local Grids = LZ.getGrids()
                             local discs = {}
                             for _, def in ipairs(State.abilities or {}) do
                                 if tostring(def.kind or '') == 'disc' then table.insert(discs, def) end
@@ -1424,7 +1428,7 @@ local function draw()
                     end
 
                     if debugSettings then
-                        local TL = getThrottledLog()
+                        local TL = LZ.getThrottledLog()
                         if TL and TL.log then
                             TL.log('debug_settings_themes', 2, 'Themes.getThemeNames()=%d current=%s',
                                 #themeNames,
@@ -1478,7 +1482,7 @@ local function draw()
                         -- Remote Abilities settings section
                         imgui.Separator()
                         if imgui.CollapsingHeader('Remote Abilities') then
-                            local RemoteAbilities = getRemoteAbilities()
+                            local RemoteAbilities = LZ.getRemoteAbilities()
                             if RemoteAbilities then
                                 local raOpen = RemoteAbilities.isOpen()
                                 local changed
@@ -1494,7 +1498,7 @@ local function draw()
 
                         -- Aggro Warning settings section
                         if imgui.CollapsingHeader('Warnings') then
-                            local AggroWarning = getAggroWarning()
+                            local AggroWarning = LZ.getAggroWarning()
                             if AggroWarning then AggroWarning.drawSettings() end
                         end
                     end)
@@ -1508,7 +1512,7 @@ local function draw()
 
                 -- Spell Set tab
                 if imgui.BeginTabItem('Spell Set') then
-                    local SSE = getSpellSetEditor()
+                    local SSE = LZ.getSpellSetEditor()
                     if SSE then
                         local ok, err = pcall(function() SSE.drawContent() end)
                         if not ok then
@@ -1527,7 +1531,7 @@ local function draw()
                         -- Sub-tabs within Healing
                         if imgui.BeginTabBar('HealingSubTabs') then
                             -- Settings sub-tab
-                            local HealSettingsTab = getHealingSettingsTab()
+                            local HealSettingsTab = LZ.getHealingSettingsTab()
                             if HealSettingsTab then
                                 if imgui.BeginTabItem('Settings') then
                                     local ok, err = pcall(function()
@@ -1549,7 +1553,7 @@ local function draw()
 
                             -- Monitor sub-tab for supported Healing Intelligence classes
                             if isHealerClass then
-                                local HealMonitor = getHealingMonitor()
+                                local HealMonitor = LZ.getHealingMonitor()
                                 if HealMonitor and HealMonitor.isInitialized and HealMonitor.isInitialized() then
                                     if imgui.BeginTabItem('Monitor') then
                                         HealMonitor.drawContent()
@@ -1572,7 +1576,7 @@ local function draw()
 
                 -- Items tab
                 if imgui.BeginTabItem('Items') then
-                    local ItemsTab = getItemsTab()
+                    local ItemsTab = LZ.getItemsTab()
                     if ItemsTab then
                         local ok, err = pcall(function()
                             ItemsTab.draw(Core.Settings, Themes.getThemeNames(), function(key, val)
@@ -1590,7 +1594,7 @@ local function draw()
 
                 -- Buffs tab
                 if imgui.BeginTabItem('Buffs') then
-                    local BuffsTab = getBuffsTab()
+                    local BuffsTab = LZ.getBuffsTab()
                     if BuffsTab then
                         local ok, err = pcall(function()
                             BuffsTab.draw(Core.Settings, Themes.getThemeNames(), function(key, val)
@@ -1655,9 +1659,9 @@ local function tickAutomation()
 
     -- Deferred init: trigger lazy.init() modules on first tick (spreads load after startup)
     if not _automationInitDone then
-        local ae = getActionExecutor()
-        local sl = getSpellLineup()
-        local ccl = getClassConfigLoader()
+        local ae = LZ.getActionExecutor()
+        local sl = LZ.getSpellLineup()
+        local ccl = LZ.getClassConfigLoader()
         _automationInitDone = (ae ~= nil) and (sl ~= nil) and (ccl ~= nil)
     end
 
@@ -1672,7 +1676,7 @@ local function tickAutomation()
 
     -- Update runtime cache (before other automation)
     PerfMonitor.begin('RuntimeCache')
-    do local M = getRuntimeCache() if M then M.tick() end end
+    do local M = LZ.getRuntimeCache() if M then M.tick() end end
     PerfMonitor.finish('RuntimeCache')
 
     local monolithicMode = _G.SIDEKICK_NEXT_CONFIG
@@ -1681,7 +1685,7 @@ local function tickAutomation()
         -- These modules own event handlers and cast state. In coordinated mode
         -- their dedicated workers are the only instances allowed to initialize.
         PerfMonitor.begin('CC')
-        local CC = getCC()
+        local CC = LZ.getCC()
         if CC then
             CC.tick()
             if allowAbilityAutomation then CC.mezTick(Core.Settings) end
@@ -1689,15 +1693,15 @@ local function tickAutomation()
         PerfMonitor.finish('CC')
 
         PerfMonitor.begin('Buff')
-        do local M = getBuff() if M then M.tick() end end
+        do local M = LZ.getBuff() if M then M.tick() end end
         PerfMonitor.finish('Buff')
 
         PerfMonitor.begin('SpellEngine')
-        do local M = getSpellEngine() if M then M.tick() end end
+        do local M = LZ.getSpellEngine() if M then M.tick() end end
         PerfMonitor.finish('SpellEngine')
 
         PerfMonitor.begin('SpellsetMgr')
-        do local M = getSpellsetManager() if M then M.tick() end end
+        do local M = LZ.getSpellsetManager() if M then M.tick() end end
         PerfMonitor.finish('SpellsetMgr')
     else
         -- Manual UI/test casts may explicitly load a UI-local SpellEngine.
@@ -1745,7 +1749,7 @@ local function tickAutomation()
 
     -- Cure tick (after healing, before rotation engine)
     PerfMonitor.begin('Cures')
-    local Cures = getCures()
+    local Cures = LZ.getCures()
     if allowAbilityAutomation and not priorityHealingActive and Cures and Cures.tick then
         Cures.tick(Core.Settings)
     end
@@ -1753,8 +1757,8 @@ local function tickAutomation()
 
     -- Run layered rotation engine (replaces flat Abilities.tryAllAbilities)
     PerfMonitor.begin('Rotation')
-    local TL = getThrottledLog()
-    local RotationEngine = getRotationEngine()
+    local TL = LZ.getThrottledLog()
+    local RotationEngine = LZ.getRotationEngine()
     if allowAbilityAutomation and Core.Settings.AutoAbilitiesEnabled ~= false and RotationEngine then
         if debugAutomationLogging and TL then
             TL.log('rotation_start', 15, 'RotationEngine.tick: abilities=%d, burnActive=%s, priorityHealing=%s',
@@ -2011,9 +2015,9 @@ local function main()
     pcall(require, 'sidekick-next.humanize')
 
     ActorsCoordinator.init()
-    getRezAccept()
+    LZ.getRezAccept()
     do
-        local monitor = getHealingMonitor()
+        local monitor = LZ.getHealingMonitor()
         if monitor and ActorsCoordinator.registerMessageCallback then
             ActorsCoordinator.registerMessageCallback('heal:telemetry', function(content)
                 monitor.setTelemetry(content)
@@ -2023,7 +2027,7 @@ local function main()
     end
     if ActorsCoordinator.registerMessageCallback then
         ActorsCoordinator.registerMessageCallback('rez:telemetry', function(content)
-            local debugUi = getCoordinatorDebug()
+            local debugUi = LZ.getCoordinatorDebug()
             if debugUi and debugUi.setRezTelemetry then
                 debugUi.setRezTelemetry(content)
             end
@@ -2106,7 +2110,7 @@ local function main()
                 if result.spellSet and result.spellSet.activated then
                     log.info('Imported spell set "%s" is now active. Use /SideKick spellset to review it.',
                         tostring(result.spellSet.name))
-                    local Memorize = getSpellSetMemorize()
+                    local Memorize = LZ.getSpellSetMemorize()
                     if Memorize and Memorize.queueApply then
                         Memorize.queueApply(result.spellSet.name, false)
                     end
@@ -2189,10 +2193,10 @@ local function main()
             queueMuleAssistImport(importArgs)
         elseif a1 == 'remote' then
             -- New command: toggle remote ability bar
-            local M = getRemoteAbilities() if M then M.toggle() end
+            local M = LZ.getRemoteAbilities() if M then M.toggle() end
         elseif a1 == 'remoteconfig' then
             -- New command: open remote abilities settings
-            local M = getRemoteAbilities() if M then M.toggleSettings() end
+            local M = LZ.getRemoteAbilities() if M then M.toggleSettings() end
         elseif a1 == 'debugsettings' then
             -- Toggle settings persistence debugging (/SideKick debugsettings on|off|toggle)
             local a2 = tostring(args[2] or ''):lower()
@@ -2212,9 +2216,9 @@ local function main()
             end
         elseif a1 == 'actorsdebug' then
             -- Opens actors debug window instead of echoing
-            do local M = getActorsDebug() if M then M.toggle() end end
+            do local M = LZ.getActorsDebug() if M then M.toggle() end end
         elseif a1 == 'coord' or a1 == 'coordinator' then
-            do local M = getCoordinatorDebug() if M then M.toggle() end end
+            do local M = LZ.getCoordinatorDebug() if M then M.toggle() end end
         elseif a1 == 'cache' then
             -- Debug command disabled (no in-game output)
         elseif a1 == 'cc' then
@@ -2227,12 +2231,12 @@ local function main()
             if spellName then
                 local target = mq.TLO.Target
                 local targetId = target and target() and target.ID() or 0
-                local SE = getSpellEngine()
+                local SE = LZ.getSpellEngine()
                 if SE then SE.cast(spellName, targetId) end
             end
         elseif a1 == 'healmonitor' then
             if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
-                do local M = getHealingMonitor() if M then M.toggle() end end
+                do local M = LZ.getHealingMonitor() if M then M.toggle() end end
             else
                 local mod = getHealingModule()
                 if mod and mod.toggleMonitor then
@@ -2245,7 +2249,7 @@ local function main()
                 ActorsCoordinator.broadcastAssistMe()
             end)
         elseif a1 == 'spellset' or a1 == 'ss' then
-            do local M = getSpellSetEditor() if M then M.toggle() end end
+            do local M = LZ.getSpellSetEditor() if M then M.toggle() end end
         elseif a1 == 'debugcombat' then
             -- Debug combat spell executor
             local ok, CombatExec = pcall(require, 'sidekick-next.utils.combat_spell_executor')
@@ -2349,7 +2353,7 @@ local function main()
     -- movement requests are sent to the coordinated worker, which must acquire
     -- target ownership before advancing from READY.
     _bindCmd('/sk_pull', function(sub, arg, arg2)
-        local Pull = getPull()
+        local Pull = LZ.getPull()
         if not Pull then return end
         local command = tostring(sub or 'status'):lower()
         if command == 'pulltarget' or command == 'clearignore' or command == 'camp' or command == 'status' then
@@ -2472,7 +2476,7 @@ local function main()
         end)
     end)
     _bindCmd('/skactors', function()
-        local M = getActorsDebug() if M then M.toggle() end
+        local M = LZ.getActorsDebug() if M then M.toggle() end
     end)
     _bindCmd('/skimport', function(...)
         queueMuleAssistImport({ ... })
@@ -2628,14 +2632,14 @@ local function main()
     end)
 
     _bindCmd('/skready', function()
-        local Readiness = getReadiness()
+        local Readiness = LZ.getReadiness()
         if Readiness and Readiness.printStatus then
             Readiness.printStatus()
         end
     end)
 
     _bindCmd('/sksession', function(sub)
-        local Stats = getSessionStats()
+        local Stats = LZ.getSessionStats()
         if not Stats then
             log.info('Session stats module not available')
             return
@@ -2652,7 +2656,7 @@ local function main()
     end)
 
     _bindCmd('/skmobintel', function(sub, arg)
-        local MobIntel = getMobIntel()
+        local MobIntel = LZ.getMobIntel()
         if not MobIntel then
             log.info('Mob intel module not available')
             return
@@ -2660,7 +2664,7 @@ local function main()
         sub = tostring(sub or ''):lower()
         if sub == 'export' then
             -- Fold in-flight HP learning into the database so the export sees it
-            do local M = getMobHpEstimator() if M and M.flush then M.flush() end end
+            do local M = LZ.getMobHpEstimator() if M and M.flush then M.flush() end end
             MobIntel.exportAll()
         elseif sub == 'mob' then
             local name = arg or mq.TLO.Target.CleanName() or ''
@@ -2700,7 +2704,7 @@ local function main()
         end
 
         if Core.Settings.SideKickBarEnabled ~= false then
-            local Bar = getBar()
+            local Bar = LZ.getBar()
             if Bar then Bar.draw({
                 abilities = State.barAbilities,
                 settings = Core.Settings,
@@ -2715,7 +2719,7 @@ local function main()
         end
 
         if Core.Settings.SideKickSpecialEnabled ~= false then
-            local SpecialBar = getSpecialBar()
+            local SpecialBar = LZ.getSpecialBar()
             if SpecialBar then SpecialBar.draw({
                 settings = Core.Settings,
                 animSpellIcons = animSpellIcons,
@@ -2727,7 +2731,7 @@ local function main()
         end
 
         if Core.Settings.SideKickDiscBarEnabled ~= false and tostring(State.classShort or '') == 'BER' then
-            local DiscBar = getDiscBar()
+            local DiscBar = LZ.getDiscBar()
             if DiscBar then DiscBar.draw({
                 abilities = State.abilities,
                 settings = Core.Settings,
@@ -2739,7 +2743,7 @@ local function main()
         end
 
         if Core.Settings.SideKickItemBarEnabled ~= false then
-            local ItemBar = getItemBar()
+            local ItemBar = LZ.getItemBar()
             if ItemBar then ItemBar.draw({
                 settings = Core.Settings,
                 animItems = animItems,
@@ -2753,7 +2757,7 @@ local function main()
             local v = Core.Settings.SideKickSkillBarEnabled
             local skillBarEnabled = (v == true) or (v == 1) or (v == '1') or (v == 'true')
             if skillBarEnabled then
-                local SkillBar = getSkillBar()
+                local SkillBar = LZ.getSkillBar()
                 if SkillBar then SkillBar.draw({
                     settings = Core.Settings,
                     onActivate = function(sk)
@@ -2766,17 +2770,17 @@ local function main()
         end
 
         -- Draw new enhancement UIs (lazy-loaded)
-        do local M = getRemoteAbilities() if M then M.draw() end end
-        do local M = getAggroWarning() if M then M.draw() end end
-        do local M = getActorsDebug() if M then M.render() end end
-        do local M = getCoordinatorDebug() if M then M.render() end end
-        do local M = getSpellSetEditor() if M then M.render() end end
+        do local M = LZ.getRemoteAbilities() if M then M.draw() end end
+        do local M = LZ.getAggroWarning() if M then M.draw() end end
+        do local M = LZ.getActorsDebug() if M then M.render() end end
+        do local M = LZ.getCoordinatorDebug() if M then M.render() end end
+        do local M = LZ.getSpellSetEditor() if M then M.render() end end
         PerfMonitor.draw()
 
         -- Healing monitor: coordinated mode renders worker telemetry only;
         -- monolithic mode renders the locally-owned Healing Intelligence UI.
         if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
-            do local M = getHealingMonitor() if M and M.draw then M.draw() end end
+            do local M = LZ.getHealingMonitor() if M and M.draw then M.draw() end end
         elseif NewHealing and NewHealing.drawMonitor then
             NewHealing.drawMonitor()
         end
@@ -2827,7 +2831,7 @@ local function main()
         refreshClassAbilitiesIfNeeded()
         drainQueue()
         syncModulesFromSettings()
-        do local M = getRezAccept() if M and M.tick then M.tick() end end
+        do local M = LZ.getRezAccept() if M and M.tick then M.tick() end end
         tickAutomation()
 
         -- Humanize: drive selector + fidget state machine.
@@ -2841,46 +2845,46 @@ local function main()
         -- Process pending spell set memorization (must be in main loop, not ImGui).
         -- This must run in both monolithic and coordinated modes; worker scripts
         -- read the active spell set but the UI script owns safe /memspell driving.
-        local Memorize = getSpellSetMemorize()
+        local Memorize = LZ.getSpellSetMemorize()
         if Memorize and Memorize.processPending then
             Memorize.processPending()
         end
 
         if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false then
             -- Process combat spells (must be in main loop for mq.delay)
-            local CombatSpellExecutor = getCombatSpellExecutor()
+            local CombatSpellExecutor = LZ.getCombatSpellExecutor()
             if CombatSpellExecutor and CombatSpellExecutor.process then
                 CombatSpellExecutor.process()
             end
         end
 
         -- Check for zone change (immune database)
-        do local M = getImmuneDB() if M then M.loadZone() end end
+        do local M = LZ.getImmuneDB() if M then M.loadZone() end end
 
         -- Resist tracker: zone change check + resolve pending cast attempts
-        do local M = getResistTracker() if M then M.loadZone() M.tick() end end
+        do local M = LZ.getResistTracker() if M then M.loadZone() M.tick() end end
 
         -- Outgoing damage observation (mob HP estimation, spell damage learning).
         -- ensureScope re-registers lean/full pattern sets if DamageObserver or
         -- CombatMode changed (the tank runs the full observer set).
-        do local M = getDamageEvents() if M and M.ensureScope then M.ensureScope() end end
-        do local M = getMobHpEstimator() if M then M.loadZone() M.tick() end end
-        do local M = getSpellDamageTracker() if M and M.tick then M.tick() end end
+        do local M = LZ.getDamageEvents() if M and M.ensureScope then M.ensureScope() end end
+        do local M = LZ.getMobHpEstimator() if M then M.loadZone() M.tick() end end
+        do local M = LZ.getSpellDamageTracker() if M and M.tick then M.tick() end end
 
         -- Mob intel: CC results, NPC cast observation, consolidated knowledge base
-        do local M = getMobIntel() if M then M.loadZone() M.tick() end end
+        do local M = LZ.getMobIntel() if M then M.loadZone() M.tick() end end
 
         -- Death forensics: rolling combat black box + death reports
-        do local M = getDeathForensics() if M then M.tick() end end
+        do local M = LZ.getDeathForensics() if M then M.tick() end end
 
         -- Session stats: XP/kills/DPS tracking
-        do local M = getSessionStats() if M then M.tick() end end
+        do local M = LZ.getSessionStats() if M then M.tick() end end
 
         -- Group readiness coordinator (actors-based, opt-in)
-        do local M = getReadiness() if M then M.tick() end end
+        do local M = LZ.getReadiness() if M then M.tick() end end
 
         -- Update aggro warning state
-        do local M = getAggroWarning() if M and M.update then M.update() end end
+        do local M = LZ.getAggroWarning() if M and M.update then M.update() end end
 
         -- Actors + GT dock/status updates (runs in main loop so yields are allowed elsewhere).
         if Core.Settings.ActorsEnabled ~= false then
@@ -2943,21 +2947,21 @@ local function main()
     end
 
     -- Shutdown: save immune database
-    do local M = getImmuneDB() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getImmuneDB() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: save resist tracker
-    do local M = getResistTracker() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getResistTracker() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: save mob HP estimates and learned spell damage
-    do local M = getMobHpEstimator() if M and M.shutdown then M.shutdown() end end
-    do local M = getSpellDamageTracker() if M and M.shutdown then M.shutdown() end end
-    do local M = getDamageEvents() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getMobHpEstimator() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getSpellDamageTracker() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getDamageEvents() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: save mob intel (CC results, NPC casts)
-    do local M = getMobIntel() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getMobIntel() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: session stats events
-    do local M = getSessionStats() if M and M.shutdown then M.shutdown() end end
+    do local M = LZ.getSessionStats() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()
