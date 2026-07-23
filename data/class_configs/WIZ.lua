@@ -102,26 +102,32 @@ M.defaultConditions = {
         return ctx.me.pctAggro > 90
     end,
 
+    -- nukeViable(castTime): target must outlive the cast (+ land margin), so we
+    -- don't start a nuke that lands on a corpse or grossly overkills a dying mob
     ['doFireNuke'] = function(ctx)
-        return ctx.combat and ctx.me.pctMana > 30
+        return ctx.combat and ctx.me.pctMana > 30 and ctx.target.nukeViable(3.5)
     end,
     ['doIceNuke'] = function(ctx)
-        return ctx.combat and ctx.me.pctMana > 30
+        return ctx.combat and ctx.me.pctMana > 30 and ctx.target.nukeViable(3.5)
     end,
     ['doMagicNuke'] = function(ctx)
-        return ctx.combat and ctx.me.pctMana > 30
+        return ctx.combat and ctx.me.pctMana > 30 and ctx.target.nukeViable(3.5)
     end,
     ['doEtherealNuke'] = function(ctx)
-        return ctx.combat and ctx.target.named
+        return ctx.combat and ctx.target.named and ctx.target.nukeViable(1.5)
     end,
+    -- Rains deliver waves for several seconds after landing - rainViable uses a
+    -- longer horizon so the waves actually connect before the mobs die.
+    -- rainSafe blocks rains that would splash mezzed mobs and break mez.
     ['doRainSpell'] = function(ctx)
         return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40
+            and ctx.target.rainViable(3.0) and ctx.target.rainSafe()
     end,
     ['doAEFire'] = function(ctx)
-        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40
+        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40 and ctx.target.nukeViable(3.0)
     end,
     ['doAEIce'] = function(ctx)
-        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40
+        return ctx.combat and ctx.me.xTargetCount >= 3 and ctx.me.pctMana > 40 and ctx.target.nukeViable(3.0)
     end,
 
     ['doSelfShield'] = function(ctx)

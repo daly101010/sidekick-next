@@ -140,6 +140,14 @@ local getBuff = lazy.init('sidekick-next.automation.buff')
 local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
 local getRezAccept = lazy.init('sidekick-next.utils.rez_accept')
+local getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
+local getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
+local getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
+local getSpellDamageTracker = lazy.init('sidekick-next.utils.spell_damage_tracker')
+local getMobIntel = lazy.init('sidekick-next.utils.mob_intel')
+local getDeathForensics = lazy.init('sidekick-next.utils.death_forensics')
+local getSessionStats = lazy.init('sidekick-next.utils.session_stats')
+local getReadiness = lazy('sidekick-next.utils.readiness')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -2569,6 +2577,113 @@ local function main()
         end
     end)
 
+    _bindCmd('/skset', function(key, ...)
+        key = tostring(key or '')
+        if key == '' then
+            log.info('Usage: /skset <SettingKey> [value] - bools toggle when value omitted')
+            log.info('Examples: /skset TankFleeHandoff off | /skset PrePullHotEtaSec 6 | /skset ReadinessEnabled')
+            return
+        end
+
+        local okReg, Registry = pcall(require, 'sidekick-next.registry')
+        local def = okReg and Registry and Registry.defaults and Registry.defaults[key]
+        if not def then
+            log.info('Unknown setting: %s', key)
+            return
+        end
+
+        local raw = table.concat({ ... }, ' ')
+        local value
+        if def.type == 'bool' then
+            local lower = raw:lower()
+            if raw == '' or lower == 'toggle' then
+                value = not (Core.Settings[key] == true or (Core.Settings[key] == nil and def.Default == true))
+            elseif lower == 'on' or lower == 'true' or lower == '1' or lower == 'yes' then
+                value = true
+            elseif lower == 'off' or lower == 'false' or lower == '0' or lower == 'no' then
+                value = false
+            else
+                log.info('%s is a bool - use on/off/toggle', key)
+                return
+            end
+        elseif def.type == 'number' then
+            value = tonumber(raw)
+            if not value then
+                log.info('%s needs a number (current: %s, default: %s)', key,
+                    tostring(Core.Settings[key]), tostring(def.Default))
+                return
+            end
+        else
+            if raw == '' then
+                log.info('%s = %s (default: %s)', key, tostring(Core.Settings[key]), tostring(def.Default))
+                return
+            end
+            value = raw
+        end
+
+        enqueue(function()
+            Core.set(key, value)
+            log.info('%s = %s', key, tostring(value))
+        end)
+    end)
+
+    _bindCmd('/skready', function()
+        local Readiness = getReadiness()
+        if Readiness and Readiness.printStatus then
+            Readiness.printStatus()
+        end
+    end)
+
+    _bindCmd('/sksession', function(sub)
+        local Stats = getSessionStats()
+        if not Stats then
+            log.info('Session stats module not available')
+            return
+        end
+        sub = tostring(sub or ''):lower()
+        if sub == 'export' then
+            Stats.exportCSV()
+        elseif sub == 'reset' then
+            Stats.reset()
+            log.info('Session stats reset')
+        else
+            Stats.printSummary()
+        end
+    end)
+
+    _bindCmd('/skmobintel', function(sub, arg)
+        local MobIntel = getMobIntel()
+        if not MobIntel then
+            log.info('Mob intel module not available')
+            return
+        end
+        sub = tostring(sub or ''):lower()
+        if sub == 'export' then
+            -- Fold in-flight HP learning into the database so the export sees it
+            do local M = getMobHpEstimator() if M and M.flush then M.flush() end end
+            MobIntel.exportAll()
+        elseif sub == 'mob' then
+            local name = arg or mq.TLO.Target.CleanName() or ''
+            if name == '' then
+                log.info('Usage: /skmobintel mob [name] (defaults to current target)')
+                return
+            end
+            for _, cc in ipairs({ 'slow', 'snare', 'mez', 'charm', 'root' }) do
+                local status, stats = MobIntel.getCCStatus(name, cc)
+                if stats then
+                    log.info('%s: %s = %s (%d landed / %d resisted)', name, cc, status,
+                        stats.landed or 0, stats.resisted or 0)
+                end
+            end
+            local casts = MobIntel.getNpcCasts(name)
+            for spell, count in pairs(casts) do
+                log.info('%s casts: %s (seen %d)', name, spell, count)
+            end
+        else
+            log.info('Usage: /skmobintel export | mob [name]')
+        end
+    end)
+
     mq.imgui.init('SideKick', function()
         -- Apply font scale for high-resolution monitors
         local fontScale = tonumber(Core.Settings.SideKickFontScale) or 1.0
@@ -2742,6 +2857,28 @@ local function main()
         -- Check for zone change (immune database)
         do local M = getImmuneDB() if M then M.loadZone() end end
 
+        -- Resist tracker: zone change check + resolve pending cast attempts
+        do local M = getResistTracker() if M then M.loadZone() M.tick() end end
+
+        -- Outgoing damage observation (mob HP estimation, spell damage learning).
+        -- ensureScope re-registers lean/full pattern sets if DamageObserver or
+        -- CombatMode changed (the tank runs the full observer set).
+        do local M = getDamageEvents() if M and M.ensureScope then M.ensureScope() end end
+        do local M = getMobHpEstimator() if M then M.loadZone() M.tick() end end
+        do local M = getSpellDamageTracker() if M and M.tick then M.tick() end end
+
+        -- Mob intel: CC results, NPC cast observation, consolidated knowledge base
+        do local M = getMobIntel() if M then M.loadZone() M.tick() end end
+
+        -- Death forensics: rolling combat black box + death reports
+        do local M = getDeathForensics() if M then M.tick() end end
+
+        -- Session stats: XP/kills/DPS tracking
+        do local M = getSessionStats() if M then M.tick() end end
+
+        -- Group readiness coordinator (actors-based, opt-in)
+        do local M = getReadiness() if M then M.tick() end end
+
         -- Update aggro warning state
         do local M = getAggroWarning() if M and M.update then M.update() end end
 
@@ -2797,6 +2934,20 @@ local function main()
 
     -- Shutdown: save immune database
     do local M = getImmuneDB() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: save resist tracker
+    do local M = getResistTracker() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: save mob HP estimates and learned spell damage
+    do local M = getMobHpEstimator() if M and M.shutdown then M.shutdown() end end
+    do local M = getSpellDamageTracker() if M and M.shutdown then M.shutdown() end end
+    do local M = getDamageEvents() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: save mob intel (CC results, NPC casts)
+    do local M = getMobIntel() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: session stats events
+    do local M = getSessionStats() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

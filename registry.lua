@@ -230,6 +230,9 @@ M.defaults = {
     CasterUseStick = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Use Stick' },
     CasterEscapeRange = { type = 'number', Default = 30, Category = 'Combat', DisplayName = 'Caster Escape Range' },
     CasterSafeZoneRadius = { type = 'number', Default = 30, Category = 'Combat', DisplayName = 'Safe Zone Radius' },
+    CasterStandoffEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Standoff (Ranged Casting)' },
+    CasterStandoffMin = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Standoff Min Distance' },
+    CasterStandoffMax = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Standoff Max Distance' },
     PreferredResistType = { type = 'text', Default = 'Any', Category = 'Combat', DisplayName = 'Preferred Resist Type' },
 
     -- Spell Rotation Settings
@@ -240,6 +243,49 @@ M.defaults = {
     RetryOnInterrupt = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Retry on Interrupt' },
     UseImmuneDatabase = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Use Immune Database' },
     AdaptiveResistSkip = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Adaptive Resist Skip' },
+
+    -- DPS Intelligence (time-to-die gating for damage spells)
+    UseDpsIntelligence = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Smart DPS (Time-to-Die)' },
+    DpsNukeLandMargin = { type = 'number', Default = 1.0, Category = 'Combat', DisplayName = 'Nuke Land Margin (sec)' },
+    DpsDotBreakevenPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'DoT Breakeven (% of duration)' },
+    DpsDefaultNukeCastTime = { type = 'number', Default = 3.0, Category = 'Combat', DisplayName = 'Default Nuke Cast Time (sec)' },
+    DpsDefaultDotDuration = { type = 'number', Default = 24, Category = 'Combat', DisplayName = 'Default DoT Duration (sec)' },
+    DpsOverkillFactor = { type = 'number', Default = 1.5, Category = 'Combat', DisplayName = 'Nuke Overkill Factor (x remaining HP)' },
+    DpsRainPayoffSec = { type = 'number', Default = 4, Category = 'Combat', DisplayName = 'Rain Wave Payoff Window (sec)' },
+    DpsRainSafetyMode = { type = 'text', Default = 'mezzed', Category = 'Combat', DisplayName = 'Rain Mez Safety (mezzed/solo/off)' },
+    DpsRainSafetyRadius = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Rain Safety Radius' },
+
+    -- Death Forensics
+    DeathForensicsEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Death Reports (Black Box)' },
+
+    -- Damage observer scope (chat event pattern matching)
+    DamageObserver = { type = 'text', Default = 'auto', Category = 'Combat', DisplayName = 'Damage Observer (auto/always/never)' },
+
+    -- Tank: auto-peel and flee-handoff
+    TankAutoPeel = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Peel (Protect Squishies First)' },
+    TankPeelMinPriority = { type = 'number', Default = 1, Category = 'Combat', DisplayName = 'Peel Min Victim Priority (1=any, 4=casters+, 5=healers)' },
+    TankFleeHandoff = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Hand Off Fleeing Mobs to DPS' },
+    TankFleeHpThreshold = { type = 'number', Default = 20, Category = 'Combat', DisplayName = 'Flee Handoff HP %' },
+    TankFleeHandoffWindowSec = { type = 'number', Default = 15, Category = 'Combat', DisplayName = 'Flee Handoff Window (sec)' },
+    TankFleeMinAdds = { type = 'number', Default = 2, Category = 'Combat', DisplayName = 'Flee Handoff Min Haters (incl. runner)' },
+
+    -- Healer: pull-landing pre-heal
+    PrePullHotEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Pre-Pull HoT on Tank' },
+    PrePullHotEtaSec = { type = 'number', Default = 8, Category = 'Combat', DisplayName = 'Pre-Pull HoT ETA Window (sec)' },
+    PrePullHotBigMult = { type = 'number', Default = 2.0, Category = 'Combat', DisplayName = 'Big HoT At Mob Multiplier >=' },
+
+    -- Group readiness coordinator (opt-in; needs actors)
+    ReadinessEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Group Readiness Coordinator' },
+    ReadinessAnnounce = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Announce READY in Group Chat' },
+    ReadyHpPct = { type = 'number', Default = 90, Category = 'Combat', DisplayName = 'Ready HP %' },
+    ReadyManaPct = { type = 'number', Default = 80, Category = 'Combat', DisplayName = 'Ready Mana %' },
+    ReadyEndPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Ready Endurance %' },
+
+    -- Resist Tracker (per-mob element resist learning)
+    UseResistTracker = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Learn Mob Resists' },
+    ResistAvoidPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Avoid Element At Resist %' },
+    ResistMinSamples = { type = 'number', Default = 4, Category = 'Combat', DisplayName = 'Resist Min Samples' },
+    ResistMinEfficiencyPct = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Avoid Element Below Efficiency %' },
 
     -- Spell Lineup Settings
     SpellRescanOnZone = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Rescan Gems on Zone' },

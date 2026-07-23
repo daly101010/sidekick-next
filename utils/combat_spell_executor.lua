@@ -35,6 +35,8 @@ local getSpellbookScanner = lazy('sidekick-next.utils.spellbook_scanner')
 local getConditionDefaults = lazy('sidekick-next.utils.condition_defaults')
 local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
 local getConditionContext = lazy('sidekick-next.utils.condition_context')
+local getDpsIntel = lazy('sidekick-next.utils.dps_intelligence')
+local getResistTracker = lazy('sidekick-next.utils.resist_tracker')
 
 --------------------------------------------------------------------------------
 -- Sorted Cast List
@@ -488,6 +490,77 @@ local function isEffectOnTarget(spellName, spellId, targetId)
     return false
 end
 
+--- DPS intelligence gates for damage spells: skip when the target won't live
+--- long enough for the cast to pay off, or when this mob resists the element
+---@param spellType string 'dot' or 'direct_damage'
+---@param spellName string|nil The spell name
+---@param targetId number The target spawn ID
+---@return boolean True if this cast should be skipped
+local function shouldSkipDamageCast(spellType, spellName, targetId)
+    if not targetId or targetId <= 0 then return false end
+
+    local spell = spellName and mq.TLO.Spell(spellName) or nil
+    local spellOk = spell and spell() ~= nil
+
+    -- Time-to-die viability (fails open inside dps_intelligence when no data)
+    local DpsIntel = getDpsIntel()
+    if DpsIntel then
+        if spellType == 'dot' then
+            local ticks = 0
+            local mySpell = spellName and mq.TLO.Me.Spell(spellName) or nil
+            if mySpell and mySpell() and mySpell.MyDuration then
+                ticks = tonumber(mySpell.MyDuration()) or 0
+            end
+            if ticks <= 0 and spellOk and spell.Duration then
+                ticks = tonumber(spell.Duration()) or 0
+            end
+            local durationSec = ticks > 0 and (ticks * 6) or nil
+            if not DpsIntel.dotViable(targetId, durationSec) then
+                return true
+            end
+        elseif spellType == 'direct_damage' then
+            local castSec = nil
+            if spellOk and spell.MyCastTime then
+                local ms = tonumber(spell.MyCastTime())
+                castSec = ms and (ms / 1000) or nil
+            end
+            if DpsIntel.isRainSpell and DpsIntel.isRainSpell(spell) then
+                -- Rains need the longer wave-payoff horizon; no single-target
+                -- overkill check (damage spreads over waves and targets).
+                -- rainSafe blocks rains that would splash mezzed mobs.
+                if not DpsIntel.rainViable(targetId, castSec) then
+                    return true
+                end
+                if DpsIntel.rainSafe and not DpsIntel.rainSafe(targetId, spellOk and spell or nil) then
+                    return true
+                end
+            -- Includes the overkill check via spellName (learned damage vs est HP)
+            elseif not DpsIntel.nukeViable(targetId, castSec, spellName) then
+                return true
+            end
+        end
+    end
+
+    -- Learned soft-resist steering
+    local Core = getCore()
+    local settings = Core and Core.Settings or nil
+    if (not settings or settings.UseResistTracker ~= false) and spellOk then
+        local RT = getResistTracker()
+        if RT and RT.shouldAvoid then
+            local resistType = spell.ResistType and spell.ResistType() or ''
+            if resistType ~= '' then
+                local spawn = mq.TLO.Spawn(targetId)
+                local mobName = (spawn and spawn() and spawn.CleanName()) or ''
+                if mobName ~= '' and RT.shouldAvoid(mobName, resistType:lower(), settings or {}) then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+end
+
 --- Get the next spell to cast based on priority and conditions
 ---@return number|nil gemSlot The gem slot to cast from (1-13)
 ---@return number|nil targetId The target spawn ID (nil for self/PB)
@@ -565,6 +638,9 @@ function M.getNextSpell()
                             if isEffectOnTarget(entry.spellName, entry.spellId, liveTargetId) then
                                 -- Effect already on target, skip this spell
                                 shouldSkip = true
+                            elseif entry.spellType == 'dot' and shouldSkipDamageCast('dot', entry.spellName, target.ID()) then
+                                -- Target dying too fast for the DoT / element resisted
+                                shouldSkip = true
                             else
                                 targetId = liveTargetId
                             end
@@ -584,7 +660,12 @@ function M.getNextSpell()
                         local targetType = target.Type and target.Type() or ""
                         local targetDead = target.Dead and target.Dead() or false
                         if targetType == "NPC" and not targetDead then
-                            targetId = target.ID()
+                            if shouldSkipDamageCast('direct_damage', entry.spellName, target.ID()) then
+                                -- Target dying too fast for the nuke / element resisted
+                                shouldSkip = true
+                            else
+                                targetId = target.ID()
+                            end
                         else
                             -- Skip this spell - no valid target
                             shouldSkip = true

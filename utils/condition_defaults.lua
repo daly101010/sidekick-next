@@ -328,6 +328,23 @@ function M.generateCombatCondition(spellEntry)
     end
 
     if category == 'direct_damage' then
+        -- Rain spells: waves at the target's location only pay off with a pack.
+        -- Gate on multiple XTarget haters (MuleAssist-style rain condition);
+        -- users can tune the count per spell in the condition builder.
+        if spell and spell() then
+            local ok, DpsIntel = pcall(require, 'sidekick-next.utils.dps_intelligence')
+            if ok and DpsIntel and DpsIntel.isRainSpell and DpsIntel.isRainSpell(spell) then
+                return {
+                    conditions = {
+                        newCondition("beneficial", "Me", "Combat", "true", nil),
+                        newCondition("detrimental", "Target", "Type", "==", "NPC"),
+                        newCondition("beneficial", "Me", "XTargetHaterCount", ">=", 3),
+                    },
+                    logic = { "AND", "AND" },
+                }
+            end
+        end
+
         -- Direct damage: InCombat + Target is NPC + Target HP < 90%
         return {
             conditions = {

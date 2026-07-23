@@ -182,6 +182,16 @@ local function preCastChecks(spellName, targetId, opts)
         return false, 'already_casting'
     end
 
+    -- Defer timed casts while the caster standoff reposition is moving us
+    -- (movement would interrupt the cast anyway; instants are fine)
+    local castTimeMs = tonumber(spell.MyCastTime()) or 0
+    if castTimeMs > 0 then
+        local okCA, CasterAssist = pcall(require, 'sidekick-next.automation.caster_assist')
+        if okCA and CasterAssist and CasterAssist.isRepositioning and CasterAssist.isRepositioning() then
+            return false, 'repositioning'
+        end
+    end
+
     -- Check window not open
     if mq.TLO.Window("CastingWindow").Open() then
         return false, 'casting_window_open'
@@ -562,6 +572,9 @@ local function handleResult(result)
             buffLog.info('spell_engine', 'Cast completed: spell=%s result=%s',
                 tostring(_castData.spellName), SpellEvents.getResultName(result))
         end
+        if M.onCastComplete and _castData then
+            pcall(M.onCastComplete, _castData, result)
+        end
         setState(M.STATE.IDLE)
         _castData = nil
     end
@@ -741,5 +754,9 @@ end
 function M.isInitialized()
     return _initialized
 end
+
+-- Optional listener invoked when a cast completes (terminal result, no retry pending).
+-- Signature: fn(castData, result) where castData = {spellName, targetId, spellCategory, ...}
+M.onCastComplete = nil
 
 return M

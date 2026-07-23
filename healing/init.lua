@@ -1241,6 +1241,74 @@ function M.tick(settings)
         end
     end
 
+    -- Priority 1.5: pre-pull HoT - a pull is inbound, get a HoT ticking on the
+    -- tank BEFORE the mob arrives so the first hits land on top of healing.
+    -- Detection is XTarget-based only (works with a non-sidekick puller).
+    -- Settings (registry): PrePullHotEnabled / PrePullHotEtaSec / PrePullHotBigMult
+    local okCore, CoreSettings = pcall(function()
+        return require('sidekick-next.utils.core').Settings
+    end)
+    local skSettings = (okCore and CoreSettings) or {}
+    if skSettings.PrePullHotEnabled ~= false then
+        -- Pull detection: prefer the tank's broadcast (one monitor per group).
+        -- Fall back to scanning locally only when no sidekick tank is active
+        -- (tankless groups / solo healer) or when I am the tank myself.
+        local inbound = nil
+        local okAct, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+        local remotePull = okAct and Actors and Actors.getPullState and Actors.getPullState() or nil
+        if remotePull then
+            if remotePull.phase == 'inbound' then
+                inbound = {
+                    mobId = remotePull.mobId, mobName = remotePull.mobName,
+                    eta = remotePull.eta, mult = remotePull.mult, dist = remotePull.dist,
+                }
+            end
+        else
+            local iAmTank = skSettings.CombatMode == 'tank'
+            local tankActive = false
+            if not iAmTank and okAct and Actors and Actors.getTankState then
+                local ts = Actors.getTankState()
+                tankActive = ts and ts.tankName and ts.tankName ~= ''
+                    and ts.updatedAt and (os.clock() - (ts.updatedAt or 0)) < 15
+            end
+            local okPM, PullMonitor = pcall(require, 'sidekick-next.healing.pull_monitor')
+            if okPM and PullMonitor then
+                if iAmTank then
+                    -- tank.tickPullBroadcast already ticks the monitor; just read
+                    inbound = PullMonitor.getInbound()
+                elseif not tankActive then
+                    PullMonitor.tick()
+                    inbound = PullMonitor.getInbound()
+                end
+            end
+        end
+        do
+            if inbound then
+                local tank = nil
+                for _, t in ipairs(allTargets) do
+                    if t.role == 'tank' then tank = t break end
+                end
+                local etaWindow = tonumber(skSettings.PrePullHotEtaSec) or 8
+                if tank and inbound.eta <= etaWindow
+                    and not (proactive and proactive.HasActiveHot and proactive.HasActiveHot(tank.name)) then
+                    -- Big HoT for raid/named-tier inbound mobs, light HoT for trash
+                    local bigMult = tonumber(skSettings.PrePullHotBigMult) or 2.0
+                    local useLight = (inbound.mult or 1.0) < bigMult
+                    local bestHot = HealSelector.SelectBestHot
+                        and HealSelector.SelectBestHot(tank, useLight, true)
+                    if bestHot and bestHot.spell then
+                        tickLog(string.format('18a-PrePullHot: mob=%s eta=%.1fs mult=%.1f spell=%s',
+                            tostring(inbound.mobName), inbound.eta, inbound.mult or 1, bestHot.spell))
+                        if executeHeal(bestHot.spell, tank.id, 'prePullHot', true) then
+                            _priorityActive = true
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     -- Priority 2: group heal
     local useGroup, groupHeal = HealSelector.ShouldUseGroupHeal(allTargets, situation)
     if useGroup and groupHeal then

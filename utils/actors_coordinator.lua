@@ -88,6 +88,21 @@ local _charmState = {
     updatedAt = 0,
 }
 
+-- Pull coordination state (tank's pull monitor broadcasts; healers consume)
+local _pullState = {
+    phase = 'idle',
+    mobId = 0,
+    mobName = '',
+    eta = 0,
+    mult = 1.0,
+    dist = 0,
+    updatedAt = 0,
+}
+
+-- Remote mob HP estimates (the damage-observer character broadcasts; others
+-- consume so lean-mode characters still get overkill checks)
+local _remoteMobHp = {}  -- mobName -> { maxHP, weight, updatedAt }
+
 local function safeMeName()
     if mq.TLO.Me and mq.TLO.Me.CleanName then
         return mq.TLO.Me.CleanName() or ''
@@ -555,6 +570,47 @@ function M.init(opts)
             return false
         end
 
+        -- Pull coordination: the tank's pull monitor announces inbound pulls so
+        -- healers don't each run their own XTarget scan
+        if id == 'pull:incoming' then
+            if fromMe then return end
+            local senderZone = tostring(content.zone or '')
+            local myZone = safeZone()
+            if senderZone ~= '' and myZone ~= '' and senderZone ~= myZone then return end
+
+            _pullState.phase = tostring(content.phase or 'idle')
+            _pullState.mobId = tonumber(content.mobId) or 0
+            _pullState.mobName = tostring(content.mobName or '')
+            _pullState.eta = tonumber(content.eta) or 0
+            _pullState.mult = tonumber(content.mult) or 1.0
+            _pullState.dist = tonumber(content.dist) or 0
+            _pullState.updatedAt = os.clock()
+            return
+        end
+
+        -- Mob HP estimates from the group's damage observer (usually the tank)
+        if id == 'mobhp:update' then
+            if fromMe then return end
+            local senderZone = tostring(content.zone or '')
+            local myZone = safeZone()
+            if senderZone ~= '' and myZone ~= '' and senderZone ~= myZone then return end
+
+            if type(content.estimates) == 'table' then
+                local now = os.clock()
+                for name, est in pairs(content.estimates) do
+                    if type(est) == 'table' and tonumber(est.maxHP) then
+                        _remoteMobHp[name] = {
+                            maxHP = tonumber(est.maxHP),
+                            weight = tonumber(est.weight) or 0,
+                            updatedAt = now,
+                        }
+                    end
+                end
+            end
+            return
+        end
+
+        -- Tank coordination: repositioning notification
         if id == 'tank:repositioning' then
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
@@ -1371,6 +1427,65 @@ function M.isCharmPet(id)
     -- recovery window) is live; a long-silent entry means the owner's
     -- worker died — fail open so the mob can be killed.
     return (os.clock() - (_charmState.updatedAt or 0)) < 30
+end
+
+--- Broadcast pull-monitor state (tank-side; healers consume via getPullState)
+-- @param state table { phase, mobId, mobName, eta, mult, dist }
+function M.broadcastPullState(state)
+    if not _dropbox then return end
+    if type(state) ~= 'table' then return end
+    _selfZone = safeZone()
+    pcall(function()
+        _dropbox:send({ mailbox = 'sidekick' }, {
+            id = 'pull:incoming',
+            phase = state.phase,
+            mobId = state.mobId,
+            mobName = state.mobName,
+            eta = state.eta,
+            mult = state.mult,
+            dist = state.dist,
+            zone = _selfZone,
+            from = _selfName,
+        })
+    end)
+end
+
+--- Get the remote pull state from the tank's monitor
+-- @return table|nil Pull state, or nil when stale (no fresh broadcast)
+function M.getPullState()
+    if _pullState.updatedAt == 0 then return nil end
+    if (os.clock() - _pullState.updatedAt) > 4 then return nil end
+    return _pullState
+end
+
+--- Broadcast mob HP estimates (observer-side)
+-- @param estimates table mobName -> { maxHP, weight }
+function M.broadcastMobHp(estimates)
+    if not _dropbox then return end
+    if type(estimates) ~= 'table' or not next(estimates) then return end
+    _selfZone = safeZone()
+    pcall(function()
+        _dropbox:send({ mailbox = 'sidekick' }, {
+            id = 'mobhp:update',
+            estimates = estimates,
+            zone = _selfZone,
+            from = _selfName,
+        })
+    end)
+end
+
+--- Get a remote mob HP estimate by mob name (from the group's damage observer)
+-- @param mobName string
+-- @return number|nil maxHP
+-- @return number weight
+function M.getRemoteMobHp(mobName)
+    local est = mobName and _remoteMobHp[mobName]
+    if not est then return nil, 0 end
+    if (os.clock() - est.updatedAt) > 30 then
+        _remoteMobHp[mobName] = nil
+        return nil, 0
+    end
+    return est.maxHP, est.weight or 0
 end
 
 --- Get current zone for comparison

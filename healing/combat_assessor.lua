@@ -136,6 +136,7 @@ function M.getThrottleInfo()
 end
 
 -- Record a mob's HP% snapshot for TTK calculation
+-- All snapshot timestamps are in SECONDS (mq.gettime() returns milliseconds)
 local function recordMobHP(mobId, mobName, hpPct)
     if not mobId or mobId == 0 then return end
 
@@ -146,7 +147,7 @@ local function recordMobHP(mobId, mobName, hpPct)
         }
     end
 
-    local now = mq.gettime()
+    local now = mq.gettime() / 1000
     local data = _mobSnapshots[mobId]
 
     -- Add snapshot
@@ -155,11 +156,8 @@ local function recordMobHP(mobId, mobName, hpPct)
         time = now,
     })
 
-    -- Keep only last 30 seconds of snapshots. `now = mq.gettime()` returns
-    -- milliseconds, so the cutoff must also be in ms — using a bare `30`
-    -- previously evicted snapshots after 30 *milliseconds*, leaving only one
-    -- sample and breaking TTK estimation entirely.
-    local cutoff = now - (30 * 1000)
+    -- Keep only last 30 seconds of snapshots (timestamps are in seconds).
+    local cutoff = now - 30
     while #data.snapshots > 1 and data.snapshots[1].time < cutoff do
         table.remove(data.snapshots, 1)
     end
@@ -174,9 +172,8 @@ local function getMobTTK(mobId)
     end
 
     local windowSec = (Config and Config.ttkWindowSec) or 5
-    local now = mq.gettime()
-    -- mq.gettime() is milliseconds; convert windowSec to ms for the cutoff.
-    local cutoff = now - (windowSec * 1000)
+    local now = mq.gettime() / 1000
+    local cutoff = now - windowSec
 
     -- Collect samples within the window
     local samples = {}
@@ -191,8 +188,7 @@ local function getMobTTK(mobId)
     end
 
     -- Calculate HP% loss rate, filtering upward jumps (heals/regen).
-    -- Convert ms → seconds for the rate math so the returned TTK is in
-    -- seconds (snapshot time is mq.gettime() ms).
+    -- Snapshot timestamps are in seconds, so the rate math yields %/s directly.
     local totalHpLoss = 0
     local totalTimeSec = 0
 
@@ -200,7 +196,7 @@ local function getMobTTK(mobId)
         local prev = samples[i - 1]
         local curr = samples[i]
         local hpDelta = prev.hpPct - curr.hpPct
-        local timeDeltaSec = (curr.time - prev.time) / 1000
+        local timeDeltaSec = curr.time - prev.time
 
         -- Only count HP decreases (ignore heals, regen)
         if hpDelta > 0 and timeDeltaSec > 0 then
@@ -222,6 +218,13 @@ local function getMobTTK(mobId)
 
     -- TTK in seconds = remaining HP% / smoothed loss rate (%/s)
     return currentHpPct / hpLossPerSec
+end
+
+--- Public accessor: measured time-to-kill for a tracked mob
+-- @param mobId number Spawn ID (must be an XTarget hater to have samples)
+-- @return number|nil TTK in seconds, or nil if not enough samples
+function M.getMobTTKById(mobId)
+    return getMobTTK(mobId)
 end
 
 local function getXTargetData()

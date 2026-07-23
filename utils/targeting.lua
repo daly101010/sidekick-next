@@ -384,7 +384,7 @@ local SKIP_LOG_COOLDOWN = 5.0  -- Only log once per 5 seconds per target
 -- @param range number Search radius (default 100)
 -- @param settings table Optional settings for safe targeting
 -- @return userdata|nil Best target spawn or nil
-function M.selectBestTarget(myId, range, settings)
+function M.selectBestTarget(myId, range, settings, excludeId)
     settings = settings or M.settings or {}
     local ignoreSet = _buildIgnoreSet(settings)
     local unmezzed = M.getUnmezzedTargets(range)
@@ -413,6 +413,9 @@ function M.selectBestTarget(myId, range, settings)
         local scoredTargets = {}
         for _, spawn in ipairs(unmezzed) do
             if _isIgnoredSpawn(spawn, ignoreSet) then
+                goto continue
+            end
+            if excludeId and excludeId > 0 and spawn.ID() == excludeId then
                 goto continue
             end
             local score, reason = M.scoreTarget(spawn, myId, settings)

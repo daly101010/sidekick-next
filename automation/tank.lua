@@ -36,6 +36,15 @@ local _state = {
     reposition = {
         settleUntil = 0,
     },
+    -- Flee-handoff: when the current target runs at low HP, leave it to the DPS
+    -- and open up on the next add instead of chasing the runner
+    flee = {
+        watchId = 0,       -- target being watched for flee behavior
+        lastDist = 0,
+        lastCheck = 0,
+        runnerId = 0,      -- mob handed off to DPS (excluded from target selection)
+        runnerUntil = 0,
+    },
 }
 
 function M.init(settings)
@@ -52,8 +61,50 @@ function M.tick(abilities, settings)
     if not me or not me() then return end
     local myId = me.ID()
 
+    -- The tank owns pull monitoring for the group (healers consume via actors)
+    M.tickPullBroadcast(M.settings)
+
     -- Run state machine
     M.runStateMachine(myId, abilities, settings)
+end
+
+-- Pull monitor broadcast state
+local _pullBroadcast = { lastSent = 0, lastPhase = 'idle' }
+
+--- Tick the pull monitor and broadcast inbound pulls to the group.
+-- Runs only on the tank, so the rest of the group doesn't need its own
+-- XTarget pull scanning.
+function M.tickPullBroadcast(settings)
+    if settings.PrePullHotEnabled == false then return end
+
+    local ok, PullMonitor = pcall(require, 'sidekick-next.healing.pull_monitor')
+    if not ok or not PullMonitor then return end
+    PullMonitor.tick()
+
+    local now = mq.gettime()
+    local inbound = PullMonitor.getInbound()
+    if inbound then
+        -- 1/sec refreshes while inbound (distance/ETA change)
+        if (now - _pullBroadcast.lastSent) >= 1000 then
+            _pullBroadcast.lastSent = now
+            _pullBroadcast.lastPhase = 'inbound'
+            Actors.broadcastPullState({
+                phase = 'inbound',
+                mobId = inbound.mobId,
+                mobName = inbound.mobName,
+                eta = inbound.eta,
+                mult = inbound.mult,
+                dist = inbound.dist,
+            })
+        end
+    elseif _pullBroadcast.lastPhase == 'inbound' then
+        -- Pull landed or was dropped: clear once
+        _pullBroadcast.lastPhase = 'idle'
+        _pullBroadcast.lastSent = now
+        Actors.broadcastPullState({
+            phase = 'idle', mobId = 0, mobName = '', eta = 0, mult = 1.0, dist = 0,
+        })
+    end
 end
 
 function M.runStateMachine(myId, abilities, settings)
@@ -98,9 +149,67 @@ function M.runManualMode()
     end
 end
 
+--- Detect the current target fleeing at low HP and hand it off to the DPS.
+-- The runner is excluded from target selection for a window so the tank opens
+-- on the next add immediately instead of chasing; sticky-mode assisters stay on
+-- the runner until it dies, so nothing escapes.
+function M.checkFleeHandoff(settings)
+    if settings.TankFleeHandoff == false then return end
+
+    local flee = _state.flee
+    local now = mq.gettime()
+
+    -- Expire an old handoff (or a runner that died)
+    if flee.runnerId > 0 then
+        local runner = mq.TLO.Spawn(flee.runnerId)
+        if now >= flee.runnerUntil or not runner or not runner() or (runner.Dead and runner.Dead()) then
+            flee.runnerId = 0
+            flee.runnerUntil = 0
+        end
+    end
+
+    local target = mq.TLO.Target
+    if not (target and target() and (target.Type and target.Type() or '') == 'NPC') then return end
+    local id = target.ID() or 0
+    if id <= 0 or id == flee.runnerId then return end
+
+    -- (Re)anchor distance watch when the target changes
+    if id ~= flee.watchId then
+        flee.watchId = id
+        flee.lastDist = tonumber(target.Distance()) or 0
+        flee.lastCheck = now
+        return
+    end
+
+    -- Sample distance about once a second
+    if (now - flee.lastCheck) < 900 then return end
+    local dist = tonumber(target.Distance()) or 0
+    local receding = dist > (flee.lastDist + 2)
+    flee.lastDist = dist
+    flee.lastCheck = now
+
+    local threshold = tonumber(settings.TankFleeHpThreshold) or 20
+    local pct = tonumber(target.PctHPs()) or 100
+    if pct > threshold or not receding then return end
+
+    -- Only hand off when there's another add to open up on
+    local minAdds = tonumber(settings.TankFleeMinAdds) or 2
+    if (Cache.unmezzedHaterCount() or 0) < minAdds then return end
+
+    flee.runnerId = id
+    flee.runnerUntil = now + ((tonumber(settings.TankFleeHandoffWindowSec) or 15) * 1000)
+    -- Force reselection this tick: selectBestTarget excludes the runner below
+    M.primaryTargetId = nil
+end
+
 function M.runAutoMode(myId, abilities, settings)
-    -- Select best target based on priority (with safe targeting / KS prevention)
-    local bestTarget = Targeting.selectBestTarget(myId, 100, settings)
+    -- Flee-handoff: leave low-HP runners to the DPS
+    M.checkFleeHandoff(settings)
+
+    -- Select best target based on priority (with safe targeting / KS prevention),
+    -- excluding a handed-off runner so we don't bounce back to it
+    local excludeId = _state.flee.runnerId > 0 and _state.flee.runnerId or nil
+    local bestTarget = Targeting.selectBestTarget(myId, 100, settings, excludeId)
 
     if bestTarget and bestTarget() then
         local targetId = bestTarget.ID()
@@ -186,7 +295,18 @@ function M.handleAggro(myId, abilities, settings)
     -- Reactive taunt: only check when taunt is ready and not already taunting
     if _state.current == STATE.IDLE then
         if Aggro.canTaunt() and Aggro.isTauntReady() then
-            local looseMob = Aggro.findMobAttackingGroup(myId)
+            -- Auto-peel: prioritize mobs beating on fragile members
+            -- (healer > caster > melee) instead of just the nearest loose mob.
+            -- With TankPeelMinPriority > 1 only those victims trigger a peel
+            -- (e.g. 4 = casters and up, 5+ = healers only - no fallback).
+            local looseMob
+            local minPriority = tonumber(settings.TankPeelMinPriority) or 1
+            if settings.TankAutoPeel ~= false and Aggro.findPriorityPeelTarget then
+                looseMob = Aggro.findPriorityPeelTarget(myId, minPriority)
+            end
+            if not (looseMob and looseMob()) and minPriority <= 1 then
+                looseMob = Aggro.findMobAttackingGroup(myId)
+            end
             if looseMob and looseMob() then
                 local dist = looseMob.Distance() or 999
                 if dist <= Aggro.TAUNT_CHASE_RANGE then

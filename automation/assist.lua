@@ -233,8 +233,9 @@ function M.tick(settings)
     settings = settings or (_Core and _Core.Settings) or M.settings
     if not M.enabled then return end
 
-    -- Route pure casters to CasterAssist
-    if CasterAssist.isPureCaster() then
+    -- Route pure casters (and standoff-mode rangers) to CasterAssist
+    if CasterAssist.isPureCaster()
+        or (CasterAssist.shouldRouteStandoff and CasterAssist.shouldRouteStandoff(settings)) then
         CasterAssist.setEnabled(true)
         CasterAssist.tick(settings)
         return
