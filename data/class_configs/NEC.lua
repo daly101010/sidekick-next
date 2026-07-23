@@ -112,23 +112,26 @@ M.defaultConditions = {
         return ctx.pet.pctHPs and ctx.pet.pctHPs < 60
     end,
 
+    -- dotViable(duration): target must live long enough for the DoT to pay off
+    -- (breakeven fraction of its duration) - a raw HP% gate can't tell a dying
+    -- trash mob at 25% from a raid boss at 25% with minutes left
     ['doSwiftDoT'] = function(ctx)
-        return ctx.combat and not ctx.target.myBuff('Swift')
+        return ctx.combat and not ctx.target.myBuff('Swift') and ctx.target.dotViable(12)
     end,
     ['doPoisonDoT'] = function(ctx)
-        return ctx.combat and not ctx.target.myBuff('Pyre') and ctx.target.pctHPs > 20
+        return ctx.combat and not ctx.target.myBuff('Pyre') and ctx.target.dotViable(24)
     end,
     ['doDiseaseDoT'] = function(ctx)
-        return ctx.combat and not ctx.target.myBuff('Scourge') and ctx.target.pctHPs > 20
+        return ctx.combat and not ctx.target.myBuff('Scourge') and ctx.target.dotViable(24)
     end,
     ['doFireDoT'] = function(ctx)
-        return ctx.combat and not ctx.target.myBuff('Pyre of the') and ctx.target.pctHPs > 20
+        return ctx.combat and not ctx.target.myBuff('Pyre of the') and ctx.target.dotViable(24)
     end,
     ['doCorruptionDoT'] = function(ctx)
-        return ctx.combat and ctx.target.named and not ctx.target.myBuff('Corruption') and ctx.target.pctHPs > 30
+        return ctx.combat and ctx.target.named and not ctx.target.myBuff('Corruption') and ctx.target.dotViable(30)
     end,
     ['doMagicDoT'] = function(ctx)
-        return ctx.combat and ctx.target.named and not ctx.target.myBuff('Grip') and ctx.target.pctHPs > 30
+        return ctx.combat and ctx.target.named and not ctx.target.myBuff('Grip') and ctx.target.dotViable(30)
     end,
     ['doLifeTap'] = function(ctx)
         return ctx.combat and ctx.me.pctHPs < 70

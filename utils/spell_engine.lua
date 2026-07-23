@@ -453,6 +453,9 @@ local function handleResult(result)
             buffLog.info('spell_engine', 'Cast completed: spell=%s result=%s',
                 tostring(_castData.spellName), SpellEvents.getResultName(result))
         end
+        if M.onCastComplete and _castData then
+            pcall(M.onCastComplete, _castData, result)
+        end
         setState(M.STATE.IDLE)
         _castData = nil
     end
@@ -627,5 +630,9 @@ end
 function M.isInitialized()
     return _initialized
 end
+
+-- Optional listener invoked when a cast completes (terminal result, no retry pending).
+-- Signature: fn(castData, result) where castData = {spellName, targetId, spellCategory, ...}
+M.onCastComplete = nil
 
 return M

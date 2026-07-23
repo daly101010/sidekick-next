@@ -5,6 +5,9 @@ local mq = require('mq')
 
 local RuntimeCache = require('sidekick-next.utils.runtime_cache')
 local Core = require('sidekick-next.utils.core')
+local lazy = require('sidekick-next.utils.lazy_require')
+
+local getDpsIntel = lazy('sidekick-next.utils.dps_intelligence')
 
 local M = {}
 
@@ -38,6 +41,8 @@ function M.build()
     -- Pet info (cached)
     local petId = safeNum(function() return me.Pet.ID() end, 0)
     local petHPs = petId > 0 and safeNum(function() return me.Pet.PctHPs() end, 100) or nil
+
+    local targetId = safeNum(function() return target.ID() end, 0)
 
     return {
         me = {
@@ -105,7 +110,7 @@ function M.build()
         },
 
         target = {
-            id = safeNum(function() return target.ID() end, 0),
+            id = targetId,
             pctHPs = safeNum(function() return target.PctHPs() end, 100),
             level = safeNum(function() return target.Level() end, 0),
             named = safe(function() return target.Named() end, false),
@@ -145,6 +150,42 @@ function M.build()
 
             -- Check target's con color
             conColor = safe(function() return target.ConColor() end, ''),
+
+            -- Estimated time-to-die in seconds (nil if unknown). Measured from the
+            -- mob's HP% decline rate; falls back to a difficulty-scaled heuristic.
+            ttd = function()
+                local dps = getDpsIntel()
+                if not dps then return nil end
+                local ok, ttd = pcall(dps.getTTD, targetId)
+                return ok and ttd or nil
+            end,
+
+            -- Will the target still be alive N seconds from now? Fails open (true)
+            -- when no data - never blocks casting blind at fight start.
+            willLive = function(seconds)
+                local dps = getDpsIntel()
+                if not dps then return true end
+                local ok, res = pcall(dps.willLive, targetId, seconds)
+                return not ok or res == true
+            end,
+
+            -- Is a nuke with this cast time worth starting? (target outlives
+            -- cast + land margin, so the nuke is neither wasted nor overkill-raced)
+            nukeViable = function(castTimeSec)
+                local dps = getDpsIntel()
+                if not dps then return true end
+                local ok, res = pcall(dps.nukeViable, targetId, castTimeSec)
+                return not ok or res == true
+            end,
+
+            -- Is a DoT with this duration worth applying? (target lives at least
+            -- the breakeven fraction of the DoT's duration)
+            dotViable = function(durationSec)
+                local dps = getDpsIntel()
+                if not dps then return true end
+                local ok, res = pcall(dps.dotViable, targetId, durationSec)
+                return not ok or res == true
+            end,
         },
 
         pet = {

@@ -126,6 +126,7 @@ function M.getThrottleInfo()
 end
 
 -- Record a mob's HP% snapshot for TTK calculation
+-- All snapshot timestamps are in SECONDS (mq.gettime() returns milliseconds)
 local function recordMobHP(mobId, mobName, hpPct)
     if not mobId or mobId == 0 then return end
 
@@ -136,7 +137,7 @@ local function recordMobHP(mobId, mobName, hpPct)
         }
     end
 
-    local now = mq.gettime()
+    local now = mq.gettime() / 1000
     local data = _mobSnapshots[mobId]
 
     -- Add snapshot
@@ -161,7 +162,7 @@ local function getMobTTK(mobId)
     end
 
     local windowSec = (Config and Config.ttkWindowSec) or 5
-    local now = mq.gettime()
+    local now = mq.gettime() / 1000
     local cutoff = now - windowSec
 
     -- Collect samples within the window
@@ -206,6 +207,13 @@ local function getMobTTK(mobId)
 
     -- TTK = remaining HP% / smoothed loss rate
     return currentHpPct / hpLossPerSec
+end
+
+--- Public accessor: measured time-to-kill for a tracked mob
+-- @param mobId number Spawn ID (must be an XTarget hater to have samples)
+-- @return number|nil TTK in seconds, or nil if not enough samples
+function M.getMobTTKById(mobId)
+    return getMobTTK(mobId)
 end
 
 local function getXTargetData()
@@ -414,7 +422,7 @@ local function calcTotalIncomingDps()
 end
 
 function M.tick()
-    local now = mq.gettime()
+    local now = mq.gettime() / 1000
     if (now - _lastUpdate) < UPDATE_INTERVAL then return end
     _lastUpdate = now
 

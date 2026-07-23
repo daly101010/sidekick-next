@@ -161,6 +161,18 @@ M.defaults = {
     RetryOnInterrupt = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Retry on Interrupt' },
     UseImmuneDatabase = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Use Immune Database' },
 
+    -- DPS Intelligence (time-to-die gating for damage spells)
+    UseDpsIntelligence = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Smart DPS (Time-to-Die)' },
+    DpsNukeLandMargin = { type = 'number', Default = 1.0, Category = 'Combat', DisplayName = 'Nuke Land Margin (sec)' },
+    DpsDotBreakevenPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'DoT Breakeven (% of duration)' },
+    DpsDefaultNukeCastTime = { type = 'number', Default = 3.0, Category = 'Combat', DisplayName = 'Default Nuke Cast Time (sec)' },
+    DpsDefaultDotDuration = { type = 'number', Default = 24, Category = 'Combat', DisplayName = 'Default DoT Duration (sec)' },
+
+    -- Resist Tracker (per-mob element resist learning)
+    UseResistTracker = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Learn Mob Resists' },
+    ResistAvoidPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Avoid Element At Resist %' },
+    ResistMinSamples = { type = 'number', Default = 4, Category = 'Combat', DisplayName = 'Resist Min Samples' },
+
     -- Spell Lineup Settings
     SpellRescanOnZone = { type = 'bool', Default = true, Category = 'Spells', DisplayName = 'Rescan Gems on Zone' },
     HealThreshold = { type = 'number', Default = 80, Category = 'Spells', DisplayName = 'Heal HP Threshold' },

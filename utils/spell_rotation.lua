@@ -47,6 +47,7 @@ M.DEBUFF_CATEGORIES = {
 local getSpellEngine = lazy('sidekick-next.utils.spell_engine')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
 local getImmuneDB = lazy('sidekick-next.utils.immune_database')
+local getResistTracker = lazy('sidekick-next.utils.resist_tracker')
 local getSpellLineup = lazy('sidekick-next.utils.spell_lineup')
 local getCache = lazy('sidekick-next.utils.runtime_cache')
 
@@ -158,6 +159,17 @@ function M.selectNextSpell(spells, settings, targetId)
         if category == 'nuke' or category == 'dot' then
             if not M.matchesResistType(spell, preferredResist) then
                 goto continue
+            end
+
+            -- Skip elements this mob has learned to resist (soft-resist steering)
+            if settings.UseResistTracker ~= false and targetName ~= '' then
+                local RT = getResistTracker()
+                if RT and RT.shouldAvoid then
+                    local resistType = spell.ResistType and spell.ResistType() or ''
+                    if resistType ~= '' and RT.shouldAvoid(targetName, resistType:lower(), settings) then
+                        goto continue
+                    end
+                end
             end
         end
 

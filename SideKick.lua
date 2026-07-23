@@ -132,6 +132,7 @@ local getCC = lazy.init('sidekick-next.automation.cc')
 local getBuff = lazy.init('sidekick-next.automation.buff')
 local getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 local getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
+local getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -2171,6 +2172,9 @@ local function main()
         -- Check for zone change (immune database)
         do local M = getImmuneDB() if M then M.loadZone() end end
 
+        -- Resist tracker: zone change check + resolve pending cast attempts
+        do local M = getResistTracker() if M then M.loadZone() M.tick() end end
+
         -- Update aggro warning state
         do local M = getAggroWarning() if M and M.update then M.update() end end
 
@@ -2224,6 +2228,9 @@ local function main()
 
     -- Shutdown: save immune database
     do local M = getImmuneDB() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: save resist tracker
+    do local M = getResistTracker() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

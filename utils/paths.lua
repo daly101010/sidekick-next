@@ -117,6 +117,13 @@ function M.getImmuneDatabasePath()
     return M.getDataDir() .. '/immune_database.lua'
 end
 
+--- Get the resist tracker database path
+-- Path: SideKick/data/resist_tracker.lua
+function M.getResistTrackerPath()
+    M.ensureDir(M.getDataDir())
+    return M.getDataDir() .. '/resist_tracker.lua'
+end
+
 -------------------------------------------------------------------------------
 -- Log File Paths
 -------------------------------------------------------------------------------
