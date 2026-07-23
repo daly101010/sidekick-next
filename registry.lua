@@ -151,6 +151,9 @@ M.defaults = {
     CasterUseStick = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Use Stick' },
     CasterEscapeRange = { type = 'number', Default = 30, Category = 'Combat', DisplayName = 'Caster Escape Range' },
     CasterSafeZoneRadius = { type = 'number', Default = 30, Category = 'Combat', DisplayName = 'Safe Zone Radius' },
+    CasterStandoffEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Standoff (Ranged Casting)' },
+    CasterStandoffMin = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Standoff Min Distance' },
+    CasterStandoffMax = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Standoff Max Distance' },
     PreferredResistType = { type = 'text', Default = 'Any', Category = 'Combat', DisplayName = 'Preferred Resist Type' },
 
     -- Spell Rotation Settings

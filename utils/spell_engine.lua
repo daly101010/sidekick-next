@@ -148,6 +148,16 @@ local function preCastChecks(spellName, targetId, opts)
         return false, 'already_casting'
     end
 
+    -- Defer timed casts while the caster standoff reposition is moving us
+    -- (movement would interrupt the cast anyway; instants are fine)
+    local castTimeMs = tonumber(spell.MyCastTime()) or 0
+    if castTimeMs > 0 then
+        local okCA, CasterAssist = pcall(require, 'sidekick-next.automation.caster_assist')
+        if okCA and CasterAssist and CasterAssist.isRepositioning and CasterAssist.isRepositioning() then
+            return false, 'repositioning'
+        end
+    end
+
     -- Check window not open
     if mq.TLO.Window("CastingWindow").Open() then
         return false, 'casting_window_open'

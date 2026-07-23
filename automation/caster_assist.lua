@@ -30,6 +30,15 @@ M.escapeState = {
     startTime = 0,
 }
 
+-- Standoff state (keep ranged distance from the target so rains/AEs on the mob
+-- don't clip the caster)
+M.standoffState = {
+    phase = 'idle',  -- idle, moving
+    startTime = 0,
+}
+M.standoffCooldownMs = 4000
+M.lastStandoffMove = 0
+
 -- Lazy-load dependencies
 local getCore = lazy('sidekick-next.utils.core')
 local getCombatAssist = lazy('sidekick-next.utils.combatassist')
@@ -176,6 +185,156 @@ local function calculateKitePosition(mobId, distance)
     return newX, newY
 end
 
+-------------------------------------------------------------------------------
+-- Standoff positioning (ranged casting distance with desynced random spots)
+-------------------------------------------------------------------------------
+
+-- Per-character deterministic angle offset + RNG seed. Three boxed characters
+-- get different base directions from the name hash alone, and the per-move
+-- jitter comes from an RNG seeded per character - so they never pick the same
+-- spot in sync even when they reposition at the same moment.
+local _standoffSeeded = false
+local _nameAngleOffset = 0
+
+local function ensureStandoffSeed()
+    if _standoffSeeded then return end
+    local name = tostring(mq.TLO.Me.CleanName() or 'unknown')
+    local h = 0
+    for i = 1, #name do
+        h = (h * 31 + name:byte(i)) % 1000003
+    end
+    math.randomseed((os.time() % 100000) + h)
+    _nameAngleOffset = (h % 90) - 45  -- degrees, spread characters across +/-45
+    _standoffSeeded = true
+end
+
+--- Validate a candidate standoff spot: reachable and keeps line of sight to the mob
+local function isValidStandoffSpot(x, y, z, mobX, mobY, mobZ)
+    -- Reachable via nav mesh?
+    local nav = mq.TLO.Navigation
+    if nav and nav.PathExists then
+        local ok, exists = pcall(function()
+            return nav.PathExists(string.format('locxyz %.2f %.2f %.2f', x, y, z))()
+        end)
+        if ok and exists == false then return false end
+    end
+
+    -- Line of sight from the spot to the mob (so casting can continue)
+    -- LineOfSight TLO uses EQ loc order: y,x,z:y,x,z
+    local ok2, los = pcall(function()
+        return mq.TLO.LineOfSight(string.format('%.2f,%.2f,%.2f:%.2f,%.2f,%.2f',
+            y, x, z, mobY, mobX, mobZ))()
+    end)
+    if ok2 and los == false then return false end
+
+    return true
+end
+
+--- Pick a randomized standoff spot on MY side of the mob
+-- @param target userdata Target spawn
+-- @param minD number Minimum distance from the mob
+-- @param maxD number Maximum distance from the mob
+-- @return number, number, number x, y, z
+local function pickStandoffSpot(target, minD, maxD)
+    ensureStandoffSeed()
+
+    local mobX = target.X() or 0
+    local mobY = target.Y() or 0
+    local mobZ = target.Z() or 0
+    local myX = mq.TLO.Me.X() or 0
+    local myY = mq.TLO.Me.Y() or 0
+    local myZ = mq.TLO.Me.Z() or mobZ
+
+    -- Base direction: from the mob toward me (stay on my own side, don't cross
+    -- the camp), then rotate by this character's personal offset
+    local dx, dy = myX - mobX, myY - mobY
+    local base
+    if (dx * dx + dy * dy) < 1 then
+        base = math.random() * 2 * math.pi
+    else
+        base = math.atan2(dx, dy)
+    end
+    base = base + math.rad(_nameAngleOffset)
+
+    for attempt = 1, 8 do
+        -- Jitter widens with each failed attempt to find valid ground
+        local spreadDeg = 20 + attempt * 10
+        local angle = base + math.rad(math.random(-spreadDeg, spreadDeg))
+        local dist = minD + (maxD - minD) * math.random()
+        local x = mobX + math.sin(angle) * dist
+        local y = mobY + math.cos(angle) * dist
+        if isValidStandoffSpot(x, y, myZ, mobX, mobY, mobZ) then
+            return x, y, myZ
+        end
+    end
+
+    -- Fallback: straight away from the mob at mid distance
+    local len = math.max(math.sqrt(dx * dx + dy * dy), 1)
+    local dist = (minD + maxD) / 2
+    return mobX + (dx / len) * dist, mobY + (dy / len) * dist, myZ
+end
+
+--- Is the standoff reposition currently moving us? (spell_engine defers timed casts)
+-- @return boolean
+function M.isRepositioning()
+    return M.standoffState.phase == 'moving'
+end
+
+--- Should assist routing send this (non-pure-caster) class through CasterAssist?
+-- Rangers use standoff positioning when enabled.
+-- @param settings table Settings
+-- @return boolean
+function M.shouldRouteStandoff(settings)
+    if not settings or settings.CasterStandoffEnabled ~= true then return false end
+    local class = mq.TLO.Me.Class.ShortName()
+    return class == 'RNG'
+end
+
+--- Standoff tick: move to a randomized ranged spot when too close to the target
+-- @param settings table Settings
+function M.tickStandoff(settings)
+    if not settings or settings.CasterStandoffEnabled ~= true then return end
+    local state = M.standoffState
+
+    local target = mq.TLO.Target
+    local haveTarget = target and target() and (target.Type and target.Type() or '') == 'NPC'
+        and not (target.Dead and target.Dead())
+
+    if state.phase == 'moving' then
+        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
+        if not haveTarget or not navActive or (os.clock() - state.startTime) > 8 then
+            if navActive then mq.cmd('/squelch /nav stop') end
+            state.phase = 'idle'
+        end
+        return
+    end
+
+    if not haveTarget then return end
+
+    -- Only reposition during combat
+    local combatState = tostring(mq.TLO.Me.CombatState() or '')
+    if combatState ~= 'COMBAT' then return end
+
+    local minD = tonumber(settings.CasterStandoffMin) or 35
+    local maxD = tonumber(settings.CasterStandoffMax) or 60
+    if maxD < minD + 5 then maxD = minD + 5 end
+
+    local dist = tonumber(target.Distance()) or 999
+    if dist >= minD then return end
+
+    -- Never interrupt an in-progress cast; we'll move as soon as it finishes
+    if mq.TLO.Me.Casting() then return end
+
+    -- Cooldown prevents dancing when mobs chase
+    if (mq.gettime() - M.lastStandoffMove) < M.standoffCooldownMs then return end
+    M.lastStandoffMove = mq.gettime()
+
+    local x, y, z = pickStandoffSpot(target, minD, maxD)
+    state.phase = 'moving'
+    state.startTime = os.clock()
+    mq.cmdf('/squelch /nav locxyz %.2f %.2f %.2f', x, y, z)
+end
+
 --- Check if current class is a pure caster
 -- @return boolean
 function M.isPureCaster()
@@ -215,10 +374,14 @@ end
 -- @param settings table Settings table
 function M.tick(settings)
     if not M.enabled then return end
-    if not M.isPureCaster() then return end
 
-    -- Check if user wants stick mode (behave like melee)
-    local useStick = settings and settings.CasterUseStick
+    local standoffEnabled = settings and settings.CasterStandoffEnabled == true
+    local isCaster = M.isPureCaster()
+    if not isCaster and not (standoffEnabled and M.shouldRouteStandoff(settings)) then return end
+
+    -- Check if user wants stick mode (behave like melee).
+    -- Standoff takes precedence - sticking to the mob defeats ranged casting.
+    local useStick = isCaster and settings and settings.CasterUseStick and not standoffEnabled
     if useStick then
         -- Delegate to CombatAssist for melee-like behavior
         local ca = getCombatAssist()
@@ -231,9 +394,15 @@ function M.tick(settings)
     -- Stay-put caster mode: check for escape conditions
     M.checkEscapeCondition(settings)
 
-    -- Handle ongoing escape navigation
+    -- Handle ongoing escape navigation (takes priority over standoff)
     if M.escapeState.phase ~= 'idle' then
         M.tickEscape(settings)
+        return
+    end
+
+    -- Standoff positioning: keep ranged distance from the target
+    if standoffEnabled then
+        M.tickStandoff(settings)
     end
 end
 
