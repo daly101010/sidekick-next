@@ -204,6 +204,22 @@ function M.sendToGroupTarget(payload)
     sendToGroupTarget(payload)
 end
 
+-- eq_ui_rebuild_classic services its 'medley_remote' mailbox from its main
+-- coroutine; script-addressed with no character = broadcast to that script
+-- on every connected peer.
+local _ADDR_EQUI = { mailbox = 'medley_remote', script = 'eq_ui_rebuild_classic' }
+
+--- Publish consolidated group vitals (tank-side, see utils/vitals_hub.lua).
+--- Fan-out is script-addressed because plain { mailbox = 'sidekick' } never
+--- crosses script names: GroupTarget HUD + classic UI rebuild.
+function M.sendVitalsGroup(payload)
+    if not _dropbox or type(payload) ~= 'table' then return end
+    payload.from = payload.from or _selfName
+    payload.server = payload.server or _selfServer
+    sendToGroupTarget(payload)
+    pcall(function() _dropbox:send(_ADDR_EQUI, payload) end)
+end
+
 function M.requestGroupTargetBounds()
     sendToGroupTarget({ id = 'window:bounds:req' })
 end

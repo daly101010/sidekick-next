@@ -148,6 +148,7 @@ local getMobIntel = lazy.init('sidekick-next.utils.mob_intel')
 local getDeathForensics = lazy.init('sidekick-next.utils.death_forensics')
 local getSessionStats = lazy.init('sidekick-next.utils.session_stats')
 local getReadiness = lazy('sidekick-next.utils.readiness')
+local getVitalsHub = lazy('sidekick-next.utils.vitals_hub')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -2912,6 +2913,10 @@ local function main()
                 settingsOpen = State.settingsOpen == true,
             })
             ActorsCoordinator.tick({ status = status })
+
+            -- Tank-side consolidated group vitals for UI consumers (no-op
+            -- unless CombatMode == 'tank'; rate-limited internally).
+            do local VH = getVitalsHub() if VH then VH.tick() end end
 
             -- Healing module actors tick (for multi-healer coordination)
             if Healing and Healing.tickActors then

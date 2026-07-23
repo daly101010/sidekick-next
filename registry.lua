@@ -281,6 +281,9 @@ M.defaults = {
     ReadyManaPct = { type = 'number', Default = 80, Category = 'Combat', DisplayName = 'Ready Mana %' },
     ReadyEndPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Ready Endurance %' },
 
+    -- Vitals hub (tank publishes consolidated group vitals for UI scripts)
+    VitalsHubEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Publish Group Vitals (Tank Hub)' },
+
     -- Resist Tracker (per-mob element resist learning)
     UseResistTracker = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Learn Mob Resists' },
     ResistAvoidPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'Avoid Element At Resist %' },
