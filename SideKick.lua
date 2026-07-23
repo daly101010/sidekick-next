@@ -136,6 +136,7 @@ local getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
 local getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
 local getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
 local getSpellDamageTracker = lazy.init('sidekick-next.utils.spell_damage_tracker')
+local getMobIntel = lazy.init('sidekick-next.utils.mob_intel')
 local getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 local getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
 local getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
@@ -2055,6 +2056,39 @@ local function main()
         end
     end)
 
+    _bindCmd('/skmobintel', function(sub, arg)
+        local MobIntel = getMobIntel()
+        if not MobIntel then
+            log.info('Mob intel module not available')
+            return
+        end
+        sub = tostring(sub or ''):lower()
+        if sub == 'export' then
+            -- Fold in-flight HP learning into the database so the export sees it
+            do local M = getMobHpEstimator() if M and M.flush then M.flush() end end
+            MobIntel.exportAll()
+        elseif sub == 'mob' then
+            local name = arg or mq.TLO.Target.CleanName() or ''
+            if name == '' then
+                log.info('Usage: /skmobintel mob [name] (defaults to current target)')
+                return
+            end
+            for _, cc in ipairs({ 'slow', 'snare', 'mez', 'charm', 'root' }) do
+                local status, stats = MobIntel.getCCStatus(name, cc)
+                if stats then
+                    log.info('%s: %s = %s (%d landed / %d resisted)', name, cc, status,
+                        stats.landed or 0, stats.resisted or 0)
+                end
+            end
+            local casts = MobIntel.getNpcCasts(name)
+            for spell, count in pairs(casts) do
+                log.info('%s casts: %s (seen %d)', name, spell, count)
+            end
+        else
+            log.info('Usage: /skmobintel export | mob [name]')
+        end
+    end)
+
     mq.imgui.init('SideKick', function()
         -- Apply font scale for high-resolution monitors
         local fontScale = tonumber(Core.Settings.SideKickFontScale) or 1.0
@@ -2183,6 +2217,9 @@ local function main()
         do local M = getMobHpEstimator() if M then M.loadZone() M.tick() end end
         do local M = getSpellDamageTracker() if M and M.tick then M.tick() end end
 
+        -- Mob intel: CC results, NPC cast observation, consolidated knowledge base
+        do local M = getMobIntel() if M then M.loadZone() M.tick() end end
+
         -- Update aggro warning state
         do local M = getAggroWarning() if M and M.update then M.update() end end
 
@@ -2244,6 +2281,9 @@ local function main()
     do local M = getMobHpEstimator() if M and M.shutdown then M.shutdown() end end
     do local M = getSpellDamageTracker() if M and M.shutdown then M.shutdown() end end
     do local M = getDamageEvents() if M and M.shutdown then M.shutdown() end end
+
+    -- Shutdown: save mob intel (CC results, NPC casts)
+    do local M = getMobIntel() if M and M.shutdown then M.shutdown() end end
 
     -- Shutdown: flush any pending Core settings
     Core.forceSave()

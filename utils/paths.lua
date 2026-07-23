@@ -139,6 +139,20 @@ function M.getSpellDamagePath()
     return string.format('%s/spell_damage_%s_%s.lua', M.getDataDir(), server, char)
 end
 
+--- Get the mob intel database path (CC results, NPC casts, contributor classes)
+-- Path: SideKick/data/mob_intel.lua
+function M.getMobIntelPath()
+    M.ensureDir(M.getDataDir())
+    return M.getDataDir() .. '/mob_intel.lua'
+end
+
+--- Get the export directory (share-ready consolidated files)
+function M.getExportDir()
+    local dir = M.getRootDir() .. '/export'
+    M.ensureDir(dir)
+    return dir
+end
+
 -------------------------------------------------------------------------------
 -- Log File Paths
 -------------------------------------------------------------------------------

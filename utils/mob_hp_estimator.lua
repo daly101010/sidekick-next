@@ -364,6 +364,18 @@ function M.tick()
     end
 end
 
+--- Merge live learning into the database and save immediately (used by exports)
+function M.flush()
+    for name, live in pairs(_live) do
+        if (live.weightSum or 0) > 0 then
+            mergeToDatabase(name, live)
+            live.estSum = 0
+            live.weightSum = 0
+        end
+    end
+    M.saveDatabase()
+end
+
 function M.init()
     M.loadDatabase()
     M.loadZone()
@@ -377,11 +389,8 @@ function M.init()
 end
 
 function M.shutdown()
-    for name, live in pairs(_live) do
-        mergeToDatabase(name, live)
-    end
+    M.flush()
     _live = {}
-    M.saveDatabase()
 end
 
 return M
