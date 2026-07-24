@@ -720,14 +720,18 @@ local function processInterrupt(content)
     local remainingSec = lib.getCastTimeRemaining()
     local threshold = lib.InterruptThreshold[content.requestingPriority] or 999
 
-    -- Allow cast owner to request self-cancel (ducking or abort)
+    -- Owner self-cancel: stopcast but KEEP the owner's claim. The callers
+    -- (cc_clearing_bar, taunt_pending) interrupt a leftover/own cast
+    -- precisely so they can USE their granted claim on the next tick —
+    -- clearing castOwner here revoked that claim mid-flight, which looped
+    -- CC forever on FAIL:already_casting (mez never cast) and killed the
+    -- tank's taunt-while-casting path. Owners abandon claims via release
+    -- (the unified executor releases on every terminal path), never via
+    -- interrupt.
     if content.requestingModule == State.castOwner.module then
         lib.log('info', M.MODULE_NAME, 'Owner interrupt: %s (%s)', content.requestingModule, tostring(content.reason or 'owner_cancel'))
-        debugLog('STOPCAST: Owner self-cancel by %s reason=%s', content.requestingModule, tostring(content.reason or 'owner_cancel'))
+        debugLog('STOPCAST: Owner self-cancel by %s reason=%s (claim retained)', content.requestingModule, tostring(content.reason or 'owner_cancel'))
         mq.cmd('/stopcast')
-        State.castOwner = nil
-        State.epoch = State.epoch + 1
-        State.pendingBroadcast = true
         return true
     end
 
@@ -785,7 +789,8 @@ local function buildStatePayload()
         local hb = State.moduleHeartbeats[moduleName]
         local need = State.moduleNeeds[moduleName]
         local heartbeatAge = hb and (now - (hb.receivedAtMs or 0)) or 0
-        local heartbeatFresh = hb ~= nil and hb.ready ~= false
+        local suspended = State.worldState.inGame == false
+        local heartbeatFresh = not suspended and hb ~= nil and hb.ready ~= false
             and heartbeatAge <= lib.Timing.MODULE_CRASH_MS
         local needValid = false
         local needAge = 0
@@ -793,17 +798,18 @@ local function buildStatePayload()
             needAge = now - (need.receivedAtMs or 0)
             needValid = need.needsAction == true and needAge <= (need.ttlMs or 250) and heartbeatFresh
         end
-        local ready = hb and hb.ready ~= false or false
+        local ready = not suspended and (hb and hb.ready ~= false or false)
         moduleDiag[moduleName] = {
             heartbeatAge = heartbeatAge,
             ready = ready,
-            stale = not heartbeatFresh,
+            stale = not suspended and not heartbeatFresh,
+            suspended = suspended,
             needsAction = need and need.needsAction or false,
             needValid = needValid,
             needPriority = need and need.priority or nil,
             needAge = needAge,
             needTtl = need and need.ttlMs or 0,
-            reason = need and need.reason or nil,
+            reason = suspended and 'zoning' or (need and need.reason or nil),
             action = hb and hb.action or nil,
             counters = hb and hb.counters or nil,
         }
@@ -1136,6 +1142,14 @@ end
 local function checkModuleHealth()
     local now = lib.getTimeMs()
 
+    -- Heartbeats are not expected while zoning. GameState alone is not a
+    -- sufficient gate because MQ may continue reporting INGAME while
+    -- Me.Zoning is true.
+    if not lib.isInGame() then
+        _lastWatchdogCheck = now
+        return
+    end
+
     -- Throttle checks
     if (now - _lastWatchdogCheck) < lib.Timing.WATCHDOG_CHECK_MS then return end
     _lastWatchdogCheck = now
@@ -1153,35 +1167,30 @@ local function checkModuleHealth()
 
     -- Process stale modules
     for _, entry in ipairs(staleModules) do
-        debugLog('WATCHDOG: Module %s heartbeat stale (%dms), presumed crashed',
-            entry.name, entry.age)
-        print(string.format(
-            '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
-            entry.name, entry.age / 1000))
-
-        -- Revoke any claims this module held
-        revokeCrashedModuleClaims(entry.name)
-
-        -- Attempt restart (logs user-facing message on max restarts too)
         local scriptPath = entry.hb.script
-        local processAlive = scriptPath and lib.isLuaScriptRunning(scriptPath)
-        if not processAlive and not attemptRestart(entry.name, scriptPath) and scriptPath then
-            local tracker = _restartTracker[scriptPath]
-            if tracker and tracker.count >= lib.MAX_MODULE_RESTARTS then
-                -- print(string.format(
-                --     '\ar[SK-Watchdog]\ax Module "%s" exceeded max restarts (%d) — giving up',
-                --     entry.name, lib.MAX_MODULE_RESTARTS))
-            end
-        end
+        local processStatus = scriptPath and lib.getLuaScriptStatus(scriptPath) or ''
 
-        if processAlive then
+        if processStatus ~= 'EXITED' then
             -- Actors delivery can be delayed across zoning. MQ2Lua's process
-            -- table is authoritative, so keep a confirmed-live worker and
-            -- refresh its local watchdog timestamp instead of duplicating it.
+            -- table is authoritative. RUNNING/STARTING/PAUSED are live; an
+            -- unavailable status is treated non-destructively. Refresh the
+            -- watchdog timestamp instead of reporting a false crash or
+            -- duplicating the worker. Revoke stale ownership for safety.
+            revokeCrashedModuleClaims(entry.name)
             entry.hb.receivedAtMs = now
             debugLog('WATCHDOG: %s heartbeat stale but Lua process is %s; keeping it',
-                scriptPath, lib.getLuaScriptStatus(scriptPath))
+                tostring(scriptPath or '-'), processStatus ~= '' and processStatus or 'UNKNOWN')
         else
+            debugLog('WATCHDOG: Module %s heartbeat stale (%dms), presumed crashed',
+                entry.name, entry.age)
+            print(string.format(
+                '\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs — presumed crashed',
+                entry.name, entry.age / 1000))
+
+            -- Only a genuinely exited process is a crash/restart candidate.
+            revokeCrashedModuleClaims(entry.name)
+            attemptRestart(entry.name, scriptPath)
+
             -- Remove a genuinely stale heartbeat while restart is pending.
             State.moduleHeartbeats[entry.name] = nil
         end
@@ -1566,9 +1575,14 @@ local function mainLoop()
     -- workers' own coordinator-absence handling can wind them down too.
     local lastParentCheckAt = lib.getTimeMs()
     local parentMisses = 0
+    local lastWakeWasInGame = lib.isInGame()
     while State.running do
         local tickStartAt = lib.getTimeMs()
-        if (tickStartAt - lastParentCheckAt) >= 5000 then
+        local wakeInGame = lib.isInGame()
+        if not wakeInGame then
+            lastParentCheckAt = tickStartAt
+            parentMisses = 0
+        elseif (tickStartAt - lastParentCheckAt) >= 5000 then
             lastParentCheckAt = tickStartAt
             if lib.isUiRunning() then
                 parentMisses = 0
@@ -1590,10 +1604,11 @@ local function mainLoop()
         -- A large wakeup gap means the whole client's game thread stalled
         -- (every Lua script freezes together). Name the moment so lockups
         -- can be correlated with user actions and other scripts' logs.
-        if State.loopGapMs > 1500 then
+        if State.loopGapMs > 1500 and wakeInGame and lastWakeWasInGame then
             printf('\ay[SK-Coordinator]\ax game-thread stall: %.1fs ending at %s',
                 State.loopGapMs / 1000, os.date('%H:%M:%S'))
         end
+        lastWakeWasInGame = wakeInGame
         tick()
         local tickDur = lib.getTimeMs() - tickStartAt
         State.lastTickMs = tickDur
