@@ -19,6 +19,7 @@ local Core = require('sidekick-next.utils.core')
 local CC = require('sidekick-next.automation.cc')
 local Cache = require('sidekick-next.utils.runtime_cache')
 local Counters = require('sidekick-next.utils.action_counters')
+local Logger = require('sidekick-next.utils.logger')
 
 local module = ModuleBase.create('cc', lib.Priority.DEBUFF)
 local _pendingAction = nil
@@ -31,16 +32,23 @@ local _lastDispatch = '-'
 -- decision transition. Off by default — combat spam otherwise.
 local _debug = false
 local _lastTraceLine = ''
+local decisionLog = Logger.new('cc')
 local function trace(fmt, ...)
-    if not _debug then return end
+    local persistedDebug = decisionLog.isLevel('debug')
+    if not _debug and not persistedDebug then return end
     local line = string.format(fmt, ...)
     if line == _lastTraceLine then return end
     _lastTraceLine = line
-    print(string.format('\am[CC-Trace]\ax %s @%.1fs', line, os.clock() % 1000))
+    if persistedDebug then
+        decisionLog.debug('%s @%.1fs', line, os.clock() % 1000)
+    else
+        print(string.format('\am[CC-Trace]\ax %s @%.1fs', line, os.clock() % 1000))
+    end
 end
 
 Core.load()
 CC.init()
+CC.trace = trace
 
 -- Mob intelligence must observe the SpellEngine that actually casts mez/charm.
 -- Only mez-capable characters own this process-local observer in coordinated
@@ -99,6 +107,14 @@ module.onTick = function(self)
     Cache.tick()
     CC.tick()
     CC.charmTick(settings())
+    -- Drain the process-local spell engine whenever it's mid-state: once an
+    -- executor job ends, nothing else ticks it, and a post-cast state that
+    -- never advances leaves isBusy() true forever — selection then starves
+    -- on spell_engine_busy and DPS holds the bar by forfeit.
+    do
+        local eng = spellEngine()
+        if eng and eng.isBusy and eng.isBusy() and eng.tick then eng.tick() end
+    end
     if _mobIntel then
         if _mobIntel.loadZone then pcall(_mobIntel.loadZone) end
         if _mobIntel.tick then pcall(_mobIntel.tick) end
@@ -291,7 +307,7 @@ module:enableUnifiedExecutor({
 mq.bind('/sk_cc', function(cmd)
     if tostring(cmd or ''):lower() == 'debug' then
         _debug = not _debug
-        CC.trace = _debug and trace or nil
+        CC.trace = trace
         print(string.format('\at[SK CC]\ax decision trace %s', _debug and 'ON' or 'OFF'))
         return
     end
@@ -302,10 +318,18 @@ mq.bind('/sk_cc', function(cmd)
     local charm = CC.charm or {}
     local steps = charm.breakSteps and table.concat(charm.breakSteps, '>') or '-'
     local localCount, remoteCount, totalCount = CC.getCounts()
-    echo('mez=%s charm=%s pending=%s reason=%s priority=%s',
+    local engState = '-'
+    do
+        local eng = spellEngine()
+        if eng and eng.getState then
+            local _, name = eng.getState()
+            engState = tostring(name or '-')
+        end
+    end
+    echo('mez=%s charm=%s pending=%s reason=%s priority=%s engine=%s',
         tostring(s.MezzingEnabled == true), tostring(s.CharmEnabled == true),
         tostring(_pendingAction and (_pendingAction.reason or _pendingAction.spellName) or '-'),
-        tostring(_pendingReason), tostring(module.priority))
+        tostring(_pendingReason), tostring(module.priority), engState)
     echo('pet=%d(%s) breakSteps=%s pendingCharm=%d attempts=%s mezReason=%s charmReason=%s',
         tonumber(charm.petId) or 0, tostring(charm.petName or ''),
         steps, tonumber(charm.pendingCharmTargetId) or 0,

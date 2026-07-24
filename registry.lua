@@ -54,6 +54,7 @@ M.defaults = {
     SideKickLogLevel = { type = 'number', Default = 3, Min = 1, Max = 5, Category = 'Diagnostics', DisplayName = 'Log Level' },
     SideKickLogFile = { type = 'bool', Default = false, Category = 'Diagnostics', DisplayName = 'Write General Log File' },
     SideKickLogFilter = { type = 'text', Default = '', Category = 'Diagnostics', DisplayName = 'Log Filter' },
+    SideKickModuleLogLevels = { type = 'text', Default = '', Category = 'Diagnostics', DisplayName = 'Per-Module Log Levels' },
     DashboardVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Dashboard Visible' },
     HealPreviewVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Heal Preview Visible' },
     SideKickMainEnabled = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Show Main Bar' },
@@ -347,7 +348,9 @@ M.defaults = {
     CharmBreakTash = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Tash Before Recharm' },
     CharmPreTash = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'Tash Before First Charm' },
     CharmBreakStun = { type = 'bool', Default = true, Category = 'CC', DisplayName = 'AE Stun On Charm Break' },
-    CharmHoldUnmezzed = { type = 'number', Default = 3, Category = 'CC', DisplayName = 'Hold Recharm If Unmezzed Mobs Exceed' },
+    -- Mez trumps a broken charm ONLY when more than this many unmezzed
+    -- haters (excluding the loose ex-pet) are in camp.
+    CharmHoldUnmezzed = { type = 'number', Default = 2, Category = 'CC', DisplayName = 'Hold Recharm If Unmezzed Mobs Exceed' },
 
     -- Spell Engine Settings
     SpellRole = { type = 'text', Default = 'default', Category = 'Spells', DisplayName = 'Spell Role' },
@@ -518,7 +521,7 @@ end
 local MODULE_KEYS = {
     ui = [[
         SideKickTheme SideKickSyncThemeWithGT SideKickDebugSettings SideKickLogLevel SideKickLogFile
-        SideKickLogFilter DashboardVisible HealPreviewVisible
+        SideKickLogFilter SideKickModuleLogLevels DashboardVisible HealPreviewVisible
         SideKickMainEnabled SideKickOptionsManual SideKickOptionsPosX SideKickOptionsPosY
         SideKickOptionsWidth SideKickOptionsHeight SideKickMainAnchor SideKickMainAnchorTarget
         SideKickMainAnchorGap SideKickMainButtonScale SideKickMainRounding SideKickMainWidth

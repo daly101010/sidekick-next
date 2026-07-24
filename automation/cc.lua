@@ -1145,9 +1145,15 @@ function M.selectMezAction(settings)
     local aeMinTargets = tonumber(settings.AEMezMinTargets) or 3
     local spellName = nil
 
-    if useAEMez and profile.ae then
+    -- Deferred charm break (camp_control_hold) forces AE preference: >2
+    -- unmezzed plus the loose ex-pet are in camp, and one AE mez both locks
+    -- the camp and makes the ex-pet safely recharmable. Overrides the
+    -- UseAEMez setting for this window; keeps a floor of 2 clustered
+    -- targets so a lone straggler still gets the cheaper single mez.
+    local campHold = (now - (M.charm.campHoldAt or 0)) < 3.0
+    if profile.ae and (useAEMez or campHold) then
         local aeCount = getAETargetCount(targetId)
-        if aeCount >= aeMinTargets then
+        if aeCount >= (campHold and 2 or aeMinTargets) then
             -- Use AE mez
             spellName = chooseSpellForLines(classConfig, profile.aeFast or profile.ae)
             if not spellName then
@@ -1203,7 +1209,7 @@ local CHARM_PET_CMD_INTERVAL = 1.5     -- /pet attack|back throttle
 local CHARM_BREAK_GIVEUP_SEC = 30      -- abandon recharm after this long
 local CHARM_MAX_ATTEMPTS = 3           -- failed recharm casts before giving up on the ex-pet
 local CHARM_ACQUIRE_MAX_ATTEMPTS = 2   -- resists before moving on to another candidate
-local CHARM_HOLD_UNMEZZED_DEFAULT = 3  -- defer recharm while more than this many unmezzed haters
+local CHARM_HOLD_UNMEZZED_DEFAULT = 2  -- defer recharm while more than this many unmezzed haters (ex-pet excluded)
 local CHARM_BLOCK_TTL_SEC = 120        -- how long a gave-up mob stays off the menu
 local TASH_TTL_SEC = 300               -- assume our tash outlives any recharm cycle
 
@@ -1220,6 +1226,7 @@ M.charm = {
     lastBroadcastAt = 0,
     lastPetCmdAt = 0,
     lastDecisionAt = 0,
+    campHoldAt = 0,         -- os.clock() of the last camp_control_hold (forces AE mez preference)
 }
 
 local _charmProfiles = {
@@ -1481,8 +1488,11 @@ function M.selectCharmAction(settings)
             end
             if unmezzed > holdAt then
                 -- Pause the give-up clock while deferred: it should only
-                -- measure active recharm effort.
+                -- measure active recharm effort. Flag the hold so mez
+                -- selection prefers an AE mez — one cast locks the camp
+                -- (ex-pet included) and reopens the recharm window.
                 M.charm.breakStartedAt = now
+                M.charm.campHoldAt = now
                 return nil, 'camp_control_hold'
             end
 
@@ -1525,6 +1535,12 @@ function M.selectCharmAction(settings)
     local blacklist = parseClassBlacklist(settings)
     local maxLevel = charmSpellMaxLevel(charmSpell)
     local tankPrimary = tankPrimaryId()
+
+    -- NOTE deliberate asymmetry: acquisition NEVER defers to mez — charm
+    -- trumps mez in every situation except one: a BROKEN charm with the
+    -- camp out of control (see the CharmHoldUnmezzed gate in the break
+    -- ladder above). Charming a mob both removes an enemy and adds DPS,
+    -- so it is always the better first cast.
 
     -- Solo hater: a lone valid mob is a free pet, not a kill — waive the
     -- tank-primary exclusion so the enchanter charms it out from under the
