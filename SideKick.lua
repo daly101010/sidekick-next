@@ -2638,6 +2638,78 @@ local function main()
         end
     end)
 
+    -- One-shot fleet health rollup: is everything running and wired?
+    -- All requires are pcall'd inline (no new upvalues, resilient to
+    -- partially-loaded sessions).
+    _bindCmd('/skhealth', function()
+        print('\ag[SideKick]\ax === fleet health ===')
+
+        local okLib, sklib = pcall(require, 'sidekick-next.sk_lib')
+        if okLib and sklib then
+            local running, stopped = 0, {}
+            local scripts = { sklib.Scripts.COORDINATOR }
+            for _, s in ipairs(sklib.Scripts.WORKERS or {}) do scripts[#scripts + 1] = s end
+            for _, s in ipairs(scripts) do
+                if sklib.isLuaScriptRunning(s) then
+                    running = running + 1
+                else
+                    stopped[#stopped + 1] = s:match('sk_%w+$') or s
+                end
+            end
+            print(string.format('  processes: %s%d/%d running\ax%s',
+                #stopped == 0 and '\ag' or '\ay', running, #scripts,
+                #stopped > 0 and ('  stopped: ' .. table.concat(stopped, ', ')
+                    .. ' (some exit by design for this class)') or ''))
+        end
+
+        do
+            local okAct, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+            if okAct and Actors and Actors.getRemoteCharacters then
+                local n = 0
+                for _ in pairs(Actors.getRemoteCharacters() or {}) do n = n + 1 end
+                print(string.format('  actors: %d live peer(s)', n))
+            end
+        end
+
+        do
+            local isTank = tostring(Core.Settings.CombatMode or 'off'):lower() == 'tank'
+            if not isTank then
+                print('  vitals hub: consumer (not tank mode)')
+            else
+                local okVH, VH = pcall(require, 'sidekick-next.utils.vitals_hub')
+                local st = okVH and VH and VH.getStats and VH.getStats() or nil
+                if st and (st.seq or 0) > 0 then
+                    print(string.format('  vitals hub: \agpublishing\ax seq=%d last=%.1fs ago',
+                        st.seq, os.clock() - (st.lastSendAt or 0)))
+                else
+                    print('  vitals hub: \aytank mode but nothing published yet\ax'
+                        .. ' (grouped? VitalsHubEnabled? ActorsEnabled?)')
+                end
+            end
+        end
+
+        do
+            local okDE, DE = pcall(require, 'sidekick-next.utils.damage_events')
+            if okDE and DE and DE.getScope then
+                local scope = tostring(DE.getScope() or 'unregistered')
+                print(string.format('  damage observer: %s%s', scope,
+                    scope == 'full' and ' (this char parses group damage)' or ''))
+            end
+        end
+
+        do
+            local okReg, Registry = pcall(require, 'sidekick-next.registry')
+            local audit = okReg and Registry and Registry.audit and Registry.audit() or nil
+            if audit then
+                print(string.format('  registry: %s',
+                    audit.ok and '\agok\ax'
+                    or string.format('\ar%d error(s)\ax — /sk config audit', #audit.errors)))
+            end
+        end
+
+        print('  detail: /sk_coord status | /skready | /sksession | /skmobintel')
+    end)
+
     _bindCmd('/sksession', function(sub)
         local Stats = LZ.getSessionStats()
         if not Stats then

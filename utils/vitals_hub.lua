@@ -112,6 +112,11 @@ function M.membersChanged(a, b)
     return false
 end
 
+--- Publish statistics for health displays.
+function M.getStats()
+    return { seq = _seq, lastSendAt = _lastSendAt }
+end
+
 --- Main-loop tick. Publishes only when this character is the designated
 --- tank (CombatMode == 'tank') and VitalsHubEnabled is on.
 function M.tick()
