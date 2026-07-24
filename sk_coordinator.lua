@@ -1296,6 +1296,13 @@ local function timedPhase(name, fn, ...)
     State.phaseMaxMs = State.phaseMaxMs or {}
     State.phaseMs[name] = dt
     if dt > (State.phaseMaxMs[name] or 0) then State.phaseMaxMs[name] = dt end
+    -- Chronic-offender counter: phaseMax only remembers the single worst
+    -- event (usually a zone load billing 20s+ to whatever phase was live),
+    -- but a phase that is slow EVERY fight racks up counts here.
+    if dt > 250 then
+        State.phaseSlowCounts = State.phaseSlowCounts or {}
+        State.phaseSlowCounts[name] = (State.phaseSlowCounts[name] or 0) + 1
+    end
     return a, b, c
 end
 
@@ -1645,6 +1652,13 @@ mq.bind('/sk_coord', function(cmd, arg1)
         table.sort(phaseParts)
         printf('\ay[SK-Coordinator]\ax phaseMax: %s',
             #phaseParts > 0 and table.concat(phaseParts, ' ') or '-')
+        local slowParts = {}
+        for name, count in pairs(State.phaseSlowCounts or {}) do
+            slowParts[#slowParts + 1] = string.format('%s=%d', name, count)
+        end
+        table.sort(slowParts)
+        printf('\ay[SK-Coordinator]\ax phases >250ms (chronic offenders): %s',
+            #slowParts > 0 and table.concat(slowParts, ' ') or 'none')
         local typeParts = {}
         for msgType, count in pairs(State.enqueueTypeCounts or {}) do
             typeParts[#typeParts + 1] = string.format('%s=%d', msgType, count)
