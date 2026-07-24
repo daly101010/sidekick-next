@@ -247,6 +247,9 @@ M.defaults = {
 
     -- DPS Intelligence (time-to-die gating for damage spells)
     UseDpsIntelligence = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Smart DPS (Time-to-Die)' },
+    -- Skip every DPS cast while own mana is below this % — tash line exempt
+    -- (it enables charm/mez landing). 0 disables. Meant for charm enchanters.
+    DpsMinManaPct = { type = 'number', Default = 0, Category = 'Combat', DisplayName = 'DPS Mana Floor % (Tash Exempt)' },
     DpsNukeLandMargin = { type = 'number', Default = 1.0, Category = 'Combat', DisplayName = 'Nuke Land Margin (sec)' },
     DpsDotBreakevenPct = { type = 'number', Default = 50, Category = 'Combat', DisplayName = 'DoT Breakeven (% of duration)' },
     DpsDefaultNukeCastTime = { type = 'number', Default = 3.0, Category = 'Combat', DisplayName = 'Default Nuke Cast Time (sec)' },
@@ -568,7 +571,7 @@ local MODULE_KEYS = {
     ]],
     dps = [[
         BurnActive BurnDuration BurnNow SpellRotationEnabled RotationResetWindow
-        UseDpsIntelligence DpsNukeLandMargin DpsDotBreakevenPct DpsDefaultNukeCastTime
+        UseDpsIntelligence DpsMinManaPct DpsNukeLandMargin DpsDotBreakevenPct DpsDefaultNukeCastTime
         DpsDefaultDotDuration DpsOverkillFactor DpsRainPayoffSec DpsRainSafetyMode
         DpsRainSafetyRadius UseResistTracker ResistAvoidPct ResistMinSamples
         ResistMinEfficiencyPct

@@ -145,6 +145,12 @@ function M.draw(settings, themeNames, onChange)
                 tooltip = 'Maximum distance to the fallback assist target (units)',
             })
             if rangeChanged and onChange then onChange('AssistRange', newRange) end
+
+            local manaFloor = tonumber(settings.DpsMinManaPct) or 0
+            local mfChanged, newMf = Components.SliderRow.percent('DPS Mana Floor', 'DpsMinManaPct', manaFloor, nil, {
+                tooltip = 'Skip ALL DPS casts while your mana is below this %.\nThe tash line is exempt (it enables charm/mez landing).\n0 = disabled. Meant for charm enchanters preserving mana for CC.',
+            })
+            if mfChanged and onChange then onChange('DpsMinManaPct', newMf) end
         end, { id = 'assist_settings', defaultOpen = true })
 
         -- Ranged standoff is a WIZARD positioning feature: keep enough

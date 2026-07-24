@@ -508,6 +508,18 @@ local function selectSpell()
     local mana = lib.safeNum(function() return mq.TLO.Me.PctMana() end, 0)
     if mana < Config.minManaPct then return nil, 'low_mana' end
 
+    -- DPS mana floor (DpsMinManaPct, UI: Automation tab): below the floor
+    -- every DPS cast is skipped EXCEPT the tash line — tash enables
+    -- charm/mez landing, and CC outranks DPS for mana. 0 = disabled.
+    local manaFloor = 0
+    do
+        local okCore, Core = pcall(require, 'sidekick-next.utils.core')
+        if okCore and Core and Core.Settings then
+            manaFloor = tonumber(Core.Settings.DpsMinManaPct) or 0
+        end
+    end
+    local manaLow = manaFloor > 0 and mana < manaFloor
+
     local CombatExec = getCombatExec()
     if not CombatExec or not CombatExec.getSortedCastList then
         return nil, 'combat_executor_unavailable'
@@ -522,6 +534,10 @@ local function selectSpell()
     local firstSkip = nil
     for _, entry in ipairs(castList) do
         if entry and entry.slot and not isUtilityGem(entry.config) and dpsOwnsSpellType(entry.spellType) then
+            if manaLow and not tostring(entry.spellName or ''):lower():find('tash', 1, true) then
+                firstSkip = firstSkip or ('mana_floor:' .. tostring(entry.spellName))
+                goto continue_entry
+            end
             local targetId = spellNeedsNpcTarget(entry) and target.id or nil
             if isSpellReady(entry.slot, entry.spellName) then
                 local conditionOk = true
@@ -548,6 +564,7 @@ local function selectSpell()
                 firstSkip = firstSkip or ('not_ready:' .. tostring(entry.spellName))
             end
         end
+        ::continue_entry::
     end
 
     return nil, firstSkip or 'no_eligible_spell'
@@ -690,12 +707,296 @@ local function directTestCast()
 end
 
 -------------------------------------------------------------------------------
+-- Coordinated DPS intelligence lifecycle
+-------------------------------------------------------------------------------
+
+local _intel = {}
+local _sessionDamageBatch = {}
+local _lastSessionDamageSendAt = 0
+local _lastIntelTelemetryAt = 0
+local _lastIntelCatalogAt = 0
+local SESSION_DAMAGE_BATCH_MS = 250
+local SESSION_DAMAGE_BATCH_MAX = 50
+local INTEL_TELEMETRY_MS = 1000
+local INTEL_CATALOG_MS = 10000
+
+local function flushSessionDamage(self, force)
+    if #_sessionDamageBatch == 0 or not self or not self.sendToLocalUi then return end
+    local now = lib.getTimeMs()
+    if not force and #_sessionDamageBatch < SESSION_DAMAGE_BATCH_MAX
+        and (now - _lastSessionDamageSendAt) < SESSION_DAMAGE_BATCH_MS then
+        return
+    end
+    local batch = _sessionDamageBatch
+    _sessionDamageBatch = {}
+    _lastSessionDamageSendAt = now
+    self:sendToLocalUi('session:damage', { events = batch })
+end
+
+local function initDpsIntelligence()
+    -- Ensure DamageObserver/CombatMode are loaded before damage_events chooses
+    -- lean versus full registration scope.
+    lib.getSettings()
+    local specs = {
+        { key = 'damageEvents', path = 'sidekick-next.utils.damage_events' },
+        { key = 'dps', path = 'sidekick-next.utils.dps_intelligence' },
+        { key = 'spellDamage', path = 'sidekick-next.utils.spell_damage_tracker' },
+        { key = 'mobHp', path = 'sidekick-next.utils.mob_hp_estimator' },
+        { key = 'resist', path = 'sidekick-next.utils.resist_tracker' },
+    }
+    for _, spec in ipairs(specs) do
+        local ok, mod = pcall(require, spec.path)
+        if ok and mod then
+            _intel[spec.key] = mod
+            if mod.init then
+                local initOk, err = pcall(mod.init)
+                if not initOk then
+                    _intel[spec.key] = nil
+                    commandEcho('intelligence init failed: %s: %s', spec.key, tostring(err))
+                end
+            end
+        else
+            commandEcho('intelligence module unavailable: %s', spec.key)
+        end
+    end
+    local damageEvents = _intel.damageEvents
+    if damageEvents and damageEvents.addListener then
+        damageEvents.addListener(function(event)
+            if type(event) ~= 'table' then return end
+            if #_sessionDamageBatch >= 400 then table.remove(_sessionDamageBatch, 1) end
+            _sessionDamageBatch[#_sessionDamageBatch + 1] = {
+                target = tostring(event.target or ''),
+                amount = tonumber(event.amount) or 0,
+                mine = event.mine == true,
+                attacker = tostring(event.attacker or ''),
+                kind = tostring(event.kind or ''),
+                spell = tostring(event.spell or ''),
+            }
+        end)
+    end
+end
+
+local function sendIntelTelemetry(self, action, reason)
+    if not self or not self.sendToLocalUi then return end
+    local now = lib.getTimeMs()
+    if (now - _lastIntelTelemetryAt) < INTEL_TELEMETRY_MS then return end
+    _lastIntelTelemetryAt = now
+
+    local settings = lib.getSettings() or {}
+    local target = getMATarget()
+    local combatActive = target and isCombatTargetActive(target) or false
+    local payload = {
+        capturedAtMs = now,
+        reason = tostring(reason or ''),
+        action = action and {
+            spellName = tostring(action.spellName or ''),
+            spellType = tostring(action.spellType or ''),
+            slot = tonumber(action.slot) or 0,
+            activeSet = tostring(action.activeSet or ''),
+        } or nil,
+        observerScope = _intel.damageEvents and _intel.damageEvents.getScope
+            and tostring(_intel.damageEvents.getScope() or '') or '',
+        modules = {
+            dps = _intel.dps ~= nil,
+            resist = _intel.resist ~= nil,
+            mobHp = _intel.mobHp ~= nil,
+            spellDamage = _intel.spellDamage ~= nil,
+            damageEvents = _intel.damageEvents ~= nil,
+        },
+        elementResists = {},
+        spellResists = {},
+    }
+
+    if target then
+        local spawn = mq.TLO.Spawn(target.id)
+        local targetName = tostring(lib.safeTLO(function()
+            return spawn and spawn() and spawn.CleanName() or ''
+        end, '') or '')
+        local pctHp = lib.safeNum(function()
+            return spawn and spawn() and spawn.PctHPs() or target.hp
+        end, tonumber(target.hp) or 0)
+        payload.target = {
+            id = tonumber(target.id) or 0,
+            name = targetName,
+            pctHp = pctHp,
+            source = tostring(target.source or ''),
+            combatActive = combatActive == true,
+            coordinatedCombat = target.coordinatedCombat == true,
+        }
+
+        local dps = _intel.dps
+        if dps then
+            if dps.getTTD then
+                local ok, ttd, source = pcall(dps.getTTD, target.id)
+                if ok then
+                    payload.target.ttd = tonumber(ttd)
+                    payload.target.ttdSource = tostring(source or 'unknown')
+                end
+            end
+            if dps.getRemainingHP then
+                local ok, remaining, weight = pcall(dps.getRemainingHP, target.id)
+                if ok then
+                    payload.target.remainingHp = tonumber(remaining)
+                    payload.target.hpWeight = tonumber(weight) or 0
+                end
+            end
+            local defaultNuke = tonumber(settings.DpsDefaultNukeCastTime) or 3
+            local defaultDot = tonumber(settings.DpsDefaultDotDuration) or 24
+            if dps.nukeViable then
+                local ok, value = pcall(dps.nukeViable, target.id, defaultNuke)
+                if ok then payload.target.nukeViable = value == true end
+            end
+            if dps.dotViable then
+                local ok, value = pcall(dps.dotViable, target.id, defaultDot)
+                if ok then payload.target.dotViable = value == true end
+            end
+            if dps.rainViable then
+                local ok, value = pcall(dps.rainViable, target.id, defaultNuke)
+                if ok then payload.target.rainViable = value == true end
+            end
+            if dps.rainSafe then
+                local ok, value = pcall(dps.rainSafe, target.id)
+                if ok then payload.target.rainSafe = value == true end
+            end
+        end
+
+        local mobHp = _intel.mobHp
+        if mobHp and mobHp.getMaxHP then
+            local ok, maxHp, weight = pcall(mobHp.getMaxHP, target.id)
+            if ok then
+                payload.target.maxHp = tonumber(maxHp)
+                payload.target.hpWeight = math.max(
+                    tonumber(payload.target.hpWeight) or 0,
+                    tonumber(weight) or 0)
+            end
+        end
+
+        local resist = _intel.resist
+        local mobStats = resist and resist.zoneStats and resist.zoneStats[targetName] or nil
+        if type(mobStats) == 'table' then
+            for element, stats in pairs(mobStats) do
+                if type(stats) == 'table' then
+                    local landed = tonumber(stats.landed) or 0
+                    local resisted = tonumber(stats.resisted) or 0
+                    local samples = landed + resisted
+                    local effCount = tonumber(stats.effCount) or 0
+                    local avoid = false
+                    if resist.shouldAvoid then
+                        local ok, value = pcall(resist.shouldAvoid, targetName, element, settings)
+                        avoid = ok and value == true
+                    end
+                    payload.elementResists[#payload.elementResists + 1] = {
+                        element = tostring(element),
+                        landed = landed,
+                        resisted = resisted,
+                        samples = samples,
+                        resistPct = samples > 0 and (resisted / samples * 100) or nil,
+                        efficiencyPct = effCount > 0
+                            and ((tonumber(stats.effSum) or 0) / effCount * 100) or nil,
+                        efficiencySamples = effCount,
+                        avoid = avoid,
+                    }
+                end
+            end
+        end
+
+        local okLog, resistLog = pcall(require, 'sidekick-next.utils.resist_log')
+        if okLog and resistLog then
+            if resistLog.load then pcall(resistLog.load) end
+            if resistLog.getPolicy then
+                local ok, policy = pcall(resistLog.getPolicy)
+                if ok and type(policy) == 'table' then payload.resistPolicy = policy end
+            end
+            if resistLog.iterZone then
+                for mobName, spellName, record in resistLog.iterZone() do
+                    if tostring(mobName) == targetName then
+                        local skip, skipReason = false, nil
+                        if resistLog.shouldSkip then
+                            local ok, value, why = pcall(resistLog.shouldSkip, spellName, targetName)
+                            if ok then
+                                skip = value == true
+                                skipReason = why
+                            end
+                        end
+                        local consecutive = 0
+                        if resistLog.getConsecutiveResists then
+                            local ok, count = pcall(
+                                resistLog.getConsecutiveResists, nil, targetName, spellName)
+                            if ok then consecutive = tonumber(count) or 0 end
+                        end
+                        payload.spellResists[#payload.spellResists + 1] = {
+                            spellName = tostring(spellName),
+                            casts = tonumber(record and record.casts) or 0,
+                            resists = tonumber(record and record.resists) or 0,
+                            lastResistAt = tonumber(record and record.lastResistAt) or 0,
+                            consecutiveResists = consecutive,
+                            skip = skip,
+                            skipReason = tostring(skipReason or ''),
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    local spellDamage = _intel.spellDamage
+    if spellDamage and type(spellDamage.data) == 'table'
+        and (now - _lastIntelCatalogAt) >= INTEL_CATALOG_MS then
+        _lastIntelCatalogAt = now
+        payload.spellDamage = {}
+        for spellName, record in pairs(spellDamage.data) do
+            if type(record) == 'table' then
+                payload.spellDamage[#payload.spellDamage + 1] = {
+                    spellName = tostring(spellName),
+                    count = tonumber(record.count) or 0,
+                    expected = tonumber(record.ema) or 0,
+                    maxSeen = tonumber(record.maxSeen) or 0,
+                    baseline = spellDamage.getBaseline
+                        and tonumber(spellDamage.getBaseline(spellName)) or nil,
+                }
+            end
+        end
+    end
+
+    self:sendToLocalUi('intel:telemetry', payload)
+end
+
+local function tickDpsIntelligence(self)
+    local damageEvents = _intel.damageEvents
+    if damageEvents and damageEvents.ensureScope then
+        pcall(damageEvents.ensureScope)
+    end
+    local resist = _intel.resist
+    if resist then
+        if resist.loadZone then pcall(resist.loadZone) end
+        if resist.tick then pcall(resist.tick) end
+    end
+    local mobHp = _intel.mobHp
+    if mobHp then
+        if mobHp.loadZone then pcall(mobHp.loadZone) end
+        if mobHp.tick then pcall(mobHp.tick) end
+    end
+    local spellDamage = _intel.spellDamage
+    if spellDamage and spellDamage.tick then pcall(spellDamage.tick) end
+    flushSessionDamage(self, false)
+end
+
+local function shutdownDpsIntelligence()
+    for _, key in ipairs({ 'resist', 'mobHp', 'spellDamage', 'damageEvents' }) do
+        local mod = _intel[key]
+        if mod and mod.shutdown then pcall(mod.shutdown) end
+    end
+end
+
+-------------------------------------------------------------------------------
 -- Module Callbacks
 -------------------------------------------------------------------------------
 
 module.onTick = function(self)
+    tickDpsIntelligence(self)
     local action, reason = selectSpell()
     _lastReason = action and ('ready:' .. tostring(action.spellName)) or tostring(reason or 'none')
+    sendIntelTelemetry(self, action, _lastReason)
     self:sendNeed(action ~= nil, action and 500 or nil, _lastReason)
 end
 
@@ -924,6 +1225,9 @@ end)
 -- Run
 -------------------------------------------------------------------------------
 
+initDpsIntelligence()
 module:run(50)
+flushSessionDamage(module, true)
+shutdownDpsIntelligence()
 
 return module
