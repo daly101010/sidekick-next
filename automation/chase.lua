@@ -202,7 +202,20 @@ function M.tick()
     -- behavior) permanently suppressed chase whenever the player wasn't
     -- actually casting.
     local casting = mq.TLO.Me.Casting()
-    if casting and casting ~= '' and casting ~= 'NULL' then _lastReason = 'casting'; return end
+    if casting and casting ~= '' and casting ~= 'NULL' then
+        -- A cast that starts mid-chase must WIN. Returning with our own nav
+        -- still running keeps the character moving, and the client cancels
+        -- the cast on the first step — mez/charm died at cast start every
+        -- time the enchanter was chasing. Only stop nav WE initiated;
+        -- external nav (standoff, tank engage) manages its own casts.
+        if _navState.initiatedNav then
+            local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
+                or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
+            if navActive then M.stopNav() end
+        end
+        _lastReason = 'casting'
+        return
+    end
     if mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active() then _lastReason = 'stick_active'; return end
 
     local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
