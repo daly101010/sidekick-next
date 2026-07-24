@@ -146,6 +146,30 @@ function M.draw(settings, themeNames, onChange)
             })
             if rangeChanged and onChange then onChange('AssistRange', newRange) end
         end, { id = 'assist_settings', defaultOpen = true })
+
+        -- Ranged standoff is a WIZARD positioning feature: keep enough
+        -- distance that rain spells never splash the caster. It is not for
+        -- general casting — in a tight camp it relocates every few seconds,
+        -- and movement defers timed casts (fatal for mezzers/healers).
+        Components.SettingGroup.draw('Ranged Standoff (Wizards)', function()
+            local standoff = settings.CasterStandoffEnabled == true
+            local soVal, soChanged = Components.CheckboxRow.draw('Keep Ranged Distance', 'CasterStandoffEnabled', standoff, nil, {
+                tooltip = 'Nav to a randomized spot 35-60 units out when the target closes in,\nso rain spells never land on yourself. For ranged nukers (wizards).\nLeave OFF for mezzers, healers, and melee — movement defers casts.',
+            })
+            if soChanged and onChange then onChange('CasterStandoffEnabled', soVal) end
+
+            if standoff then
+                local minD = tonumber(settings.CasterStandoffMin) or 35
+                local minChanged, newMin = Components.SliderRow.int('Min Distance', 'CasterStandoffMin', minD, 20, 80, nil, {
+                    tooltip = 'Reposition when the target is closer than this (rain splash radius + margin)',
+                })
+                if minChanged and onChange then onChange('CasterStandoffMin', newMin) end
+
+                local maxD = tonumber(settings.CasterStandoffMax) or 60
+                local maxChanged, newMax = Components.SliderRow.int('Max Distance', 'CasterStandoffMax', maxD, 25, 120)
+                if maxChanged and onChange then onChange('CasterStandoffMax', newMax) end
+            end
+        end, { id = 'standoff_settings', defaultOpen = false })
     end
 
     -- Stick commands apply to any combat mode that moves the character
