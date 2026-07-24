@@ -7,6 +7,13 @@ local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
+-- Optional decision-trace hook. sk_cc points this at its console tracer
+-- while /sk_cc debug is on; nil (the default) makes every dlog a no-op.
+M.trace = nil
+local function dlog(fmt, ...)
+    if M.trace then M.trace(fmt, ...) end
+end
+
 -- Lazy-load Actors to avoid circular requires
 local getActors = lazy('sidekick-next.utils.actors_coordinator')
 
@@ -1286,7 +1293,7 @@ local function myPetId()
 end
 
 -- Broadcast the protected pet ID (0 = explicit release). Receivers store it
--- in actors_coordinator._charmState; the handler accepts our own loopback so
+-- in actors_coordinator's owner-keyed charm states; the handler accepts our own loopback so
 -- sibling workers on this character see it too.
 function M.broadcastCharmState(force)
     local now = os.clock()
@@ -1308,6 +1315,10 @@ end
 
 local function clearCharm(reason)
     local hadPet = (tonumber(M.charm.petId) or 0) > 0
+    if hadPet then
+        dlog('charm-cleared: pet=%d %s (%s)', tonumber(M.charm.petId) or 0,
+            tostring(M.charm.petName or ''), tostring(reason or '?'))
+    end
     M.charm.petId = 0
     M.charm.petName = ''
     M.charm.breakSteps = nil
@@ -1684,6 +1695,7 @@ function M.charmTick(settings)
     local pendingId = tonumber(M.charm.pendingCharmTargetId) or 0
     if pendingId > 0 then
         if petIdNow == pendingId then
+            dlog('charm-confirmed: pet=%d', pendingId)
             M.charm.petId = pendingId
             local ok, name = pcall(function()
                 return tostring(mq.TLO.Spawn(pendingId).CleanName() or '')
@@ -1698,6 +1710,8 @@ function M.charmTick(settings)
             M.broadcastCharmState(true)
         elseif (now - (M.charm.pendingCharmAt or 0)) > 12 then
             -- Cast window long gone with no pet: count the failure.
+            dlog('charm-fail: no pet 12s after cast target=%d attempts=%d',
+                pendingId, (M.charm.attempts[pendingId] or 0) + 1)
             M.charm.attempts[pendingId] = (M.charm.attempts[pendingId] or 0) + 1
             M.charm.pendingCharmTargetId = 0
             M.charm.pendingCharmAt = 0
@@ -1710,6 +1724,8 @@ function M.charmTick(settings)
             local casting = mq.TLO.Me.Casting() or ''
             if not busy and (casting == '' or casting == 'NULL') then
                 -- Cast fully resolved without producing a pet: failed.
+                dlog('charm-fail: cast resolved, no pet (resist/interrupt) target=%d attempts=%d',
+                    pendingId, (M.charm.attempts[pendingId] or 0) + 1)
                 M.charm.attempts[pendingId] = (M.charm.attempts[pendingId] or 0) + 1
                 M.charm.pendingCharmTargetId = 0
                 M.charm.pendingCharmAt = 0

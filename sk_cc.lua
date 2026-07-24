@@ -27,8 +27,35 @@ local _lastCharmReason = '-'
 local _lastMezReason = '-'
 local _lastDispatch = '-'
 
+-- Decision trace (/sk_cc debug): change-gated one-liners for every CC
+-- decision transition. Off by default — combat spam otherwise.
+local _debug = false
+local _lastTraceLine = ''
+local function trace(fmt, ...)
+    if not _debug then return end
+    local line = string.format(fmt, ...)
+    if line == _lastTraceLine then return end
+    _lastTraceLine = line
+    print(string.format('\am[CC-Trace]\ax %s @%.1fs', line, os.clock() % 1000))
+end
+
 Core.load()
 CC.init()
+
+-- Mob intelligence must observe the SpellEngine that actually casts mez/charm.
+-- Only mez-capable characters own this process-local observer in coordinated
+-- mode; the UI host remains presentation-only.
+local _mobIntel = nil
+if CC.isMezClass() then
+    local ok, mod = pcall(require, 'sidekick-next.utils.mob_intel')
+    if ok and mod then
+        _mobIntel = mod
+        if mod.init then
+            local initOk = pcall(mod.init)
+            if not initOk then _mobIntel = nil end
+        end
+    end
+end
 
 local function settings()
     return Core.Settings or {}
@@ -72,8 +99,20 @@ module.onTick = function(self)
     Cache.tick()
     CC.tick()
     CC.charmTick(settings())
+    if _mobIntel then
+        if _mobIntel.loadZone then pcall(_mobIntel.loadZone) end
+        if _mobIntel.tick then pcall(_mobIntel.tick) end
+    end
     mq.doevents()
     local action, priority, reason = computePending()
+    if action then
+        trace('decide: %s spell=%s target=%s(%d) step=%s',
+            tostring(action.reason or reason), tostring(action.spellName or '?'),
+            tostring(action.targetName or '?'), tonumber(action.targetId) or 0,
+            tostring(action.charmStep or '-'))
+    else
+        trace('idle: mez=%s charm=%s', tostring(_lastMezReason), tostring(_lastCharmReason))
+    end
     if action then
         _pendingAction = action
         self.priority = priority
@@ -98,6 +137,7 @@ module.onTick = function(self)
         local nowMs = lib.getTimeMs()
         if (nowMs - _lastInterruptReqAt) >= 1000 then
             _lastInterruptReqAt = nowMs
+            trace('interrupt-req: cc_pending (someone else casting, cc action waiting)')
             self:requestInterrupt('cc_pending')
         end
     end
@@ -150,6 +190,7 @@ local function dispatchAction(action)
     end
     _lastDispatch = string.format('%s=%s%s', reasonTag,
         success and 'ok' or 'FAIL', success and '' or (':' .. tostring(reason)))
+    trace('dispatch: %s', _lastDispatch)
     return success, reason
 end
 
@@ -202,6 +243,7 @@ module:enableUnifiedExecutor({
         if st.castStarted then
             -- Our cast was issued; ride it to completion.
             if not lib.isCasting() and not (engine and engine.isBusy and engine.isBusy()) then
+                trace('cast-end: %s (bar clear, engine idle)', tostring(action.spellName or '?'))
                 return true, 'completed', 'completed'
             end
             return true, 'casting'
@@ -211,28 +253,42 @@ module:enableUnifiedExecutor({
         -- request is an owner self-cancel — the coordinator /stopcasts it.
         if not st.interruptSent and lib.isCasting() then
             st.interruptSent = true
+            trace('interrupt-req: cc_clearing_bar (leftover cast=%s)', tostring(mq.TLO.Me.Casting() or '?'))
             self:requestInterrupt('cc_clearing_bar')
         end
         local success, reason = dispatchAction(action)
         if success then
             st.castStarted = true
             st.deadline = lib.getTimeMs() + 15000
+            trace('cast-start: %s on %s(%d)', tostring(action.spellName or '?'),
+                tostring(action.targetName or '?'), tonumber(action.targetId) or 0)
             return true, 'casting'
         end
         if reason ~= 'already_casting' and reason ~= 'spell_engine_busy' then
+            trace('cast-abort: %s (%s)', tostring(action.spellName or '?'), tostring(reason))
             return true, reason, 'failed'
         end
         return true, 'waiting_cast_bar'
     end,
     onFailure = function(action)
+        trace('action-failed: %s target=%d (claim released)',
+            tostring(action and action.reason or '?'), tonumber(action and action.targetId) or 0)
         if action and action.targetId then CC.releaseClaim(tonumber(action.targetId) or 0) end
     end,
     onCancel = function(action)
+        trace('action-cancelled: %s target=%d (ownership lost/superseded)',
+            tostring(action and action.reason or '?'), tonumber(action and action.targetId) or 0)
         if action and action.targetId then CC.releaseClaim(tonumber(action.targetId) or 0) end
     end,
 })
 
-mq.bind('/sk_cc', function()
+mq.bind('/sk_cc', function(cmd)
+    if tostring(cmd or ''):lower() == 'debug' then
+        _debug = not _debug
+        CC.trace = _debug and trace or nil
+        print(string.format('\at[SK CC]\ax decision trace %s', _debug and 'ON' or 'OFF'))
+        return
+    end
     local s = settings()
     local function echo(fmt, ...)
         print(string.format('\at[SK CC]\ax ' .. fmt, ...))
@@ -259,5 +315,6 @@ end)
 
 module:enablePeerActors()
 module:run(50)
+if _mobIntel and _mobIntel.shutdown then pcall(_mobIntel.shutdown) end
 
 return module
