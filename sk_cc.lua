@@ -234,7 +234,12 @@ module:enableUnifiedExecutor({
     end,
     onTick = function(action, self, job)
         local st = job.cc
-        if not st then return true, 'no_wait_state', 'failed' end
+        -- No wait state means dispatch succeeded first-try and the job is
+        -- monitored by the spell engine — bare `true` lets the executor's
+        -- normal monitor ride the cast. Returning 'failed' here (the old
+        -- behavior) aborted our OWN cast ~0.3s after every clean dispatch;
+        -- it went unnoticed while the bar was always blocked pre-claim-fix.
+        if not st then return true end
         if lib.getTimeMs() > st.deadline then
             return true, 'cast_bar_timeout', 'failed'
         end
@@ -270,9 +275,10 @@ module:enableUnifiedExecutor({
         end
         return true, 'waiting_cast_bar'
     end,
-    onFailure = function(action)
-        trace('action-failed: %s target=%d (claim released)',
-            tostring(action and action.reason or '?'), tonumber(action and action.targetId) or 0)
+    onFailure = function(action, _, _, result)
+        trace('action-failed: %s target=%d why=%s (claim released)',
+            tostring(action and action.reason or '?'), tonumber(action and action.targetId) or 0,
+            tostring(result and result.reason or '?'))
         if action and action.targetId then CC.releaseClaim(tonumber(action.targetId) or 0) end
     end,
     onCancel = function(action)
