@@ -84,6 +84,7 @@ function M.create(moduleName, priority)
         stateDropbox = nil,
         peerActorsEnabled = false,
         peerActors = nil,
+        forensicsCastHooked = false,
         settingsRevision = nil,
 
         -- Unified action executor (opt-in during compatibility migration)
@@ -330,7 +331,8 @@ function M.create(moduleName, priority)
             local ok, diagnostic = pcall(self.getDiagnosticAction, self)
             if ok and type(diagnostic) == 'table' then action = diagnostic end
         end
-        local stateReady = self:hasValidState() and not self.awaitingResumeState
+        local inGame = lib.isInGame()
+        local stateReady = inGame and self:hasValidState() and not self.awaitingResumeState
         pcall(function()
             self.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR, character = lib.localCharacter() }, {
                 msgType = 'heartbeat',
@@ -339,6 +341,7 @@ function M.create(moduleName, priority)
                 ownerServer = lib.getMyServer(),
                 sentAtMs = lib.getTimeMs(),
                 ready = stateReady,
+                suspended = not inGame,
                 action = action,
                 counters = ActionCounters.snapshot(),
             })
@@ -423,7 +426,12 @@ function M.create(moduleName, priority)
         local value = needsAction == true
         -- Always send if reason changed (diagnostic updates matter)
         local reasonChanged = reason ~= self.lastNeedReason
-        if not reasonChanged and self.lastNeedValue == value and (now - (self.lastNeedSentAt or 0)) < 100 then
+        -- Unchanged needs are pure keep-alives. Refresh at 400ms against a
+        -- 1000ms TTL instead of 100ms against 250ms: the old cadence cost
+        -- ~110 need sends/sec fleet-wide (~1ms apiece sender-side) and made
+        -- `drain` the coordinator's top chronic offender. Value/reason
+        -- CHANGES still send immediately, so engagement latency is unchanged.
+        if not reasonChanged and self.lastNeedValue == value and (now - (self.lastNeedSentAt or 0)) < 400 then
             return
         end
         self.lastNeedValue = value
@@ -437,7 +445,9 @@ function M.create(moduleName, priority)
                 ownerServer = lib.getMyServer(),
                 priority = self.priority,
                 needsAction = value,
-                ttlMs = ttlMs or 250,
+                -- Default TTL must stay comfortably above the 400ms
+                -- keep-alive refresh or steady needs flap expired/valid.
+                ttlMs = ttlMs or 1000,
                 reason = reason,
             })
         end)
@@ -714,6 +724,36 @@ function M.create(moduleName, priority)
         self.peerActorsEnabled = true
     end
 
+    --- Send low-volume worker telemetry to the UI script on this character.
+    -- Script scoping is explicit because a mailbox-only Actor address cannot
+    -- cross from sidekick-next/sk_* into the sidekick-next UI process.
+    function self:sendToLocalUi(msgId, payload)
+        if not self.dropbox or not msgId or msgId == '' then return false end
+        local character = lib.localCharacter()
+        if not character then return false end
+        local server = lib.getMyServer()
+        local safePayload = actorSafeCopy(payload or {}) or {}
+        safePayload.id = msgId
+        safePayload.from = safePayload.from or lib.getMyName()
+        safePayload.server = safePayload.server or server
+        local sent = false
+        local uiScripts = type(lib.Scripts.UI) == 'table'
+            and lib.Scripts.UI or { lib.Scripts.UI }
+        for _, scriptName in ipairs(uiScripts) do
+            if scriptName and scriptName ~= '' then
+                local address = {
+                    mailbox = 'sidekick',
+                    script = scriptName,
+                    character = character,
+                }
+                if server and server ~= '' then address.server = server end
+                local ok = pcall(self.dropbox.send, self.dropbox, address, safePayload)
+                sent = sent or ok
+            end
+        end
+        return sent
+    end
+
     function self:initialize()
         debugLogToFile(self.name, 'Initializing module (priority=%d)', self.priority)
         lib.log('info', self.name, 'Initializing module (priority=%d)', self.priority)
@@ -736,6 +776,37 @@ function M.create(moduleName, priority)
                 self:onStateReceived(content)
             end
         end)
+
+        -- Automatic casts occur in worker-local SpellEngine instances. Forward
+        -- their terminal results to the UI-owned death black box.
+        if not self.forensicsCastHooked then
+            local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
+            if ok and SpellEngine and SpellEngine.addCastCompleteListener then
+                SpellEngine.addCastCompleteListener(function(castData, result)
+                    local settings = lib.getSettings()
+                    if settings and settings.DeathForensicsEnabled == false then return end
+                    castData = castData or {}
+                    local targetId = tonumber(castData.targetId) or 0
+                    local targetName = ''
+                    if targetId > 0 then
+                        targetName = lib.safeTLO(function()
+                            local spawn = mq.TLO.Spawn(targetId)
+                            return spawn and spawn() and spawn.CleanName() or ''
+                        end, '') or ''
+                    end
+                    self:sendToLocalUi('forensics:cast', {
+                        castData = {
+                            spellName = tostring(castData.spellName or ''),
+                            spellCategory = tostring(castData.spellCategory or ''),
+                            targetId = targetId,
+                            targetName = targetName,
+                        },
+                        result = tonumber(result) or result,
+                    })
+                end)
+                self.forensicsCastHooked = true
+            end
+        end
 
         if self.peerActorsEnabled then
             local ok, coordinator = pcall(require, 'sidekick-next.utils.actors_coordinator')
@@ -823,7 +894,12 @@ function M.create(moduleName, priority)
 
             do
                 local nowMs = lib.getTimeMs()
-                if (nowMs - lastParentCheckAt) >= 5000 then
+                if not lib.isInGame() then
+                    -- Process TLOs can be unavailable during zoning; never
+                    -- count that expected gap as a missing parent.
+                    lastParentCheckAt = nowMs
+                    parentMisses = 0
+                elseif (nowMs - lastParentCheckAt) >= 5000 then
                     lastParentCheckAt = nowMs
                     if lib.isUiRunning() then
                         parentMisses = 0
