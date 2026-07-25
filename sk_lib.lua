@@ -32,6 +32,19 @@ M.Priority = {
     MEDITATION = 7,  -- Lowest priority (sit/stand)
 }
 
+-- Reverse lookup for logs: 4 -> 'DPS(4)', 2.75 -> 'TANK_ENGAGE(2.75)'.
+local _priorityNames = nil
+function M.priorityName(value)
+    if not _priorityNames then
+        _priorityNames = {}
+        for name, v in pairs(M.Priority) do _priorityNames[v] = name end
+    end
+    local v = tonumber(value)
+    if v == nil then return tostring(value) end
+    local name = _priorityNames[v]
+    return name and string.format('%s(%g)', name, v) or string.format('?(%g)', v)
+end
+
 -- Interrupt thresholds (seconds remaining to let cast finish)
 -- Lower threshold = cast can be interrupted sooner
 -- 999 = effectively never interrupt based on time
@@ -106,7 +119,7 @@ M.Timing = {
     COALESCE_MS = 20,
 
     -- Watchdog thresholds
-    MODULE_CRASH_MS = 10000,        -- 10s without heartbeat = module presumed crashed (zone loads can stall 3-5s)
+    MODULE_CRASH_MS = 10000,        -- 10s of in-game heartbeat silence = module presumed crashed
     COORDINATOR_ABSENCE_MS = 10000, -- 10s without state = coordinator presumed crashed
     RESTART_COOLDOWN_MS = 15000,    -- 15s between restart attempts for same module
     WATCHDOG_CHECK_MS = 1000,       -- 1s between watchdog scans
@@ -223,9 +236,22 @@ function M.getGameState()
     return tostring(state or ''):upper()
 end
 
+--- True while MacroQuest reports that the character is changing zones.
+--- GameState can remain INGAME during part of a zone transition, so callers
+--- must also consult Me.Zoning before touching world/character TLOs.
+function M.isZoning()
+    if M.getGameState() ~= 'INGAME' then return false end
+    return M.safeTLO(function()
+        return mq.TLO.Me and mq.TLO.Me.Zoning and mq.TLO.Me.Zoning() == true
+    end, false) == true
+end
+
 --- True only while the local character is fully available for automation.
 function M.isInGame()
-    return M.getGameState() == 'INGAME'
+    if M.getGameState() ~= 'INGAME' then return false end
+    return M.safeTLO(function()
+        return not (mq.TLO.Me and mq.TLO.Me.Zoning and mq.TLO.Me.Zoning() == true)
+    end, false) == true
 end
 
 --- Read the persisted global automation pause flag.
@@ -475,27 +501,31 @@ function M.getMainAssistId()
     return M.safeNum(function() return ma.ID() end, 0)
 end
 
--- Log levels: 0=none, 1=error, 2=warn, 3=info, 4=debug
-M.LogLevel = 1  -- Set to 1 to only show errors, 4 for all messages
-
-local logLevelValue = {
-    error = 1,
-    warn = 2,
-    info = 3,
-    debug = 4,
-}
+-- Kept for compatibility with older callers. The unified logger now owns
+-- effective global and per-module levels.
+M.LogLevel = 1
+local _unifiedLogger = nil
+local _moduleLoggers = {}
 
 --- Log with prefix
--- @param level string 'debug', 'info', 'warn', 'error'
+-- @param level string 'verbose', 'debug', 'info', 'warn', 'error'
 -- @param module string Module name
 -- @param fmt string Format string
 -- @param ... any Format args
 function M.log(level, module, fmt, ...)
-    local levelVal = logLevelValue[level] or 4
-    if levelVal > M.LogLevel then
-        return
+    if not _unifiedLogger then
+        local ok, logger = pcall(require, 'sidekick-next.utils.logger')
+        if not ok or not logger then return end
+        _unifiedLogger = logger
     end
-    -- In-game echo disabled
+    module = tostring(module or 'unknown')
+    local logger = _moduleLoggers[module]
+    if not logger then
+        logger = _unifiedLogger.new(module, 1)
+        _moduleLoggers[module] = logger
+    end
+    local writer = logger[tostring(level or 'debug'):lower()] or logger.debug
+    writer(fmt, ...)
 end
 
 return M

@@ -853,7 +853,8 @@ local function broadcastState()
     local sent = {}
     local heartbeatCount = 0
     for _ in pairs(State.moduleHeartbeats) do heartbeatCount = heartbeatCount + 1 end
-    debugLog('broadcastState: tickId=%d epoch=%d priority=%d heartbeatCount=%d',
+    lib.log('verbose', M.MODULE_NAME,
+        'broadcastState: tickId=%d epoch=%d priority=%d heartbeatCount=%d',
         State.tickId, State.epoch, State.activePriority, heartbeatCount)
 
     local function send(address, key, description, body)
@@ -872,7 +873,8 @@ local function broadcastState()
 
     local function sendToScript(scriptName, body)
         if not scriptName or scriptName == '' then return false end
-        debugLog('broadcastState: Sending to script=%s', scriptName)
+        lib.log('verbose', M.MODULE_NAME,
+            'broadcastState: Sending to script=%s', scriptName)
         return send({ mailbox = lib.Mailbox.STATE, script = scriptName,
             character = lib.localCharacter() },
             'script:' .. scriptName, 'script=' .. scriptName, body)
@@ -1036,7 +1038,8 @@ local function processMessage(content, sender, nowMs)
         -- Track module heartbeat
         if content.module then
             State.knownModules[content.module] = true
-            debugLog('HEARTBEAT received: module=%s script=%s mailbox=%s',
+            lib.log('verbose', M.MODULE_NAME,
+                'HEARTBEAT received: module=%s script=%s mailbox=%s',
                 tostring(content.module), tostring(senderScript), tostring(mailbox))
             State.moduleHeartbeats[content.module] = {
                 receivedAtMs = nowMs,  -- Use coordinator-local time for staleness (not sender time)
@@ -1065,7 +1068,8 @@ local function processMessage(content, sender, nowMs)
                 receivedAtMs = nowMs,
                 reason = content.reason,
             }
-            debugLog('NEED received: module=%s priority=%d needsAction=%s ttlMs=%d reason=%s',
+            lib.log('verbose', M.MODULE_NAME,
+                'NEED received: module=%s priority=%d needsAction=%s ttlMs=%d reason=%s',
                 tostring(content.module), tonumber(content.priority) or -1,
                 tostring(content.needsAction), tonumber(content.ttlMs) or 250,
                 tostring(content.reason or ''))
@@ -1343,6 +1347,7 @@ local function initialize()
 end
 
 local _lastStatusLog = 0
+local _lastVerboseSnapshotAt = 0
 local _lastCoordinatorTickAt = lib.getTimeMs()
 
 local function rebaseSchedulerPause(gapMs)
@@ -1500,6 +1505,27 @@ local function tick()
                 return count
             end)())
     end
+    if (now - _lastVerboseSnapshotAt) >= 1000 then
+        _lastVerboseSnapshotAt = now
+        local needCount, readyCount = 0, 0
+        for _, need in pairs(State.moduleNeeds) do
+            if need and need.needsAction == true then needCount = needCount + 1 end
+        end
+        for _, heartbeat in pairs(State.moduleHeartbeats) do
+            if heartbeat and heartbeat.ready == true then readyCount = readyCount + 1 end
+        end
+        lib.log('verbose', M.MODULE_NAME,
+            'snapshot tick=%d epoch=%d priority=%d combat=%s castBusy=%s castOwner=%s/%s targetOwner=%s/%s actionableNeeds=%d readyWorkers=%d queue=%d loopGap=%dms tick=%dms',
+            tonumber(State.tickId) or 0, tonumber(State.epoch) or 0,
+            tonumber(State.activePriority) or -1, tostring(State.worldState.inCombat == true),
+            tostring(State.castBusy == true),
+            tostring(State.castOwner and State.castOwner.module or '-'),
+            tostring(State.castOwner and State.castOwner.claimId or '-'),
+            tostring(State.targetOwner and State.targetOwner.module or '-'),
+            tostring(State.targetOwner and State.targetOwner.claimId or '-'),
+            needCount, readyCount, #pendingActorMessages,
+            tonumber(State.loopGapMs) or 0, tonumber(State.lastTickMs) or 0)
+    end
 
     -- Update world state. TLO-heavy (~30 reads); the safety gates it feeds
     -- (self-dead, incapacitation, cast-busy) tolerate 150ms staleness, so
@@ -1526,7 +1552,8 @@ local function tick()
             State.activePriority, newPriority,
             tostring(State.castBusy),
             State.castOwner and State.castOwner.module or 'nil')
-        lib.log('info', M.MODULE_NAME, 'Priority change: %d -> %d', State.activePriority, newPriority)
+        lib.log('info', M.MODULE_NAME, 'Priority change: %s -> %s',
+            lib.priorityName(State.activePriority), lib.priorityName(newPriority))
         local revoked = revokeOnPriorityChange(newPriority)
         State.activePriority = newPriority
         State.epoch = State.epoch + 1
