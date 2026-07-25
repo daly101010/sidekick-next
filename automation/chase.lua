@@ -197,6 +197,26 @@ function M.tick()
     if mq.TLO.Me.Hovering() then _lastReason = 'hovering'; return end
     if mq.TLO.Me.AutoFire() then _lastReason = 'autofire'; return end
     if mq.TLO.Me.Combat() then _lastReason = 'melee_combat'; return end
+
+    -- Ranged standoff owns in-combat positioning: while it's enabled and
+    -- combat is active, chase yields entirely. Otherwise the two movement
+    -- systems tug-of-war — standoff parks 35-60 units from the mob, chase
+    -- notices we're beyond ChaseDistance of the tank and drags us back in,
+    -- and the character ping-pongs between the two forever.
+    do
+        local okCore, Core = pcall(require, 'sidekick-next.utils.core')
+        if okCore and Core and Core.Settings
+            and Core.Settings.CasterStandoffEnabled == true
+            and tostring(mq.TLO.Me.CombatState() or '') == 'COMBAT' then
+            if _navState.initiatedNav then
+                local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
+                    or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
+                if navActive then M.stopNav() end
+            end
+            _lastReason = 'standoff_combat'
+            return
+        end
+    end
     -- me.Casting() returns the spell name when casting OR the literal "NULL"
     -- when idle — must reject both. Treating "NULL" as truthy (the previous
     -- behavior) permanently suppressed chase whenever the player wasn't

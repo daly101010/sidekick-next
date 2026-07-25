@@ -137,9 +137,11 @@ module.onTick = function(self)
         self:sendNeed(false, nil, _lastReason)
         return
     end
-    if CasterAssist.isPureCaster() then
+    if CasterAssist.isPureCaster()
+        or (CasterAssist.shouldRouteStandoff and CasterAssist.shouldRouteStandoff(settings))
+    then
         _selectedTarget = nil
-        _lastReason = 'pure_caster'
+        _lastReason = CasterAssist.isPureCaster() and 'pure_caster' or 'ranged_standoff'
         self:sendNeed(false, nil, _lastReason)
         return
     end
@@ -177,9 +179,11 @@ module.executeAction = function(self)
         CombatAssist.stop()
         return true, 'mode_off'
     end
-    if CasterAssist.isPureCaster() then
+    if CasterAssist.isPureCaster()
+        or (CasterAssist.shouldRouteStandoff and CasterAssist.shouldRouteStandoff(settings))
+    then
         CombatAssist.stop()
-        return true, 'pure_caster'
+        return true, CasterAssist.isPureCaster() and 'pure_caster' or 'ranged_standoff'
     end
 
     local owner = self.state and self.state.targetOwner
