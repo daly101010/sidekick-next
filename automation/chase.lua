@@ -208,13 +208,23 @@ function M.tick()
         if okCore and Core and Core.Settings
             and Core.Settings.CasterStandoffEnabled == true
             and tostring(mq.TLO.Me.CombatState() or '') == 'COMBAT' then
-            if _navState.initiatedNav then
-                local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
-                    or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
-                if navActive then M.stopNav() end
+            -- Leash exception: if the chase target has run a SUBSTANTIAL
+            -- distance away (tank chasing a fleeing mob out of camp),
+            -- keeping up matters more than the standoff spot — fall
+            -- through and let chase run. Inside the leash, chase yields
+            -- so casts are never movement-interrupted mid-fight.
+            local leash = math.max(150, (tonumber(M.state.distance) or 30) * 4)
+            local spawn = M.resolveSpawn()
+            local dist = (spawn and spawn()) and M.distanceTo(spawn) or nil
+            if not dist or dist <= leash then
+                if _navState.initiatedNav then
+                    local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
+                        or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
+                    if navActive then M.stopNav() end
+                end
+                _lastReason = dist and string.format('standoff_combat:%.0f<=%d', dist, leash) or 'standoff_combat'
+                return
             end
-            _lastReason = 'standoff_combat'
-            return
         end
     end
     -- me.Casting() returns the spell name when casting OR the literal "NULL"
