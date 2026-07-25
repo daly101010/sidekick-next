@@ -57,6 +57,16 @@ local function validateTarget(targetId, source, settings)
         return nil, 'target_dead'
     end
 
+    -- Hard engagement radius: after a wipe/rez, sticky targets and stale
+    -- tank broadcasts can still name mobs that RESET across the zone —
+    -- spawn-valid, alive, often still damaged. Never navigate to a mob
+    -- beyond AssistRange; if it isn't near camp, it isn't our fight.
+    local dist = lib.safeNum(function() return spawn.Distance3D() end, 999)
+    local maxRange = tonumber(settings.AssistRange) or 100
+    if dist > maxRange then
+        return nil, string.format('beyond_assist_range:%d>%d', math.floor(dist), maxRange)
+    end
+
     local hp = lib.safeNum(function() return spawn.PctHPs() end, 100)
     local engageAt = tonumber(settings.AssistAt) or 97
     local engageCondition = tostring(settings.AssistEngageCondition or 'hp'):lower()
