@@ -7,6 +7,7 @@ local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local lazy = require('sidekick-next.utils.lazy_require')
+local Logger = require('sidekick-next.utils.logger')
 
 -- Create module instance
 local module = ModuleBase.create('buffs', lib.Priority.BUFF)
@@ -127,8 +128,12 @@ local getSpellEvents = lazy('sidekick-next.utils.spell_events')
 -- Helper Functions
 -------------------------------------------------------------------------------
 
+local function buffDebugEnabled()
+    return _buffDebugEnabled or Logger.wouldLog('buffs', 'debug')
+end
+
 local function diagLog(key, intervalSec, fmt, ...)
-    if not _buffDebugEnabled then return end
+    if not buffDebugEnabled() then return end
 
     local now = os.clock()
     key = tostring(key or 'diag')
@@ -170,15 +175,16 @@ local function traceLog(level, category, key, intervalSec, fmt, ...)
 
     local BuffLogger = getBuffLogger()
     if BuffLogger then
-        if BuffLogger.init then BuffLogger.init({ level = _buffDebugEnabled and 'debug' or 'info', enabled = true }) end
+        if BuffLogger.init then BuffLogger.init({ level = buffDebugEnabled() and 'debug' or 'info', enabled = true }) end
         local writer = BuffLogger[level or 'info'] or BuffLogger.info
         if writer then writer(category or 'trace', '%s', msg) end
     end
 
-    -- Keep normal operation quiet, but make failures visible without requiring
-    -- the user to find a file. Debug mode mirrors the throttled trace stream to
-    -- the MQ console so selection -> claim -> memorize -> cast can be followed.
-    if _buffDebugEnabled or level == 'warn' or level == 'error' then
+    -- The unified logger owns normal console/file routing. Preserve the legacy
+    -- runtime-only debug command as a fallback when the persisted module level
+    -- would otherwise suppress the line.
+    local unifiedLevel = (level == 'warn' or level == 'error') and level or 'debug'
+    if _buffDebugEnabled and not Logger.wouldLog('buffs', unifiedLevel) then
         local color = level == 'error' and '\ar' or (level == 'warn' and '\ay' or '\at')
         pcall(function()
             printf('%s[SK Buffs][%s][%s]\ax %s', color,
@@ -190,8 +196,8 @@ local function traceLog(level, category, key, intervalSec, fmt, ...)
         lib.log('warn', module.name, '%s', msg)
     elseif level == 'error' then
         lib.log('error', module.name, '%s', msg)
-    elseif _buffDebugEnabled then
-        lib.log('info', module.name, '%s', msg)
+    elseif buffDebugEnabled() then
+        lib.log('debug', module.name, '%s', msg)
     end
 end
 
@@ -720,6 +726,17 @@ local function isOocBuffLikeSpell(spellName)
     if subcategory:find('heal', 1, true) or subcategory == 'delayed' then
         return false
     end
+    -- A spell with no duration (Harvest, instant utilities) leaves no buff
+    -- icon to verify — observe-after-cast always fails and the worker
+    -- recast it every retry window forever. Zero-duration spells are not
+    -- buffs; the rotation/utility paths own them (e.g. WIZ doHarvest).
+    local durationTicks = 0
+    pcall(function()
+        durationTicks = tonumber(spell.Duration and spell.Duration() or 0) or 0
+    end)
+    if durationTicks <= 0 then
+        return false
+    end
     if targetType == 'target' or targetType == 'single' or targetType:find('group', 1, true)
         or targetType:find('self', 1, true) or targetType == 'pb ae' then
         return true
@@ -829,6 +846,24 @@ local function ensureTarget(id)
     return currentTargetId == id
 end
 
+--- Return whether a spawn still represents a living buff recipient.
+--- Group.Member.ID can resolve to the member's corpse after death, so a
+--- positive spawn ID alone is not sufficient.
+local function isLiveBuffSpawn(id)
+    id = tonumber(id) or 0
+    if id <= 0 then return false, 'missing_spawn' end
+
+    local spawn = mq.TLO.Spawn(id)
+    if not spawn or not spawn() then return false, 'missing_spawn' end
+
+    local spawnType = tostring(lib.safeTLO(function() return spawn.Type() end, '') or ''):lower()
+    if spawnType == 'corpse' then return false, 'target_is_corpse' end
+    if lib.safeTLO(function() return spawn.Dead() end, false) == true then
+        return false, 'target_is_dead'
+    end
+    return true, nil
+end
+
 local function selfHasBuff(spellName, spellId)
     if not spellName then return false end
 
@@ -910,8 +945,12 @@ function groupBuffCandidates(myId)
     for i = 1, memberCount do
         local member = mq.TLO.Group.Member(i)
         if member and member() then
-            local id = tonumber(member.ID()) or 0
-            if id > 0 and id ~= myId then
+            local id = lib.safeNum(function() return member.ID() end, 0)
+            local dead = lib.safeTLO(function() return member.Dead() end, false) == true
+            local offline = lib.safeTLO(function() return member.Offline() end, false) == true
+            local otherZone = lib.safeTLO(function() return member.OtherZone() end, false) == true
+            local liveSpawn = select(1, isLiveBuffSpawn(id))
+            if id > 0 and id ~= myId and liveSpawn and not dead and not offline and not otherZone then
                 local name = member.CleanName and member.CleanName() or ''
                 table.insert(candidates, {
                     id = id,
@@ -957,6 +996,25 @@ end
 
 local function conditionPassesForTarget(buffDef, candidate)
     local condition = buffDef and buffDef.condition
+    -- Spellset persistence stores conditions as SERIALIZED STRINGS.
+    -- Indexing the string for `.conditions` returned nil, so the
+    -- "no conditions = always pass" guard silently ignored EVERY OOC buff
+    -- condition (Harvest cast at full mana). Deserialize once per
+    -- definition; an unparseable configured condition fails CLOSED — the
+    -- user expressed intent we cannot honor, so don't cast.
+    if type(condition) == 'string' then
+        if buffDef._parsedCondition == nil then
+            local CB = getConditionBuilder()
+            buffDef._parsedCondition = (CB and CB.deserialize and CB.deserialize(condition)) or false
+            if buffDef._parsedCondition == false then
+                traceLog('warn', 'conditions', 'cond_parse_' .. tostring(buffDef.category), 30,
+                    'OOC buff condition failed to deserialize; buff withheld: category=%s spell=%s',
+                    tostring(buffDef.category), tostring(buffDef.spellName))
+            end
+        end
+        if buffDef._parsedCondition == false then return false end
+        condition = buffDef._parsedCondition
+    end
     if not condition or not condition.conditions or #condition.conditions == 0 then return true end
 
     local ConditionBuilder = getConditionBuilder()
@@ -1009,7 +1067,7 @@ local function candidateHasBuff(candidate, spellName, spellId, category, rebuffW
         triggered = actorHasTriggeredEffect(candidate.tlo, spellName)
     end
 
-    if _buffDebugEnabled then
+    if buffDebugEnabled() then
         local probe = buffProbe(candidate.isSelf and mq.TLO.Me or candidate.tlo, spellName, spellId)
         local stateText = cached and string.format('present=%s pending=%s remaining=%s spellId=%s',
             tostring(cached.present), tostring(cached.pending), tostring(cached.remaining), tostring(cached.spellId)) or 'nil'
@@ -1614,8 +1672,20 @@ local function findBuffNeed()
                 local isSelfOnly = isSelfOnlySpell(spellName)
                 local isGroup = isGroupSpell(spellName)
                 local castableTarget = req.targetId
+                local requestTargetLive, requestTargetReason = isLiveBuffSpawn(castableTarget)
+                if not requestTargetLive then
+                    -- Death can leave a request keyed by the old spawn/corpse
+                    -- ID. Remove it now so it cannot dominate every normal
+                    -- scan until its 30-60 second lease expires.
+                    if BuffReqs.clearRequest then
+                        BuffReqs.clearRequest(castableTarget, req.category)
+                    end
+                    traceLog('info', 'scan', 'request_dead_target_' .. tostring(req.category), 0,
+                        'Discarded buff request: spell=%s category=%s target=%s(%d) reason=%s',
+                        tostring(spellName), tostring(req.category), tostring(req.from),
+                        tonumber(castableTarget) or 0, tostring(requestTargetReason))
                 -- Self-only spells can only satisfy a request from us.
-                if isSelfOnly and castableTarget ~= myId then
+                elseif isSelfOnly and castableTarget ~= myId then
                     -- skip self-only request from someone else
                 else
                     if spellWouldStack(spellName) and hasEnoughMana(spellName) then
@@ -1671,7 +1741,7 @@ local function findBuffNeed()
                     local cached = getCachedBuffState(myId, category, rebuffWindow)
                     local hasSelf = selfHasBuff(spellName, spellId)
                     local hasBuff = cached ~= nil or hasSelf
-                    if _buffDebugEnabled then
+                    if buffDebugEnabled() then
                         local probe = buffProbe(mq.TLO.Me, spellName, spellId)
                         local stateText = cached and string.format('present=%s pending=%s remaining=%s spellId=%s',
                             tostring(cached.present), tostring(cached.pending), tostring(cached.remaining), tostring(cached.spellId)) or 'nil'
@@ -1784,6 +1854,12 @@ local function findBuffNeed()
                     spellName = spellName,
                     targetId = isGroup and myId or target.id,
                     targetName = isGroup and _selfName or target.name,
+                    -- Preserve the candidate that caused a group spell to be
+                    -- selected. Group casts target self, so targetId alone
+                    -- cannot detect that the original recipient died while a
+                    -- hot-swap or coordinator claim was pending.
+                    needTargetId = target.id,
+                    needTargetName = target.name,
                     isSelfOnly = false,
                     isGroup = isGroup,
                 }
@@ -1981,6 +2057,8 @@ module.getAction = function(self)
         spellName = spellName,
         targetId = targetId,
         targetName = action.targetName,
+        needTargetId = action.needTargetId,
+        needTargetName = action.needTargetName,
         category = action.category,
         isSelfOnly = action.isSelfOnly,
         isGroup = action.isGroup,
@@ -2057,6 +2135,25 @@ module.executeAction = function(self)
             'Buff action invalid: spell=%s category=%s target=%s',
             tostring(spellName), tostring(category), tostring(targetId))
         return true, 'invalid_action'
+    end
+
+    local recipientId = tonumber(action.needTargetId) or targetId
+    if not action.isSelfOnly then
+        local recipientLive, recipientReason = isLiveBuffSpawn(recipientId)
+        if not recipientLive then
+            traceLog('info', 'action', 'action_dead_target_' .. tostring(category), 0,
+                'Buff action cancelled: spell=%s category=%s recipient=%s(%d) reason=%s',
+                tostring(spellName), tostring(category),
+                tostring(action.needTargetName or action.targetName), recipientId,
+                tostring(recipientReason))
+            _pendingAction = nil
+            _pendingReason = nil
+            _buffGemSwap.requestedSpell = ''
+            maybeRestoreBuffGem()
+            clearActiveBuff()
+            self:sendNeed(false, nil, 'buff_target_invalid:' .. tostring(recipientReason))
+            return true, recipientReason
+        end
     end
 
     local levelUsable, requiredLevel, currentLevel = spellUsableAtCurrentLevel(spellName)
@@ -2548,7 +2645,7 @@ mq.bind('/sk_buffs', function(cmd, arg)
             tostring(_activeBuff.state),
             tostring(_activeBuff.waitReason),
             failureCount,
-            tostring(_buffDebugEnabled))
+            tostring(buffDebugEnabled()))
         for category, failure in pairs(_buffFailures) do
             commandEcho('backoff category=%s reason=%s failures=%d retryInMs=%d',
                 tostring(category), tostring(failure.reason), tonumber(failure.count) or 0,
