@@ -10,6 +10,7 @@ local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local lazy = require('sidekick-next.utils.lazy_require')
 local RezData = require('sidekick-next.utils.rez_data')
+local Logger = require('sidekick-next.utils.logger')
 
 local getCore = lazy('sidekick-next.utils.core')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
@@ -27,6 +28,7 @@ local LEASE_TTL_SECONDS = 30
 local TARGET_TIMEOUT_MS = 1500
 local MEMORIZE_TIMEOUT_MS = 12000
 local READY_TIMEOUT_MS = 5000
+local STAND_TIMEOUT_MS = 2000
 local NAV_TIMEOUT_MS = 15000
 local CAST_START_TIMEOUT_MS = 2500
 local CAST_TIMEOUT_MARGIN_MS = 3000
@@ -86,7 +88,7 @@ end
 
 local function debugEnabled()
     if Runtime.runtimeDebug ~= nil then return Runtime.runtimeDebug end
-    return settingBool('RezDebug', false)
+    return settingBool('RezDebug', false) or Logger.wouldLog('resurrection', 'debug')
 end
 
 local function echo(fmt, ...)
@@ -378,7 +380,13 @@ local function findRezTarget(inCombat)
     for index = 1, groupCount do
         local member = mq.TLO.Group.Member(index)
         if member and member() then
-            local memberName = lib.safeTLO(function() return member.CleanName() end, '') or ''
+            -- groupmember only inherits spawn fields while the member is in the
+            -- current zone. Name() is roster-backed and survives death,
+            -- zoning, and release-to-bind; CleanName() alone can become empty.
+            local memberName = lib.safeTLO(function() return member.Name() end, '') or ''
+            if memberName == '' then
+                memberName = lib.safeTLO(function() return member.CleanName() end, '') or ''
+            end
             local dead = lib.safeTLO(function() return member.Dead() end, false) == true
             local offline = lib.safeTLO(function() return member.Offline() end, false) == true
             local otherZone = lib.safeTLO(function() return member.OtherZone() end, false) == true
@@ -388,34 +396,40 @@ local function findRezTarget(inCombat)
             if memberName ~= '' and not dead and not offline and not otherZone then
                 seenNames[memberName:lower()] = true
             end
-            if dead and not offline and not otherZone then
-                sawDead = true
-                local name = memberName
-                local classShort = lib.safeTLO(function() return member.Class.ShortName() end, '') or ''
-                if forced ~= '' and name:lower() ~= forced then goto continue end
-                if inCombat and not Runtime.forceNext and not combatClassAllowed(classShort) then
-                    sawFiltered = true
-                    goto continue
-                end
-
-                local spawn = mq.TLO.Spawn(string.format([[pccorpse ="%s's corpse"]], name))
-                if spawn and spawn() then
+            local name = memberName
+            if name ~= '' and (forced == '' or name:lower() == forced) then
+                local spawn = findPlayerCorpse(name)
+                if spawn then
+                    -- The exact local PC corpse is authoritative. Group flags
+                    -- commonly show OtherZone after release-to-bind, and a
+                    -- non-SideKick group member has no Actor peer to recover
+                    -- that target through the Actor-Team fallback.
+                    sawDead = true
+                    local classShort = lib.safeTLO(function() return member.Class.ShortName() end, '') or ''
                     local corpseId = lib.safeNum(function() return spawn.ID() end, 0)
                     local spawnType = (lib.safeTLO(function() return spawn.Type() end, '') or ''):lower()
-                    if corpseId > 0 and spawnType == 'corpse' then
-                        local lastAt = Runtime.lastAttempt[corpseId] or 0
-                        if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
-                            return {
-                                corpseId = corpseId,
-                                memberName = name,
-                                classShort = classShort,
-                                distance = lib.safeNum(function() return spawn.Distance() end, 99999),
-                                source = 'group',
-                            }, nil
-                        end
-                        sawSuppressed = true
+                    if corpseId <= 0 or spawnType ~= 'corpse' then goto continue end
+                    if inCombat and not Runtime.forceNext and not combatClassAllowed(classShort) then
+                        sawFiltered = true
+                        goto continue
                     end
+                    local lastAt = Runtime.lastAttempt[corpseId] or 0
+                    if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
+                        return {
+                            corpseId = corpseId,
+                            memberName = name,
+                            classShort = classShort,
+                            distance = lib.safeNum(function() return spawn.Distance() end, 99999),
+                            source = 'group',
+                        }, nil
+                    end
+                    sawSuppressed = true
+                    goto continue
                 end
+            end
+
+            if dead and not offline and not otherZone then
+                sawDead = true
             end
         end
         ::continue::
@@ -794,6 +808,17 @@ local function targetIs(corpseId)
     return lib.safeNum(function() return mq.TLO.Target.ID() end, 0) == corpseId
 end
 
+local function isStanding()
+    return lib.safeTLO(function() return mq.TLO.Me.Standing() end, false) == true
+end
+
+local function requestStand(workflow, resumePhase, now)
+    mq.cmd('/squelch /stand')
+    workflow.resumeAfterStand = resumePhase
+    workflow.deadlineMs = now + STAND_TIMEOUT_MS
+    workflow.phase = 'stand_wait'
+end
+
 local function resourceReady(resource)
     if resource.kind == 'item' then
         local current = select(1, itemResource(true))
@@ -819,6 +844,7 @@ local function targetRangeReason(target, resource, inCombat)
     target.distance = distance
     local resourceRange = tonumber(resource and resource.range) or 100
     if resourceRange <= 0 then resourceRange = 100 end
+    if resource then resource.range = resourceRange end
     if distance <= resourceRange then return nil end
 
     -- Navigation is deliberately OOC-only. Without it, an out-of-range corpse
@@ -989,6 +1015,7 @@ local function startWorkflow(action)
         needsMemorize = action.needsMemorize == true,
         aaId = tonumber(action.aaId),
     }
+    if resource.range <= 0 then resource.range = 100 end
     Runtime.workflow = {
         action = action,
         phase = 'target_send',
@@ -1132,7 +1159,23 @@ local function stepWorkflow()
         return false, 'corpse_in_range'
     end
 
+    if workflow.phase == 'stand_wait' then
+        if isStanding() then
+            workflow.phase = workflow.resumeAfterStand or 'prepare_resource'
+            workflow.resumeAfterStand = nil
+            return false, 'standing_ready'
+        end
+        if now >= workflow.deadlineMs then
+            return beginRestore(false, 'rez_stand_failed')
+        end
+        return false, 'standing_for_rez'
+    end
+
     if workflow.phase == 'prepare_resource' then
+        if not isStanding() then
+            requestStand(workflow, 'prepare_resource', now)
+            return false, 'standing_for_rez'
+        end
         if workflow.resource.kind == 'spell' and not findGemSlot(workflow.resource.name) then
             if lib.inCombat() then return beginRestore(false, 'cannot_memorize_rez_in_combat') end
             local slot = requestedRezGem()
@@ -1167,6 +1210,10 @@ local function stepWorkflow()
     end
 
     if workflow.phase == 'ready_wait' then
+        if not isStanding() then
+            requestStand(workflow, 'ready_wait', now)
+            return false, 'standing_for_rez'
+        end
         if resourceReady(workflow.resource) then
             mq.cmdf('/target id %d', workflow.targetId)
             workflow.deadlineMs = now + TARGET_TIMEOUT_MS
@@ -1181,6 +1228,10 @@ local function stepWorkflow()
         if not targetIs(workflow.targetId) then
             if now >= workflow.deadlineMs then return beginRestore(false, 'cast_target_failed') end
             return false, 'targeting_for_cast'
+        end
+        if not isStanding() then
+            requestStand(workflow, 'cast_target_wait', now)
+            return false, 'standing_for_rez'
         end
 
         local SpellEvents = getSpellEvents()
@@ -1312,6 +1363,24 @@ module.onTick = function(self)
         self:sendNeed(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
+    end
+
+    -- Don't START a rez while moving (chase/follow/nav in progress):
+    -- stopping mid-travel to target a corpse strands the healer behind the
+    -- group. An already-running workflow above is unaffected — RezNavigate
+    -- moves on purpose. Manual /sk_rez force also bypasses this pause.
+    if not Runtime.forceNext then
+        local moving = lib.safeTLO(function() return mq.TLO.Me.Moving() end, false) == true
+        local navActive = lib.safeTLO(function()
+            return mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
+        end, false) == true
+        if moving or navActive then
+            clearLocalIntent('moving')
+            setReason('moving')
+            self:sendNeed(false, nil, Runtime.reason)
+            sendTelemetry(self)
+            return
+        end
     end
 
     local target, targetReason = findRezTarget(inCombat)
