@@ -1365,23 +1365,6 @@ module.onTick = function(self)
         return
     end
 
-    -- Don't START a rez while moving (chase/follow/nav in progress):
-    -- stopping mid-travel to target a corpse strands the healer behind the
-    -- group. An already-running workflow above is unaffected — RezNavigate
-    -- moves on purpose. Manual /sk_rez force also bypasses this pause.
-    if not Runtime.forceNext then
-        local moving = lib.safeTLO(function() return mq.TLO.Me.Moving() end, false) == true
-        local navActive = lib.safeTLO(function()
-            return mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
-        end, false) == true
-        if moving or navActive then
-            clearLocalIntent('moving')
-            setReason('moving')
-            self:sendNeed(false, nil, Runtime.reason)
-            sendTelemetry(self)
-            return
-        end
-    end
 
     local target, targetReason = findRezTarget(inCombat)
     if not target then
@@ -1417,6 +1400,27 @@ module.onTick = function(self)
         self:sendNeed(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
+    end
+
+    -- Movement policy (runs only once the corpse is in range): nav-driven
+    -- movement (chase/follow) yields — stop nav and let the rez proceed;
+    -- chase's own casting guard keeps it paused once the cast starts.
+    -- MANUAL keyboard movement instead pauses the rez until the player
+    -- stops — never fight the human at the wheel. /sk_rez force bypasses.
+    if not Runtime.forceNext then
+        local navActive = lib.safeTLO(function()
+            return mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
+        end, false) == true
+        local moving = lib.safeTLO(function() return mq.TLO.Me.Moving() end, false) == true
+        if navActive then
+            mq.cmd('/squelch /nav stop')
+        elseif moving then
+            clearLocalIntent('manual_movement')
+            setReason('manual_movement')
+            self:sendNeed(false, nil, Runtime.reason)
+            sendTelemetry(self)
+            return
+        end
     end
 
     local wins, coordinationReason = localWinsIntent(target, resource)
