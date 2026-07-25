@@ -607,6 +607,24 @@ function M.runLayer(layer, abilities, settings, state, ctx, classConfig)
             end
         end
 
+        -- 3c. Cooldown gate: an ability still on recast must not be
+        -- considered at all. Without this, long-recharge utilities
+        -- (Harvest, epics) passed every gate each tick and were dispatched
+        -- just to be rejected downstream — claim spam and log noise.
+        do
+            local okCd, Cooldowns = pcall(require, 'sidekick-next.abilities.cooldowns')
+            if okCd and Cooldowns and Cooldowns.probe then
+                local rem = Cooldowns.probe({ label = def.spellName or def.name or def.settingKey })
+                if (tonumber(rem) or 0) > 0 then
+                    if M.debugLogging and TL then
+                        TL.log('ability_cooldown_' .. abilityName, 15,
+                            '  %s: SKIP (on cooldown, %sms remaining)', abilityName, tostring(rem))
+                    end
+                    goto continue
+                end
+            end
+        end
+
         -- 4. Try to execute
         if M.debugLogging and TL then
             TL.log('ability_exec_' .. abilityName, 5, '  %s: EXECUTING (all gates passed)', abilityName)
