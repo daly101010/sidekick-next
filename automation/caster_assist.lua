@@ -35,9 +35,17 @@ M.escapeState = {
 M.standoffState = {
     phase = 'idle',  -- idle, moving
     startTime = 0,
+    targetId = 0,
 }
 M.standoffCooldownMs = 4000
 M.lastStandoffMove = 0
+M.coordinatedTarget = {
+    id = 0,
+    name = '',
+    combatActive = false,
+    receivedAtMs = 0,
+}
+local COORDINATED_TARGET_TTL_MS = 2500
 
 -- Lazy-load dependencies
 local getCore = lazy('sidekick-next.utils.core')
@@ -286,6 +294,31 @@ function M.isRepositioning()
     return M.standoffState.phase == 'moving'
 end
 
+--- Accept the local sk_dps intelligence snapshot. Actor callbacks only store
+--- data; all navigation remains in the yieldable SideKick main loop.
+---@param content table
+function M.setCoordinatedTarget(content)
+    local target = type(content) == 'table' and content.target or nil
+    M.coordinatedTarget = {
+        id = tonumber(target and target.id) or 0,
+        name = tostring(target and target.name or ''),
+        combatActive = target and target.combatActive == true or false,
+        receivedAtMs = mq.gettime(),
+    }
+end
+
+--- Stop only navigation started by the standoff controller.
+function M.stopStandoff()
+    if M.standoffState.phase == 'moving' then
+        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
+            and mq.TLO.Navigation.Active()
+        if navActive then mq.cmd('/squelch /nav stop') end
+    end
+    M.standoffState.phase = 'idle'
+    M.standoffState.startTime = 0
+    M.standoffState.targetId = 0
+end
+
 --- Should assist routing send this (non-pure-caster) class through CasterAssist?
 -- Rangers use standoff positioning when enabled.
 -- @param settings table Settings
@@ -296,21 +329,26 @@ function M.shouldRouteStandoff(settings)
     return class == 'RNG'
 end
 
---- Standoff tick: move to a randomized ranged spot when too close to the target
+--- Standoff tick: move to a randomized ranged spot when outside the configured band.
 -- @param settings table Settings
-function M.tickStandoff(settings)
+-- @param targetId number|nil Coordinated DPS target; current target is the legacy fallback
+function M.tickStandoff(settings, targetId)
     if not settings or settings.CasterStandoffEnabled ~= true then return end
     local state = M.standoffState
 
-    local target = mq.TLO.Target
+    targetId = tonumber(targetId) or 0
+    local target = targetId > 0 and mq.TLO.Spawn(targetId) or mq.TLO.Target
     local haveTarget = target and target() and (target.Type and target.Type() or '') == 'NPC'
         and not (target.Dead and target.Dead())
 
     if state.phase == 'moving' then
         local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
-        if not haveTarget or not navActive or (os.clock() - state.startTime) > 8 then
+        if not haveTarget or (targetId > 0 and state.targetId ~= targetId)
+            or not navActive or (os.clock() - state.startTime) > 8
+        then
             if navActive then mq.cmd('/squelch /nav stop') end
             state.phase = 'idle'
+            state.targetId = 0
         end
         return
     end
@@ -326,7 +364,14 @@ function M.tickStandoff(settings)
     if maxD < minD + 5 then maxD = minD + 5 end
 
     local dist = tonumber(target.Distance()) or 999
-    if dist >= minD then return end
+    if dist >= minD and dist <= maxD then
+        -- If Chase started navigation before standoff acquired this combat
+        -- target, stop that competing route once we are already in the band.
+        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
+            and mq.TLO.Navigation.Active()
+        if navActive then mq.cmd('/squelch /nav stop') end
+        return
+    end
 
     -- Never interrupt an in-progress cast; we'll move as soon as it finishes
     if mq.TLO.Me.Casting() then return end
@@ -338,7 +383,43 @@ function M.tickStandoff(settings)
     local x, y, z = pickStandoffSpot(target, minD, maxD)
     state.phase = 'moving'
     state.startTime = os.clock()
+    state.targetId = targetId > 0 and targetId or (tonumber(target.ID()) or 0)
     mq.cmdf('/squelch /nav locxyz %.2f %.2f %.2f', x, y, z)
+end
+
+--- Independent coordinated-mode movement tick. Returns true while a fresh,
+--- active DPS target owns follower movement so Chase does not fight the
+--- standoff navigation. This path never targets, sticks, or enables attack.
+---@param settings table
+---@return boolean ownsMovement
+function M.tickCoordinated(settings)
+    local enabled = settings and settings.CasterStandoffEnabled == true
+    local class = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
+    local supported = M.PURE_CASTERS[class] == true or class == 'RNG'
+    if not enabled or not supported then
+        M.stopStandoff()
+        return false
+    end
+
+    local target = M.coordinatedTarget
+    local ageMs = mq.gettime() - (tonumber(target.receivedAtMs) or 0)
+    if ageMs < 0 or ageMs > COORDINATED_TARGET_TTL_MS
+        or target.combatActive ~= true or (tonumber(target.id) or 0) <= 0
+    then
+        M.stopStandoff()
+        return false
+    end
+
+    local spawn = mq.TLO.Spawn(target.id)
+    if not (spawn and spawn()) or tostring(spawn.Type() or '') ~= 'NPC'
+        or (spawn.Dead and spawn.Dead())
+    then
+        M.stopStandoff()
+        return false
+    end
+
+    M.tickStandoff(settings, target.id)
+    return true
 end
 
 --- Check if current class is a pure caster

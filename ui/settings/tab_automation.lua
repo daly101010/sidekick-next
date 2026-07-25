@@ -145,26 +145,34 @@ function M.draw(settings, themeNames, onChange)
                 tooltip = 'Maximum distance to the fallback assist target (units)',
             })
             if rangeChanged and onChange then onChange('AssistRange', newRange) end
-
-            local manaFloor = tonumber(settings.DpsMinManaPct) or 0
-            local mfChanged, newMf = Components.SliderRow.percent('DPS Mana Floor', 'DpsMinManaPct', manaFloor, nil, {
-                tooltip = 'Skip ALL DPS casts while your mana is below this %.\nThe tash line is exempt (it enables charm/mez landing).\n0 = disabled. Meant for charm enchanters preserving mana for CC.',
-            })
-            if mfChanged and onChange then onChange('DpsMinManaPct', newMf) end
         end, { id = 'assist_settings', defaultOpen = true })
+    end
+
+    -- DPS casting gates apply in ANY combat mode (sk_dps runs regardless),
+    -- so this group renders independent of the mode branch above.
+    Components.SettingGroup.draw('DPS Casting', function()
+        local manaFloor = tonumber(settings.DpsMinManaPct) or 0
+        local mfChanged, newMf = Components.SliderRow.percent('DPS Mana Floor', 'DpsMinManaPct', manaFloor, nil, {
+            tooltip = 'Skip ALL DPS casts while your mana is below this %.\nThe tash line is exempt (it enables charm/mez landing).\n0 = disabled. Meant for charm enchanters preserving mana for CC.',
+        })
+        if mfChanged and onChange then onChange('DpsMinManaPct', newMf) end
+    end, { id = 'dps_casting_settings', defaultOpen = false })
 
         -- Ranged standoff is a WIZARD positioning feature: keep enough
         -- distance that rain spells never splash the caster. It is not for
         -- general casting — in a tight camp it relocates every few seconds,
         -- and movement defers timed casts (fatal for mezzers/healers).
-        Components.SettingGroup.draw('Ranged Standoff (Wizards)', function()
+    Components.SettingGroup.draw('Ranged Standoff (Casters)', function()
             local standoff = settings.CasterStandoffEnabled == true
-            local soVal, soChanged = Components.CheckboxRow.draw('Keep Ranged Distance', 'CasterStandoffEnabled', standoff, nil, {
-                tooltip = 'Nav to a randomized spot 35-60 units out when the target closes in,\nso rain spells never land on yourself. For ranged nukers (wizards).\nLeave OFF for mezzers, healers, and melee — movement defers casts.',
+        local soVal, soChanged = Components.CheckboxRow.draw(
+            'Keep Ranged Distance', 'CasterStandoffEnabled', standoff, nil, {
+                tooltip = 'Maintain a randomized casting distance from the coordinated DPS target.\n'
+                    .. 'This does not enable melee Assist, /stick, or /attack.\n'
+                    .. 'Movement defers timed casts, so leave it OFF for healers and mezzers.',
             })
             if soChanged and onChange then onChange('CasterStandoffEnabled', soVal) end
 
-            if standoff then
+            if soVal then
                 local minD = tonumber(settings.CasterStandoffMin) or 35
                 local minChanged, newMin = Components.SliderRow.int('Min Distance', 'CasterStandoffMin', minD, 20, 80, nil, {
                     tooltip = 'Reposition when the target is closer than this (rain splash radius + margin)',
@@ -175,8 +183,7 @@ function M.draw(settings, themeNames, onChange)
                 local maxChanged, newMax = Components.SliderRow.int('Max Distance', 'CasterStandoffMax', maxD, 25, 120)
                 if maxChanged and onChange then onChange('CasterStandoffMax', newMax) end
             end
-        end, { id = 'standoff_settings', defaultOpen = false })
-    end
+    end, { id = 'standoff_settings', defaultOpen = false })
 
     -- Stick commands apply to any combat mode that moves the character
     -- (assist engage stick + soft-pause stick). Melee positioning lives here:
