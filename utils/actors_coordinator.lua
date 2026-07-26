@@ -35,6 +35,67 @@ local _statusDropbox = nil
 local _selfName = ''
 local _selfServer = ''
 local _selfZone = ''
+
+-- Sender-identity + monotonic sequence guard for last-write-wins state topics.
+-- The topics in GUARDED_TOPICS have historically overwritten each other in
+-- receive order regardless of send order; a same-sender packet arriving late
+-- (network jitter, MQ delay) could clobber a fresher one. Sequence gating fixes
+-- that within a session. sessionId lets peers accept messages again after a
+-- sender restart (new session -> reset expected sequence).
+--
+-- Wire fields: `from` (existing sender-name field on every broadcastFleet
+-- payload), `sessionId`, `sequence`. Old-format messages without sessionId
+-- are still accepted — rolling restarts stay safe.
+local GUARDED_TOPICS = {
+    ['target:primary'] = true,
+    ['tank:repositioning'] = true,
+    ['tank:settled'] = true,
+    ['tank:taunt_run'] = true,
+    ['tank:taunt_done'] = true,
+    ['tank:mode'] = true,
+    ['cc:charmpet'] = true,
+}
+local _mySessionId = ''
+local _topicSeq = {}       -- [topic] = last outgoing sequence
+local _topicSeenSeq = {}   -- [topic] = { [sender_key] = { sessionId, sequence } }
+
+local function ensureSessionId()
+    if _mySessionId ~= '' then return _mySessionId end
+    local server = tostring(_selfServer or ''):gsub('%s+', '')
+    local name = tostring(_selfName or ''):gsub('%s+', '')
+    if server == '' or name == '' then return '' end
+    _mySessionId = string.format('%s:%s:%d:%d', server, name, os.time(), mq.gettime and mq.gettime() or 0)
+    return _mySessionId
+end
+
+local function nextSeq(topic)
+    local n = (_topicSeq[topic] or 0) + 1
+    _topicSeq[topic] = n
+    return n
+end
+
+--- Returns true if the incoming guarded message is stale (same sender, same
+--- session, sequence <= last accepted). Missing sessionId/sequence -> accept
+--- (backwards compat).
+local function isStaleGuardedMessage(topic, content, sender)
+    if not GUARDED_TOPICS[topic] then return false end
+    local senderKey = tostring((content and content.from) or (sender and sender.character) or ''):lower()
+    if senderKey == '' then return false end
+    local sessionId = content and content.sessionId
+    local sequence = content and tonumber(content.sequence)
+    if not sessionId or not sequence then return false end
+    local table_ = _topicSeenSeq[topic]
+    if not table_ then
+        table_ = {}
+        _topicSeenSeq[topic] = table_
+    end
+    local prev = table_[senderKey]
+    if prev and prev.sessionId == sessionId and sequence <= prev.sequence then
+        return true
+    end
+    table_[senderKey] = { sessionId = sessionId, sequence = sequence }
+    return false
+end
 local _actorsInitError = nil
 local _lastGroupTargetMsgAt = 0
 local _lastGroupTargetMsgId = ''
@@ -517,6 +578,7 @@ function M.init(opts)
             local senderZone = tostring(content.zone or '')
             local myZone = safeZone()
             if senderZone ~= '' and myZone ~= '' and senderZone ~= myZone then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
 
             _tankState.primaryTargetId = content.targetId
             _tankState.primaryTargetName = content.targetName
@@ -629,6 +691,7 @@ function M.init(opts)
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             if not senderIsAuthorizedTank(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
             _callPositioning('enterSoftPause')
             return
         end
@@ -637,6 +700,7 @@ function M.init(opts)
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             if not senderIsAuthorizedTank(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
             _callPositioning('exitSoftPause')
             return
         end
@@ -645,6 +709,7 @@ function M.init(opts)
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             if not senderIsAuthorizedTank(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
             _callPositioning('enterSoftPause')
             return
         end
@@ -653,6 +718,7 @@ function M.init(opts)
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             if not senderIsAuthorizedTank(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
             _callPositioning('exitSoftPause')
             return
         end
@@ -662,6 +728,7 @@ function M.init(opts)
             if fromMe then return end
             if not senderInSameZone(content, sender) then return end
             if not senderIsAuthorizedTank(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
             _tankState.tankMode = content.mode
             return
         end
@@ -699,6 +766,7 @@ function M.init(opts)
         -- wins, so accepting our own loopback is harmless.
         if id == 'cc:charmpet' then
             if not senderInSameZone(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
             local petId = tonumber(content.petId) or 0
             local owner = tostring(content.owner or '')
             -- petId == 0 is an explicit release; only honor it from the same
@@ -1312,6 +1380,13 @@ function M.broadcastFleet(msgId, payload)
     payload = payload or {}
     payload.id = msgId
     payload.from = payload.from or _selfName
+    if GUARDED_TOPICS[msgId] then
+        local sid = ensureSessionId()
+        if sid ~= '' then
+            payload.sessionId = payload.sessionId or sid
+            payload.sequence = payload.sequence or nextSeq(msgId)
+        end
+    end
     for _, script in ipairs(fleetScripts()) do
         pcall(function()
             _dropbox:send({ mailbox = 'sidekick', script = script }, payload)
