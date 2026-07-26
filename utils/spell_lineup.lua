@@ -1,4 +1,4 @@
--- F:/lua/sidekick/utils/spell_lineup.lua
+-- utils/spell_lineup.lua
 -- Spell Lineup - Gem scanning and spell categorization
 
 local mq = require('mq')

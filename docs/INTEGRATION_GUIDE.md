@@ -157,19 +157,18 @@ displaced gem and is consumed after a worker restart. Combat never
 auto-memorizes or initiates navigation.
 
 `automation/cc.lua` and `automation/cures.lua` expose side-effect-free
-selection functions plus explicit execution functions. Their compatibility
-`tick`/`mezTick` entry points exist only for the feature-flagged monolithic
-mode. `automation/meditation.lua` is a no-op compatibility shim; the worker is
-the only meditation owner. `sk_disciplines.lua` excludes all mez predicates so
-it cannot become a second CC caster.
+selection functions plus explicit execution functions used by `sk_cc.lua`
+and `sk_cures.lua` workers. `automation/meditation.lua` is a no-op shim;
+the `sk_meditation.lua` worker is the only meditation owner.
+`sk_disciplines.lua` excludes all mez predicates so it cannot become a
+second CC caster.
 
 `sk_assist.lua` is the coordinated owner of melee assist targeting and
 positioning. It requests only the target resource at DPS priority, allowing
 `sk_dps.lua` to hold the cast resource concurrently. Higher-priority healing,
 cure, resurrection, or CC work revokes the assist target lease before those
-workers retarget. The UI-host `automation/assist.lua` tick remains monolithic
-compatibility code and must not run automatic assist actions in coordinated
-mode.
+workers retarget. `automation/assist.lua` is a helper library — it must not
+run automatic assist actions from the UI host; the worker owns that.
 
 `sk_tank.lua` is the coordinated owner of tank-mode targeting, auto-attack,
 positioning stick commands, tank emergency/defensive abilities, hate tools,
@@ -412,6 +411,69 @@ all yielding work.
 6. Add the script to `sk_lib.lua`, the coordinator debug ordering, and this
    document.
 7. Confirm the UI host does not also initialize or tick the subsystem.
+
+## Actor topic conventions
+
+sidekick-next currently uses two disjoint Actors planes; keeping them apart
+is intentional but the split is easy to miss on first read.
+
+**`sk:*` control plane.** Mailbox `sk:supervisor` / `sk:state` / `sk:claim`
+/ `sk:release` / `sk:interrupt` / `sk:hb` / `sk:need` / `sk:team`. Used by
+the coordinator + workers for claim arbitration, priority tiers, supervisor
+heartbeats. Envelope key is `msgType`. Handled entirely inside
+`sk_coordinator.lua`, `sk_module_base.lua`, `utils/actors_team.lua`. If you
+are adding claim / need / interrupt semantics, this is the plane.
+
+**`sidekick` peer plane.** Mailbox `sidekick`, ~30 topics fanned out via
+`ActorsCoordinator.broadcastFleet(topic, payload)`. Envelope key is `id`.
+This is the plane for cross-character state that isn't a coordinator
+claim — target selection, mez lists, buff status, cure requests, tank
+positioning, charm-pet identity, healing HoT snapshots, etc. If you are
+adding "everyone should know X", this is the plane.
+
+Full protocol unification (single envelope, single topic namespace) is
+deferred; both planes carry `from = <char name>` so callers can identify
+the sender uniformly.
+
+### Guarded topics — sender identity + sequence
+
+A subset of peer-plane topics is last-write-wins state that would flip if
+same-sender packets arrived out of order (network jitter, MQ delay):
+
+- `target:primary` — tank identity + primary kill target
+- `tank:repositioning`, `tank:settled`, `tank:taunt_run`, `tank:taunt_done`
+- `tank:mode`
+- `tank:camp_anchor` — tank's live idle position
+- `cc:charmpet` — the enchanter's protected charm pet
+- `pull:intent` — cooperative puller election
+
+`ActorsCoordinator.broadcastFleet` auto-augments payloads on these topics
+with `sessionId` (per-sender lifetime ID) and monotonic `sequence`.
+Receivers call `isStaleGuardedMessage(id, content, sender)` and drop same-
+session packets with sequence ≤ last accepted. A new `sessionId` (sender
+restart) resets the sequence gate. Missing fields → accepted (rolling
+restarts stay safe).
+
+To add a new guarded topic:
+1. Add the id to `GUARDED_TOPICS` in `utils/actors_coordinator.lua`.
+2. In the receiver block, call `if isStaleGuardedMessage(id, content, sender) then return end`
+   after your zone / authorization gates.
+3. Send via `broadcastFleet` — the augmentation is automatic.
+
+### Camp anchor and puller election
+
+`sk_tank.lua` broadcasts `tank:camp_anchor` whenever its idle anchor
+re-anchors (~every 5s while OOC and stationary).
+`ActorsCoordinator.getTankCampAnchor(maxAgeSec)` returns the freshest
+value. `automation/pull.lua` prefers it over its own snapshot so
+`RETURN_CAMP` tracks tank drift.
+
+`automation/pull.lua` broadcasts `pull:intent` every 2s while
+`Config.enabled == true`, carrying `startedAt` (seconds since epoch).
+`ActorsCoordinator.getEarliestPullPeer()` returns the earliest-startedAt
+same-zone peer within a 6s TTL. When another peer's startedAt is earlier
+than ours, we yield (skip pulls, keep ticking sensors). Mid-pull work
+runs to completion to avoid stranded mobs.
 
 ## Actors message contracts
 

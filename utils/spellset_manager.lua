@@ -1,4 +1,4 @@
--- F:/lua/sidekick/utils/spellset_manager.lua
+-- utils/spellset_manager.lua
 -- Spell Set Manager - spell set storage, resolution, and OOC memorization
 -- Note: Buff casting is handled by automation/buff.lua which uses getBuffSwapLines()
 

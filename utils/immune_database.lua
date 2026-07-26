@@ -1,4 +1,4 @@
--- F:/lua/sidekick/utils/immune_database.lua
+-- utils/immune_database.lua
 -- Immune Database - Persistent tracking of mob immunities per zone
 
 local mq = require('mq')

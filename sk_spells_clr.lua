@@ -1,4 +1,4 @@
--- F:/lua/sidekick/sk_spells_clr.lua
+-- sk_spells_clr.lua
 -- Cleric spell lines for SideKick multi-script system
 -- Spells ordered highest to lowest level within each line
 -- Data sourced from Allakhazam EverQuest spell database

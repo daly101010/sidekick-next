@@ -366,9 +366,10 @@ Buffing, Mezzing, Resurrection, Pull, and the relevant spell/AA/disc toggles.
 The Pause button, `/sk pause`, and `/sk resume` control the global
 `AutomationPaused` setting and apply to every coordinated worker.
 
-`AutomationLevel` is retained as a compatibility setting for the optional
-monolithic runtime. Its old manual/hybrid/auto behavior is not a coordinated
-worker control and is intentionally not shown in the current Automation tab.
+`AutomationLevel` (`manual`/`hybrid`/`auto`) is read by the coordinated
+workers to gate cast vs. movement actions. Its historical UI presence is
+intentionally hidden — the Pause button and per-domain toggles in the
+Automation tab are the user-facing knobs.
 
 Pull runs in its own coordinated worker. The Pull tab or `/sk_pull start` saves
 the configuration through the main SideKick process; scanning is harmless, and
@@ -1103,7 +1104,7 @@ suffixes are:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| AutomationLevel | text | auto | Compatibility-only play style for monolithic mode |
+| AutomationLevel | text | auto | Play style (`manual` / `hybrid` / `auto`) — controls cast vs. movement gating |
 | AutomationPaused | bool | false | Global pause |
 | ChaseEnabled | bool | false | Chase toggle |
 | ChaseRole | text | ma | Chase target role |
@@ -1212,12 +1213,12 @@ Higher priority (lower number) always preempts lower priority. The coordinator i
 | `automation/meditation.lua` | Retired no-op compatibility shim |
 | `utils/` | Core utilities (28 modules) |
 | `utils/core.lua` | Settings I/O, INI parsing |
-| `utils/actors_coordinator.lua` | Cross-character Actors messaging |
+| `utils/actors_coordinator.lua` | Cross-character Actors messaging (fleet fan-out, guarded topics, camp/pull peer state) |
 | `utils/actors_team.lua` | Coordinator-owned Actor Team presence and leader election |
+| `utils/class_roles.lua` | Canonical TANK / PURE_CASTERS / HYBRID_MELEE / PURE_MELEE / HEALER_CLASSES sets |
 | `utils/combat_spell_executor.lua` | Combat spell selection |
 | `utils/spellset_manager.lua` | Spell set storage |
 | `utils/spell_engine.lua` | Spell casting engine |
-| `utils/rotation_engine.lua` | Combat rotation logic |
 | `utils/immune_database.lua` | Spell immunity database |
 | `abilities/` | Ability loading and cooldowns |
 | `abilities/cooldowns.lua` | Cooldown timer smoothing |

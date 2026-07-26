@@ -387,8 +387,8 @@ local function shouldAutoUse(entry, inCombat, hpPct)
 end
 
 -- Read-only helpers used by the coordinated item worker. Keeping selection and
--- readiness here ensures the UI, monolithic compatibility path, and worker all
--- interpret the per-slot modes and saved conditions identically.
+-- readiness here ensures the UI and worker interpret the per-slot modes and
+-- saved conditions identically.
 function M.itemReady(itemName)
     return itemReady(itemName)
 end

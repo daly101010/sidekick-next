@@ -1184,15 +1184,6 @@ function M.selectMezAction(settings)
     }, 'mez'
 end
 
---- Backward-compatible monolithic entry point.
--- The coordinated runtime calls selectMezAction() from sk_cc.lua and does not
--- reach this function.
-function M.mezTick(settings)
-    local action = M.selectMezAction(settings)
-    if not action then return false end
-    return M.castMez(action.targetId, action.targetName, action.spellName)
-end
-
 --------------------------------------------------------------------------------
 -- Charm (DPS charm pet)
 --------------------------------------------------------------------------------
