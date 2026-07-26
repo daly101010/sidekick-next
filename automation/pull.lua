@@ -110,7 +110,12 @@ local State = {
     ignoreUntilMs    = {},  -- [spawnId] = expireMs
     pausedManually   = false,
     initialized      = false,
+    -- Cooperative puller election: seconds-since-epoch when this puller
+    -- became enabled. Peers with an earlier value win.
+    pullStartedAt    = 0,
+    lastIntentBroadcastMs = 0,
 }
+local PULL_INTENT_BROADCAST_MS = 2000
 
 -- Config bridge ---------------------------------------------------------------
 
@@ -579,11 +584,18 @@ function M.init(opts)
     if State.initialized then return end
     State.initialized = true
     loadFromSettings()
+    -- Persisted enable: seed pullStartedAt so the cooperative election
+    -- comparison has a real value to compare against instead of 0.
+    if Config.enabled and (State.pullStartedAt or 0) == 0 then
+        State.pullStartedAt = os.time()
+    end
 end
 
 function M.start()
     persist('enabled', true)
     State.pausedManually = false
+    State.pullStartedAt = os.time()
+    State.lastIntentBroadcastMs = 0  -- broadcast immediately on next tick
     setCampHere()
     setState(M.STATES.IDLE, 'started')
     printf('\at[Pull]\ax start mode=%s ability=%s', Config.mode, Config.ability)
@@ -592,8 +604,31 @@ end
 function M.stop()
     persist('enabled', false)
     State.pausedManually = true
+    State.pullStartedAt = 0
     M.cancel('stopped')
     printf('\at[Pull]\ax stop')
+end
+
+-- True when a same-zone peer puller has an earlier startedAt (i.e., they
+-- started pulling first). Yielders still tick sensors and observe state but
+-- do not initiate new pulls.
+local function yieldingToEarlierPeer()
+    local A = getActors()
+    if not (A and A.getEarliestPullPeer) then return false end
+    local peer = A.getEarliestPullPeer()
+    if not peer then return false end
+    local peerStart = tonumber(peer.startedAt) or 0
+    local myStart = tonumber(State.pullStartedAt) or 0
+    if peerStart <= 0 then return false end
+    if myStart <= 0 then return true end
+    if peerStart < myStart then return true end
+    -- Tie-break by sender name to break exact-second ties deterministically.
+    if peerStart == myStart then
+        local lib = getSkLib()
+        local myName = lib and lib.getMyName and lib.getMyName() or ''
+        return tostring(peer.from or ''):lower() < tostring(myName):lower()
+    end
+    return false
 end
 
 function M.selectTargetId(tid)
@@ -660,6 +695,11 @@ function M.reloadSettings()
     if not Config.enabled and State.pullState ~= M.STATES.IDLE and M.cancel then
         M.cancel('disabled')
     end
+    if Config.enabled and (State.pullStartedAt or 0) == 0 then
+        State.pullStartedAt = os.time()
+    elseif not Config.enabled then
+        State.pullStartedAt = 0
+    end
 end
 function M.setCamp() setCampHere() end
 function M.cancel(reason)
@@ -675,6 +715,31 @@ function M.tick(opts)
     local allowActions = opts.allowActions ~= false
     if not State.initialized then M.init() end
     if not Config.enabled and State.pullState == M.STATES.IDLE then return end
+
+    -- Broadcast pull:intent every ~2s while enabled, so peer pullers can
+    -- see us and elect the earliest-startedAt as the active one.
+    if Config.enabled and (State.pullStartedAt or 0) > 0 then
+        local now = nowMs()
+        if (now - (State.lastIntentBroadcastMs or 0)) >= PULL_INTENT_BROADCAST_MS then
+            State.lastIntentBroadcastMs = now
+            local A = getActors()
+            if A and A.broadcastPullIntent then
+                pcall(A.broadcastPullIntent, State.pullStartedAt)
+            end
+        end
+    end
+
+    -- Cooperative yield: if a same-zone peer with earlier startedAt is
+    -- broadcasting, let them own pulling. Only yield when we're idle or
+    -- scanning; mid-pull we finish what we started to avoid stranded mobs.
+    if Config.enabled and (State.pullState == M.STATES.IDLE
+        or State.pullState == M.STATES.SCAN
+        or State.pullState == M.STATES.WAITING_GATE) then
+        if yieldingToEarlierPeer() then
+            setState(M.STATES.IDLE, 'yielding_to_peer')
+            return
+        end
+    end
 
     local s = State.pullState
     if not allowActions and (s == M.STATES.READY

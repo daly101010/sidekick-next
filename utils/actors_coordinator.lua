@@ -55,6 +55,7 @@ local GUARDED_TOPICS = {
     ['tank:mode'] = true,
     ['tank:camp_anchor'] = true,
     ['cc:charmpet'] = true,
+    ['pull:intent'] = true,
 }
 local _mySessionId = ''
 local _topicSeq = {}       -- [topic] = last outgoing sequence
@@ -139,6 +140,14 @@ local _tankState = {
     updatedAt = 0,
     campAnchor = nil,   -- { x, y, z, from, updatedAt } from tank:camp_anchor
 }
+
+-- Cooperative puller election. Every enabled pull worker periodically
+-- broadcasts pull:intent with its startedAt timestamp. Peers with a later
+-- startedAt yield to peers with earlier startedAt in the same zone. Not a
+-- hard election (no coordinator claim) — just a signal to keep two enabled
+-- pull workers from both pulling.
+local _pullPeers = {}  -- [sender_key] = { from, startedAt, zone, updatedAt }
+local PULLER_TTL_SEC = 6.0  -- broadcast every ~2s; three misses => TTL out
 
 -- Charm-pet protection state. The charming enchanter broadcasts its pet's
 -- spawn ID so every worker in the group treats that mob as off-limits: DPS
@@ -732,6 +741,25 @@ function M.init(opts)
             if not senderIsAuthorizedTank(content, sender) then return end
             if isStaleGuardedMessage(id, content, sender) then return end
             _tankState.tankMode = content.mode
+            return
+        end
+
+        -- Pull coordination: cooperative election. Multiple characters with
+        -- Pull_enabled would otherwise race; the earliest-startedAt in each
+        -- zone wins, later peers yield (they still tick their sensors and
+        -- state, they just skip issuing actual pulls). See automation/pull.lua
+        -- for the yield decision.
+        if id == 'pull:intent' then
+            if not senderInSameZone(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
+            local senderKey = tostring((content and content.from) or (sender and sender.character) or ''):lower()
+            if senderKey == '' then return end
+            _pullPeers[senderKey] = {
+                from = tostring(content.from or sender.character or ''),
+                startedAt = tonumber(content.startedAt) or 0,
+                zone = tostring(content.zone or ''),
+                updatedAt = os.clock(),
+            }
             return
         end
 
@@ -1545,6 +1573,39 @@ function M.getTankCampAnchor(maxAgeSec)
         return nil
     end
     return a
+end
+
+--- Broadcast our own pull intent. Callers pass startedAt (Lua seconds since
+--- os.time epoch) — a fixed value that stays constant while this puller is
+--- enabled, so earliest-wins comparisons are stable across broadcasts.
+function M.broadcastPullIntent(startedAt)
+    if not _dropbox then return end
+    _selfZone = safeZone()
+    M.broadcastFleet('pull:intent', {
+        startedAt = tonumber(startedAt) or os.time(),
+        zone = _selfZone,
+    })
+end
+
+--- Return the earliest-startedAt peer puller in our zone that is NOT us and
+--- whose last broadcast is within PULLER_TTL_SEC, else nil. Callers should
+--- yield when this returns a peer with startedAt <= self.startedAt.
+function M.getEarliestPullPeer()
+    local now = os.clock()
+    local myKey = tostring(_selfName or ''):lower()
+    local myZone = tostring(_selfZone or ''):lower()
+    local best
+    for key, peer in pairs(_pullPeers) do
+        if key ~= myKey and (now - (peer.updatedAt or 0)) <= PULLER_TTL_SEC then
+            local peerZone = tostring(peer.zone or ''):lower()
+            if myZone == '' or peerZone == '' or peerZone == myZone then
+                if not best or (peer.startedAt or 0) < (best.startedAt or math.huge) then
+                    best = peer
+                end
+            end
+        end
+    end
+    return best
 end
 
 --- Get the protected charm-pet state (for target selection to read)
