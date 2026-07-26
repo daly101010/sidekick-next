@@ -710,6 +710,12 @@ module.onTick = function(self)
                         and math.sqrt(dx * dx + dy * dy) or math.huge
                     if fromAnchor < 30 or fromAnchor > 100 or _anchor.setAt == 0 then
                         _anchor.x, _anchor.y, _anchor.z, _anchor.setAt = x, y, z, nowMs
+                        -- Broadcast anchor so the pull worker's RETURN_CAMP
+                        -- follows the tank's live position instead of its own
+                        -- fixed-at-first-pull coordinate.
+                        if Actors.broadcastTankCampAnchor then
+                            Actors.broadcastTankCampAnchor(x, y, z)
+                        end
                     elseif _settings.TankRepositionEnabled == true
                         and tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
                         -- Return to camp after combat (rgmercs ReturnToCamp).

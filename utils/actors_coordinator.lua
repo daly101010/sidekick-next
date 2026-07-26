@@ -53,6 +53,7 @@ local GUARDED_TOPICS = {
     ['tank:taunt_run'] = true,
     ['tank:taunt_done'] = true,
     ['tank:mode'] = true,
+    ['tank:camp_anchor'] = true,
     ['cc:charmpet'] = true,
 }
 local _mySessionId = ''
@@ -136,6 +137,7 @@ local _tankState = {
     tankId = nil,
     tankName = nil,
     updatedAt = 0,
+    campAnchor = nil,   -- { x, y, z, from, updatedAt } from tank:camp_anchor
 }
 
 -- Charm-pet protection state. The charming enchanter broadcasts its pet's
@@ -730,6 +732,27 @@ function M.init(opts)
             if not senderIsAuthorizedTank(content, sender) then return end
             if isStaleGuardedMessage(id, content, sender) then return end
             _tankState.tankMode = content.mode
+            return
+        end
+
+        -- Tank coordination: live camp anchor. Broadcast by sk_tank whenever
+        -- it re-anchors its own idle position. Pull worker prefers this over
+        -- its historical setCampHere() coordinate so RETURN_CAMP follows tank
+        -- drift instead of returning to the position at first pull.
+        if id == 'tank:camp_anchor' then
+            if not senderInSameZone(content, sender) then return end
+            if not senderIsAuthorizedTank(content, sender) then return end
+            if isStaleGuardedMessage(id, content, sender) then return end
+            local x = tonumber(content.x)
+            local y = tonumber(content.y)
+            local z = tonumber(content.z)
+            if x and y and z then
+                _tankState.campAnchor = {
+                    x = x, y = y, z = z,
+                    from = tostring(content.from or ''),
+                    updatedAt = os.clock(),
+                }
+            end
             return
         end
 
@@ -1495,9 +1518,33 @@ function M.broadcastTauntDone()
     M.broadcastFleet('tank:taunt_done', { zone = _selfZone })
 end
 
+--- Broadcast the tank's live camp anchor. Rate-limited by sk_tank's own 5s
+--- refresh cadence; the receiver stores it in _tankState.campAnchor.
+function M.broadcastTankCampAnchor(x, y, z)
+    if not _dropbox then return end
+    if not (x and y and z) then return end
+    _selfZone = safeZone()
+    M.broadcastFleet('tank:camp_anchor', {
+        x = tonumber(x), y = tonumber(y), z = tonumber(z),
+        zone = _selfZone,
+    })
+end
+
 --- Get the current tank state (for assisters to read)
 function M.getTankState()
     return _tankState
+end
+
+--- Get the tank's live camp anchor if one has been broadcast recently, else
+--- nil. Consumers should treat nil as "no live anchor available; fall back
+--- to your own stored coord."
+function M.getTankCampAnchor(maxAgeSec)
+    local a = _tankState.campAnchor
+    if not a then return nil end
+    if maxAgeSec and (os.clock() - (a.updatedAt or 0)) > maxAgeSec then
+        return nil
+    end
+    return a
 end
 
 --- Get the protected charm-pet state (for target selection to read)

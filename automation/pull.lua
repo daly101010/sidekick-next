@@ -24,6 +24,7 @@ local getCore     = lazy.once('sidekick-next.utils.core')
 local getSkLib    = lazy.once('sidekick-next.sk_lib')
 local getHumanize = lazy.once('sidekick-next.humanize')
 local getChase    = lazy.once('sidekick-next.automation.chase')
+local getActors   = lazy.once('sidekick-next.utils.actors_coordinator')
 
 local M = {}
 local READY_TIMEOUT_MS = 10000
@@ -287,6 +288,19 @@ end
 
 -- Camp -----------------------------------------------------------------------
 
+-- Camp anchor: prefer the tank's live-broadcast anchor over our own snapshot,
+-- so RETURN_CAMP follows tank drift instead of returning to the position at
+-- first pull. Falls back to our local State.camp* if no tank is broadcasting.
+local TANK_ANCHOR_MAX_AGE = 15  -- seconds; sk_tank rebroadcasts every ~5s
+local function effectiveCamp()
+    local A = getActors()
+    if A and A.getTankCampAnchor then
+        local a = A.getTankCampAnchor(TANK_ANCHOR_MAX_AGE)
+        if a then return a.x, a.y, a.z end
+    end
+    return State.campX, State.campY, State.campZ
+end
+
 local function setCampHere()
     if not meSafe() then return end
     local me = mq.TLO.Me
@@ -308,8 +322,8 @@ end
 local function navToCamp()
     if not State.campSet then return end
     local face = Config.pullBackwards and 'facing=backward' or ''
-    mq.cmdf('/nav locyxz %.2f %.2f %.2f %s log=off',
-        State.campY, State.campX, State.campZ, face)
+    local x, y, z = effectiveCamp()
+    mq.cmdf('/nav locyxz %.2f %.2f %.2f %s log=off', y, x, z, face)
 end
 
 local function navActive()
@@ -321,7 +335,8 @@ end
 local function distToCamp()
     if not State.campSet or not meSafe() then return 99999 end
     local me = mq.TLO.Me
-    local dx, dy, dz = (me.X() or 0) - State.campX, (me.Y() or 0) - State.campY, (me.Z() or 0) - State.campZ
+    local x, y, z = effectiveCamp()
+    local dx, dy, dz = (me.X() or 0) - x, (me.Y() or 0) - y, (me.Z() or 0) - z
     return math.sqrt(dx*dx + dy*dy + dz*dz)
 end
 
@@ -352,8 +367,9 @@ local function tick_SCAN()
         require('sidekick-next.utils.bandolier').activatePull()
     end)
 
+    local scanX, scanY, scanZ = effectiveCamp()
     local res = Scan.scan({
-        checkX = State.campX, checkY = State.campY, checkZ = State.campZ,
+        checkX = scanX, checkY = scanY, checkZ = scanZ,
         pullRadius = Config.pullRadius,
         pullZRadius = Config.pullZRadius,
         useLevels = Config.useLevels,
