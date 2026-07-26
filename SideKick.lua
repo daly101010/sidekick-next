@@ -18,78 +18,12 @@ local CombatAssist = require('sidekick-next.utils.combatassist')
 local Chase = require('sidekick-next.automation.chase')
 local Assist = require('sidekick-next.automation.assist')
 local Burn = require('sidekick-next.automation.burn')
-local Tank = require('sidekick-next.automation.tank')
 local HealerClasses = require('sidekick-next.utils.healer_classes')
 local RezData = require('sidekick-next.utils.rez_data')
 -- Lazy getters bundled into one table: the main function was at LuaJIT's
 -- hard limit of 60 upvalues per function, and each bare `local getX` it
 -- referenced cost one upvalue. One table = one upvalue for all of them.
 local LZ = {}
-LZ.getLegacyHealing = lazy.once('sidekick-next.automation.healing')
-local NewHealing = nil  -- Lazy-loaded for supported healer classes
-
--- Phased healing module loader: spreads the healing module load
--- across multiple main loop ticks to avoid blocking MQ frames.
--- Phase 0: warmup (3s, legacy healing covers)
--- Phase 1: require module (fast since submodule requires are deferred)
--- Phases 2-6: initPhased(1..5), one per tick
--- Phase 7+: fully ready
-local _healPhase = 0            -- Current loading phase
-local _healMod = nil            -- Module reference during phased loading
-local _healLoadComplete = false  -- True when all phases finished
-local _healingWarmupStart = nil  -- Set when main loop begins
-local HEALING_WARMUP_SEC = 3.0  -- Seconds before starting phased load
-
-local function getHealingModule()
-    local me = mq.TLO.Me
-    if not me or not me() then return LZ.getLegacyHealing() end
-    local classShort = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
-    local upper = classShort:upper()
-    if not HealerClasses.isSupported(upper) then return LZ.getLegacyHealing() end
-
-    -- Advance one phase per call until complete
-    if not _healLoadComplete then
-        -- Phase 0: warmup (use legacy healing while other systems stabilize)
-        if _healPhase == 0 then
-            if _healingWarmupStart and (os.clock() - _healingWarmupStart) >= HEALING_WARMUP_SEC then
-                _healPhase = 1
-            end
-
-        -- Phase 1: require the module (fast since submodule requires are now deferred)
-        elseif _healPhase == 1 then
-            local ok, mod = pcall(require, 'sidekick-next.healing')
-            if ok and mod then
-                _healMod = mod
-                _healPhase = 2
-            else
-                _healLoadComplete = true
-            end
-
-        -- Phases 2+: incremental init (one phase per tick)
-        elseif _healMod then
-            local initPhase = _healPhase - 1
-            local totalPhases = _healMod.TOTAL_INIT_PHASES or 5
-            if initPhase <= totalPhases then
-                pcall(_healMod.initPhased, initPhase)
-                _healPhase = _healPhase + 1
-
-                if not NewHealing and _healMod.isInitialized and _healMod.isInitialized() then
-                    NewHealing = _healMod
-                end
-
-                if initPhase >= totalPhases then
-                    _healLoadComplete = true
-                end
-            else
-                _healLoadComplete = true
-            end
-        end
-    end
-
-    return NewHealing or LZ.getLegacyHealing()
-end
-
-local Healing = nil  -- Will be set dynamically by getHealingModule()
 
 LZ.getCures = lazy.init('sidekick-next.automation.cures')
 LZ.getPull = lazy('sidekick-next.automation.pull')
@@ -121,10 +55,6 @@ local _ezSpringSettings = (function()
 end)()
 
 local Anchor = require('sidekick-next.ui.anchor')
-local Items = require('sidekick-next.utils.items')
-
--- Loading screen overlay (rendered during phased healing load)
-local Loader = require('sidekick-next.ui.loader')
 
 -- Performance monitor (tracks per-module frame times)
 local PerfMonitor = require('sidekick-next.ui.perf_monitor')
@@ -135,12 +65,9 @@ LZ.getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
 LZ.getActorsDebug = lazy('sidekick-next.ui.actors_debug')
 LZ.getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
 
--- Runtime cache, action executor, rotation engine, CC, and spell engine (lazy-loaded)
+-- Runtime cache, action executor, and spell engine (lazy-loaded)
 LZ.getRuntimeCache = lazy.init('sidekick-next.utils.runtime_cache')
 LZ.getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
-LZ.getRotationEngine = lazy('sidekick-next.utils.rotation_engine')
-LZ.getCC = lazy.init('sidekick-next.automation.cc')
-LZ.getBuff = lazy.init('sidekick-next.automation.buff')
 LZ.getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 LZ.getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
 LZ.getRezAccept = lazy.init('sidekick-next.utils.rez_accept')
@@ -154,11 +81,9 @@ LZ.getSessionStats = lazy.init('sidekick-next.utils.session_stats')
 LZ.getReadiness = lazy('sidekick-next.utils.readiness')
 LZ.getSpellLineup = lazy.init('sidekick-next.utils.spell_lineup')
 LZ.getClassConfigLoader = lazy.init('sidekick-next.utils.class_config_loader')
-LZ.getSpellsetManager = lazy.init('sidekick-next.utils.spellset_manager')
 LZ.getSpellSetEditor = lazy.init('sidekick-next.ui.spell_set_editor')
 
 LZ.getSpellSetMemorize = lazy('sidekick-next.utils.spellset_memorize')
-LZ.getCombatSpellExecutor = lazy('sidekick-next.utils.combat_spell_executor')
 LZ.getThrottledLog = lazy('sidekick-next.utils.throttled_log')
 LZ.getHealingMonitor = lazy('sidekick-next.healing.ui.monitor')
 LZ.getHealingSettingsTab = lazy('sidekick-next.ui.settings.tab_healing')
@@ -278,23 +203,14 @@ local function queueItemActivation(entry)
     local requestId = string.format('ui:%d:%d', mq.gettime(), _itemManualRequestCounter)
 
     enqueue(function()
-        local coordinated = _G.SIDEKICK_NEXT_CONFIG
-            and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
-        if coordinated then
-            local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_items', 'item:manual', {
-                requestId = requestId,
-                requestedAtMs = mq.gettime(),
-                itemName = itemName,
-                slotKey = slotKey,
-            })
-            if not sent then
-                print(string.format('\ar[SideKick Items]\ax Could not queue %s: item worker transport unavailable', itemName))
-            end
-        else
-            Items.useItem(itemName, {
-                throttleKey = slotKey ~= '' and slotKey or itemName,
-                minInterval = 0.25,
-            })
+        local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_items', 'item:manual', {
+            requestId = requestId,
+            requestedAtMs = mq.gettime(),
+            itemName = itemName,
+            slotKey = slotKey,
+        })
+        if not sent then
+            print(string.format('\ar[SideKick Items]\ax Could not queue %s: item worker transport unavailable', itemName))
         end
     end)
 end
@@ -1679,44 +1595,17 @@ local function tickAutomation()
     do local M = LZ.getRuntimeCache() if M then M.tick() end end
     PerfMonitor.finish('RuntimeCache')
 
-    local monolithicMode = _G.SIDEKICK_NEXT_CONFIG
-        and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false
-    if monolithicMode then
-        -- These modules own event handlers and cast state. In coordinated mode
-        -- their dedicated workers are the only instances allowed to initialize.
-        PerfMonitor.begin('CC')
-        local CC = LZ.getCC()
-        if CC then
-            CC.tick()
-            if allowAbilityAutomation then CC.mezTick(Core.Settings) end
-        end
-        PerfMonitor.finish('CC')
-
-        PerfMonitor.begin('Buff')
-        do local M = LZ.getBuff() if M then M.tick() end end
-        PerfMonitor.finish('Buff')
-
-        PerfMonitor.begin('SpellEngine')
-        do local M = LZ.getSpellEngine() if M then M.tick() end end
-        PerfMonitor.finish('SpellEngine')
-
-        PerfMonitor.begin('SpellsetMgr')
-        do local M = LZ.getSpellsetManager() if M then M.tick() end end
-        PerfMonitor.finish('SpellsetMgr')
-    else
-        -- Manual UI/test casts may explicitly load a UI-local SpellEngine.
-        -- Advance it if present, but do not instantiate it during normal
-        -- coordinated automation.
-        local loadedSpellEngine = package.loaded['sidekick-next.utils.spell_engine']
-        if loadedSpellEngine and loadedSpellEngine.tick then loadedSpellEngine.tick() end
-    end
+    -- Manual UI/test casts may explicitly load a UI-local SpellEngine.
+    -- Advance it if present, but do not instantiate it during normal
+    -- coordinated automation.
+    local loadedSpellEngine = package.loaded['sidekick-next.utils.spell_engine']
+    if loadedSpellEngine and loadedSpellEngine.tick then loadedSpellEngine.tick() end
 
     -- Process events for cast result detection
     mq.doevents()
 
-    -- Chase is local movement controlled by the UI host. It must run in both
-    -- coordinated and monolithic modes; worker scripts handle casts/claims but
-    -- do not own follower movement.
+    -- Chase is local movement controlled by the UI host. Worker scripts handle
+    -- casts and claims but do not own follower movement.
     PerfMonitor.begin('Chase')
     if allowMovementAutomation then
         Chase.tick()
@@ -1725,97 +1614,8 @@ local function tickAutomation()
     end
     PerfMonitor.finish('Chase')
 
-    -- In canonical coordinated mode this script is the UI/state host only.
-    -- Automatic combat/cast actions are executed exclusively by claimed worker
-    -- modules. Local follower movement remains above this return.
-    if not monolithicMode then
-        PerfMonitor.finishFrame()
-        return
-    end
-
-    local priorityHealingActive = false
-    if playStyle ~= 'manual' then
-        PerfMonitor.begin('Healing')
-        Healing = getHealingModule()  -- Get appropriate module for current class
-        if Healing and Healing.tick then
-            log.debug('[HealingTick] calling Healing.tick')
-            priorityHealingActive = Healing.tick(Core.Settings) == true
-            log.debug('[HealingTick] result=%s', tostring(priorityHealingActive))
-        else
-            log.debug('[HealingTick] no Healing.tick available')
-        end
-        PerfMonitor.finish('Healing')
-    end
-
-    -- Cure tick (after healing, before rotation engine)
-    PerfMonitor.begin('Cures')
-    local Cures = LZ.getCures()
-    if allowAbilityAutomation and not priorityHealingActive and Cures and Cures.tick then
-        Cures.tick(Core.Settings)
-    end
-    PerfMonitor.finish('Cures')
-
-    -- Run layered rotation engine (replaces flat Abilities.tryAllAbilities)
-    PerfMonitor.begin('Rotation')
-    local TL = LZ.getThrottledLog()
-    local RotationEngine = LZ.getRotationEngine()
-    if allowAbilityAutomation and Core.Settings.AutoAbilitiesEnabled ~= false and RotationEngine then
-        if debugAutomationLogging and TL then
-            TL.log('rotation_start', 15, 'RotationEngine.tick: abilities=%d, burnActive=%s, priorityHealing=%s',
-                #(State.abilities or {}), tostring(Burn.active), tostring(priorityHealingActive))
-        end
-        -- When tank mode is active, tank module owns the aggro layer
-        local skipLayers = nil
-        if (Core.Settings.CombatMode or 'off') == 'tank' then
-            skipLayers = { aggro = true }
-        end
-        RotationEngine.tick({
-            abilities = State.abilities,
-            settings = Core.Settings,
-            burnActive = Burn.active,
-            priorityHealingActive = priorityHealingActive,
-            skipLayers = skipLayers,
-        })
-
-        -- Process mash queue (ON_COOLDOWN abilities) after rotation
-        -- These are instant/off-GCD abilities that fire whenever ready
-        RotationEngine.processMashQueue({
-            abilities = State.abilities,
-            settings = Core.Settings,
-        })
-    else
-        if debugAutomationLogging and TL then
-            TL.log('rotation_skip', 15, 'RotationEngine SKIP: allowAbilityAutomation=%s, AutoAbilitiesEnabled=%s',
-                tostring(allowAbilityAutomation), tostring(Core.Settings.AutoAbilitiesEnabled))
-        end
-    end
-    PerfMonitor.finish('Rotation')
-
-    PerfMonitor.begin('Burn')
-    Burn.tick()
-    PerfMonitor.finish('Burn')
-
-    PerfMonitor.begin('Tank')
-    local CombatMode = Core.Settings.CombatMode or 'off'
-    if allowMovementAutomation and CombatMode == 'tank' then
-        Tank.tick(State.abilities, Core.Settings)
-    end
-    PerfMonitor.finish('Tank')
-
-    PerfMonitor.begin('Assist')
-    if allowMovementAutomation then
-        if not priorityHealingActive then
-            Assist.tick()
-        end
-    end
-    PerfMonitor.finish('Assist')
-
-    PerfMonitor.begin('Items')
-    if allowAbilityAutomation and Items and Items.tick and Core.Settings.AutoItemsEnabled ~= false then
-        Items.tick()
-    end
-    PerfMonitor.finish('Items')
-
+    -- This script is the UI/state host only. Automatic combat/cast actions
+    -- are executed exclusively by claimed worker modules.
     PerfMonitor.finishFrame()
 end
 
@@ -2057,10 +1857,8 @@ local function main()
         stick_cmd = Core.Settings.StickCommand,
     })
     Assist.init({ Core = Core, CombatAssist = CombatAssist })
-    Tank.init(Core.Settings)
-    -- Cures are owned and initialized by sk_cures in coordinated mode. The
-    -- feature-flagged monolithic path initializes them lazily inside its tick.
-    -- All other modules init on first access via lazy.init().
+    -- Cures are owned and initialized by sk_cures. All other modules init on
+    -- first access via lazy.init().
 
     local function queueMuleAssistImport(importArgs)
         local options = { preview = false, importSpellSet = true, activateSpellSet = true }
@@ -2235,14 +2033,7 @@ local function main()
                 if SE then SE.cast(spellName, targetId) end
             end
         elseif a1 == 'healmonitor' then
-            if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
-                do local M = LZ.getHealingMonitor() if M then M.toggle() end end
-            else
-                local mod = getHealingModule()
-                if mod and mod.toggleMonitor then
-                    mod.toggleMonitor()
-                end
-            end
+            do local M = LZ.getHealingMonitor() if M then M.toggle() end end
         elseif a1 == 'assistme' then
             -- Broadcast assist me to all peers in same zone
             enqueue(function()
@@ -2767,14 +2558,6 @@ local function main()
             imgui.PushFont(imgui.GetFont(), imgui.GetFontSize() * fontScale)
         end
 
-        -- Loading screen overlay during phased healing module init
-        if not _healLoadComplete and _healPhase > 0 then
-            local totalPhases = (_healMod and _healMod.TOTAL_INIT_PHASES or 5) + 2  -- +2 for warmup + require phases
-            Loader.draw(_healPhase, totalPhases, false)
-        elseif _healLoadComplete and _healPhase > 0 then
-            Loader.draw(_healPhase, _healPhase, true)
-        end
-
         if Core.Settings.SideKickBarEnabled ~= false then
             local Bar = LZ.getBar()
             if Bar then Bar.draw({
@@ -2849,13 +2632,8 @@ local function main()
         do local M = LZ.getSpellSetEditor() if M then M.render() end end
         PerfMonitor.draw()
 
-        -- Healing monitor: coordinated mode renders worker telemetry only;
-        -- monolithic mode renders the locally-owned Healing Intelligence UI.
-        if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
-            do local M = LZ.getHealingMonitor() if M and M.draw then M.draw() end end
-        elseif NewHealing and NewHealing.drawMonitor then
-            NewHealing.drawMonitor()
-        end
+        -- Healing monitor renders worker telemetry.
+        do local M = LZ.getHealingMonitor() if M and M.draw then M.draw() end end
 
         if State.shouldDraw then
             draw()
@@ -2869,8 +2647,6 @@ local function main()
             imgui.PopFont()
         end
     end)
-
-    _healingWarmupStart = os.clock()  -- Start warmup timer (defers heavy CLR healing load)
 
     -- Camp detection: any running Lua worker issuing commands (sit, stand,
     -- casts, sticks) aborts the camp countdown. Shut the whole SideKick fleet
@@ -2906,28 +2682,12 @@ local function main()
         do local M = LZ.getRezAccept() if M and M.tick then M.tick() end end
         tickAutomation()
 
-        -- Humanize: drive selector + fidget state machine.
-        if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false then
-            local ok, H = pcall(require, 'sidekick-next.humanize')
-            if ok and H and H.tick then H.tick() end
-            local okF, F = pcall(require, 'sidekick-next.humanize.fidget')
-            if okF and F and F.tick then F.tick() end
-        end
-
-        -- Process pending spell set memorization (must be in main loop, not ImGui).
-        -- This must run in both monolithic and coordinated modes; worker scripts
-        -- read the active spell set but the UI script owns safe /memspell driving.
+        -- Process pending spell set memorization (must be in main loop, not
+        -- ImGui). Worker scripts read the active spell set but the UI script
+        -- owns safe /memspell driving.
         local Memorize = LZ.getSpellSetMemorize()
         if Memorize and Memorize.processPending then
             Memorize.processPending()
-        end
-
-        if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE == false then
-            -- Process combat spells (must be in main loop for mq.delay)
-            local CombatSpellExecutor = LZ.getCombatSpellExecutor()
-            if CombatSpellExecutor and CombatSpellExecutor.process then
-                CombatSpellExecutor.process()
-            end
         end
 
         -- Check for zone change (immune database)
@@ -2998,11 +2758,6 @@ local function main()
                 local okVH, VH = pcall(require, 'sidekick-next.utils.vitals_hub')
                 if okVH and VH then VH.tick() end
             end
-
-            -- Healing module actors tick (for multi-healer coordination)
-            if Healing and Healing.tickActors then
-                Healing.tickActors()
-            end
         end
 
         -- Flush pending settings writes (debounced, max once/sec)
@@ -3011,11 +2766,6 @@ local function main()
         mq.doevents()
         mq.delay(1)
         end
-    end
-
-    -- Shutdown: healing module (new healing intelligence)
-    if NewHealing and NewHealing.shutdown then
-        NewHealing.shutdown()
     end
 
     -- Shutdown: save immune database

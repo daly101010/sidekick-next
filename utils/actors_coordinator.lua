@@ -535,16 +535,14 @@ function M.init(opts)
         end
 
         -- Tank coordination: repositioning / settled / taunt events.
-        -- A raw `require` here used to crash the whole actors mailbox handler
-        -- for the session if positioning.lua failed to load; wrap with pcall
-        -- to match the pattern used by other handlers in this file.
-        local function _callPositioning(method)
-            if _G.SIDEKICK_NEXT_CONFIG and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false then
-                return
-            end
-            local Positioning = package.loaded['sidekick-next.utils.positioning']
-            if not Positioning or not Positioning[method] then return end
-            Positioning[method]()
+        -- Peer soft-pause on tank movement is intentionally disabled in the
+        -- coordinated worker fleet — a wired-up variant lived only behind the
+        -- retired monolithic mode. Retained as a no-op so the tank:* handler
+        -- blocks below still consume their messages instead of falling through
+        -- to unrelated handlers; a follow-up plan can re-enable via a proper
+        -- worker if soft-pause is desired.
+        local function _callPositioning(_method)
+            return
         end
 
         -- Only accept tank:* from the currently designated tank (the most

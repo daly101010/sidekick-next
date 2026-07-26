@@ -96,9 +96,6 @@ M.Scripts = {
         'sidekick-next/sk_disciplines',
         'sidekick-next/sk_fidget',
     },
-    LEGACY_WORKERS = {
-        'sidekick-next/sk_healing_emergency',
-    },
 }
 
 -- Timing constants (milliseconds)

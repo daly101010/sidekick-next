@@ -57,26 +57,7 @@ function M.draw(settings, themeNames, onChange)
         end, { id = 'actor_team', defaultOpen = true })
     end
 
-    local coordinatedMode = not _G.SIDEKICK_NEXT_CONFIG
-        or _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
-    if actorsEnabled and not coordinatedMode then
-        Components.SettingGroup.draw('Actor Coordination', function()
-            -- Coordinate healing
-            local healCoord = settings.HealCoordinateActors ~= false
-            local healVal, healChanged = Components.CheckboxRow.draw('Coordinate Heals', 'HealCoordinateActors', healCoord, nil, {
-                tooltip = 'Share healing assignments with other characters',
-            })
-            if healChanged and onChange then onChange('HealCoordinateActors', healVal) end
-
-            -- Track HoTs via actors
-            local hotTrack = settings.HealTrackHoTsViaActors ~= false
-            local hotVal, hotChanged = Components.CheckboxRow.draw('Track HoTs via Actors', 'HealTrackHoTsViaActors', hotTrack, nil, {
-                tooltip = 'Share HoT tracking data between characters',
-            })
-            if hotChanged and onChange then onChange('HealTrackHoTsViaActors', hotVal) end
-
-        end, { id = 'actor_coord', defaultOpen = true })
-    elseif coordinatedMode then
+    if actorsEnabled then
         imgui.TextDisabled('Heal, cure, CC, and cast ownership is coordinator-managed.')
     end
 

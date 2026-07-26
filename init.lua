@@ -17,7 +17,6 @@ _G.SIDEKICK_NEXT_CONFIG = {
     VISUAL_REDESIGN = false,     -- Placeholder for C experiments
     DEBUG_SETTINGS = false,      -- Log ImGui setting interactions (dev)
     HUMANIZE_BEHAVIOR = true,   -- Behavioral humanization layer (humanize/). Off = byte-identical to baseline.
-    COORDINATED_MODE = true,    -- Workers own all automatic game actions.
     IS_UI_PROCESS = true,       -- Only the UI entry sets this; worker processes
                                 -- never do. Gates process-global registrations
                                 -- like slash-command binds (MQ binds are global

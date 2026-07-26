@@ -96,9 +96,6 @@ function M.start()
     for _, script in ipairs(lib.Scripts.WORKERS) do
         stopScript(script, 3000)
     end
-    for _, script in ipairs(lib.Scripts.LEGACY_WORKERS or {}) do
-        stopScript(script, 3000)
-    end
     stopScript(lib.Scripts.COORDINATOR, 3000)
 
     startScript(lib.Scripts.COORDINATOR, 3000)
@@ -176,9 +173,6 @@ function M.stop()
     send('supervisor_shutdown')
     mq.delay(50)
     for _, script in ipairs(lib.Scripts.WORKERS) do
-        stopScript(script, 3000)
-    end
-    for _, script in ipairs(lib.Scripts.LEGACY_WORKERS or {}) do
         stopScript(script, 3000)
     end
     stopScript(lib.Scripts.COORDINATOR, 3000)

@@ -263,7 +263,7 @@ function M.checkCategoryCondition(spellEntry, settings)
 
     -- Heal: someone below threshold (basic check - self for now)
     if category == 'heal' then
-        -- When tiered healing is enabled, healing is handled by automation.healing.
+        -- When healing is enabled, the sk_healing worker owns the heal slot.
         if settings.DoHeals == true then
             return false
         end

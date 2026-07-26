@@ -43,7 +43,6 @@ local Mods = {
     Assist          = lazy('sidekick-next.automation.assist'),
     Positioning     = lazy('sidekick-next.utils.positioning'),
     CombatAssist    = lazy('sidekick-next.utils.combatassist'),
-    RotationEngine  = lazy('sidekick-next.utils.rotation_engine'),
     SpellEngine     = lazy('sidekick-next.utils.spell_engine'),
     SpellEvents     = lazy('sidekick-next.utils.spell_events'),
     SpellRotation   = lazy('sidekick-next.utils.spell_rotation'),
@@ -624,31 +623,6 @@ end)
 -- ---------------------------------------------------------------------------
 -- Panels: ROTATION
 -- ---------------------------------------------------------------------------
-
-M.register('Rotation', 'Last Tick (per layer)', function()
-    local RE = Mods.RotationEngine()
-    if not RE or not RE.getLastTickStats then imgui.TextDisabled('No rotation engine'); return end
-    local s = RE.getLastTickStats()
-    safeText('Tick at', string.format('%.1fs ago', os.clock() - (s.tickAt or 0)))
-    safeBool('Spell rotation ran', s.spellRotationRan)
-    safeBool('  ↳ deferred (high pri)', s.spellRotationDeferred)
-    if s.skipReason then safeText('Skip reason', tostring(s.skipReason)) end
-    if not isEmpty(s.layers) then
-        if imgui.BeginTable('##sk_dash_layers', 4, 0) then
-            imgui.TableSetupColumn('Layer'); imgui.TableSetupColumn('Abilities')
-            imgui.TableSetupColumn('Executed'); imgui.TableSetupColumn('Spell attempts')
-            imgui.TableHeadersRow()
-            for name, st in pairs(s.layers) do
-                imgui.TableNextRow()
-                imgui.TableNextColumn(); imgui.Text(tostring(name))
-                imgui.TableNextColumn(); imgui.Text(tostring(st.abilities or 0))
-                imgui.TableNextColumn(); imgui.Text(tostring(st.executed or 0))
-                imgui.TableNextColumn(); imgui.Text(tostring(st.spellAttempts or 0))
-            end
-            imgui.EndTable()
-        end
-    end
-end)
 
 M.register('Rotation', 'Resist Log (current target)', function()
     local R = Mods.ResistLog()
