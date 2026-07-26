@@ -3,22 +3,16 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local Roles = require('sidekick-next.utils.class_roles')
 
 local M = {}
 
--- Class categorization
-M.PURE_CASTERS = {
-    ENC = true, WIZ = true, MAG = true,
-    NEC = true, CLR = true, DRU = true, SHM = true,
-}
-
-M.HYBRID_MELEE = {
-    PAL = true, SHD = true, RNG = true, BST = true, BRD = true,
-}
-
-M.PURE_MELEE = {
-    WAR = true, MNK = true, ROG = true, BER = true,
-}
+-- Class categorization (re-exported from utils/class_roles.lua so external
+-- callers can still read caster_assist.PURE_CASTERS, but the source of
+-- truth lives in one file).
+M.PURE_CASTERS = Roles.PURE_CASTERS
+M.HYBRID_MELEE = Roles.HYBRID_MELEE
+M.PURE_MELEE = Roles.PURE_MELEE
 
 -- State
 M.enabled = false

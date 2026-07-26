@@ -86,7 +86,7 @@ local DEFAULT_CLASSES = {
     WAR = true, PAL = true, SHD = true,
     BER = true, MNK = true, ROG = true,
 }
-local TANK_CLASSES = { WAR = true, PAL = true, SHD = true }
+local TANK_CLASSES = require('sidekick-next.utils.class_roles').TANK_CLASSES
 
 local function shouldRunForClass(cfg, classShort)
     -- Explicit class-config opt-out wins.

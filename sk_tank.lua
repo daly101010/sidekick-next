@@ -14,11 +14,12 @@ local Aggro = require('sidekick-next.utils.aggro')
 local Engine = require('sidekick-next.utils.discipline_engine')
 local Actors = require('sidekick-next.utils.actors_coordinator')
 local Counters = require('sidekick-next.utils.action_counters')
+local Roles = require('sidekick-next.utils.class_roles')
 
 local module = ModuleBase.create('tank', lib.Priority.DPS)
 module:enablePeerActors()
 
-local TANK_CLASSES = { WAR = true, PAL = true, SHD = true }
+local TANK_CLASSES = Roles.TANK_CLASSES
 local PRIMARY_BROADCAST_MS = 1000
 local TARGET_SETTLE_MS = 150
 local TAUNT_TIMEOUT_MS = 3500
@@ -177,7 +178,10 @@ local function choosePrimary()
     -- then higher level, then finish what's hurt; named get a bump. No bonus
     -- for mobs targeting the tank — a mob on the tank is the SAFE case, and
     -- mobs beating on squishies are the recovery-taunt branch's job.
-    local HEALER_CLASSES = { CLR = true, DRU = true, SHM = true }
+    -- Enemy NPC classification: PAL is intentionally excluded because
+    -- enemy paladins are hybrids, not pure healers — Roles.HEALER_CLASSES
+    -- (which does include PAL) is for own-team healing dispatch.
+    local ENEMY_PURE_HEALERS = { CLR = true, DRU = true, SHM = true }
     local best, bestScore = nil, -math.huge
     for _, row in ipairs(Cache.xtarget.haters or {}) do
         -- Cache.isMobMezzed consults the mezzer's broadcast mez list; the
@@ -197,7 +201,7 @@ local function choosePrimary()
             if spawn then
                 local score = (100 - (tonumber(row.hp) or 100))
                     + (tonumber(row.level) or 0) * 3
-                if HEALER_CLASSES[tostring(row.classShort or ''):upper()] then
+                if ENEMY_PURE_HEALERS[tostring(row.classShort or ''):upper()] then
                     score = score + 400
                 end
                 if safe(function() return spawn.Named() end, false) == true then score = score + 100 end

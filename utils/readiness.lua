@@ -26,14 +26,10 @@ local ANNOUNCE_COOLDOWN_MS = 8000
 
 local getCore = lazy('sidekick-next.utils.core')
 local getActors = lazy('sidekick-next.utils.actors_coordinator')
+local Roles = require('sidekick-next.utils.class_roles')
 
-local PURE_CASTERS = {
-    CLR = true, DRU = true, SHM = true, ENC = true,
-    WIZ = true, MAG = true, NEC = true,
-}
-local HYBRIDS = {
-    PAL = true, SHD = true, RNG = true, BST = true, BRD = true,
-}
+local PURE_CASTERS = Roles.PURE_CASTERS
+local HYBRIDS = Roles.HYBRID_MELEE
 
 local function getSettings()
     local Core = getCore()
