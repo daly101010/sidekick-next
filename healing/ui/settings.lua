@@ -28,7 +28,7 @@ function M.draw()
     if imgui.CollapsingHeader('Thresholds') then
         imgui.PushItemWidth(150)
 
-        local emergency = (Config.emergencyPct ~= nil) and Config.emergencyPct or 25
+        local emergency = Config.getEmergencyPct()
         emergency, changed = imgui.SliderInt('Emergency HP %', emergency, 10, 50)
         if changed then Config.emergencyPct = emergency end
 

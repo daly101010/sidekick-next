@@ -521,7 +521,7 @@ end
 function M.getPriority(target)
     if not target then return 99 end
 
-    local emergencyPct = (Config and Config.emergencyPct ~= nil) and Config.emergencyPct or 25
+    local emergencyPct = Config.getEmergencyPct()
 
     if target.pctHP < emergencyPct then return 1 end  -- Emergency
     if target.role == 'tank' then return 2 end

@@ -621,7 +621,7 @@ local function calculateSupplementGap(targetInfo, config)
     -- HoT isn't keeping up - check if we have enough safety buffer
     -- Calculate current HP and danger threshold
     local currentHp = targetInfo.currentHP or ((targetInfo.maxHP or 1) * ((targetInfo.pctHP or 100) / 100))
-    local dangerPct = config.emergencyPct or 25
+    local dangerPct = config.getEmergencyPct()
     local dangerHp = (targetInfo.maxHP or 1) * (dangerPct / 100)
     local hpAboveDanger = currentHp - dangerHp
 
@@ -697,7 +697,7 @@ local function shouldUseFastCatchup(targetInfo, efficientHeal, situation)
         or (maxHP * ((tonumber(targetInfo.pctHP) or 100) / 100))
     local projectedPctAtLand = ((currentHP - (dps * castSec)) / maxHP) * 100
     local netCatchup = expected - (dps * castSec)
-    local emergencyFloor = tonumber(Config and Config.emergencyPct) or 25
+    local emergencyFloor = Config.getEmergencyPct()
     local maxHPKnown = targetInfo.maxHPKnown == true
     local fallingBehind = targetInfo.burstDetected == true
         -- Absolute DPS is scaled by the fallback Max HP estimate. It cannot be
@@ -729,7 +729,7 @@ function M.SelectHeal(targetInfo, situation)
 
     local isSelf = targetInfo._isSelf or false
 
-    if targetInfo.pctHP < config.emergencyPct then
+    if targetInfo.pctHP < config.getEmergencyPct() then
         local heal = M.FindFastestHeal(deficit, isSelf, targetInfo)
         if heal then
             heal.details = joinDetails(heal.details, 'trigger=emergency')
@@ -1216,7 +1216,7 @@ function M.ShouldUseGroupHeal(targets, situation)
     local hasEmergency = false
     local hurtTargets = {}
     for _, t in ipairs(targets or {}) do
-        if (t.pctHP or 100) < (config.emergencyPct or 25) then
+        if (t.pctHP or 100) < config.getEmergencyPct() then
             hasEmergency = true
         end
         if t.deficit and t.deficit > 0 then
@@ -1465,7 +1465,7 @@ function M.findHealTarget()
     local injured = TargetMonitor.getInjuredTargets(100 - (config.minHealPct or 10))
     if #injured == 0 then return nil, nil end
     local target = injured[1]
-    local tier = (target.pctHP < (config.emergencyPct or 25)) and 'emergency' or 'normal'
+    local tier = (target.pctHP < config.getEmergencyPct()) and 'emergency' or 'normal'
     return target, tier
 end
 

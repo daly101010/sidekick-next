@@ -489,8 +489,10 @@ local function stageHealingConfig(config, result)
         for i = 2, #hotHeals - 1 do assign('hot', hotHeals[i].name) end
     end
 
-    local healsOn = toBool(readKey(config.raw, 'Heals', 'HealsOn'))
-    if healsOn ~= nil then HealingConfig.enabled = healsOn end
+    -- Heals.HealsOn -> DoHeals is already routed by mapBool() in buildPlan
+    -- (see the 'Heals' section above) and applied via Core.set. No second
+    -- write needed here; the healing config no longer carries a mirrored
+    -- `enabled` field.
     local thresholds = {}
     for _, entry in ipairs(config.entries.Heals or {}) do
         if entry.threshold then thresholds[#thresholds + 1] = entry.threshold end

@@ -21,8 +21,7 @@ end
 
 local function getEmergencyPct()
     local cfg = getHealingConfig()
-    if cfg and cfg.emergencyPct then return cfg.emergencyPct end
-    return 25
+    return cfg and cfg.getEmergencyPct and cfg.getEmergencyPct() or 25
 end
 
 local function anyGroupMemberCritical(emergencyPct)

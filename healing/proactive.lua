@@ -648,7 +648,7 @@ function M.shouldApplyHoT(target, hotSpellName)
     end
 
     -- No HoTs during emergency (cheap check first)
-    if target.pctHP < (Config.emergencyPct or 25) then
+    if target.pctHP < Config.getEmergencyPct() then
         return false, 'emergency'
     end
 

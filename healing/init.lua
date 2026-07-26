@@ -445,7 +445,7 @@ local function buildHealingContext()
     }
 
     for _, t in ipairs(allTargets) do
-        if (t.pctHP or 100) < (Config.emergencyPct or 25) then
+        if (t.pctHP or 100) < Config.getEmergencyPct() then
             situation.hasEmergency = true
         end
         if (t.deficit or 0) > 0 then
@@ -519,9 +519,9 @@ end
 local function buildHealAction(opts)
     opts = opts or {}
 
-    if Config.enabled == false then
-        return nil, 'disabled'
-    end
+    -- DoHeals gate lives in sk_healing.lua:onTick which already returns
+    -- early before ever calling buildHealAction. Re-checking here would be
+    -- redundant and would require this module to import Core just for that.
     if not isHealerClass() then
         return nil, 'not_healer'
     end
@@ -558,7 +558,7 @@ local function buildHealAction(opts)
     -- Emergency
     if not opts.excludeEmergency then
         for _, t in ipairs(ctx.allTargets) do
-            if (t.pctHP or 100) < (Config.emergencyPct or 25) then
+            if (t.pctHP or 100) < Config.getEmergencyPct() then
                 local heal, reason = HealSelector.SelectHeal(t, situation)
                 if heal then
                     local action = buildHealActionForTarget(t, heal, 'emergency', reason)
@@ -1091,13 +1091,6 @@ function M.tick(settings)
     end
     tickLog('10-OptionalDone')
 
-    -- Check if healing is enabled (Config.enabled is the single source of truth)
-    tickLog('11-CheckEnabled')
-    if Config.enabled == false then
-        _priorityActive = false
-        return false
-    end
-
     -- Check if we're a healer class
     tickLog('12-CheckHealerClass')
     if not isHealerClass() then
@@ -1175,7 +1168,7 @@ function M.tick(settings)
     }
 
     for _, t in ipairs(allTargets) do
-        if (t.pctHP or 100) < (Config.emergencyPct or 25) then
+        if (t.pctHP or 100) < Config.getEmergencyPct() then
             situation.hasEmergency = true
         end
         if (t.deficit or 0) > 0 then
@@ -1212,7 +1205,7 @@ function M.tick(settings)
     -- Priority 1: emergency
     tickLog('18-CheckEmergency')
     for _, t in ipairs(allTargets) do
-        if (t.pctHP or 100) < (Config.emergencyPct or 25) then
+        if (t.pctHP or 100) < Config.getEmergencyPct() then
             tickLog(string.format('19-EmergencyTarget: %s HP=%d', tostring(t.name), t.pctHP or 0))
             local heal, reason = HealSelector.SelectHeal(t, situation)
             tickLog(string.format('20-EmergencyHeal: spell=%s reason=%s', tostring(heal and heal.spell), tostring(reason)))

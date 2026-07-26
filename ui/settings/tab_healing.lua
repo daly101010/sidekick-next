@@ -196,9 +196,6 @@ local function initHealingTab()
 
     _healingMod = { Config = config }
 
-    -- Sync Config.enabled with DoHeals on init (DoHeals is the source of truth)
-    -- This will be done in draw() when settings are available
-
     local ok2, uiOrErr = pcall(require, 'sidekick-next.healing.ui.settings')
     if ok2 and uiOrErr then
         _healingSettingsUI = uiOrErr
@@ -236,19 +233,13 @@ function M.draw(settings, themeNames, onChange)
     -- Try to load healing module
     initHealingTab()
 
-    -- Healing Intelligence is the only healing system - sync DoHeals with Config.enabled
     local hiConfig = _healingMod and _healingMod.Config or nil
 
-    -- On first draw, sync Config.enabled to match DoHeals (DoHeals is source of truth)
+    -- One-time migration: rescue former Core toggles into the healing config.
+    -- Runs once per session per class.
     if not _settingsSynced and hiConfig then
         _settingsSynced = true
-        local doHealsValue = settings.DoHeals == true
         local changedConfig = false
-        if hiConfig.enabled ~= doHealsValue then
-            hiConfig.enabled = doHealsValue
-            changedConfig = true
-        end
-        -- One-time compatibility migration from the former Core toggles.
         if (settings.DoPetHeals == true or settings.HealPetsEnabled == true)
             and hiConfig.healPetsEnabled ~= true then
             hiConfig.healPetsEnabled = true
@@ -261,15 +252,12 @@ function M.draw(settings, themeNames, onChange)
         if changedConfig and hiConfig.save then hiConfig.save() end
     end
 
-    local hiEnabled = hiConfig and hiConfig.enabled == true
-
     -- ========== BASIC HEALING SETTINGS ==========
     Components.SettingGroup.section('Healing', themeName)
 
-    -- Main toggle - controls both DoHeals and Healing Intelligence
+    -- Main toggle — DoHeals is the sole authority.
     local doHeals = settings.DoHeals == true
 
-    -- Toggle badge for healing (clickable to toggle)
     local healVal, healChanged = Components.StatusBadge.toggle('Healing', doHeals, themeName, {
         enabledText = 'Active',
         disabledText = 'Off',
@@ -277,16 +265,10 @@ function M.draw(settings, themeNames, onChange)
     })
     if healChanged then
         if onChange then onChange('DoHeals', healVal) end
-        -- Sync with Healing Intelligence Config
-        if hiConfig then
-            hiConfig.enabled = healVal
-            if hiConfig.save then hiConfig.save() end
-        end
         doHeals = healVal
     end
 
-    -- Sync hiEnabled for conditional display below
-    hiEnabled = doHeals and hiConfig ~= nil
+    local hiEnabled = doHeals and hiConfig ~= nil
 
     if doHeals then
         Components.SettingGroup.draw('Healing Options', function()

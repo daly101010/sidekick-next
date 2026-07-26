@@ -9,8 +9,9 @@ local getLogger = lazy.once('sidekick-next.healing.logger')
 local M = {
     _version = "1.0",
 
-    -- Master enable toggle (single source of truth)
-    enabled = true,
+    -- Enable/disable lives on Core.Settings.DoHeals — read it directly at
+    -- tick time. This module used to carry a mirrored `enabled` field with
+    -- a sk_healing.syncSettings bridge; both are gone.
 
     -- Thresholds
     emergencyPct = 25,
@@ -959,6 +960,16 @@ end
 
 function M.GetConfigPath()
     return getConfigPath()
+end
+
+--- Emergency HP threshold, resolved with class overrides already applied by
+--- applyClassDefaults (PAL gets 30, everyone else 25). Never returns nil —
+--- callers can drop their old `or 25` fallbacks. This is intentionally
+--- parameterless: it returns the running healer's threshold, which is the
+--- correct choice for both "am I in an emergency" and "is this heal target
+--- below my emergency line" checks.
+function M.getEmergencyPct()
+    return M.emergencyPct or 25
 end
 
 -- Class-specific default overrides (applied before user config)

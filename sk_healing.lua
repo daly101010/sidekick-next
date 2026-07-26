@@ -64,12 +64,7 @@ end
 
 local function syncSettings()
     ensureCoreLoaded()
-    local settings = Core.Settings or {}
-    local doHeals = settings.DoHeals == true
-    if Healing.Config and Healing.Config.enabled ~= doHeals then
-        Healing.Config.enabled = doHeals
-    end
-    return settings
+    return Core.Settings or {}
 end
 
 local function ensureHealingInitialized(settings)
