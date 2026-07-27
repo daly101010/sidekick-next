@@ -18,6 +18,9 @@ local State = {
     last = nil,
     receivedAtMs = 0,
     rezTelemetry = nil,
+    inbox = {},
+    coordinatorBootId = nil,
+    lastTickId = 0,
 }
 local renderRezTelemetry
 
@@ -120,35 +123,37 @@ local priorityNames = {
     [lib.Priority.EMERGENCY] = 'Emergency',
     [lib.Priority.HEALING] = 'Healing',
     [lib.Priority.RESURRECTION] = 'Resurrection',
-    [lib.Priority.TANK_RECOVERY] = 'Tank Recovery',
+    [lib.Priority.TANK] = 'Tank',
+    [lib.Priority.CROWD_CONTROL] = 'Crowd Control',
     [lib.Priority.DEBUFF] = 'Debuff',
-    [lib.Priority.TANK_AGGRO] = 'Tank Aggro',
     [lib.Priority.PULL] = 'Pull',
     [lib.Priority.DPS] = 'DPS',
-    [lib.Priority.IDLE] = 'Idle',
     [lib.Priority.BUFF] = 'Buff',
     [lib.Priority.MEDITATION] = 'Meditation',
+    [lib.Priority.SCRIBING] = 'Scribing',
+    [lib.Priority.AMBIENT] = 'Ambient',
+    [lib.Priority.IDLE] = 'Idle',
 }
 
 local moduleOrder = {
-    healing_emergency = 10,
-    emergency = 20,
-    pull = 52,
-    healing = 30,
-    cures = 35,
-    resurrection = 40,
-    cc = 45,
-    disciplines = 50,
-    tank = 53,
-    assist = 55,
-    dps = 60,
-    items = 62,
-    resources = 65,
-    buffs = 70,
-    spell_memorize = 80,
-    fidget = 85,
-    meditation = 90,
-    next_meditation = 90,
+    emergency = 1,
+    healing = 2,
+    cures = 3,
+    resurrection = 4,
+    tank = 5,
+    cc = 6,
+    debuff = 7,
+    pull = 8,
+    assist = 9,
+    chase = 10,
+    resources = 11,
+    disciplines = 12,
+    items = 13,
+    dps = 14,
+    buffs = 15,
+    meditation = 16,
+    scribing = 17,
+    fidget = 18,
 }
 
 local function formatBool(v)
@@ -193,35 +198,78 @@ local function renderTable(tableId, rows)
     end
 end
 
-local function renderOwnerBlock(title, owner)
+local function renderLeaseBlock(title, lease)
     imgui.Text(title)
-    if not owner then
+    if not lease then
         imgui.SameLine()
         imgui.TextColored(0.6, 0.6, 0.6, 1, 'none')
         return
     end
 
+    local now = mq.gettime()
+    local renewedAt = tonumber(lease.renewedAtMs) or tonumber(lease.grantedAtMs) or now
+    local ttlMs = tonumber(lease.ttlMs) or 0
     local rows = {
-        { 'Module', tostring(owner.module or '?') },
-        { 'Priority', tostring(priorityNames[owner.priority] or owner.priority or '?') },
-        { 'Claim ID', tostring(owner.claimId or '?') },
-        { 'TTL (ms)', tostring(owner.ttlMs or '?') },
-        { 'Expects Cast Start', formatBool(owner.expectsCastStart) },
-        { 'Cast Started', formatBool(owner.castStartedAtMs ~= nil) },
+        { 'Holder', tostring(lease.holderModule or '?') },
+        { 'Tier', tostring(priorityNames[lease.tier] or lease.tier or '?') },
+        { 'Status', tostring(lease.status or '?') },
+        { 'Request ID', tostring(lease.requestId or '?') },
+        { 'Worker Session', tostring(lease.workerSessionId or '?') },
+        { 'Lease Age (ms)', tostring(math.max(0, now - (tonumber(lease.grantedAtMs) or now))) },
+        { 'Renew Age / TTL', string.format('%d / %d',
+            math.max(0, now - renewedAt), ttlMs) },
+        { 'Revocation Reason', tostring(lease.revokeReason or '-') },
     }
     renderTable('##' .. title .. '_owner', rows)
+end
 
-    local action = owner.action
-    if action and type(action) == 'table' then
-        if imgui.TreeNode(title .. '_action', 'Action') then
-            local arows = {
-                { 'Kind', tostring(action.kind or '?') },
-                { 'Name', tostring(action.name or action.spellName or '?') },
-                { 'Target ID', tostring(action.targetId or '?') },
-                { 'Reason', tostring(action.reason or '') },
-            }
-            renderTable('##' .. title .. '_action_table', arows)
-            imgui.TreePop()
+local function copyStateValue(value, depth)
+    depth = depth or 0
+    local valueType = type(value)
+    if valueType == 'nil' or valueType == 'boolean'
+        or valueType == 'number' or valueType == 'string' then
+        return value
+    end
+    if valueType ~= 'table' or depth >= 7 then return nil end
+    local copied = {}
+    for key, item in pairs(value) do
+        local copiedKey = copyStateValue(key, depth + 1)
+        local copiedValue = copyStateValue(item, depth + 1)
+        if copiedKey ~= nil and copiedValue ~= nil then copied[copiedKey] = copiedValue end
+    end
+    return copied
+end
+
+local function drainStateInbox()
+    if #State.inbox == 0 then return end
+    local inbox = State.inbox
+    State.inbox = {}
+    local myName = tostring(lib.getMyName() or '')
+    local myServer = tostring(lib.getMyServer() or '')
+    for _, entry in ipairs(inbox) do
+        local content = entry.content
+        local sender = entry.sender or {}
+        local logicalMailbox = tostring(sender.mailbox or ''):lower():match('([^:]+)$')
+        local transportValid = tostring(sender.character or '') == myName
+            and tostring(sender.server or '') == myServer
+            and tostring(sender.script or '') == tostring(lib.Scripts.COORDINATOR or '')
+            and logicalMailbox == 'coordinator'
+        local bootId = tostring(content and content.coordinatorBootId or '')
+        local tickId = tonumber(content and content.tickId) or 0
+        if transportValid and bootId ~= ''
+            and bootId ~= tostring(State.coordinatorBootId or '') then
+            State.coordinatorBootId = bootId
+            State.lastTickId = 0
+        end
+        if tostring(content.ownerName or '') == myName
+            and tostring(content.ownerServer or '') == myServer
+            and transportValid
+            and tonumber(content.version) == tonumber(lib.LEASE_PROTOCOL_VERSION)
+            and tickId > State.lastTickId
+            and content.epoch then
+            State.last = content
+            State.lastTickId = tickId
+            State.receivedAtMs = mq.gettime()
         end
     end
 end
@@ -282,11 +330,11 @@ local function renderModuleDiagnostics(moduleDiag)
     if imgui.BeginTable('##module_diag', 7, flags) then
         imgui.TableSetupColumn('Module', ImGuiTableColumnFlags.WidthFixed, 130)
         imgui.TableSetupColumn('HB', ImGuiTableColumnFlags.WidthFixed, 55)
-        imgui.TableSetupColumn('Needs', ImGuiTableColumnFlags.WidthFixed, 50)
-        imgui.TableSetupColumn('Priority', ImGuiTableColumnFlags.WidthFixed, 70)
-        imgui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthFixed, 150)
-        imgui.TableSetupColumn('Age', ImGuiTableColumnFlags.WidthFixed, 60)
-        imgui.TableSetupColumn('Reason', ImGuiTableColumnFlags.WidthStretch)
+        imgui.TableSetupColumn('Queued', ImGuiTableColumnFlags.WidthFixed, 55)
+        imgui.TableSetupColumn('Tier', ImGuiTableColumnFlags.WidthFixed, 95)
+        imgui.TableSetupColumn('Order', ImGuiTableColumnFlags.WidthFixed, 45)
+        imgui.TableSetupColumn('Request Age', ImGuiTableColumnFlags.WidthFixed, 90)
+        imgui.TableSetupColumn('Worker Session', ImGuiTableColumnFlags.WidthStretch)
         imgui.TableHeadersRow()
 
         for _, entry in ipairs(sorted) do
@@ -298,12 +346,12 @@ local function renderModuleDiagnostics(moduleDiag)
 
             -- Module name
             imgui.TableNextColumn()
-            if diag.needValid then
-                imgui.TextColored(0.3, 1.0, 0.3, 1, name)  -- Green = active need
+            if diag.requestId then
+                imgui.TextColored(0.3, 1.0, 0.3, 1, name)
             elseif diag.ready then
-                imgui.Text(name)  -- White = alive, no need
+                imgui.Text(name)
             else
-                imgui.TextColored(0.6, 0.6, 0.6, 1, name)  -- Gray = not ready
+                imgui.TextColored(0.6, 0.6, 0.6, 1, name)
             end
 
             -- Heartbeat age
@@ -319,51 +367,27 @@ local function renderModuleDiagnostics(moduleDiag)
                 imgui.TextColored(1.0, 0.3, 0.3, 1, string.format('%.1fs', hbAge / 1000))
             end
 
-            -- Needs action
+            -- Pending lease request
             imgui.TableNextColumn()
-            if diag.needValid then
+            if diag.requestId then
                 imgui.TextColored(0.3, 1.0, 0.3, 1, 'YES')
-            elseif diag.needsAction then
-                imgui.TextColored(1.0, 0.5, 0.3, 1, 'exp')  -- Sent need but expired
             else
                 imgui.TextColored(0.6, 0.6, 0.6, 1, 'no')
             end
 
-            -- Need priority
+            -- Fixed registered tier
             imgui.TableNextColumn()
-            if diag.needPriority then
-                local pName = priorityNames[diag.needPriority] or tostring(diag.needPriority)
-                imgui.Text(pName)
-            else
-                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
-            end
+            imgui.Text(tostring(priorityNames[diag.tier] or diag.tier or '-'))
 
-            -- Unified executor lifecycle (active action or most recent result)
+            -- Stable deterministic tiebreak order
             imgui.TableNextColumn()
-            local action = diag.action
-            if action and action.phase then
-                local label = string.format('%s: %s', tostring(action.phase), tostring(action.name or '?'))
-                if action.active then
-                    imgui.TextColored(0.3, 1.0, 0.3, 1, label)
-                elseif action.phase == 'failed' or action.phase == 'cancelled' then
-                    imgui.TextColored(1.0, 0.5, 0.3, 1, label)
-                else
-                    imgui.TextDisabled(label)
-                end
-                if imgui.IsItemHovered() then
-                    local tooltip = string.format('reason=%s elapsed=%dms',
-                        tostring(action.reason or '-'), tonumber(action.elapsedMs) or 0)
-                    imgui.SetTooltip(tooltip:gsub('%%', '%%%%'))
-                end
-            else
-                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
-            end
+            imgui.Text(tostring(diag.order or '-'))
 
-            -- Need age
+            -- Request age / TTL
             imgui.TableNextColumn()
-            if diag.needsAction or diag.needValid then
-                local age = diag.needAge or 0
-                local ttl = diag.needTtl or 250
+            if diag.requestId then
+                local age = tonumber(diag.requestAge) or 0
+                local ttl = tonumber(diag.requestTtl) or 0
                 local pct = ttl > 0 and (age / ttl) or 0
                 if pct < 0.5 then
                     imgui.Text(string.format('%d/%d', age, ttl))
@@ -376,23 +400,12 @@ local function renderModuleDiagnostics(moduleDiag)
                 imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
             end
 
-            -- Reason (diagnostic - why module does/doesn't need action)
+            -- Worker process identity. Actions intentionally never cross this
+            -- boundary, so the coordinator UI cannot display spell/target.
             imgui.TableNextColumn()
-            local reason = diag.reason
-            if reason and reason ~= '' then
-                -- Color code common reasons
-                if reason == 'no_action' or reason == 'no_emergency' or reason == 'no_emergency_action' then
-                    imgui.TextColored(0.6, 0.6, 0.6, 1, reason)
-                elseif reason == 'heals_disabled' or reason == 'spells_disabled'
-                    or reason == 'not_healer' or reason == 'not_clr' then
-                    imgui.TextColored(1.0, 0.3, 0.3, 1, reason)  -- Red = config/class problem
-                elseif reason == 'init_failed' or reason == 'no_settings' then
-                    imgui.TextColored(1.0, 0.5, 0.3, 1, reason)  -- Orange = init problem
-                elseif reason == 'owns_cast' or reason == 'action found' then
-                    imgui.TextColored(0.3, 1.0, 0.3, 1, reason)  -- Green = working
-                else
-                    imgui.Text(reason)
-                end
+            local session = tostring(diag.workerSessionId or '')
+            if session ~= '' then
+                imgui.Text(session)
             else
                 imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
             end
@@ -439,11 +452,11 @@ local function renderTeamDiagnostics(team)
         imgui.TableSetupColumn('Zone', ImGuiTableColumnFlags.WidthFixed, 90)
         imgui.TableSetupColumn('State', ImGuiTableColumnFlags.WidthFixed, 75)
         imgui.TableSetupColumn('Priority', ImGuiTableColumnFlags.WidthFixed, 75)
-        imgui.TableSetupColumn('Action', ImGuiTableColumnFlags.WidthStretch)
+        imgui.TableSetupColumn('Lease', ImGuiTableColumnFlags.WidthStretch)
         imgui.TableSetupColumn('Age', ImGuiTableColumnFlags.WidthFixed, 55)
         imgui.TableHeadersRow()
         for _, member in ipairs(members) do
-            local action = member.action or {}
+            local lease = member.lease or {}
             local state = member.dead and 'dead'
                 or member.incapacitated and 'blocked'
                 or member.automationPaused and 'paused'
@@ -465,8 +478,10 @@ local function renderTeamDiagnostics(team)
             imgui.TableNextColumn()
             imgui.Text(tostring(priorityNames[member.activePriority] or member.activePriority or '-'))
             imgui.TableNextColumn()
-            if action.name and action.name ~= '' then
-                imgui.Text(string.format('%s: %s', tostring(action.phase or 'claimed'), tostring(action.name)))
+            if lease.holderModule and lease.holderModule ~= '' then
+                imgui.Text(string.format('%s: %s',
+                    tostring(lease.status or 'active'),
+                    tostring(lease.holderModule)))
             else
                 imgui.TextDisabled('-')
             end
@@ -518,27 +533,17 @@ local function getHealingDecision()
         return _healDiagCache
     end
 
-    -- The claimed action is the authoritative decision made by the worker.
-    -- Before a claim is granted, the need reason still explains its state.
-    local owner = state and state.castOwner or nil
-    local action = owner and owner.module == 'healing' and owner.action or nil
-    local reason = tostring(worker.reason or (worker.needValid and 'awaiting claim' or 'no action needed'))
-    if action and action.tier == 'emergency' then
-        _healDiagCache.result = nil
-        _healDiagCache.reason = reason
-        _healDiagCache.emergencyResult = action
-        _healDiagCache.emergencyReason = 'action claimed'
-    elseif action then
-        _healDiagCache.result = action
-        _healDiagCache.reason = 'action claimed'
-        _healDiagCache.emergencyResult = nil
-        _healDiagCache.emergencyReason = reason
-    else
-        _healDiagCache.result = nil
-        _healDiagCache.reason = reason
-        _healDiagCache.emergencyResult = nil
-        _healDiagCache.emergencyReason = reason
-    end
+    -- Worker action details are deliberately local and never sent through the
+    -- action-blind coordinator. This view reports queue/lease state only.
+    local lease = state and state.lease or nil
+    local reason = worker.requestId and 'lease requested'
+        or (lease and lease.holderModule == 'healing' and 'lease active')
+        or 'no healing lease request'
+    _healDiagCache.result = nil
+    _healDiagCache.reason = reason
+    _healDiagCache.emergencyResult = nil
+    _healDiagCache.emergencyReason =
+        'Emergency action detail is local to sk_emergency'
 
     return _healDiagCache
 end
@@ -704,12 +709,6 @@ local function renderHealAvailability()
     end
 end
 
---- Latest coordinator state snapshot received by the UI process. Shared with
---- other diagnostic tabs (Activity) so they don't need their own receive path.
-function M.getLastState()
-    return State.last
-end
-
 function M.init()
     if M._initialized then return end
     M._initialized = true
@@ -730,12 +729,20 @@ function M.init()
     M._stateDropbox = actors.register(lib.Mailbox.STATE, function(message)
         local content = message()
         if type(content) ~= 'table' then return end
-        if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
-        if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
-        if content.tickId and content.epoch then
-            State.last = content
-            State.receivedAtMs = mq.gettime()
-        end
+        local copied = copyStateValue(content)
+        if not copied then return end
+        local sender = message.sender or {}
+        local entry = {
+            content = copied,
+            sender = {
+                character = tostring(sender.character or ''),
+                server = tostring(sender.server or ''),
+                script = tostring(sender.script or ''),
+                mailbox = tostring(sender.mailbox or ''),
+            },
+        }
+        if #State.inbox >= 4 then table.remove(State.inbox, 1) end
+        State.inbox[#State.inbox + 1] = entry
     end)
 end
 
@@ -744,6 +751,7 @@ end
 function M.drawContent()
     -- Ensure Actor listener is registered
     M.init()
+    drainStateInbox()
 
     if not State.last then
         imgui.TextColored(0.7, 0.7, 0.7, 1, 'Waiting for coordinator state...')
@@ -758,7 +766,12 @@ function M.drawContent()
 
     local rows = {
         { 'Active Priority', tostring(priorityNames[State.last.activePriority] or State.last.activePriority or '?') },
-        { 'Cast Busy', formatBool(State.last.castBusy) },
+        { 'Lifecycle', tostring(State.last.lifecycle or '?') },
+        { 'Lease Requests', tostring(State.last.requestCount or 0) },
+        { 'Recovery Requests', tostring(State.last.recoveryRequestCount or 0) },
+        { 'Preemption Enabled', formatBool(State.last.leasePreemptionEnabled) },
+        { 'Scheduler Available', formatBool(State.last.schedulerAvailable) },
+        { 'Cast Busy', formatBool(State.last.worldState and State.last.worldState.castBusy) },
         { 'Automation Paused', formatBool(State.last.automationPaused) },
         { 'Settings Revision', tostring(State.last.settingsRevision or 0) },
         { 'Epoch', tostring(State.last.epoch or '?') },
@@ -772,9 +785,7 @@ function M.drawContent()
     imgui.Spacing()
     imgui.Separator()
 
-    renderOwnerBlock('Cast Owner', State.last.castOwner)
-    imgui.Spacing()
-    renderOwnerBlock('Target Owner', State.last.targetOwner)
+    renderLeaseBlock('Current Lease', State.last.lease)
 
     imgui.Spacing()
     imgui.Separator()
@@ -878,8 +889,11 @@ function M.setRezTelemetry(telemetry)
     end
 end
 
+--- Latest coordinator snapshot for any UI consumer. Draining here keeps
+--- dashboards current even when the coordinator debug panel is never drawn.
 function M.getLastState()
     M.init()
+    drainStateInbox()
     return State.last, State.receivedAtMs
 end
 

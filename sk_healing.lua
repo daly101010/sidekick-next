@@ -343,21 +343,17 @@ local function targetCastable(spellName, id)
 end
 
 local function interruptAndConfirm(self, castInfo, reason)
-    self:requestInterrupt(reason)
+    if not self:ownsLease() then return false end
+    Healing.cancelHealCast(castInfo, reason)
     local deadline = lib.getTimeMs() + 750
-    local function coordinatorStillOwnsCast()
-        local owner = self.state and self.state.castOwner
-        return owner and owner.module == self.name
-    end
-    while lib.getTimeMs() < deadline
-        and (lib.isCasting() or coordinatorStillOwnsCast()) do
+    while lib.getTimeMs() < deadline and lib.isCasting() do
+        self:renewLease()
         mq.delay(25)
     end
-    if lib.isCasting() or coordinatorStillOwnsCast() then
+    if lib.isCasting() then
         lib.log('warn', self.name, 'Interrupt was not confirmed: %s', tostring(reason))
         return false
     end
-    Healing.cancelHealCast(castInfo, reason)
     return true
 end
 
@@ -375,55 +371,40 @@ module.onTick = function(self)
     local settings = syncSettings()
     if not settings then
         clearPendingAction()
-        self:sendNeed(false, nil, 'no_settings')
+        self:setIntent(false, nil, 'no_settings')
         return
     end
 
     if settings.UseSpells == false then
         clearPendingAction()
-        self:sendNeed(false, nil, 'spells_disabled')
+        self:setIntent(false, nil, 'spells_disabled')
         return
     end
 
     if settings.DoHeals ~= true then
         clearPendingAction()
-        self:sendNeed(false, nil, 'heals_disabled')
+        self:setIntent(false, nil, 'heals_disabled')
         return
     end
 
     if not isHealerClass() then
         clearPendingAction()
-        self:sendNeed(false, nil, 'not_healer')
+        self:setIntent(false, nil, 'not_healer')
         return
     end
 
     if not ensureHealingInitialized(settings) then
         clearPendingAction()
-        self:sendNeed(false, nil, 'init_failed')
+        self:setIntent(false, nil, 'init_failed')
         return
     end
 
     Healing.tickSensors()
     maybeSendAnalyticsTelemetry(self.peerActors)
 
-    if self:ownsCast() then
-        if not self:ownsAction() then
-            clearPendingAction()
-            self:releaseClaim('partial_ownership')
-            self:sendNeed(false, nil, 'partial_ownership')
-            return
-        end
+    if self:ownsLease() then
         clearPendingAction()
-        local ttlMs = 1000
-        local ownerAction = self.state and self.state.castOwner and self.state.castOwner.action
-        self.priority = actionPriority(ownerAction)
-        if ownerAction then
-            local castInfo = Healing.prepareHealCast(ownerAction)
-            if castInfo and castInfo.castTimeMs then
-                ttlMs = castInfo.castTimeMs + 1500
-            end
-        end
-        self:sendNeed(true, ttlMs, 'owns_cast')
+        self:setIntent(true, 5000, 'owns_lease')
         return
     end
 
@@ -433,38 +414,36 @@ module.onTick = function(self)
     })
 
     local needs = action ~= nil
-    local needTtlMs = nil
+    local intentTtlMs = nil
     if needs then
         if lib.getTimeMs() < (_manaBackoffUntilMs or 0) then
             clearPendingAction()
             _pendingReason = _manaBackoffReason or 'mana_backoff'
-            self:sendNeed(false, nil, _pendingReason)
+            self:setIntent(false, nil, _pendingReason)
             return
         end
         local manaOk, manaReason = manaReadyForSpell(action.spellName or action.name)
         if not manaOk then
             clearPendingAction()
             _pendingReason = manaReason
-            self:sendNeed(false, nil, manaReason)
+            self:setIntent(false, nil, manaReason)
             return
         end
         local castInfo = Healing.prepareHealCast(action)
         if castInfo and castInfo.castTimeMs then
-            needTtlMs = castInfo.castTimeMs + 1500
+            intentTtlMs = castInfo.castTimeMs + 1500
         else
-            needTtlMs = 1000
+            intentTtlMs = 1000
         end
-        self.priority = actionPriority(action)
-        local ready, intentReason = distributedIntentReady(action, needTtlMs)
+        local ready, intentReason = distributedIntentReady(action, intentTtlMs)
         if not ready then
             clearPendingAction()
             _pendingReason = intentReason
-            self:sendNeed(false, nil, intentReason)
+            self:setIntent(false, nil, intentReason)
             return
         end
     else
         _intent = nil
-        self.priority = lib.Priority.HEALING
     end
     local nextPendingKey = action and intentKey(action) or nil
     if nextPendingKey ~= _pendingKey then
@@ -473,15 +452,7 @@ module.onTick = function(self)
     end
     _pendingAction = action
     _pendingReason = reason
-    self:sendNeed(needs, needTtlMs, reason or 'no_action')
-
-    if needs and self.state and self.state.castBusy and not self:ownsCast() then
-        local owner = self.state.castOwner
-        local ownerPriority = owner and owner.priority or lib.Priority.IDLE
-        if ownerPriority > self.priority then
-            self:requestInterrupt('heal_preempt')
-        end
-    end
+    self:setIntent(needs, intentTtlMs, reason or 'no_action')
 end
 
 module.shouldAct = function(self)
@@ -499,7 +470,7 @@ module.getAction = function(self)
     if not spellName or targetIdVal <= 0 then
         _pendingReason = not spellName and 'invalid_action_spell' or 'invalid_action_target_id'
         clearPendingAction()
-        self:sendNeed(false, nil, _pendingReason)
+        self:setIntent(false, nil, _pendingReason)
         return nil
     end
 
@@ -534,10 +505,10 @@ module.getDiagnosticAction = function(self)
     local action = _pendingAction
     if not action then return nil end
     local phase = 'waiting_priority'
-    if self.claimPending then
-        phase = 'claim_pending'
-    elseif self:isMyPriority() then
-        phase = 'awaiting_claim'
+    if self.requestPending then
+        phase = 'lease_pending'
+    elseif self:canRequestLease() then
+        phase = 'awaiting_lease'
     end
     return {
         active = false,
@@ -551,11 +522,11 @@ module.getDiagnosticAction = function(self)
 end
 
 module.executeAction = function(self)
-    if not self:ownsAction() then
+    if not self:ownsLease() then
         return false, 'no_ownership'
     end
 
-    local action = self.state and self.state.castOwner and self.state.castOwner.action
+    local action = self:getLeaseAction()
     if not action then
         return false, 'no_action'
     end
@@ -663,7 +634,8 @@ module.executeAction = function(self)
             end
         end
 
-        if not self:ownsAction() then
+        self:renewLease()
+        if not self:ownsLease() then
             lib.log('warn', self.name, 'Lost ownership during cast')
             if not lib.isCasting() then break end
         end
@@ -738,7 +710,7 @@ module:enableUnifiedExecutor({
             })
             if emergencyAction and action._interruptRequested ~= true then
                 action._interruptRequested = true
-                self:requestInterrupt('preempted_for_emergency')
+                Healing.cancelHealCast(castInfo, 'preempted_for_emergency')
                 return true, 'preempted_for_emergency', 'interrupting'
             end
         end
@@ -747,7 +719,7 @@ module:enableUnifiedExecutor({
         if ducked and action._interruptRequested ~= true then
             local reason = 'duck_' .. tostring(duckReason or 'heal')
             action._interruptRequested = true
-            self:requestInterrupt(reason)
+            Healing.cancelHealCast(castInfo, reason)
             return true, reason, 'interrupting'
         end
         return true
@@ -786,18 +758,16 @@ mq.bind('/sk_healing', function(cmd)
     elseif cmd == 'status' then
         local settings = Core.Settings or {}
         local action = _pendingAction
-        commandEcho('running=%s hasState=%s statePrio=%s priority=%s claimPending=%s claimId=%s claimSend=%s claimSendError=%s claimAge=%dms ownsAction=%s ownsCast=%s useSpells=%s doHeals=%s pending=%s target=%s targetId=%s tier=%s pendingMs=%d reason=%s manaBackoffMs=%d',
+        commandEcho('running=%s hasState=%s tier=%s leasePending=%s requestId=%s requestSend=%s requestSendError=%s requestAge=%dms ownsLease=%s useSpells=%s doHeals=%s pending=%s target=%s targetId=%s actionTier=%s pendingMs=%d reason=%s manaBackoffMs=%d',
             tostring(module.running),
             tostring(module:hasValidState()),
-            tostring(module.state and module.state.activePriority),
-            tostring(module:isMyPriority()),
-            tostring(module.claimPending),
-            tostring(module.currentClaimId or 'none'),
-            tostring(module.lastClaimSendOk),
-            tostring(module.lastClaimSendError or '-'),
-            module.lastClaimSendAt > 0 and math.max(0, lib.getTimeMs() - module.lastClaimSendAt) or 0,
-            tostring(module:ownsAction()),
-            tostring(module:ownsCast()),
+            tostring(module.priority),
+            tostring(module.requestPending),
+            tostring(module.currentRequestId or 'none'),
+            tostring(module.lastRequestSendOk),
+            tostring(module.lastRequestSendError or '-'),
+            module.requestLastSentAt > 0 and math.max(0, lib.getTimeMs() - module.requestLastSentAt) or 0,
+            tostring(module:ownsLease()),
             tostring(settings.UseSpells ~= false),
             tostring(settings.DoHeals == true),
             tostring(action and action.spellName or 'none'),

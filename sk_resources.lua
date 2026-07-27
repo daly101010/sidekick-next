@@ -297,7 +297,7 @@ end
 module.onTick = function(self)
     local action, reason = getResourceNeed()
     _lastReason = action and 'ready:' .. tostring(action.spellName) or tostring(reason or 'none')
-    self:sendNeed(action ~= nil, action and 1000 or nil, _lastReason)
+    self:setIntent(action ~= nil, nil, _lastReason)
 end
 
 module.shouldAct = function(self)
@@ -313,7 +313,6 @@ module.getAction = function(self)
     local myId = lib.safeNum(function() return mq.TLO.Me.ID() end, 0)
     return {
         kind = lib.ActionKind.CAST_SPELL,
-        type = lib.ClaimType.CAST,
         name = action.spellName,
         spellName = action.spellName,
         castTargetId = 0,
@@ -330,11 +329,11 @@ module.getAction = function(self)
 end
 
 module.executeAction = function(self)
-    if not self:ownsCast() then
-        return false, 'no_cast_ownership'
+    if not self:ownsLease() then
+        return false, 'no_lease'
     end
 
-    local action = self.state and self.state.castOwner and self.state.castOwner.action
+    local action = self:getLeaseAction()
     if not action then return false, 'no_action' end
 
     local settings = getSettings()
@@ -365,7 +364,8 @@ module.executeAction = function(self)
     local maxWaitMs = 5000
     while lib.isCasting() do
         mq.delay(50)
-        if not self:ownsCast() then return true, 'ownership_lost' end
+        if not self:ownsLease() then return true, 'lease_lost' end
+        self:renewLease()
         if (lib.getTimeMs() - startMs) > maxWaitMs then return true, 'cast_timeout' end
     end
 
@@ -409,11 +409,12 @@ mq.bind('/sk_resources', function(cmd)
         local spell, reason, slot = findReadyResourceSpell()
         local setStatus = getSpellSetStatus()
         local status = string.format(
-            'running=%s hasState=%s priority=%s ownsCast=%s lastReason=%s enabled=%s activeSet=%s gems=%s utility=%s/%s/%s utilitySpell=%s slot=%s reason=%s path=%s loadError=%s pathError=%s',
+            'running=%s hasState=%s tier=%s ownsLease=%s leasePending=%s lastReason=%s enabled=%s activeSet=%s gems=%s utility=%s/%s/%s utilitySpell=%s slot=%s reason=%s path=%s loadError=%s pathError=%s',
             tostring(module.running),
             tostring(module:hasValidState()),
-            tostring(module:isMyPriority()),
-            tostring(module:ownsCast()),
+            tostring(module.priority),
+            tostring(module:ownsLease()),
+            tostring(module.currentRequestId ~= nil and not module:ownsLease()),
             tostring(_lastReason),
             tostring(settings.enabled),
             tostring(setStatus.activeSet),

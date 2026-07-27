@@ -37,7 +37,7 @@ function M.draw(settings, themeNames, onChange)
         Components.SettingGroup.draw('Actor Team', function()
             local teamEnabled = settings.ActorsTeamEnabled ~= false
             local teamVal, teamChanged = Components.CheckboxRow.draw('Enable Team Presence', 'ActorsTeamEnabled', teamEnabled, nil, {
-                tooltip = 'Publish coordinator presence, role, action, and module readiness to this trusted character team. OOG rez uses this team, not every generic Actor peer.',
+                tooltip = 'Publish coordinator presence, role, lease state, and module readiness to this trusted character team. OOG rez uses this team, not every generic Actor peer.',
             })
             if teamChanged and onChange then onChange('ActorsTeamEnabled', teamVal) end
 

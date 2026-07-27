@@ -11,6 +11,7 @@ local ModuleBase = require('sidekick-next.sk_module_base')
 local lazy = require('sidekick-next.utils.lazy_require')
 local RezData = require('sidekick-next.utils.rez_data')
 local Logger = require('sidekick-next.utils.logger')
+local ActionExecutor = require('sidekick-next.utils.action_executor')
 
 local getCore = lazy('sidekick-next.utils.core')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
@@ -32,7 +33,9 @@ local STAND_TIMEOUT_MS = 2000
 local NAV_TIMEOUT_MS = 15000
 local CAST_START_TIMEOUT_MS = 2500
 local CAST_TIMEOUT_MARGIN_MS = 3000
-local CLAIM_TTL_MS = 45000
+local WORKFLOW_TIMEOUT_MS = 90000
+local CONSENT_TTL_MS = 5000
+local MAX_CONSENT_INBOX = 16
 
 local Runtime = {
     lastAttempt = {},
@@ -55,6 +58,8 @@ local Runtime = {
     stopAfterCleanup = false,
     lastDebug = {},
     actorScan = nil,
+    consentInbox = {},
+    pendingConsent = nil,
 }
 
 local function nowMs()
@@ -407,8 +412,11 @@ local function findRezTarget(inCombat)
                     sawDead = true
                     local classShort = lib.safeTLO(function() return member.Class.ShortName() end, '') or ''
                     local corpseId = lib.safeNum(function() return spawn.ID() end, 0)
-                    local spawnType = (lib.safeTLO(function() return spawn.Type() end, '') or ''):lower()
-                    if corpseId <= 0 or spawnType ~= 'corpse' then goto continue end
+                    local corpseType = lib.safeTLO(function() return spawn.Type() end, '') or ''
+                    local corpseName = lib.safeTLO(function() return spawn.CleanName() end, '') or ''
+                    if corpseId <= 0 or corpseName == '' or corpseType:lower() ~= 'corpse' then
+                        goto continue
+                    end
                     if inCombat and not Runtime.forceNext and not combatClassAllowed(classShort) then
                         sawFiltered = true
                         goto continue
@@ -417,6 +425,8 @@ local function findRezTarget(inCombat)
                     if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
                         return {
                             corpseId = corpseId,
+                            corpseName = corpseName,
+                            corpseType = corpseType,
                             memberName = name,
                             classShort = classShort,
                             distance = lib.safeNum(function() return spawn.Distance() end, 99999),
@@ -474,7 +484,8 @@ local function findRezTarget(inCombat)
                 scan.corpseId = tonumber(corpseDiag.corpseId) or 0
                 scan.corpseType = tostring(corpseDiag.corpseType or '')
                 scan.corpseName = tostring(corpseDiag.corpseName or '')
-                if spawn and scan.corpseId > 0 then
+                if spawn and scan.corpseId > 0 and scan.corpseName ~= ''
+                    and scan.corpseType:lower() == 'corpse' then
                     sawDead = true
                     scan.result = 'corpse_found'
                     if inCombat and not Runtime.forceNext and not combatClassAllowed(classShort) then
@@ -486,12 +497,14 @@ local function findRezTarget(inCombat)
                     if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
                         return {
                             corpseId = scan.corpseId,
+                            corpseName = scan.corpseName,
+                            corpseType = scan.corpseType,
                             memberName = name,
                             classShort = classShort,
                             distance = lib.safeNum(function() return spawn.Distance() end, 99999),
-                                source = 'actor_team',
-                                targetServer = tostring(member.server or ''),
-                            }, nil
+                            source = 'actor_team',
+                            targetServer = tostring(member.server or ''),
+                        }, nil
                     end
                     scan.result = 'attempt_suppressed'
                     sawSuppressed = true
@@ -549,16 +562,21 @@ local function receivePeerIntent(content, sender, fromMe)
     local corpseId = tonumber(content.corpseId) or 0
     local rezzer = trim(content.from or (sender and sender.character)):lower()
     if corpseId <= 0 or rezzer == '' then return true end
+    local nowEpoch = os.time()
     Runtime.peerIntents[corpseId] = Runtime.peerIntents[corpseId] or {}
     Runtime.peerIntents[corpseId][rezzer] = {
         corpseId = corpseId,
         from = trim(content.from or (sender and sender.character)),
         priority = tonumber(content.priority) or 50,
         resourceKind = tostring(content.resourceKind or ''),
-        expiresAt = tonumber(content.expiresAt) or (os.time() + INTENT_TTL_SECONDS),
+        expiresAt = math.max(nowEpoch,
+            math.min(tonumber(content.expiresAt)
+                or (nowEpoch + INTENT_TTL_SECONDS),
+                nowEpoch + (INTENT_TTL_SECONDS * 2))),
     }
     local workflow = Runtime.workflow
-    if workflow and workflow.targetId == corpseId and settingBool('RezCoordinateActors', true) then
+    if workflow and not workflow.terminalReason
+        and workflow.targetId == corpseId and settingBool('RezCoordinateActors', true) then
         local peerPriority = tonumber(content.priority) or 50
         local localPriority = math.max(0, math.floor(settingNumber('RezPriority', 50)))
         local peerName = trim(content.from or (sender and sender.character))
@@ -589,7 +607,8 @@ local function receivePeerCompleted(content, sender, fromMe)
     if corpseId <= 0 then return true end
     Runtime.lastAttempt[corpseId] = nowMs()
     Runtime.peerIntents[corpseId] = nil
-    if Runtime.workflow and Runtime.workflow.targetId == corpseId then
+    if Runtime.workflow and not Runtime.workflow.terminalReason
+        and Runtime.workflow.targetId == corpseId then
         local phase = Runtime.workflow.phase
         -- Once the command has been issued, changing winners can interrupt a
         -- valid rez and leave both rezzers uncertain about the outcome.
@@ -602,27 +621,74 @@ local function receivePeerCompleted(content, sender, fromMe)
 end
 
 local function receiveConsentRequest(content, sender, fromMe)
-    if fromMe or not settingBool('RezCoordinateActors', true) then return true end
-    if trim(content.targetName):lower() ~= myName():lower() then return true end
-    local rezzer = trim(content.rezzer or content.from)
-    if rezzer == '' then return true end
+    if fromMe then return true end
+    local entry = {
+        targetName = tostring(content and content.targetName or ''),
+        rezzer = tostring(content and (content.rezzer or content.from) or ''),
+        teamId = tostring(content and content.teamId or ''),
+        zone = tostring(content and content.zone or ''),
+        senderCharacter = tostring(sender and sender.character or ''),
+        senderServer = tostring(sender and sender.server or ''),
+        receivedAtMs = nowMs(),
+    }
+    if #Runtime.consentInbox >= MAX_CONSENT_INBOX then
+        table.remove(Runtime.consentInbox, 1)
+    end
+    Runtime.consentInbox[#Runtime.consentInbox + 1] = entry
+    return true
+end
+
+local function consentRequestValid(entry)
+    if type(entry) ~= 'table' or not settingBool('RezCoordinateActors', true) then
+        return false, 'actor_rez_coordination_disabled'
+    end
+    if (nowMs() - (tonumber(entry.receivedAtMs) or 0)) > CONSENT_TTL_MS then
+        return false, 'consent_request_expired'
+    end
+    if trim(entry.targetName):lower() ~= myName():lower() then
+        return false, 'consent_target_changed'
+    end
+
+    local rezzer = trim(entry.rezzer)
+    local senderCharacter = trim(entry.senderCharacter)
+    if rezzer == '' or senderCharacter == ''
+        or rezzer:lower() ~= senderCharacter:lower() then
+        return false, 'consent_sender_mismatch'
+    end
 
     local team = module.state and module.state.team or nil
     if type(team) ~= 'table' or team.enabled ~= true
-        or tostring(content.teamId or '') ~= tostring(team.teamId or '') then return true end
-    local requesterFresh = false
+        or tostring(entry.teamId or '') ~= tostring(team.teamId or '') then
+        return false, 'consent_team_mismatch'
+    end
     for _, member in ipairs(team.members or {}) do
-        if trim(member.character):lower() == rezzer:lower()
+        local sameCharacter = trim(member.character):lower() == rezzer:lower()
+        local expectedServer = trim(member.server):lower()
+        local senderServer = trim(entry.senderServer):lower()
+        local sameServer = expectedServer == '' or senderServer == ''
+            or expectedServer == senderServer
+        if sameCharacter and sameServer
+            and member.self ~= true
             and (tonumber(member.ageMs) or 999999) <= 5000 then
-            requesterFresh = true
-            break
+            return true
         end
     end
-    if not requesterFresh then return true end
+    return false, 'consent_requester_not_fresh'
+end
 
-    mq.cmdf('/consent %s', rezzer)
-    echo('Granted corpse consent to Actor Team rezzer %s', rezzer)
-    return true
+local function drainConsentInbox()
+    if Runtime.pendingConsent then
+        local valid = consentRequestValid(Runtime.pendingConsent)
+        if not valid then Runtime.pendingConsent = nil end
+    end
+    if #Runtime.consentInbox == 0 then return end
+
+    local inbox = Runtime.consentInbox
+    Runtime.consentInbox = {}
+    for _, entry in ipairs(inbox) do
+        local valid = consentRequestValid(entry)
+        if valid then Runtime.pendingConsent = entry end
+    end
 end
 
 local function ensureActorCallbacks(self)
@@ -780,18 +846,35 @@ local function requestedRezGem()
     return math.max(1, math.min(total, configured))
 end
 
-local function stopWorkflowNav(workflow)
-    if workflow and workflow.navStarted then
-        mq.cmd('/squelch /nav stop')
-        workflow.navStarted = false
-    end
-end
-
 local function navActive()
     return lib.safeTLO(function()
         return (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
             or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
     end, false) == true
+end
+
+local function updateDirtyEffects(workflow)
+    module:markDirtyEffects(workflow ~= nil and (
+        workflow.navStarted == true
+        or workflow.navStopPending == true
+        or workflow.castMayBeActive == true
+        or workflow.tempGem == true))
+end
+
+local function requestWorkflowNavStop(workflow, resumePhase, includeActive)
+    if not workflow then return false end
+    local shouldStop = workflow.navStarted == true or workflow.navStopPending == true
+        or (includeActive == true and navActive())
+    if not shouldStop then return false end
+
+    workflow.navStarted = false
+    workflow.navStopPending = true
+    workflow.resumeAfterNavStop = resumePhase
+    workflow.navStopRetryAtMs = nowMs() + 1000
+    workflow.phase = 'nav_stop_wait'
+    updateDirtyEffects(workflow)
+    mq.cmd('/squelch /nav stop')
+    return true
 end
 
 local function navPathExists(corpseId)
@@ -848,7 +931,7 @@ local function targetRangeReason(target, resource, inCombat)
     if distance <= resourceRange then return nil end
 
     -- Navigation is deliberately OOC-only. Without it, an out-of-range corpse
-    -- must never consume an Actor election or coordinator action claim.
+    -- must never consume an Actor election or request a local lease.
     if inCombat or not settingBool('RezNavigate', false) then
         return string.format('corpse_out_of_range:%.1f', distance)
     end
@@ -865,11 +948,11 @@ local function actionFor(target, resource)
     if resource.kind == 'aa' then kind = lib.ActionKind.USE_AA end
     return {
         kind = kind,
-        type = lib.ClaimType.ACTION,
-        wants = { 'target', 'cast' },
         name = resource.name,
         targetId = target.corpseId,
-        targetName = target.memberName,
+        targetName = target.corpseName,
+        targetType = target.corpseType,
+        memberName = target.memberName,
         targetClass = target.classShort,
         targetSource = target.source,
         targetServer = target.targetServer,
@@ -880,8 +963,8 @@ local function actionFor(target, resource)
         resourceGemSlot = resource.gemSlot,
         needsMemorize = resource.needsMemorize == true,
         aaId = resource.aaId,
-        claimTtlMs = CLAIM_TTL_MS,
-        timeoutMs = CLAIM_TTL_MS,
+        forceRequested = Runtime.forceNext == true,
+        timeoutMs = WORKFLOW_TIMEOUT_MS,
         castStartTimeoutMs = 30000,
         idempotencyKey = string.format('rez:%s:%d', resource.kind, target.corpseId),
         reason = string.format('rez %s with %s', target.memberName, resource.name),
@@ -890,25 +973,42 @@ end
 
 local function cleanupAction(workflow)
     return {
-        kind = lib.ActionKind.USE_ITEM,
-        type = lib.ClaimType.CAST,
-        wants = { 'cast' },
+        kind = 'rez_cleanup',
         name = 'restore rez gem',
-        targetId = nil,
+        skipBoundaryTarget = true,
+        breaksInvis = false,
         resourceKind = 'restore',
-        claimTtlMs = 30000,
         timeoutMs = 30000,
         idempotencyKey = string.format('rez:restore:%d', tonumber(workflow.tempGemSlot) or 0),
         reason = 'restore temporary rez gem',
     }
 end
 
+local function consentAction(entry)
+    return {
+        kind = 'rez_consent',
+        name = 'corpse consent',
+        skipBoundaryTarget = true,
+        breaksInvis = false,
+        rezzer = trim(entry and entry.rezzer),
+        targetName = nil,
+        teamId = tostring(entry and entry.teamId or ''),
+        consentReceivedAtMs = tonumber(entry and entry.receivedAtMs) or 0,
+        timeoutMs = CONSENT_TTL_MS,
+        idempotencyKey = string.format('rez:consent:%s:%s:%d',
+            tostring(entry and entry.teamId or ''),
+            trim(entry and entry.rezzer):lower(),
+            tonumber(entry and entry.receivedAtMs) or 0),
+        reason = 'grant corpse consent to trusted Actor Team rezzer',
+    }
+end
+
 local function finishWorkflow(success, reason)
     local workflow = Runtime.workflow
     if not workflow then return true, reason or 'completed' end
-    stopWorkflowNav(workflow)
     if workflow.tempGem then clearRezLeaseAndRecovery() end
     closeSpellBook()
+    module:markDirtyEffects(false)
 
     if workflow.targetId and workflow.targetId > 0 then
         Runtime.lastAttempt[workflow.targetId] = nowMs()
@@ -933,11 +1033,27 @@ local function finishWorkflow(success, reason)
     -- immediately following that success broadcast with rez:cancelled.
     clearLocalIntent(reason, not workflow.completionBroadcast)
     echo('%s: %s', success and '\agCompleted\ax' or '\arStopped\ax', Runtime.lastResult)
-    if Runtime.stopAfterCleanup then
-        Runtime.stopAfterCleanup = false
-        module:stop()
-    end
     return true, Runtime.lastResult
+end
+
+local function continueWorkflowCleanup(workflow)
+    if workflow.castMayBeActive == true then
+        if lib.isCasting() then
+            mq.cmd('/stopcast')
+            workflow.castStopRetryAtMs = nowMs() + 500
+            workflow.phase = 'cancel_cast_wait'
+            updateDirtyEffects(workflow)
+            return false, 'stopping_rez_cast'
+        end
+        workflow.castMayBeActive = false
+        updateDirtyEffects(workflow)
+    end
+
+    if not workflow.tempGem or not settingBool('RezRestoreGem', true) then
+        return finishWorkflow(workflow.terminalSuccess, workflow.terminalReason)
+    end
+    workflow.phase = 'restore_send'
+    return false, 'restoring_gem'
 end
 
 local function beginRestore(success, reason)
@@ -945,7 +1061,7 @@ local function beginRestore(success, reason)
     if not workflow then return true, reason end
     workflow.terminalSuccess = success == true
     workflow.terminalReason = reason or (success and 'completed' or 'failed')
-    stopWorkflowNav(workflow)
+    workflow.cancelReason = nil
 
     -- Tell peers as soon as the rez command/cast completes. Gem restoration can
     -- take several more seconds and must not make another rezzer think the
@@ -966,11 +1082,10 @@ local function beginRestore(success, reason)
         end
     end
 
-    if not workflow.tempGem or not settingBool('RezRestoreGem', true) then
-        return finishWorkflow(workflow.terminalSuccess, workflow.terminalReason)
+    if requestWorkflowNavStop(workflow, 'cleanup_continue', false) then
+        return false, 'stopping_rez_navigation'
     end
-    workflow.phase = 'restore_send'
-    return false, 'restoring_gem'
+    return continueWorkflowCleanup(workflow)
 end
 
 local function loadRecoveryWorkflow()
@@ -1002,6 +1117,7 @@ local function loadRecoveryWorkflow()
         terminalReason = 'recovered_temporary_gem',
     }
     Runtime.workflow.action = cleanupAction(Runtime.workflow)
+    updateDirtyEffects(Runtime.workflow)
     echo('Recovered an interrupted rez gem swap; restoring gem %d', slot)
 end
 
@@ -1018,11 +1134,14 @@ local function startWorkflow(action)
     if resource.range <= 0 then resource.range = 100 end
     Runtime.workflow = {
         action = action,
-        phase = 'target_send',
+        phase = 'movement_guard',
         targetId = tonumber(action.targetId) or 0,
-        targetName = tostring(action.targetName or ''),
+        targetName = tostring(action.memberName or ''),
+        corpseName = tostring(action.targetName or ''),
+        corpseType = tostring(action.targetType or ''),
         targetClass = tostring(action.targetClass or ''),
         targetSource = tostring(action.targetSource or 'group'),
+        forceRequested = action.forceRequested == true,
         resource = resource,
         startedAtMs = nowMs(),
     }
@@ -1082,13 +1201,61 @@ local function stepWorkflow()
             return finishWorkflow(workflow.terminalSuccess, workflow.terminalReason)
         end
         if now >= workflow.deadlineMs then
-            return finishWorkflow(false, workflow.terminalReason .. ':restore_timeout')
+            workflow.restoreAttempts = (tonumber(workflow.restoreAttempts) or 0) + 1
+            workflow.phase = 'restore_send'
+            return false, 'restore_retry'
         end
         return false, 'restoring_gem'
     end
 
+    if workflow.phase == 'nav_stop_wait' then
+        if not navActive() then
+            workflow.navStarted = false
+            workflow.navStopPending = false
+            local resumePhase = workflow.resumeAfterNavStop or 'target_send'
+            workflow.resumeAfterNavStop = nil
+            updateDirtyEffects(workflow)
+            if resumePhase == 'cleanup_continue' then
+                return continueWorkflowCleanup(workflow)
+            end
+            workflow.phase = resumePhase
+            return false, 'navigation_stopped'
+        end
+        if now >= (tonumber(workflow.navStopRetryAtMs) or 0) then
+            mq.cmd('/squelch /nav stop')
+            workflow.navStopRetryAtMs = now + 1000
+        end
+        return false, 'stopping_rez_navigation'
+    end
+
+    if workflow.phase == 'cancel_cast_wait' then
+        if not lib.isCasting() then
+            workflow.castMayBeActive = false
+            updateDirtyEffects(workflow)
+            return continueWorkflowCleanup(workflow)
+        end
+        if now >= (tonumber(workflow.castStopRetryAtMs) or 0) then
+            mq.cmd('/stopcast')
+            workflow.castStopRetryAtMs = now + 500
+        end
+        return false, 'stopping_rez_cast'
+    end
+
     local spawn = corpseSpawn(workflow.targetId)
     if not spawn then return beginRestore(false, 'corpse_gone') end
+
+    if workflow.phase == 'movement_guard' then
+        if navActive() then
+            requestWorkflowNavStop(workflow, 'target_send', true)
+            return false, 'stopping_existing_navigation'
+        end
+        local moving = lib.safeTLO(function() return mq.TLO.Me.Moving() end, false) == true
+        if moving and not workflow.forceRequested then
+            return beginRestore(false, 'manual_movement')
+        end
+        workflow.phase = 'target_send'
+        return false, 'movement_ready'
+    end
 
     if workflow.phase == 'target_send' then
         mq.cmdf('/target id %d', workflow.targetId)
@@ -1129,8 +1296,9 @@ local function stepWorkflow()
         if not navPathExists(workflow.targetId) then
             return beginRestore(false, 'no_navigation_path')
         end
-        mq.cmdf('/squelch /nav id %d distance=15 lineofsight=on log=off', workflow.targetId)
         workflow.navStarted = true
+        updateDirtyEffects(workflow)
+        mq.cmdf('/squelch /nav id %d distance=15 lineofsight=on log=off', workflow.targetId)
         workflow.deadlineMs = now + NAV_TIMEOUT_MS
         workflow.phase = 'nav_wait'
         return false, 'navigating_to_corpse'
@@ -1139,15 +1307,19 @@ local function stepWorkflow()
     if workflow.phase == 'nav_wait' then
         local distance = corpseDistance(workflow.targetId) or 99999
         if distance <= (workflow.resource.range or 100) then
-            stopWorkflowNav(workflow)
-            mq.cmdf('/target id %d', workflow.targetId)
-            mq.cmd('/corpse')
-            workflow.deadlineMs = now + 300
-            workflow.phase = 'nav_drag_wait'
+            requestWorkflowNavStop(workflow, 'nav_drag_send', false)
         elseif now >= workflow.deadlineMs or not navActive() then
             return beginRestore(false, 'navigation_failed_or_timed_out')
         end
         return false, 'navigating_to_corpse'
+    end
+
+    if workflow.phase == 'nav_drag_send' then
+        mq.cmdf('/target id %d', workflow.targetId)
+        mq.cmd('/corpse')
+        workflow.deadlineMs = now + 300
+        workflow.phase = 'nav_drag_wait'
+        return false, 'dragging_after_navigation'
     end
 
     if workflow.phase == 'nav_drag_wait' then
@@ -1185,8 +1357,11 @@ local function stepWorkflow()
             workflow.originalGemId = gemId(slot)
             workflow.originalGemName = gemName(slot)
             workflow.lastLeaseAtMs = 0
+            updateDirtyEffects(workflow)
             writeLease(workflow)
-            writeRecovery(workflow)
+            if not writeRecovery(workflow) then
+                return beginRestore(false, 'rez_recovery_write_failed')
+            end
             mq.cmdf('/memspell %d "%s"', slot, workflow.resource.name)
             workflow.deadlineMs = now + MEMORIZE_TIMEOUT_MS
             workflow.phase = 'memorize_wait'
@@ -1237,6 +1412,8 @@ local function stepWorkflow()
         local SpellEvents = getSpellEvents()
         if SpellEvents and SpellEvents.resetResult then SpellEvents.resetResult() end
         workflow.castResultResetAt = os.clock()
+        workflow.castMayBeActive = true
+        updateDirtyEffects(workflow)
         if workflow.resource.kind == 'spell' then
             local slot = findGemSlot(workflow.resource.name)
             if not slot then return beginRestore(false, 'rez_spell_missing_before_cast') end
@@ -1275,10 +1452,11 @@ local function stepWorkflow()
         local failure = castFailureReason(workflow)
         if failure then return beginRestore(false, failure) end
         if not lib.isCasting() then
+            workflow.castMayBeActive = false
+            updateDirtyEffects(workflow)
             return beginRestore(true, 'rez_cast_completed')
         end
         if now >= workflow.deadlineMs then
-            mq.cmd('/stopcast')
             return beginRestore(false, 'rez_cast_timeout')
         end
         return false, 'casting_rez'
@@ -1319,12 +1497,21 @@ module.onTick = function(self)
     ensureSpellEvents()
     pcall(mq.doevents)
     loadRecoveryWorkflow()
+    drainConsentInbox()
     prunePeerIntents()
+
+    if Runtime.stopAfterCleanup and not Runtime.workflow and not self.currentRequestId then
+        Runtime.stopAfterCleanup = false
+        self:setIntent(false, nil, 'manual_stop')
+        self:stop()
+        return
+    end
 
     if Runtime.workflow then
         writeLease(Runtime.workflow)
         if Runtime.workflow.targetId and Runtime.workflow.targetId > 0
-            and Runtime.workflow.resource and Runtime.workflow.phase ~= 'restore_send'
+            and Runtime.workflow.resource and not Runtime.workflow.terminalReason
+            and Runtime.workflow.phase ~= 'restore_send'
             and Runtime.workflow.phase ~= 'restore_wait'
             and not Runtime.workflow.cancelReason then
             local stillWins, coordinationReason = localWinsIntent({
@@ -1340,7 +1527,7 @@ module.onTick = function(self)
             end
         end
         setReason('workflow:' .. tostring(Runtime.workflow.phase))
-        self:sendNeed(true, 5000, Runtime.reason)
+        self:setIntent(true, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
@@ -1349,18 +1536,44 @@ module.onTick = function(self)
     Runtime.resource = nil
     Runtime.pendingAction = nil
 
+    if Runtime.pendingConsent then
+        Runtime.pendingAction = consentAction(Runtime.pendingConsent)
+        setReason('ready:consent:' .. trim(Runtime.pendingConsent.rezzer))
+        self:setIntent(true, nil, Runtime.reason)
+        sendTelemetry(self)
+        return
+    end
+
+    -- Every character keeps this worker alive so an Actor Team corpse owner can
+    -- grant leased consent. Only rez-capable classes may select rez work.
+    if not RezData.isRezClass(myClassShort()) then
+        clearLocalIntent('not_rez_class')
+        setReason('not_rez_class')
+        self:setIntent(false, nil, Runtime.reason)
+        sendTelemetry(self)
+        return
+    end
+
+    if lib.isSelfDeadOrHovering and lib.isSelfDeadOrHovering() then
+        clearLocalIntent('self_dead')
+        setReason('self_dead')
+        self:setIntent(false, nil, Runtime.reason)
+        sendTelemetry(self)
+        return
+    end
+
     local inCombat = lib.inCombat()
     if not Runtime.forceNext and inCombat and not settingBool('AutoRezInCombat', false) then
         clearLocalIntent('combat_rez_disabled')
         setReason('combat_rez_disabled')
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
     if not Runtime.forceNext and not inCombat and not settingBool('AutoRezOOC', true) then
         clearLocalIntent('ooc_rez_disabled')
         setReason('ooc_rez_disabled')
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
@@ -1370,7 +1583,7 @@ module.onTick = function(self)
     if not target then
         clearLocalIntent(targetReason)
         setReason(targetReason)
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
@@ -1380,14 +1593,14 @@ module.onTick = function(self)
     if not resource then
         clearLocalIntent(resourceReason)
         setReason(resourceReason)
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
     if resource.needsMemorize and isSpellBookOpen() then
         clearLocalIntent('manual_spellbook_open')
         setReason('manual_spellbook_open')
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
@@ -1397,27 +1610,23 @@ module.onTick = function(self)
     if rangeReason then
         clearLocalIntent(rangeReason)
         setReason(rangeReason)
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
 
-    -- Movement policy (runs only once the corpse is in range): nav-driven
-    -- movement (chase/follow) yields — stop nav and let the rez proceed;
-    -- chase's own casting guard keeps it paused once the cast starts.
-    -- MANUAL keyboard movement instead pauses the rez until the player
-    -- stops — never fight the human at the wheel. /sk_rez force bypasses.
+    -- Selection is read-only. Coordinated navigation can finish while this
+    -- request waits; any stale nav still present after grant is stopped inside
+    -- the leased workflow. Manual keyboard movement defers automatic rez work.
     if not Runtime.forceNext then
-        local navActive = lib.safeTLO(function()
+        local navigationActive = lib.safeTLO(function()
             return mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
         end, false) == true
         local moving = lib.safeTLO(function() return mq.TLO.Me.Moving() end, false) == true
-        if navActive then
-            mq.cmd('/squelch /nav stop')
-        elseif moving then
+        if moving and not navigationActive then
             clearLocalIntent('manual_movement')
             setReason('manual_movement')
-            self:sendNeed(false, nil, Runtime.reason)
+            self:setIntent(false, nil, Runtime.reason)
             sendTelemetry(self)
             return
         end
@@ -1426,14 +1635,14 @@ module.onTick = function(self)
     local wins, coordinationReason = localWinsIntent(target, resource)
     if not wins then
         setReason(coordinationReason)
-        self:sendNeed(false, nil, Runtime.reason)
+        self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
 
     Runtime.pendingAction = actionFor(target, resource)
     setReason(string.format('ready:%s:%s', resource.kind, target.memberName))
-    self:sendNeed(true, 5000, Runtime.reason)
+    self:setIntent(true, nil, Runtime.reason)
     sendTelemetry(self)
 end
 
@@ -1456,21 +1665,101 @@ module.onSchedulerResume = function(_, gapMs)
 end
 
 module.executeAction = function(self)
-    if not self:ownsClaim() then return false, 'no_ownership' end
+    if not self:ownsLease(self.currentRequestId) then return false, 'no_lease' end
+    local action = self:getLeaseAction()
+    if not action then return true, 'missing_leased_rez_action' end
+
+    if action.kind == 'rez_consent' then
+        local pending = Runtime.pendingConsent
+        local valid, invalidReason = consentRequestValid(pending)
+        local sameRequest = valid
+            and trim(action.rezzer):lower() == trim(pending.rezzer):lower()
+            and tostring(action.teamId or '') == tostring(pending.teamId or '')
+            and tonumber(action.consentReceivedAtMs) == tonumber(pending.receivedAtMs)
+        if not sameRequest then
+            Runtime.pendingConsent = nil
+            Runtime.pendingAction = nil
+            return true, invalidReason or 'consent_request_changed'
+        end
+        mq.cmdf('/consent %s', trim(action.rezzer))
+        echo('Granted corpse consent to Actor Team rezzer %s', trim(action.rezzer))
+        Runtime.pendingConsent = nil
+        Runtime.pendingAction = nil
+        Runtime.lastResult = 'consent_granted:' .. trim(action.rezzer)
+        return true, Runtime.lastResult
+    end
+
     if not Runtime.workflow then
         -- Selection is recomputed every tick before execution. If settings,
         -- corpse state, or Actor election changed after the coordinator grant,
-        -- release the now-stale claim without performing side effects.
+        -- release the now-stale lease without performing side effects.
         if not Runtime.pendingAction then
             return true, 'rez_action_stale:' .. tostring(Runtime.reason or 'unknown')
         end
-        local owner = self.state and self.state.castOwner
-        local action = owner and owner.action or Runtime.pendingAction
-        if not action then return true, 'missing_rez_action' end
+        if tostring(action.idempotencyKey or '')
+            ~= tostring(Runtime.pendingAction.idempotencyKey or '') then
+            return true, 'rez_action_changed_before_grant'
+        end
         startWorkflow(action)
     end
     return stepWorkflow()
 end
+
+module.onLeaseFinalizing = function(self, action, reason)
+    if not lib.isInGame() then
+        return false, 'waiting_for_ingame_recovery'
+    end
+    self:cancelUnifiedAction(tostring(reason or 'lease_finalizing'))
+    ActionExecutor.consumeResult()
+
+    -- A coordinator recovery lease can arrive before this worker's first
+    -- sensor tick. Load the durable gem-swap marker from this normal coroutine
+    -- before reporting the orphaned effects as drained.
+    loadRecoveryWorkflow()
+    local workflow = Runtime.workflow
+    if tostring(reason or '') == 'orphan_recovery'
+        and (not workflow or workflow.orphanRecoveryInitialized ~= true) then
+        if not workflow then
+            workflow = {
+                action = action,
+                phase = 'cleanup_continue',
+                cleanupOnly = true,
+                resource = { kind = 'restore', name = '' },
+                terminalSuccess = false,
+                terminalReason = 'orphan_recovery',
+            }
+            Runtime.workflow = workflow
+        end
+        workflow.orphanRecoveryInitialized = true
+        workflow.navStarted = workflow.navStarted == true or navActive()
+        workflow.castMayBeActive = workflow.castMayBeActive == true or lib.isCasting()
+        updateDirtyEffects(workflow)
+        if requestWorkflowNavStop(workflow, 'cleanup_continue', false) then
+            return false, 'stopping_orphaned_navigation'
+        end
+        local done, detail = continueWorkflowCleanup(workflow)
+        if done then return true, detail end
+        return false, detail
+    end
+
+    if not workflow then
+        self:markDirtyEffects(false)
+        return true
+    end
+
+    if not workflow.terminalReason then
+        local done, detail = beginRestore(false,
+            tostring(reason or workflow.cancelReason or 'lease_finalizing'))
+        if done then return true, detail end
+        return false, detail
+    end
+
+    local done, detail = stepWorkflow()
+    if done then return true, detail end
+    return false, detail
+end
+
+module.onSafetyDrain = module.onLeaseFinalizing
 
 
 module:enableUnifiedExecutor({
@@ -1509,8 +1798,9 @@ mq.bind('/sk_rez', function(cmd, arg)
     if cmd == '' or cmd == 'status' then
         local workflow = Runtime.workflow
         local team = module.state and module.state.team or {}
-        echo('running=%s priority=%s owns=%s reason=%s phase=%s target=%s(%s/%s) resource=%s:%s winner=%s last=%s',
-            tostring(module.running), tostring(module:isMyPriority()), tostring(module:ownsClaim()),
+        echo('running=%s request=%s ownsLease=%s reason=%s phase=%s target=%s(%s/%s) resource=%s:%s winner=%s last=%s',
+            tostring(module.running), tostring(module.currentRequestId or '-'),
+            tostring(module:ownsLease(module.currentRequestId)),
             Runtime.reason, workflow and workflow.phase or 'idle',
             workflow and workflow.targetName or Runtime.target and Runtime.target.memberName or '-',
             workflow and workflow.targetClass or Runtime.target and Runtime.target.classShort or '-',
@@ -1573,10 +1863,6 @@ mq.bind('/sk_rez', function(cmd, arg)
         echo('Usage: /sk_rez status | debug on|off | retry | now [group/team member] | stop')
     end
 end)
-
-if not RezData.isRezClass(myClassShort()) then
-    return module
-end
 
 module:run(50)
 return module

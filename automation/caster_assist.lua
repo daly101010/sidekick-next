@@ -323,6 +323,58 @@ function M.shouldRouteStandoff(settings)
     return class == 'RNG'
 end
 
+--- Side-effect-free standoff eligibility for the leased assist worker.
+function M.getStandoffNeed(settings, targetId)
+    if not settings or settings.CasterStandoffEnabled ~= true then
+        return false, 'standoff_disabled'
+    end
+    local class = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
+    if M.PURE_CASTERS[class] ~= true and class ~= 'RNG' then
+        return false, 'unsupported_class'
+    end
+    targetId = tonumber(targetId) or 0
+    local target = targetId > 0 and mq.TLO.Spawn(targetId) or nil
+    if not (target and target()) or tostring(target.Type() or '') ~= 'NPC'
+        or (target.Dead and target.Dead()) then
+        return false, 'target_invalid'
+    end
+    if M.standoffState.phase == 'moving' then
+        return M.standoffState.targetId == targetId,
+            M.standoffState.targetId == targetId and 'moving' or 'different_target'
+    end
+    if tostring(mq.TLO.Me.CombatState() or '') ~= 'COMBAT' then
+        return false, 'not_in_combat'
+    end
+    local casting = tostring(mq.TLO.Me.Casting() or '')
+    if casting ~= '' and casting ~= 'NULL' then return false, 'casting' end
+    local minD = tonumber(settings.CasterStandoffMin) or 35
+    local maxD = tonumber(settings.CasterStandoffMax) or 60
+    if maxD < minD + 5 then maxD = minD + 5 end
+    local distance = tonumber(target.Distance()) or 999
+    if distance >= minD and distance <= maxD then return false, 'in_band' end
+    if (mq.gettime() - M.lastStandoffMove) < M.standoffCooldownMs then
+        return false, 'cooldown'
+    end
+    local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
+        and mq.TLO.Navigation.Active() == true
+    if navActive then return false, 'external_navigation_active' end
+    return true, string.format('outside_band:%.1f', distance)
+end
+
+function M.startStandoff(settings, targetId)
+    local needed, reason = M.getStandoffNeed(settings, targetId)
+    if not needed then return false, reason end
+    M.tickStandoff(settings, targetId)
+    return M.isRepositioning(),
+        M.isRepositioning() and 'standoff_started' or 'standoff_not_started'
+end
+
+function M.advanceStandoff(settings, targetId)
+    M.tickStandoff(settings, targetId)
+    return not M.isRepositioning(),
+        M.isRepositioning() and 'standoff_moving' or 'standoff_complete'
+end
+
 --- Standoff tick: move to a randomized ranged spot when outside the configured band.
 -- @param settings table Settings
 -- @param targetId number|nil Coordinated DPS target; current target is the legacy fallback

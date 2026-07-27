@@ -16,7 +16,7 @@
 --   ctx.me.pctHPs / pctMana / pctEndurance / activeDisc / pctAggro
 --   ctx.me.buff(<name>)   -> truthy if buff active on self
 --   ctx.combat            -> bool
---   ctx.burnNow           -> bool (the user's BurnNow setting)
+--   ctx.burnNow           -> bool (the user's canonical BurnActive setting)
 --   ctx.target.id / pctHPs / named / secondaryPctAggro
 
 local mq = require('mq')
@@ -125,7 +125,7 @@ function M.buildContext()
         hasTarget = typ == 'npc'
     end
 
-    local burnNow = settings.BurnNow == true
+    local burnNow = settings.BurnActive == true
 
     local ND = getNamed()
     local isNamed = false

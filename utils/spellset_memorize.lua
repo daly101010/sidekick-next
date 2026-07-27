@@ -4,7 +4,6 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
-local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
 
 local M = {}
@@ -18,6 +17,8 @@ M.pendingSet = nil      -- Queued set to apply when out of combat
 M.pendingSave = false   -- Whether to save before applying
 M.suspendUntilMs = 0    -- External lease holder can pause spellset enforcement
 M.suspendReason = nil
+M._dirtyEffect = false  -- Owned gem/spellbook mutation not yet observed settled
+M._cleanupCloseIssuedAt = 0
 
 --------------------------------------------------------------------------------
 -- Lazy-loaded dependencies
@@ -26,17 +27,42 @@ M.suspendReason = nil
 local getPersistence = lazy('sidekick-next.utils.spellset_persistence')
 local getSpellSetData = lazy('sidekick-next.utils.spellset_data')
 local getConditionDefaults = lazy('sidekick-next.utils.condition_defaults')
+local getActorsCoordinator = lazy('sidekick-next.utils.actors_coordinator')
 
 --------------------------------------------------------------------------------
 -- Constants
 --------------------------------------------------------------------------------
 
-local CLEAR_DELAY_MS = 500          -- Delay after right-click to clear gem
 local MEMORIZE_TIMEOUT_MS = 12000   -- Max time to wait for memorization
 local WAIT_POLL_MS = 100            -- Poll interval for wait functions
 local MANUAL_SCAN_INTERVAL_MS = 250 -- Polling is cheap and runs only while idle/OOC
 local MANUAL_SETTLE_MS = 750        -- Require a stable post-memorization layout
-local STATUS_MODULE = 'spell_memorize'
+local WORKER_SCRIPT = 'sidekick-next/sk_scribing'
+local APPLY_TOPIC = 'spellset:apply'
+local STATUS_TOPIC = 'spellset:status'
+local TRANSPORT_TTL_MS = 5000
+local COMMAND_RETRY_MS = 1000
+local MAX_COMMAND_INBOX = 16
+
+local _workerMode = false
+local _workerTransportInitialized = false
+local _clientTransportInitialized = false
+local _commandInbox = {}
+local _clientStatusInbox = {}
+local _clientQueued = nil
+local _clientRemote = {
+    busy = false,
+    pendingSet = nil,
+    reason = 'idle',
+    requestId = nil,
+    receivedAtMs = 0,
+}
+local _transportSession = string.format('spellset:%d:%d',
+    lib.getTimeMs(), math.random(100000, 999999))
+local _transportSequence = 0
+local _workerRequestId = nil
+local _lastWorkerStatus = nil
+local _lastWorkerStatusAtMs = 0
 
 --------------------------------------------------------------------------------
 -- Internal Helpers
@@ -69,7 +95,6 @@ local function clearGem(slot)
     -- Right-click on the gem to clear it
     -- Note: CastSpellWnd uses 0-indexed buttons, so slot 1 = CSPW_Spell0
     mq.cmdf('/nomodkey /notify CastSpellWnd CSPW_Spell%d rightmouseup', slot - 1)
-    mq.delay(CLEAR_DELAY_MS)
 end
 
 -- Gem state checks (no waiting). The state machine driver polls these once
@@ -165,14 +190,217 @@ end
 -- Public Functions
 --------------------------------------------------------------------------------
 
+local function nextTransportId(prefix)
+    _transportSequence = _transportSequence + 1
+    return string.format('%s:%s:%d:%d', tostring(prefix),
+        _transportSession, lib.getTimeMs(), _transportSequence)
+end
+
+local function hasValidV2Envelope(content)
+    local envelope = type(content) == 'table'
+        and type(content.envelope) == 'table' and content.envelope or nil
+    local sequence = envelope and tonumber(envelope.sequence) or 0
+    local ttlMs = envelope and tonumber(envelope.ttlMs) or 0
+    return envelope ~= nil
+        and tonumber(envelope.version) == 2
+        and tostring(envelope.session or '') ~= ''
+        and sequence > 0
+        and sequence == math.floor(sequence)
+        and ttlMs > 0 and ttlMs <= 30000
+        and tonumber(envelope.sentAtMs) ~= nil
+end
+
+local function isLocalUiSender(sender, fromMe)
+    if fromMe ~= true or type(sender) ~= 'table' then return false end
+    local script = tostring(sender.script or ''):gsub('\\', '/'):lower()
+    local scripts = type(lib.Scripts.UI) == 'table'
+        and lib.Scripts.UI or { lib.Scripts.UI }
+    local allowed = false
+    for _, scriptName in ipairs(scripts) do
+        if script == tostring(scriptName or ''):gsub('\\', '/'):lower() then
+            allowed = true
+            break
+        end
+    end
+    if not allowed then return false end
+    local mailbox = tostring(sender.mailbox or ''):lower()
+    return (mailbox:match('([^:]+)$') or mailbox) == 'sidekick'
+end
+
+local function copyApplyMessage(content, sender)
+    if type(content) ~= 'table' then return nil end
+    local setName = tostring(content.setName or '')
+    local requestId = tostring(content.requestId or '')
+    local ttlMs = tonumber(content.ttlMs) or TRANSPORT_TTL_MS
+    if setName == '' or #setName > 256
+        or requestId == '' or #requestId > 128
+        or ttlMs <= 0 or ttlMs > TRANSPORT_TTL_MS then
+        return nil
+    end
+    return {
+        setName = setName,
+        saveFirst = content.saveFirst == true,
+        requestId = requestId,
+        issuedAtMs = tonumber(content.issuedAtMs) or 0,
+        ttlMs = ttlMs,
+        ownerName = tostring(sender and sender.character or ''),
+        ownerServer = tostring(sender and sender.server or ''),
+    }
+end
+
+local function copyStatusMessage(content)
+    if type(content) ~= 'table' then return nil end
+    return {
+        busy = content.busy == true,
+        pendingSet = tostring(content.pendingSet or ''),
+        reason = tostring(content.reason or ''),
+        requestId = tostring(content.requestId or ''),
+        sentAtMs = tonumber(content.sentAtMs) or 0,
+    }
+end
+
+function M.initializeWorker()
+    if _workerTransportInitialized then return true end
+    _workerMode = true
+    local Actors = getActorsCoordinator()
+    if not Actors or not Actors.registerMessageCallback then return false end
+    Actors.registerMessageCallback(APPLY_TOPIC, function(content, sender, fromMe)
+        -- Actor callbacks retain no message handle and perform no TLO, file,
+        -- gameplay, send, or yielding work.
+        if type(content) ~= 'table'
+            or tostring(content.id or ''):lower() ~= APPLY_TOPIC
+            or not hasValidV2Envelope(content)
+            or not isLocalUiSender(sender, fromMe)
+            or #_commandInbox >= MAX_COMMAND_INBOX then
+            return true
+        end
+        local copied = copyApplyMessage(content, sender)
+        if copied then _commandInbox[#_commandInbox + 1] = copied end
+        return true
+    end)
+    _workerTransportInitialized = true
+    return true
+end
+
+function M.initializeClient()
+    if _clientTransportInitialized then return true end
+    local Actors = getActorsCoordinator()
+    if not Actors or not Actors.registerMessageCallback then return false end
+    Actors.registerMessageCallback(STATUS_TOPIC, function(content, _, fromMe)
+        if fromMe ~= true or #_clientStatusInbox >= MAX_COMMAND_INBOX then return true end
+        local copied = copyStatusMessage(content)
+        if copied then _clientStatusInbox[#_clientStatusInbox + 1] = copied end
+        return true
+    end)
+    _clientTransportInitialized = true
+    return true
+end
+
+function M.drainWorkerCommands()
+    if not _workerMode or #_commandInbox == 0 then return 0 end
+    local inbox = _commandInbox
+    _commandInbox = {}
+    local now = lib.getTimeMs()
+    local myName = tostring(lib.getMyName() or ''):lower()
+    local myServer = tostring(lib.getMyServer() or ''):lower()
+    local accepted = 0
+    for _, command in ipairs(inbox) do
+        local ageMs = now - command.issuedAtMs
+        local fresh = command.issuedAtMs > 0
+            and ageMs >= 0
+            and ageMs <= math.max(1, command.ttlMs)
+        local localOwner = tostring(command.ownerName or ''):lower() == myName
+            and tostring(command.ownerServer or ''):lower() == myServer
+        if fresh and localOwner and command.setName ~= ''
+            and command.requestId ~= '' and command.requestId ~= _workerRequestId then
+            -- Last accepted request wins; a currently executing job remains
+            -- bounded and the replacement waits in pendingSet.
+            M.pendingSet = command.setName
+            M.pendingSave = command.saveFirst == true
+            _workerRequestId = command.requestId
+            accepted = accepted + 1
+        end
+    end
+    return accepted
+end
+
+function M.drainClientStatus()
+    if #_clientStatusInbox == 0 then return end
+    local inbox = _clientStatusInbox
+    _clientStatusInbox = {}
+    for _, status in ipairs(inbox) do
+        if status.sentAtMs >= (_clientRemote.receivedAtMs or 0) then
+            _clientRemote.busy = status.busy
+            _clientRemote.pendingSet = status.pendingSet ~= '' and status.pendingSet or nil
+            _clientRemote.reason = status.reason
+            _clientRemote.requestId = status.requestId ~= '' and status.requestId or nil
+            _clientRemote.receivedAtMs = status.sentAtMs
+            if _clientQueued and _clientRemote.requestId == _clientQueued.requestId then
+                _clientQueued.acknowledged = true
+            end
+        end
+    end
+end
+
+function M.publishWorkerStatus(reason, force)
+    if not _workerMode then return false end
+    local now = lib.getTimeMs()
+    local busy = M.isMemorizing == true or M._memJob ~= nil
+    local pendingSet = M.pendingSet
+    local signature = table.concat({
+        tostring(busy), tostring(pendingSet or ''), tostring(reason or ''),
+        tostring(_workerRequestId or ''),
+    }, '|')
+    if force ~= true and signature == _lastWorkerStatus
+        and (now - _lastWorkerStatusAtMs) < 1000 then
+        return true
+    end
+    _lastWorkerStatus = signature
+    _lastWorkerStatusAtMs = now
+    local Actors = getActorsCoordinator()
+    if not Actors or not Actors.sendToLocalScript then return false end
+    local payload = {
+        busy = busy,
+        pendingSet = pendingSet or '',
+        reason = tostring(reason or (busy and 'active' or 'idle')),
+        requestId = tostring(_workerRequestId or ''),
+        sentAtMs = now,
+    }
+    local sent = false
+    local scripts = type(lib.Scripts.UI) == 'table' and lib.Scripts.UI
+        or { lib.Scripts.UI }
+    for _, scriptName in ipairs(scripts) do
+        local ok = Actors.sendToLocalScript(scriptName, STATUS_TOPIC, payload)
+        sent = ok or sent
+    end
+    return sent
+end
+
 --- Queue a spell set for application (safe to call from ImGui callback)
---- The actual memorization happens in processPending() from the main loop
+--- The UI path stores intent only. processPending() sends it from the main
+--- loop; the scribing worker performs mutations only after acquiring a lease.
 ---@param setName string The name of the spell set to apply
 ---@param saveFirst boolean|nil If true, save before applying
 function M.queueApply(setName, saveFirst)
-    M.pendingSet = setName
-    M.pendingSave = saveFirst or false
+    setName = tostring(setName or '')
+    if setName == '' then return false end
+    if _workerMode then
+        M.pendingSet = setName
+        M.pendingSave = saveFirst == true
+        _workerRequestId = _workerRequestId or nextTransportId('local')
+    else
+        M.initializeClient()
+        _clientQueued = {
+            setName = setName,
+            saveFirst = saveFirst == true,
+            requestId = nextTransportId('apply'),
+            issuedAtMs = lib.getTimeMs(),
+            lastSentAtMs = 0,
+            acknowledged = false,
+        }
+    end
     print(string.format('\ay[SpellSetMemorize]\ax Queued "%s" for memorization', setName or ''))
+    return true
 end
 
 --------------------------------------------------------------------------------
@@ -263,61 +491,9 @@ function M.clearSuspend(reason)
     end
 end
 
-local _statusActor = nil
-local _lastStatusNeed = nil
-local _lastStatusReason = nil
-local _lastStatusSentAt = 0
-local _lastHeartbeatAt = 0
-
-local function getStatusActor()
-    if _statusActor ~= nil then return _statusActor end
-    local ok, actor = pcall(function()
-        return actors.register(STATUS_MODULE, function() end)
-    end)
-    _statusActor = ok and actor or false
-    return _statusActor
-end
-
 local function publishStatus(needsAction, reason)
-    local actor = getStatusActor()
-    if not actor then return end
-
-    local now = lib.getTimeMs()
-    if (now - (_lastHeartbeatAt or 0)) >= lib.Timing.MODULE_HEARTBEAT_MS then
-        _lastHeartbeatAt = now
-        pcall(function()
-            actor:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
-                msgType = 'heartbeat',
-                module = STATUS_MODULE,
-                ownerName = lib.getMyName(),
-                ownerServer = lib.getMyServer(),
-                sentAtMs = now,
-                ready = true,
-            })
-        end)
-    end
-
-    local need = needsAction == true
-    reason = tostring(reason or (need and 'memorizing' or 'idle'))
-    if need == _lastStatusNeed and reason == _lastStatusReason and (now - (_lastStatusSentAt or 0)) < 100 then
-        return
-    end
-
-    _lastStatusNeed = need
-    _lastStatusReason = reason
-    _lastStatusSentAt = now
-    pcall(function()
-        actor:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
-            msgType = 'need',
-            module = STATUS_MODULE,
-            ownerName = lib.getMyName(),
-            ownerServer = lib.getMyServer(),
-            priority = lib.Priority.BUFF,
-            needsAction = need,
-            ttlMs = need and 1000 or 250,
-            reason = reason,
-        })
-    end)
+    M.publishWorkerStatus(tostring(reason
+        or (needsAction and 'memorizing' or 'idle')), false)
 end
 
 local function _abortMemJob(reason, requeue)
@@ -431,6 +607,8 @@ end
 -- main-loop tick. Each step does at most one TLO read pass + one issued
 -- command — the heavy lifting is yielding back to the main loop between
 -- ticks rather than blocking inside mq.delay loops.
+local isSpellBookOpen
+
 local function _stepMemJob()
     local job = M._memJob
     if not job then return end
@@ -480,10 +658,12 @@ local function _stepMemJob()
             job.targetSpellName = spellName
             if currentSpellId then
                 clearGem(job.slot)
+                M._dirtyEffect = true
                 job.deadlineMs = now + 3000
                 job.phase = 'wait_clear'
             else
                 mq.cmdf('/memspell %d "%s"', job.slot, spellName)
+                M._dirtyEffect = true
                 job.deadlineMs = now + MEMORIZE_TIMEOUT_MS
                 job.phase = 'wait_mem'
             end
@@ -493,6 +673,7 @@ local function _stepMemJob()
         if currentSpellId then
             -- No config but slot has a spell — clear it, no follow-up memspell.
             clearGem(job.slot)
+            M._dirtyEffect = true
             job.deadlineMs = now + 3000
             job.targetSpellId = 0  -- signal: no memspell after clear
             job.phase = 'wait_clear'
@@ -505,8 +686,10 @@ local function _stepMemJob()
 
     if job.phase == 'wait_clear' then
         if isGemEmpty(job.slot) then
+            M._dirtyEffect = false
             if job.targetSpellId and job.targetSpellId > 0 then
                 mq.cmdf('/memspell %d "%s"', job.slot, job.targetSpellName)
+                M._dirtyEffect = true
                 job.deadlineMs = now + MEMORIZE_TIMEOUT_MS
                 job.phase = 'wait_mem'
             else
@@ -519,6 +702,7 @@ local function _stepMemJob()
             -- Try memspell anyway if we have a target — otherwise advance.
             if job.targetSpellId and job.targetSpellId > 0 then
                 mq.cmdf('/memspell %d "%s"', job.slot, job.targetSpellName)
+                M._dirtyEffect = true
                 job.deadlineMs = now + MEMORIZE_TIMEOUT_MS
                 job.phase = 'wait_mem'
             else
@@ -530,6 +714,7 @@ local function _stepMemJob()
 
     if job.phase == 'wait_mem' then
         if isGemMemorized(job.slot, job.targetSpellId) then
+            M._dirtyEffect = false
             job.phase = 'next_slot'
             return
         end
@@ -549,6 +734,7 @@ local function _stepMemJob()
             return
         end
         clearGem(reservedSlot)
+        M._dirtyEffect = true
         job.deadlineMs = now + 3000
         job.slot = reservedSlot
         job.phase = 'reserved_wait'
@@ -556,14 +742,41 @@ local function _stepMemJob()
     end
 
     if job.phase == 'reserved_wait' then
-        if isGemEmpty(job.slot) or now >= job.deadlineMs then
+        if isGemEmpty(job.slot) then
+            M._dirtyEffect = false
+            job.phase = 'done'
+        elseif now >= job.deadlineMs then
             job.phase = 'done'
         end
         return
     end
 
     if job.phase == 'done' then
+        if M._dirtyEffect and isSpellBookOpen and isSpellBookOpen() then
+            lib.safeTLO(function()
+                local window = mq.TLO.Window('SpellBookWnd')
+                if window and window.Open and window.Open() and window.DoClose then
+                    window.DoClose()
+                end
+                return true
+            end, false)
+            M._cleanupCloseIssuedAt = now
+            job.deadlineMs = now + 1500
+            job.phase = 'cleanup_wait'
+            return
+        end
+        M._dirtyEffect = false
         _finishMemJob()
+        return
+    end
+
+    if job.phase == 'cleanup_wait' then
+        if not isSpellBookOpen() then
+            M._dirtyEffect = false
+            _finishMemJob()
+        elseif now >= job.deadlineMs then
+            _abortMemJob('spellbook_cleanup_timeout', true)
+        end
         return
     end
 end
@@ -575,7 +788,7 @@ end
 local _lastManualScanAtMs = -MANUAL_SCAN_INTERVAL_MS
 local _manualGemObservations = {}
 
-local function isSpellBookOpen()
+isSpellBookOpen = function()
     local ok, open = pcall(function()
         local window = mq.TLO.Window('SpellBookWnd')
         return window and window.Open and window.Open() or false
@@ -715,11 +928,10 @@ end
 
 --- Process pending spell set / advance active job. Called from main loop.
 --- One state-machine step per tick — never blocks.
-function M.processPending()
+local function advancePendingLeased()
     if isSuspended() then
-        -- Suspension means another worker owns the temporary buff gem. Do not
-        -- advertise need=true here, or the coordinator can give spell_memorize
-        -- active priority even though this module is intentionally idle.
+        -- Another worker owns the temporary buff gem. Keep the request queued
+        -- and do not advance any gem mutation.
         publishStatus(false, 'suspended:' .. tostring(M.suspendReason or 'external'))
         return
     end
@@ -771,24 +983,155 @@ function M.processPending()
     -- M.apply just sets up _memJob; the next tick will start advancing it.
 end
 
+--- Read-only/local planning for the dedicated scribing worker.
+function M.inspectWork()
+    M.drainWorkerCommands()
+
+    if M._dirtyEffect then
+        return {
+            mode = 'cleanup',
+            setName = M._memJob and M._memJob.setName or M.pendingSet,
+            phase = M._memJob and M._memJob.phase or 'orphan_cleanup',
+        }, 'owned_effect_cleanup'
+    end
+
+    if M._memJob and inCombat() then
+        _abortMemJob('combat detected', true)
+    end
+    if M._memJob and isSuspended() then
+        _abortMemJob('suspended:' .. tostring(M.suspendReason or 'external'), true)
+    end
+    if isSuspended() then return nil, 'suspended:' .. tostring(M.suspendReason or 'external') end
+
+    if M._memJob then
+        return {
+            mode = 'apply',
+            setName = M._memJob.setName,
+            phase = M._memJob.phase,
+        }, 'active'
+    end
+    if M.pendingSet and not inCombat() then
+        return {
+            mode = 'apply',
+            setName = M.pendingSet,
+            phase = 'pending',
+        }, 'pending'
+    end
+
+    if not M.isMemorizing then adoptManualGemChanges() end
+    return nil, inCombat() and 'combat_wait' or 'idle'
+end
+
+--- Advance exactly one state-machine step under an exact local lease.
+---@return boolean terminal True when this lease episode is complete
+---@return string reason Diagnostic phase/result
+function M.advanceLeased()
+    if not _workerMode then return true, 'not_worker' end
+    M.drainWorkerCommands()
+    if isSuspended() then
+        if M._memJob then
+            _abortMemJob('suspended:' .. tostring(M.suspendReason or 'external'), true)
+        end
+        return true, 'suspended'
+    end
+    advancePendingLeased()
+    if M._memJob then
+        return false, 'phase:' .. tostring(M._memJob.phase or 'active')
+    end
+    if M.pendingSet then
+        return true, inCombat() and 'combat_requeued' or 'pending_requeued'
+    end
+    return true, 'completed'
+end
+
+function M.abortActive(reason, requeue)
+    if M._memJob then _abortMemJob(reason or 'aborted', requeue ~= false) end
+end
+
+function M.hasDirtyEffects()
+    return M._dirtyEffect == true
+end
+
+--- Drain only effects this process marked when it issued a gem mutation.
+--- Must be called from a worker finalizer holding the exact/recovery lease.
+function M.drainOwnedEffects(reason)
+    if M._dirtyEffect then
+        if isSpellBookOpen() then
+            local now = _nowMs()
+            if (now - (M._cleanupCloseIssuedAt or 0)) >= 250 then
+                M._cleanupCloseIssuedAt = now
+                lib.safeTLO(function()
+                    local window = mq.TLO.Window('SpellBookWnd')
+                    if window and window.Open and window.Open() and window.DoClose then
+                        window.DoClose()
+                    end
+                    return true
+                end, false)
+            end
+            if isSpellBookOpen() then return false, 'closing_owned_spellbook' end
+        end
+        M._dirtyEffect = false
+    end
+    M.abortActive(reason or 'lease_finalized', true)
+    return true, reason or 'effects_drained'
+end
+
+--- UI-host transport tick. It sends intent only; no TLO/gameplay mutation is
+--- performed here. The worker acknowledges asynchronously through STATUS_TOPIC.
+function M.processPending()
+    if _workerMode then return end
+    M.initializeClient()
+    M.drainClientStatus()
+    local queued = _clientQueued
+    if not queued then return end
+    if queued.acknowledged then
+        _clientQueued = nil
+        return
+    end
+    local now = lib.getTimeMs()
+    if (now - (queued.lastSentAtMs or 0)) < COMMAND_RETRY_MS then return end
+    queued.lastSentAtMs = now
+    queued.issuedAtMs = now
+    local Actors = getActorsCoordinator()
+    if not Actors or not Actors.sendToLocalScript then return end
+    Actors.sendToLocalScript(WORKER_SCRIPT, APPLY_TOPIC, {
+        setName = queued.setName,
+        saveFirst = queued.saveFirst == true,
+        requestId = queued.requestId,
+        issuedAtMs = queued.issuedAtMs,
+        ttlMs = TRANSPORT_TTL_MS,
+        ownerName = lib.getMyName(),
+        ownerServer = lib.getMyServer(),
+    })
+end
+
 --- Cancel the pending spell set
 function M.cancelPending()
-    if M.pendingSet then
+    if _workerMode and M.pendingSet then
         print(string.format('\ay[SpellSetMemorize]\ax Cancelled pending set "%s"', M.pendingSet))
         M.pendingSet = nil
+    elseif not _workerMode and _clientQueued then
+        print(string.format('\ay[SpellSetMemorize]\ax Cancelled pending set "%s"',
+            tostring(_clientQueued.setName or '')))
+        _clientQueued = nil
     end
 end
 
 --- Check if memorization is in progress (active job or legacy flag).
 ---@return boolean True if busy memorizing
 function M.isBusy()
-    return M.isMemorizing or M._memJob ~= nil
+    if _workerMode then return M.isMemorizing or M._memJob ~= nil end
+    M.drainClientStatus()
+    return _clientRemote.busy == true
 end
 
 --- Get the pending set name (if any)
 ---@return string|nil The pending set name or nil
 function M.getPendingSet()
-    return M.pendingSet
+    if _workerMode then return M.pendingSet end
+    M.drainClientStatus()
+    if _clientQueued then return _clientQueued.setName end
+    return _clientRemote.pendingSet
 end
 
 return M

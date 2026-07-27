@@ -10,29 +10,33 @@ local _coreLoadedAtMs = 0
 local _settingsRevision = nil
 
 -- Version for compatibility checks
-M.VERSION = '2.0.0'
+M.VERSION = '3.0.0'
+M.LEASE_PROTOCOL_VERSION = 2
 
--- Priority tiers (lower = higher priority)
+-- Fixed coordinator tiers. Workers never send or override these values.
+-- Lower numbers run first.
 M.Priority = {
     EMERGENCY = 0,
     HEALING = 1,
     RESURRECTION = 2,
-    DEBUFF = 3,
-    PULL = 3.5,       -- Movement/target ownership before normal DPS assist
-    TANK_RECOVERY = 2.5, -- Loose-mob taunt/aggro recovery
-    TANK_ENGAGE = 2.75,  -- Engaging the next kill target. Queues only behind
-                         -- emergency/heals/rez-cures/recovery taunts; must
-                         -- outrank the tank's own DPS rotation, or a stun
-                         -- mid-cast holds the target resource and delays the
-                         -- turn to the next mob by a full cast time.
-    TANK_AGGRO = 3.25,   -- Routine tank hate tools
-    DPS = 4,
-    IDLE = 5,
-    BUFF = 6,        -- OOC buffs
-    MEDITATION = 7,  -- Lowest priority (sit/stand)
+    TANK = 3,
+    CROWD_CONTROL = 4,
+    DEBUFF = 5,
+    PULL = 6,
+    DPS = 7,
+    BUFF = 8,
+    MEDITATION = 9,
+    SCRIBING = 10,
+    AMBIENT = 11,
+    IDLE = 99,
 }
+-- Internal tank action rankings may continue to use these names, but the
+-- coordinator collapses all of them to the registered Tank tier.
+M.Priority.TANK_RECOVERY = M.Priority.TANK
+M.Priority.TANK_ENGAGE = M.Priority.TANK
+M.Priority.TANK_AGGRO = M.Priority.TANK
 
--- Reverse lookup for logs: 4 -> 'DPS(4)', 2.75 -> 'TANK_ENGAGE(2.75)'.
+-- Reverse lookup for coordinator diagnostics.
 local _priorityNames = nil
 function M.priorityName(value)
     if not _priorityNames then
@@ -45,57 +49,65 @@ function M.priorityName(value)
     return name and string.format('%s(%g)', name, v) or string.format('?(%g)', v)
 end
 
--- Interrupt thresholds (seconds remaining to let cast finish)
--- Lower threshold = cast can be interrupted sooner
--- 999 = effectively never interrupt based on time
-M.InterruptThreshold = {
-    [0] = 0.0,   -- Emergency: immediate
-    [1] = 0.5,   -- Healing: 0.5s
-    [2] = 1.0,   -- Resurrection: 1.0s
-    [2.5] = 0.25, -- Tank recovery: interrupt quickly for a loose mob
-    [2.75] = 0.5, -- Tank engage: brief grace for an in-flight cast, then take over
-    [3] = 1.0,   -- Debuff: 1.0s
-    [3.25] = 0.5, -- Routine tank aggro
-    [3.5] = 999, -- Pull owns movement/target only
-    [4] = 999,   -- DPS: never interrupt (lowest combat priority)
-    [5] = 999,   -- Idle: never interrupt
-    [6] = 1.0,   -- Buff: can be interrupted (OOC, higher priorities like DPS can interrupt)
-    [7] = 999,   -- Meditation: never interrupt (no casts)
-}
-
 -- Mailbox names
 M.Mailbox = {
     STATE = 'sk:state',
-    CLAIM = 'sk:claim',
-    RELEASE = 'sk:release',
-    INTERRUPT = 'sk:interrupt',
+    LEASE_REQUEST = 'lease:request',
+    LEASE_WITHDRAW = 'lease:withdraw',
+    LEASE_RENEW = 'lease:renew',
+    LEASE_RELEASE = 'lease:release',
+    LEASE_RECOVERED = 'lease:recovered',
     HEARTBEAT = 'sk:hb',
-    NEED = 'sk:need',
     SUPERVISOR = 'sk:supervisor',
     TEAM = 'sk:team',
 }
 
--- Script names used for routing between multi-script modules
+-- The single worker registry is the source of truth for scheduling,
+-- supervision, routing, and UI diagnostics. `order` is a global deterministic
+-- tiebreaker; it is intentionally independent of request arrival order.
+M.WorkerRegistry = {
+    { module = 'emergency',    script = 'sidekick-next/sk_emergency',    tier = M.Priority.EMERGENCY,    order = 1,  canPreempt = true,  enableSetting = 'DoHeals' },
+    { module = 'healing',      script = 'sidekick-next/sk_healing',      tier = M.Priority.HEALING,      order = 2,  canPreempt = true,  enableSetting = 'DoHeals' },
+    { module = 'cures',        script = 'sidekick-next/sk_cures',        tier = M.Priority.HEALING,      order = 3,  canPreempt = true,  enableSetting = 'DoCures' },
+    { module = 'resurrection', script = 'sidekick-next/sk_resurrection', tier = M.Priority.RESURRECTION, order = 4,  canPreempt = true,  canActDead = true },
+    { module = 'tank',         script = 'sidekick-next/sk_tank',         tier = M.Priority.TANK,         order = 5,  canPreempt = true },
+    { module = 'cc',           script = 'sidekick-next/sk_cc',           tier = M.Priority.CROWD_CONTROL,order = 6,  enableSetting = 'MezzingEnabled' },
+    { module = 'debuff',       script = 'sidekick-next/sk_debuff',       tier = M.Priority.DEBUFF,       order = 7,  enableSetting = 'DpsEnabled' },
+    { module = 'pull',         script = 'sidekick-next/sk_pull',         tier = M.Priority.PULL,         order = 8 },
+    { module = 'assist',       script = 'sidekick-next/sk_assist',       tier = M.Priority.DPS,          order = 9 },
+    { module = 'chase',        script = 'sidekick-next/sk_chase',        tier = M.Priority.DPS,          order = 10, enableSetting = 'ChaseEnabled' },
+    { module = 'resources',    script = 'sidekick-next/sk_resources',    tier = M.Priority.DPS,          order = 11 },
+    { module = 'disciplines',  script = 'sidekick-next/sk_disciplines',  tier = M.Priority.DPS,          order = 12, enableSetting = 'AutoAbilitiesEnabled' },
+    { module = 'items',        script = 'sidekick-next/sk_items',        tier = M.Priority.DPS,          order = 13, enableSetting = 'AutoItemsEnabled' },
+    { module = 'dps',          script = 'sidekick-next/sk_dps',          tier = M.Priority.DPS,          order = 14, enableSetting = 'DpsEnabled' },
+    { module = 'buffs',        script = 'sidekick-next/sk_buffs',        tier = M.Priority.BUFF,         order = 15, enableSetting = 'BuffingEnabled' },
+    { module = 'meditation',   script = 'sidekick-next/sk_meditation',   tier = M.Priority.MEDITATION,   order = 16, enableSetting = 'MeditationMode' },
+    { module = 'scribing',     script = 'sidekick-next/sk_scribing',     tier = M.Priority.SCRIBING,     order = 17 },
+    { module = 'fidget',       script = 'sidekick-next/sk_fidget',       tier = M.Priority.AMBIENT,      order = 18 },
+}
+
+M.WorkerByModule = {}
+local _workerScripts = {}
+for _, spec in ipairs(M.WorkerRegistry) do
+    M.WorkerByModule[spec.module] = spec
+    _workerScripts[#_workerScripts + 1] = spec.script
+end
+
+function M.getWorkerSpec(moduleName)
+    return M.WorkerByModule[tostring(moduleName or '')]
+end
+
+function M.getWorkerScripts()
+    local result = {}
+    for i, script in ipairs(_workerScripts) do result[i] = script end
+    return result
+end
+
+-- Script names used for routing between multi-script modules.
 M.Scripts = {
     COORDINATOR = 'sidekick-next/sk_coordinator',
     UI = { 'sidekick-next', 'sidekick-next/init' },
-    WORKERS = {
-        'sidekick-next/sk_emergency',
-        'sidekick-next/sk_healing',
-        'sidekick-next/sk_cures',
-        'sidekick-next/sk_cc',
-        'sidekick-next/sk_assist',
-        'sidekick-next/sk_tank',
-        'sidekick-next/sk_pull',
-        'sidekick-next/sk_dps',
-        'sidekick-next/sk_items',
-        'sidekick-next/sk_resources',
-        'sidekick-next/sk_buffs',
-        'sidekick-next/sk_meditation',
-        'sidekick-next/sk_resurrection',
-        'sidekick-next/sk_disciplines',
-        'sidekick-next/sk_fidget',
-    },
+    WORKERS = M.getWorkerScripts(),
 }
 
 -- Timing constants (milliseconds)
@@ -109,9 +121,12 @@ M.Timing = {
     MODULE_HEARTBEAT_MS = 500,
     SUPERVISOR_HEARTBEAT_MS = 500,
     SUPERVISOR_ABSENCE_MS = 10000,
-    CLAIM_DEFAULT_TTL_MS = 15000,
-    TARGET_CLAIM_TTL_MS = 15000,
-    CLAIM_CAST_START_MS = 1000,      -- Revoke ordinary spell claims that never start a cast
+    LEASE_REQUEST_TTL_MS = 2000,
+    LEASE_REQUEST_REFRESH_MS = 500,
+    LEASE_TTL_MS = 5000,
+    LEASE_RENEW_MS = 500,
+    LEASE_REVOCATION_GRACE_MS = 2000,
+    LEASE_RECOVERY_TTL_MS = 5000,
     WARMUP_MS = 500,
     COALESCE_MS = 20,
 
@@ -135,19 +150,14 @@ M.ActionKind = {
     USE_SKILL = 'use_skill',
 }
 
--- Claim types
-M.ClaimType = {
-    ACTION = 'action',  -- target + cast together (default)
-    TARGET = 'target',  -- target only
-    CAST = 'cast',      -- cast only
-}
-
---- Generate a unique claim ID
+--- Generate a unique request ID.
 -- @param module string Module name
 -- @param counter number Monotonic counter
--- @return string Unique claim ID
-function M.generateClaimId(module, counter)
-    return string.format('%s_%d_%d', module, os.time(), counter)
+-- @param workerSessionId string Worker process session
+-- @return string Unique request ID
+function M.generateRequestId(module, counter, workerSessionId)
+    return string.format('%s:%s:%d', tostring(module or ''),
+        tostring(workerSessionId or ''), tonumber(counter) or 0)
 end
 
 --- Get current time in milliseconds

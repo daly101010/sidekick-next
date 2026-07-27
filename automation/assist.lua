@@ -199,25 +199,9 @@ function M.runTankBroadcastAssist(settings)
     local hasTankData = M.updateTargetFromTank()
     if not hasTankData then return false end
 
-    local assistMode = settings and settings.AssistTargetMode or 'sticky'
-
-    -- Determine current target based on mode
-    if assistMode == 'sticky' then
-        -- Stay on current target until it dies
-        if M.currentTargetId and M.currentTargetId > 0 then
-            local spawn = mq.TLO.Spawn(M.currentTargetId)
-            if not spawn or not spawn() or (spawn.Dead and spawn.Dead()) then
-                -- Current target dead, pick up primary
-                M.currentTargetId = M.primaryTargetId
-            end
-        else
-            -- No current target, use primary
-            M.currentTargetId = M.primaryTargetId
-        end
-    else
-        -- Follow mode: always match tank's primary
-        M.currentTargetId = M.primaryTargetId
-    end
+    -- The tank's primary publication is group kill intent. Never infer group
+    -- intent from the tank's temporary live/working target during aggro work.
+    M.currentTargetId = M.primaryTargetId
 
     -- Check engage conditions and engage
     if M.currentTargetId and M.shouldEngage(settings) then

@@ -118,13 +118,12 @@ function M.draw(settings, themeNames, onChange)
                 end
             end
 
-            local assistTargetModes = { 'sticky', 'follow' }
-            local assistTargetMode = tostring(settings.AssistTargetMode or 'sticky')
-            local astModeChanged, newAstMode = Components.ComboRow.byValue('Target Mode', 'AssistTargetMode', assistTargetMode, assistTargetModes, nil, {
-                tooltip = 'Sticky: Keep target until dead. Follow: Switch with tank.',
-                width = 100,
-            })
-            if astModeChanged and onChange then onChange('AssistTargetMode', newAstMode) end
+            ImGui.TextDisabled('Target source: coordinated primary')
+            if ImGui.IsItemHovered() then
+                ImGui.SetTooltip(
+                    'Assist remains on the published group kill target while '
+                    .. 'the tank temporarily swaps targets for aggro recovery.')
+            end
 
             local engageConditions = { 'hp', 'tank_aggro' }
             local engageCondition = tostring(settings.AssistEngageCondition or 'hp')

@@ -457,8 +457,8 @@ function M.render()
         return
     end
 
-    -- NOTE: processPending() must be called from the main loop, not here
-    -- See SideKick.lua main loop for the call to Memorize.processPending()
+    -- The main loop forwards queued intent to the leased scribing worker.
+    -- ImGui callbacks never send Actor messages or mutate spell gems directly.
 
     -- Window setup
     imgui.SetNextWindowSize(600, 700, ImGuiCond.FirstUseEver)

@@ -318,8 +318,8 @@ function M.tick(opts)
         spells = SpellLineup.getSpells(false, settings)
     end
 
-    -- Check if spell rotation is enabled
-    if not settings.SpellRotationEnabled then return end
+    -- DPS is the canonical gate for automated offensive spell selection.
+    if settings.DpsEnabled == false then return end
 
     -- Get spell engine
     local SpellEngine = getSpellEngine()

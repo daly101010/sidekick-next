@@ -1,28 +1,19 @@
 -- F:/lua/sidekick-next/sk_meditation.lua
--- Meditation module for SideKick multi-script system
--- Priority 7: Lowest priority (sit/stand for resource regeneration)
--- Does not use claim system - just issues /sit and /stand commands
+-- Leased meditation worker (sit/stand for resource regeneration).
 
 local mq = require('mq')
-local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
+local ModuleBase = require('sidekick-next.sk_module_base')
 local ActionCounters = require('sidekick-next.utils.action_counters')
 
-local M = {}
+local M = ModuleBase.create('meditation', lib.Priority.MEDITATION)
 
 local debugLog = require('sidekick-next.utils.debug_log').module('sk_meditation', 'SK_MEDITATION')
 
--- Module identity
--- Keep the actor/coordinator identity distinct from production SideKick's
--- `meditation` worker. Both trees can be installed or running concurrently.
-M.MODULE_NAME = 'next_meditation'
+M.MODULE_NAME = 'meditation'
 
 -- Internal state
 local State = {
-    -- State from Coordinator
-    coordState = nil,
-    stateReceivedAt = 0,
-
     -- Meditation state
     lastCmdAt = 0,
     lastStateChangeAt = 0,
@@ -34,18 +25,7 @@ local State = {
     hasMana = true,
     hasEndurance = true,
 
-    -- Running flag
-    running = true,
-    initialized = false,
-    warmupUntil = 0,
-
-    -- Need tracking
-    lastNeedSentAt = 0,
-    lastNeedValue = nil,
-
-    -- Actor dropbox
-    dropbox = nil,
-    stateDropbox = nil,
+    lastNeedReason = 'init',
 }
 
 -- Load settings directly from INI (we run as separate script)
@@ -122,7 +102,7 @@ local function loadSettingsFromIni()
 end
 
 local function getSettings()
-    local revision = tonumber(State.coordState and State.coordState.settingsRevision) or 0
+    local revision = tonumber(M.state and M.state.settingsRevision) or 0
     if not _settings or revision ~= _settingsRevision then
         _settings = loadSettingsFromIni()
         _settingsRevision = revision
@@ -161,12 +141,11 @@ local function safeBool(fn)
 end
 
 local function hasValidState()
-    if not State.coordState then return false end
-    return not lib.isStale(State.coordState.sentAtMs, State.coordState.ttlMs)
+    return M:hasValidState()
 end
 
 local function isWarmingUp()
-    return lib.getTimeMs() < State.warmupUntil
+    return M:isWarmingUp()
 end
 
 local function normalizeMode(mode)
@@ -364,94 +343,12 @@ local function cmdStand(now)
     State.lastStateChangeAt = now
 end
 
--------------------------------------------------------------------------------
--- Need Hint Communication
--------------------------------------------------------------------------------
-
-local function sendNeed(needsAction, ttlMs, reason)
-    if not State.dropbox then return end
-    local now = lib.getTimeMs()
-    local value = needsAction == true
-    local reasonChanged = reason ~= State.lastNeedReason
-    if not reasonChanged and State.lastNeedValue == value and (now - (State.lastNeedSentAt or 0)) < 100 then
-        return
-    end
-    State.lastNeedValue = value
-    State.lastNeedSentAt = now
-    State.lastNeedReason = reason
-    pcall(function()
-        State.dropbox:send({ mailbox = lib.Mailbox.NEED, script = lib.Scripts.COORDINATOR }, {
-            msgType = 'need',
-            module = M.MODULE_NAME,
-            ownerName = lib.getMyName(),
-            ownerServer = lib.getMyServer(),
-            priority = lib.Priority.MEDITATION,
-            needsAction = value,
-            ttlMs = ttlMs or 500,
-            reason = reason,
-        })
-    end)
-end
-
-local function sendHeartbeat()
-    if not State.dropbox then return end
-    pcall(function()
-        State.dropbox:send({ mailbox = lib.Mailbox.HEARTBEAT, script = lib.Scripts.COORDINATOR }, {
-            msgType = 'heartbeat',
-            module = M.MODULE_NAME,
-            ownerName = lib.getMyName(),
-            ownerServer = lib.getMyServer(),
-            sentAtMs = lib.getTimeMs(),
-            ready = true,
-            counters = ActionCounters.snapshot(),
-        })
-    end)
-end
-
--------------------------------------------------------------------------------
--- Coordinator Communication
--------------------------------------------------------------------------------
-
-local function isMyPriority()
-    if not hasValidState() then return false end
-    return State.coordState.activePriority == lib.Priority.MEDITATION
-end
-
-local function isCastOwnerActive()
-    if not hasValidState() then return false end
-    -- Only block when actively casting (castBusy), not just for having a claim.
-    -- A module can hold a cast claim while preparing (gem memorization, targeting)
-    -- and we should be able to sit during that prep time.
-    return State.coordState.castBusy == true
-end
-
--- Check if we should block meditation due to other activity
--- Block ONLY when someone is actively casting or has a cast claim.
--- We can safely sit between casts regardless of active priority.
--- The casting check and castOwner check already handle "don't sit WHILE
--- casting" individually, but this catches cast claims about to start.
-local function shouldBlockForOtherActivity()
-    if not hasValidState() then return false end
-    -- Block if actively casting
-    if State.coordState.castBusy then return true end
-    -- Block during active buff casting (buff module holds long TTL claims)
-    local ap = State.coordState.activePriority
-    if ap == lib.Priority.BUFF and State.coordState.castOwner then
-        return true
-    end
-    -- Allow meditation between casts for all other priorities
-    return false
+local function updateIntent(needsAction, ttlMs, reason)
+    State.lastNeedReason = tostring(reason or (needsAction and 'ready' or 'idle'))
+    M:setIntent(needsAction == true, ttlMs, State.lastNeedReason)
 end
 
 local function spellMemorizationActive()
-    if hasValidState() then
-        local diag = State.coordState.moduleDiag or {}
-        local mem = diag.spell_memorize
-        if mem and mem.needValid == true and mem.needsAction == true then
-            return true, mem.reason or 'spell_memorize'
-        end
-    end
-
     local bookOpen = safeBool(function()
         local wnd = mq.TLO.Window and mq.TLO.Window('SpellBookWnd')
         return wnd and wnd.Open and wnd.Open() == true
@@ -466,25 +363,47 @@ end
 -------------------------------------------------------------------------------
 
 local _lastTickLog = 0
+local _pendingAction = nil
 
-local function tick()
+local function proposeState(command, reason, now, settings)
+    if not canChangeState(now, settings) then
+        updateIntent(false, nil, 'state_change_throttled:' .. tostring(reason or command))
+        return false
+    end
+    _pendingAction = {
+        kind = 'meditation_state',
+        meditationCommand = command,
+        name = command == 'sit' and 'Sit to meditate' or 'Stand',
+        breaksInvis = false,
+        skipBoundaryTarget = true,
+        settleMs = 150,
+        timeoutMs = 1500,
+        idempotencyKey = 'meditation:' .. command,
+        reason = tostring(reason or command),
+    }
+    updateIntent(true, nil, _pendingAction.reason)
+    return true
+end
+
+M.onTick = function(self)
+    _pendingAction = nil
     -- Remain loaded through zoning, but do not sit/stand or inspect character
     -- state until MacroQuest reports that the character is fully in game.
     if not lib.isInGame() then
-        sendNeed(false, nil, 'not_ingame')
+        updateIntent(false, nil, 'not_ingame')
         return
     end
 
-    local paused = State.coordState and State.coordState.automationPaused
+    local paused = self.state and self.state.automationPaused
     if paused == nil and lib.isAutomationPaused then paused = lib.isAutomationPaused() end
     if paused == true then
-        sendNeed(false, nil, 'automation_paused')
+        updateIntent(false, nil, 'automation_paused')
         return
     end
 
     -- Safety: stop if no valid state
     if not hasValidState() then
-        sendNeed(false, nil, 'no_state')
+        updateIntent(false, nil, 'no_state')
         return
     end
 
@@ -506,7 +425,7 @@ local function tick()
 
     if mode == 'off' then
         if shouldLog then debugLog('tick: mode is off, skipping') end
-        sendNeed(false, nil, 'mode_off')
+        updateIntent(false, nil, 'mode_off')
         return
     end
 
@@ -514,7 +433,7 @@ local function tick()
     local me = getMeData()
     if not me or (me.id or 0) <= 0 then
         if shouldLog then debugLog('tick: no me data') end
-        sendNeed(false, nil, 'no_me')
+        updateIntent(false, nil, 'no_me')
         return
     end
 
@@ -524,7 +443,7 @@ local function tick()
     local incapacitated, incapReason = lib.isIncapacitated()
     if incapacitated then
         if shouldLog then debugLog('tick: blocked by %s', tostring(incapReason)) end
-        sendNeed(false, nil, 'incapacitated:' .. tostring(incapReason or 'unknown'))
+        updateIntent(false, nil, 'incapacitated:' .. tostring(incapReason or 'unknown'))
         return
     end
 
@@ -548,28 +467,14 @@ local function tick()
     local hovering = safeBool(function() return mq.TLO.Me.Hovering and mq.TLO.Me.Hovering() end)
     if hovering then
         if shouldLog then debugLog('tick: blocked by hovering') end
-        sendNeed(false, nil, 'hovering')
+        updateIntent(false, nil, 'hovering')
         return
     end
 
     -- Casting check - don't sit while casting
     if me.casting == true then
         if shouldLog then debugLog('tick: blocked by casting') end
-        sendNeed(false, nil, 'casting')
-        return
-    end
-
-    -- Don't sit while cast owner is active (someone is casting)
-    if isCastOwnerActive() then
-        if shouldLog then debugLog('tick: blocked by castOwner active') end
-        sendNeed(false, nil, 'cast_owner_active')
-        return
-    end
-
-    -- Don't sit while actively casting spells or buff module is casting
-    if shouldBlockForOtherActivity() then
-        if shouldLog then debugLog('tick: blocked by other activity (priority=%s)', tostring(State.coordState and State.coordState.activePriority)) end
-        sendNeed(false, nil, 'cast_busy')
+        updateIntent(false, nil, 'casting')
         return
     end
 
@@ -578,7 +483,7 @@ local function tick()
     local movementBlocking = movementActive and me.moving == true
     if movementBlocking and me.sitting == true and canChangeState(now, settings) then
         if shouldLog then debugLog('tick: standing due to movement plugins') end
-        cmdStand(now)
+        proposeState('stand', 'movement_active', now, settings)
         return
     end
 
@@ -589,9 +494,10 @@ local function tick()
         if me.sitting == true and canChangeState(now, settings) then
             if shouldLog then debugLog('tick: standing due to aggro') end
             ActionCounters.bump('aggro_stand')
-            cmdStand(now)
+            proposeState('stand', 'aggro_hold', now, settings)
+            return
         end
-        sendNeed(false, nil, 'aggro_hold')
+        updateIntent(false, nil, 'aggro_hold')
         return
     end
 
@@ -599,9 +505,10 @@ local function tick()
     if inCombat and mode == 'ooc' then
         if me.sitting == true and canChangeState(now, settings) then
             if shouldLog then debugLog('tick: standing due to combat (ooc mode)') end
-            cmdStand(now)
+            proposeState('stand', 'ooc_in_combat', now, settings)
+            return
         end
-        sendNeed(false, nil, 'ooc_in_combat')
+        updateIntent(false, nil, 'ooc_in_combat')
         return
     end
 
@@ -611,7 +518,7 @@ local function tick()
         local readyAt = State.combatEndedAt + delay + (State.postCombatJitter or 0)
         if now < readyAt then
             if shouldLog then debugLog('tick: post-combat delay (%.1fs remaining)', (readyAt - now) / 1000) end
-            sendNeed(false, nil, 'post_combat_delay')
+            updateIntent(false, nil, 'post_combat_delay')
             return
         end
     end
@@ -619,16 +526,17 @@ local function tick()
     -- Moving check
     if me.moving == true then
         if shouldLog then debugLog('tick: blocked by moving') end
-        sendNeed(false, nil, 'moving')
+        updateIntent(false, nil, 'moving')
         return
     end
 
     local memActive, memReason = spellMemorizationActive()
     if memActive then
         if shouldLog then debugLog('tick: spell memorization active (%s)', tostring(memReason)) end
-        sendNeed(me.sitting ~= true, nil, 'spell_memorize:' .. tostring(memReason or 'active'))
+        updateIntent(me.sitting ~= true, nil, 'spell_memorize:' .. tostring(memReason or 'active'))
         if me.sitting ~= true and canChangeState(now, settings) then
-            cmdSit(now)
+            proposeState('sit', 'spell_memorize:' .. tostring(memReason or 'active'),
+                now, settings)
         end
         return
     end
@@ -672,180 +580,67 @@ local function tick()
     end
 
     if shouldLog then
-        debugLog('tick: needsAction=%s isMyPriority=%s', tostring(needsAction), tostring(isMyPriority()))
+        debugLog('tick: needsAction=%s ownsLease=%s',
+            tostring(needsAction), tostring(self:ownsLease()))
     end
 
-    sendNeed(needsAction, nil, needReason)
+    updateIntent(needsAction, nil, needReason)
 
-    -- Meditation acts independently of activePriority.
     -- Sitting/standing doesn't use cast or target claims — it's just /sit or /stand.
-    -- The blocking checks above (castBusy, casting, hovering, aggro, movement) already
     -- ensure we only sit when safe. The standard EQ healer loop is:
     --   sit → stand → cast heal → sit again
-    -- Standing is instant so there's no delay if a heal needs to fire.
 
-    -- Execute sit/stand
     if wantSit and me.sitting ~= true then
-        if canChangeState(now, settings) then
-            cmdSit(now)
-        end
+        proposeState('sit', needReason, now, settings)
         return
     end
 
     if not wantSit and me.sitting == true and settings.MeditationStandWhenDone == true then
-        if canChangeState(now, settings) then
-            cmdStand(now)
-        end
+        proposeState('stand', needReason, now, settings)
         return
     end
 end
 
--------------------------------------------------------------------------------
--- Message Handling
--------------------------------------------------------------------------------
-
-local function onStateReceived(content)
-    if type(content) ~= 'table' then return end
-    if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
-    if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
-
-    State.coordState = content
-    State.stateReceivedAt = lib.getTimeMs()
-
-    -- Start warmup on first state
-    if not State.initialized then
-        State.warmupUntil = lib.getTimeMs() + lib.Timing.WARMUP_MS
-        State.initialized = true
-        lib.log('info', M.MODULE_NAME, 'First state received, warming up for %dms', lib.Timing.WARMUP_MS)
-    end
+M.shouldAct = function()
+    return _pendingAction ~= nil
 end
 
--------------------------------------------------------------------------------
--- Initialization
--------------------------------------------------------------------------------
-
-local function initialize()
-    lib.log('info', M.MODULE_NAME, 'Initializing Meditation module (priority=%d)', lib.Priority.MEDITATION)
-
-    -- Register actor to receive state broadcasts
-    State.dropbox = actors.register(M.MODULE_NAME, function(message)
-        local content = message()
-        if type(content) ~= 'table' then return end
-
-        -- Check if this is a state broadcast
-        if content.tickId and content.epoch then
-            onStateReceived(content)
-        end
-    end)
-
-    -- Also listen on state mailbox
-    State.stateDropbox = actors.register(lib.Mailbox.STATE, function(message)
-        local content = message()
-        if type(content) == 'table' and content.tickId and content.epoch then
-            onStateReceived(content)
-        end
-    end)
-
-    lib.log('info', M.MODULE_NAME, 'Meditation module ready, waiting for Coordinator state...')
+M.getAction = function()
+    return _pendingAction
 end
 
---- Check if coordinator has been absent too long
-local function isCoordinatorAbsent()
-    if not lib.isInGame() then return false end
-    -- Not initialized yet or never received state
-    if not State.initialized then return false end
-    if State.stateReceivedAt == 0 then return false end
-
-    local now = lib.getTimeMs()
-    local absence = now - State.stateReceivedAt
-    if absence <= lib.Timing.COORDINATOR_ABSENCE_MS then return false end
-
-    local status = lib.getLuaScriptStatus(lib.Scripts.COORDINATOR)
-    if status ~= 'EXITED' then
-        State.stateReceivedAt = now
-        debugLog('WATCHDOG: coordinator actor state stale but Lua status=%s; keeping worker',
-            status ~= '' and status or 'UNKNOWN')
-        return false
-    end
-    return true
-end
-
-local function mainLoop()
-    initialize()
-
-    local lastHeartbeat = 0
-    local tickDelayMs = 100  -- Meditation can tick slower
-    local _coordinatorAbsentLogged = false
-    local wasInGame = lib.isInGame()
-    -- Orphan watchdog (mirrors ModuleBase.run): self-terminate when the
-    -- parent UI script is force-stopped and never ran Supervisor.stop().
-    local lastParentCheckAt = lib.getTimeMs()
-    local parentMisses = 0
-
-    while State.running do
-        -- Pump chat events: the combat-damage aggro guard (skmed_hit_me /
-        -- skmed_miss_me) only fires from mq.doevents, and this hand-rolled
-        -- loop is not ModuleBase.run (which pumps automatically).
-        if mq.doevents then pcall(mq.doevents) end
-
-        do
-            local nowMs = lib.getTimeMs()
-            if (nowMs - lastParentCheckAt) >= 5000 then
-                lastParentCheckAt = nowMs
-                if lib.isUiRunning() then
-                    parentMisses = 0
-                else
-                    parentMisses = parentMisses + 1
-                    if parentMisses >= 2 then
-                        lib.log('info', 'meditation',
-                            'Parent SideKick script stopped; shutting down worker')
-                        State.running = false
-                        break
-                    end
-                end
+M:enableUnifiedExecutor({
+    preflight = function(action)
+        local me = getMeData()
+        if not me then return false, 'no_me' end
+        if me.casting == true then return false, 'casting' end
+        local command = tostring(action.meditationCommand or '')
+        if command == 'sit' then
+            if me.sitting == true then return false, 'already_sitting' end
+            if me.moving == true then
+                return false, 'movement_active'
             end
-        end
-
-        tick()
-
-        -- Send heartbeat periodically
-        local now = lib.getTimeMs()
-        local inGame = lib.isInGame()
-        if inGame and not wasInGame then
-            -- Give the coordinator's first post-zone state broadcast time to
-            -- arrive before applying the absence watchdog.
-            State.stateReceivedAt = now
-        end
-        wasInGame = inGame
-        if (now - lastHeartbeat) >= lib.Timing.MODULE_HEARTBEAT_MS then
-            sendHeartbeat()
-            lastHeartbeat = now
-        end
-
-        -- Watchdog: check for coordinator absence
-        if isCoordinatorAbsent() then
-            if not _coordinatorAbsentLogged then
-                _coordinatorAbsentLogged = true
-                local absence = now - State.stateReceivedAt
-                -- print(string.format(
-                --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
-                --     M.MODULE_NAME, absence / 1000))
-                debugLog('WATCHDOG: Coordinator absent for %dms, shutting down', now - State.stateReceivedAt)
-                lib.log('warn', M.MODULE_NAME,
-                    'Stopping worker: coordinator Lua process is EXITED')
-            end
-            -- Meditation does not use claims, so no releaseClaim needed
-            State.running = false
+            if iHaveAggro(me, getSettings()) then return false, 'aggro_hold' end
+        elseif command == 'stand' then
+            if me.sitting ~= true then return false, 'already_standing' end
         else
-            _coordinatorAbsentLogged = false
+            return false, 'invalid_meditation_command'
         end
+        return true
+    end,
+    dispatch = function(action)
+        local now = lib.getTimeMs()
+        if action.meditationCommand == 'sit' then
+            cmdSit(now)
+        else
+            cmdStand(now)
+        end
+        _pendingAction = nil
+        return true, 'issued', 'settle'
+    end,
+})
 
-        mq.delay(tickDelayMs)
-    end
-
-    lib.log('info', M.MODULE_NAME, 'Meditation module stopped')
-end
-
+                --     '\ar[SK-Watchdog]\ax Module "%s": Coordinator absent for %.1fs — shutting down gracefully',
 -------------------------------------------------------------------------------
 -- Command Binding
 -------------------------------------------------------------------------------
@@ -894,7 +689,7 @@ local function handleCommand(cmd)
     elseif cmd == 'audit' then
         echoLastSettingsAudit()
     elseif cmd == 'stop' then
-        State.running = false
+        M:stop()
         lib.log('info', M.MODULE_NAME, 'Stop requested')
         commandEcho('Stop requested')
     elseif cmd == 'reload' then
@@ -913,10 +708,10 @@ local function handleCommand(cmd)
         local me = getMeData() or {}
         lib.log('info', M.MODULE_NAME, 'script=sidekick-next/sk_meditation config=%s rawMode=%s',
             tostring(_settingsPath or 'unknown'), tostring(settings.MeditationMode))
-        lib.log('info', M.MODULE_NAME, 'running=%s, hasState=%s, isMyPriority=%s, mode=%s, mana=%s, sitting=%s, lastReason=%s',
-            tostring(State.running),
+        lib.log('info', M.MODULE_NAME, 'running=%s, hasState=%s, ownsLease=%s, mode=%s, mana=%s, sitting=%s, lastReason=%s',
+            tostring(M.running),
             tostring(hasValidState()),
-            tostring(isMyPriority()),
+            tostring(M:ownsLease()),
             tostring(normalizeMode(settings.MeditationMode)),
             tostring(me.mana),
             tostring(me.sitting),
@@ -927,7 +722,7 @@ local function handleCommand(cmd)
             tostring(me.moving == true),
             tostring(movementPluginsActive()),
             tostring(me.casting == true),
-            tostring(State.coordState and State.coordState.castBusy == true),
+            tostring(M.state and M.state.worldState and M.state.worldState.castBusy == true),
             tostring(iHaveAggro(me, settings)),
             tostring(me.hp),
             tostring(me.endur),
@@ -935,10 +730,10 @@ local function handleCommand(cmd)
         commandEcho('script=sidekick-next/sk_meditation config=%s rawMode=%s normalized=%s reason=%s',
             tostring(_settingsPath or 'unknown'), tostring(settings.MeditationMode),
             tostring(normalizeMode(settings.MeditationMode)), tostring(State.lastNeedReason))
-        commandEcho('state=%s priority=%s mana=%s sitting=%s combat=%s moving=%s casting=%s castBusy=%s aggro=%s',
-            tostring(hasValidState()), tostring(isMyPriority()), tostring(me.mana), tostring(me.sitting),
+        commandEcho('state=%s ownsLease=%s mana=%s sitting=%s combat=%s moving=%s casting=%s castBusy=%s aggro=%s',
+            tostring(hasValidState()), tostring(M:ownsLease()), tostring(me.mana), tostring(me.sitting),
             tostring(lib.inCombat()), tostring(me.moving == true), tostring(me.casting == true),
-            tostring(State.coordState and State.coordState.castBusy == true),
+            tostring(M.state and M.state.worldState and M.state.worldState.castBusy == true),
             tostring(iHaveAggro(me, settings)))
         commandEcho('thresholds mana=%s/%s hp=%s/%s end=%s/%s',
             tostring(settings.MeditationManaStartPct), tostring(settings.MeditationManaStopPct),
@@ -959,6 +754,6 @@ mq.bind('/sk_meditation', handleCommand)
 -- Run
 -------------------------------------------------------------------------------
 
-mainLoop()
+M:run(100)
 
 return M

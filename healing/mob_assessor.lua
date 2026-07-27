@@ -900,7 +900,8 @@ function M.checkEngagedMob(mobId)
 end
 
 -- Main tick function - call from healing main loop
-function M.tick()
+function M.tick(opts)
+    opts = opts or {}
     local now = mq.gettime()
 
     -- Zone change detection
@@ -946,6 +947,10 @@ function M.tick()
     if M.isSafeZone(M.state.currentZone) then
         return
     end
+
+    -- Coordinated sensor loops may update/read cached zone facts but must not
+    -- target mobs, issue /consider, wait, or restore targets without a lease.
+    if opts.readOnly == true then return end
 
     -- Only process when safe
     if not M.isSafeToConsider() then

@@ -1590,8 +1590,14 @@ function M.selectCharmAction(settings)
     -- AFTER candidate selection so we never dismiss without a replacement.
     if petIdNow > 0 then
         if (now - (M.charm.lastPetDismissAt or 0)) >= 5.0 then
-            M.charm.lastPetDismissAt = now
-            mq.cmd('/pet get lost')
+            return {
+                kind = 'pet_command',
+                petCommand = 'dismiss',
+                targetId = petIdNow,
+                targetName = tostring(mq.TLO.Pet.CleanName() or ''),
+                reason = 'charm_dismiss_pet',
+                urgent = false,
+            }, 'charm_dismiss_pet'
         end
         return nil, 'dismissing_pet'
     end
@@ -1767,17 +1773,45 @@ function M.charmTick(settings)
         local petTargetId = 0
         pcall(function() petTargetId = tonumber(mq.TLO.Pet.Target.ID()) or 0 end)
         if petTargetId ~= primaryId then
-            M.charm.lastPetCmdAt = now
-            mq.cmdf('/pet attack %d', primaryId)
+            return {
+                kind = 'pet_command',
+                petCommand = 'attack',
+                targetId = primaryId,
+                reason = 'charm_pet_attack',
+            }
         end
     else
         local petFighting = false
         pcall(function() petFighting = mq.TLO.Pet.Combat() == true end)
         if petFighting then
-            M.charm.lastPetCmdAt = now
-            mq.cmd('/pet back off')
+            return {
+                kind = 'pet_command',
+                petCommand = 'backoff',
+                targetId = petId,
+                reason = 'charm_pet_backoff',
+            }
         end
     end
+end
+
+function M.executePetCommand(action)
+    if type(action) ~= 'table' then return false, 'no_action' end
+    local command = tostring(action.petCommand or '')
+    if command == 'dismiss' then
+        mq.cmd('/pet get lost')
+        M.charm.lastPetDismissAt = os.clock()
+    elseif command == 'attack' then
+        local targetId = tonumber(action.targetId) or 0
+        if targetId <= 0 then return false, 'invalid_target' end
+        mq.cmdf('/pet attack %d', targetId)
+        M.charm.lastPetCmdAt = os.clock()
+    elseif command == 'backoff' then
+        mq.cmd('/pet back off')
+        M.charm.lastPetCmdAt = os.clock()
+    else
+        return false, 'unknown_pet_command'
+    end
+    return true, 'issued'
 end
 
 return M

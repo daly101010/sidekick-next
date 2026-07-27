@@ -10,20 +10,46 @@ M.state = {
     userPaused = false,
 }
 
-M.ROLES = { 'none', 'ma', 'mt', 'leader', 'raid1', 'raid2', 'raid3' }
+M.ROLES = { 'none', 'ma', 'mt', 'leader', 'raid1', 'raid2', 'raid3', 'byname' }
 
-local _navState = {
-    lastPosX = 0,
-    lastPosY = 0,
-    stuckCount = 0,
-    lastNavAt = 0,
-    initiatedNav = false,
-}
-
--- Per-chase-episode jitter so the trigger distance varies between catches
--- without oscillating mid-chase. Cleared whenever we're in range.
+local _Core = nil
+local _lastReason = 'init'
+local _lastIntent = nil
 local _chaseRoll = nil
-local _chaseJitterPct = 0.20  -- ±20% default
+local _chaseJitterPct = 0.20
+
+local function nowMs()
+    return (mq.gettime and mq.gettime()) or math.floor(os.clock() * 1000)
+end
+
+local function trim(value)
+    local text = tostring(value or ''):gsub('^%s+', '')
+    return (text:gsub('%s+$', ''))
+end
+
+local function safeValue(fn, fallback)
+    local ok, value = pcall(fn)
+    if not ok or value == nil then return fallback end
+    return value
+end
+
+local function safeBool(fn)
+    return safeValue(fn, false) == true
+end
+
+local function safeNum(fn, fallback)
+    return tonumber(safeValue(fn, fallback)) or fallback
+end
+
+local function safeString(fn, fallback)
+    local value = safeValue(fn, fallback or '')
+    if value == nil then return fallback or '' end
+    return tostring(value)
+end
+
+local function clearChaseRoll()
+    _chaseRoll = nil
+end
 
 local function humanizeOn()
     local cfg = _G.SIDEKICK_NEXT_CONFIG
@@ -35,9 +61,7 @@ local function humanizeOn()
     return true
 end
 
--- Effective trigger distance: configured value with ±_chaseJitterPct jitter,
--- fixed for the duration of one chase episode.
-local function effectiveMaxDist(base)
+local function effectiveMaxDistance(base)
     if not humanizeOn() or _chaseJitterPct <= 0 then return base end
     if not _chaseRoll then
         local lo = base * (1 - _chaseJitterPct)
@@ -47,137 +71,69 @@ local function effectiveMaxDist(base)
     return _chaseRoll
 end
 
-local function clearChaseRoll() _chaseRoll = nil end
-
-function M.getChaseJitterPct() return _chaseJitterPct end
-function M.setChaseJitterPct(v)
-    v = tonumber(v) or 0.20
-    if v < 0 then v = 0 end
-    if v > 0.5 then v = 0.5 end
-    _chaseJitterPct = v
-    _chaseRoll = nil
+local function localZone()
+    return {
+        id = safeNum(function() return mq.TLO.Zone.ID() end, 0),
+        shortName = safeString(function() return mq.TLO.Zone.ShortName() end, ''),
+        instanceId = safeNum(function() return mq.TLO.Me.Instance() end, 0),
+    }
 end
 
-local _Core = nil
-local _lastReason = 'init'
+local function localServer()
+    return safeString(function() return mq.TLO.EverQuest.Server() end, '')
+end
+
+local function spawnExists(spawn)
+    return spawn ~= nil and safeValue(function() return spawn() end, nil) ~= nil
+end
+
+local function sameText(left, right)
+    return trim(left):lower() == trim(right):lower()
+end
+
+function M.getChaseJitterPct()
+    return _chaseJitterPct
+end
+
+function M.setChaseJitterPct(value)
+    value = tonumber(value) or 0.20
+    _chaseJitterPct = math.max(0, math.min(0.5, value))
+    clearChaseRoll()
+end
+
+function M.endEpisode()
+    clearChaseRoll()
+end
 
 function M.init(opts)
     opts = opts or {}
     _Core = opts.Core
 end
 
-function M.stopNav()
-    if mq and mq.cmd then mq.cmd('/squelch /nav stop') end
-    _navState.initiatedNav = false
+function M.validateDistance(distance)
+    distance = tonumber(distance)
+    return distance ~= nil and distance >= 15 and distance <= 300
 end
 
-local function isUnderwater()
-    local ok, wet = pcall(function() return mq.TLO.Me.FeetWet and mq.TLO.Me.FeetWet() end)
-    return ok and wet
+function M.applySettings(settings)
+    settings = settings or {}
+    M.enabled = settings.ChaseEnabled == true
+    M.state.role = tostring(settings.ChaseRole or 'ma'):lower()
+    M.state.target = trim(settings.ChaseTarget)
+    M.state.distance = tonumber(settings.ChaseDistance) or 30
+    if M.enabled then M.state.userPaused = false end
+    return settings
 end
 
-local function navMeshLoaded()
-    if not mq.TLO.Navigation or not mq.TLO.Navigation.MeshLoaded then return false end
-    local ok, result = pcall(function() return mq.TLO.Navigation.MeshLoaded() end)
-    return ok and result
-end
-
-local function checkStuck()
-    local x = mq.TLO.Me.X() or 0
-    local y = mq.TLO.Me.Y() or 0
-    if math.abs(x - _navState.lastPosX) < 1 and math.abs(y - _navState.lastPosY) < 1 then
-        _navState.stuckCount = _navState.stuckCount + 1
-    else
-        _navState.stuckCount = 0
-    end
-    _navState.lastPosX = x
-    _navState.lastPosY = y
-    return _navState.stuckCount >= 4
-end
-
--- Non-blocking stuck recovery: kicks off the back+strafe hold sequence and
--- schedules releases via module state so the main loop doesn't freeze for
--- 500ms. Releases are drained in tickStuckRecovery() each tick.
-local _recovery = nil  -- { stage, releaseAt, strafe }
-
-local function doStuckRecovery()
-    if _recovery then return end  -- already in flight
-
-    mq.cmd('/keypress back hold')
-    local now = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
-    local strafe = (math.random(2) == 1) and 'strafe_left' or 'strafe_right'
-    _recovery = { stage = 'back', releaseAt = now + 200, strafe = strafe }
-
-    _navState.stuckCount = 0
-    _navState.lastNavAt = 0
-end
-
-local function tickStuckRecovery()
-    if not _recovery then return end
-    local now = (mq.gettime and mq.gettime()) or (os.clock() * 1000)
-    if now < _recovery.releaseAt then return end
-
-    if _recovery.stage == 'back' then
-        mq.cmd('/keypress back')
-        mq.cmdf('/keypress %s hold', _recovery.strafe)
-        _recovery.stage = 'strafe'
-        _recovery.releaseAt = now + 300
-    elseif _recovery.stage == 'strafe' then
-        mq.cmdf('/keypress %s', _recovery.strafe)
-        _recovery = nil
-    end
-end
-
-function M.validateDistance(dist)
-    dist = tonumber(dist)
-    if not dist then return false end
-    return dist >= 15 and dist <= 300
-end
-
-function M.resolveSpawn()
-    local role = tostring(M.state.role or 'none'):lower()
-    if role == 'ma' then
-        return mq.TLO.Group and mq.TLO.Group.MainAssist
-    elseif role == 'mt' then
-        return mq.TLO.Group and mq.TLO.Group.MainTank
-    elseif role == 'leader' then
-        return mq.TLO.Group and mq.TLO.Group.Leader
-    elseif role == 'raid1' then
-        return mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(1)
-    elseif role == 'raid2' then
-        return mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(2)
-    elseif role == 'raid3' then
-        return mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(3)
-    end
-
-    local name = tostring(M.state.target or ''):gsub('^%s+', ''):gsub('%s+$', '')
-    if name == '' then return nil end
-    return mq.TLO.Spawn and mq.TLO.Spawn('pc =' .. name) or nil
-end
-
-function M.distanceTo(spawn)
-    local meX, meY = mq.TLO.Me.X(), mq.TLO.Me.Y()
-    local tx, ty = spawn.X(), spawn.Y()
-    if not meX or not meY or not tx or not ty then return nil end
-    local dx, dy = meX - tx, meY - ty
-    return math.sqrt(dx * dx + dy * dy)
-end
-
-function M.setEnabled(val, opts)
+function M.setEnabled(value, opts)
     opts = opts or {}
-    M.enabled = val and true or false
-
+    M.enabled = value == true
     if _Core and _Core.set then
         _Core.set('ChaseEnabled', M.enabled)
     elseif _Core and _Core.Settings then
         _Core.Settings.ChaseEnabled = M.enabled
     end
-
-    if not M.enabled then
-        M.stopNav()
-        clearChaseRoll()
-    end
-
+    if not M.enabled then clearChaseRoll() end
     if opts.user then
         M.state.userPaused = not M.enabled
     elseif M.enabled then
@@ -185,180 +141,300 @@ function M.setEnabled(val, opts)
     end
 end
 
-function M.tick()
-    -- Always advance any in-flight stuck-recovery release sequence so the
-    -- back/strafe hold gets cleared even if chase is paused mid-recovery.
-    tickStuckRecovery()
+-- Chase movement is worker-owned. This compatibility method deliberately
+-- performs no command so the UI host cannot stop another process's movement.
+function M.stopNav()
+    clearChaseRoll()
+    _lastReason = 'worker_owned'
+end
 
-    if not M.enabled then _lastReason = 'disabled'; return end
-    if M.state.userPaused then _lastReason = 'user_paused'; return end
-    if not mq or not mq.TLO or not mq.TLO.Me or not mq.TLO.Me() then _lastReason = 'no_character'; return end
+function M.resolveSpawn(settings)
+    settings = settings or M.state
+    local role = tostring(settings.ChaseRole or settings.role or 'none'):lower()
+    if role == 'none' then return nil, 'role_none' end
 
-    if mq.TLO.Me.Hovering() then _lastReason = 'hovering'; return end
-    if mq.TLO.Me.AutoFire() then _lastReason = 'autofire'; return end
-    if mq.TLO.Me.Combat() then _lastReason = 'melee_combat'; return end
-
-    -- Ranged standoff owns in-combat positioning: while it's enabled and
-    -- combat is active, chase yields entirely. Otherwise the two movement
-    -- systems tug-of-war — standoff parks 35-60 units from the mob, chase
-    -- notices we're beyond ChaseDistance of the tank and drags us back in,
-    -- and the character ping-pongs between the two forever.
-    do
-        local okCore, Core = pcall(require, 'sidekick-next.utils.core')
-        if okCore and Core and Core.Settings
-            and Core.Settings.CasterStandoffEnabled == true
-            and tostring(mq.TLO.Me.CombatState() or '') == 'COMBAT' then
-            -- Leash exception: if the chase target has run a SUBSTANTIAL
-            -- distance away (tank chasing a fleeing mob out of camp),
-            -- keeping up matters more than the standoff spot — fall
-            -- through and let chase run. Inside the leash, chase yields
-            -- so casts are never movement-interrupted mid-fight.
-            local leash = math.max(150, (tonumber(M.state.distance) or 30) * 4)
-            local spawn = M.resolveSpawn()
-            local dist = (spawn and spawn()) and M.distanceTo(spawn) or nil
-            if not dist or dist <= leash then
-                if _navState.initiatedNav then
-                    local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
-                        or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
-                    if navActive then M.stopNav() end
-                end
-                _lastReason = dist and string.format('standoff_combat:%.0f<=%d', dist, leash) or 'standoff_combat'
-                return
-            end
-        end
-    end
-    -- me.Casting() returns the spell name when casting OR the literal "NULL"
-    -- when idle — must reject both. Treating "NULL" as truthy (the previous
-    -- behavior) permanently suppressed chase whenever the player wasn't
-    -- actually casting.
-    local casting = mq.TLO.Me.Casting()
-    if casting and casting ~= '' and casting ~= 'NULL' then
-        -- A cast that starts mid-chase must WIN. Returning with our own nav
-        -- still running keeps the character moving, and the client cancels
-        -- the cast on the first step — mez/charm died at cast start every
-        -- time the enchanter was chasing. Only stop nav WE initiated;
-        -- external nav (standoff, tank engage) manages its own casts.
-        if _navState.initiatedNav then
-            local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
-                or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
-            if navActive then M.stopNav() end
-        end
-        _lastReason = 'casting'
-        return
-    end
-    if mq.TLO.Stick and mq.TLO.Stick.Active and mq.TLO.Stick.Active() then _lastReason = 'stick_active'; return end
-
-    local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
-        or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
-
-    if navActive and not _navState.initiatedNav then
-        _lastReason = 'external_nav_active'
-        return
-    end
-    if not navActive then
-        _navState.initiatedNav = false
+    local spawn
+    if role == 'ma' then
+        spawn = mq.TLO.Group and mq.TLO.Group.MainAssist
+    elseif role == 'mt' then
+        spawn = mq.TLO.Group and mq.TLO.Group.MainTank
+    elseif role == 'leader' then
+        spawn = mq.TLO.Group and mq.TLO.Group.Leader
+    elseif role == 'raid1' or role == 'raid2' or role == 'raid3' then
+        local index = tonumber(role:sub(-1))
+        spawn = mq.TLO.Raid and mq.TLO.Raid.MainAssist
+            and mq.TLO.Raid.MainAssist(index) or nil
+    elseif role == 'byname' then
+        local name = trim(settings.ChaseTarget or settings.target)
+        if name == '' then return nil, 'empty_target_name' end
+        spawn = mq.TLO.Spawn and mq.TLO.Spawn('pc =' .. name) or nil
+    else
+        return nil, 'invalid_role:' .. role
     end
 
-    local spawn = M.resolveSpawn()
-    if not (spawn and spawn()) then
-        _navState.stuckCount = 0
-        _lastReason = 'no_chase_target'
-        return
-    end
-    if spawn.Type and spawn.Type() ~= 'PC' then _lastReason = 'target_not_pc'; return end
+    if not spawnExists(spawn) then return nil, 'no_chase_target' end
+    return spawn, nil
+end
 
-    local dist = M.distanceTo(spawn)
-    if not dist then _lastReason = 'no_distance'; return end
-    local baseDist = tonumber(M.state.distance) or 30
-    local maxDist = effectiveMaxDist(baseDist)
-    if dist <= maxDist then
-        if navActive then M.stopNav() end
-        _navState.stuckCount = 0
+function M.distanceTo(spawn)
+    if not spawnExists(spawn) then return nil end
+    local meX = safeValue(function() return mq.TLO.Me.X() end, nil)
+    local meY = safeValue(function() return mq.TLO.Me.Y() end, nil)
+    local meZ = safeValue(function() return mq.TLO.Me.Z() end, nil)
+    local targetX = safeValue(function() return spawn.X() end, nil)
+    local targetY = safeValue(function() return spawn.Y() end, nil)
+    local targetZ = safeValue(function() return spawn.Z() end, nil)
+    if not meX or not meY or not targetX or not targetY then return nil end
+    local dx = tonumber(meX) - tonumber(targetX)
+    local dy = tonumber(meY) - tonumber(targetY)
+    local dz = (tonumber(meZ) or 0) - (tonumber(targetZ) or 0)
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+function M.position()
+    return {
+        x = safeNum(function() return mq.TLO.Me.X() end, 0),
+        y = safeNum(function() return mq.TLO.Me.Y() end, 0),
+        z = safeNum(function() return mq.TLO.Me.Z() end, 0),
+    }
+end
+
+function M.fingerprint(settings)
+    settings = settings or M.state
+    local spawn, reason = M.resolveSpawn(settings)
+    if not spawn then return nil, reason end
+
+    local spawnType = safeString(function() return spawn.Type() end, ''):lower()
+    if spawnType ~= 'pc' then return nil, 'target_not_pc' end
+
+    local id = safeNum(function() return spawn.ID() end, 0)
+    local selfId = safeNum(function() return mq.TLO.Me.ID() end, 0)
+    if id <= 0 then return nil, 'target_missing_id' end
+    if id == selfId then return nil, 'target_is_self' end
+
+    local cleanName = safeString(function() return spawn.CleanName() end, '')
+    local uniqueName = safeString(function() return spawn.Name() end, '')
+    if cleanName == '' then return nil, 'target_missing_name' end
+
+    local zone = localZone()
+    return {
+        id = id,
+        cleanName = cleanName,
+        uniqueName = uniqueName,
+        type = 'PC',
+        source = tostring(settings.ChaseRole or settings.role or 'none'):lower(),
+        server = localServer(),
+        zoneId = zone.id,
+        zoneShortName = zone.shortName,
+        instanceId = zone.instanceId,
+    }, nil
+end
+
+function M.validateFingerprint(fingerprint)
+    if type(fingerprint) ~= 'table' then return nil, 'missing_fingerprint' end
+
+    local zone = localZone()
+    if zone.id <= 0 or zone.id ~= tonumber(fingerprint.zoneId) then
+        return nil, 'zone_changed'
+    end
+    if zone.instanceId ~= (tonumber(fingerprint.instanceId) or 0) then
+        return nil, 'instance_changed'
+    end
+    if fingerprint.server and fingerprint.server ~= ''
+        and not sameText(localServer(), fingerprint.server)
+    then
+        return nil, 'server_changed'
+    end
+
+    local id = tonumber(fingerprint.id) or 0
+    if id <= 0 then return nil, 'target_missing_id' end
+    local spawn = mq.TLO.Spawn and mq.TLO.Spawn(id) or nil
+    if not spawnExists(spawn) then return nil, 'target_missing' end
+    if safeNum(function() return spawn.ID() end, 0) ~= id then
+        return nil, 'target_id_changed'
+    end
+    if safeString(function() return spawn.Type() end, ''):lower() ~= 'pc' then
+        return nil, 'target_not_pc'
+    end
+    if not sameText(safeString(function() return spawn.CleanName() end, ''), fingerprint.cleanName) then
+        return nil, 'target_name_changed'
+    end
+    if fingerprint.uniqueName and fingerprint.uniqueName ~= ''
+        and not sameText(safeString(function() return spawn.Name() end, ''), fingerprint.uniqueName)
+    then
+        return nil, 'target_identity_changed'
+    end
+    return spawn, nil
+end
+
+function M.combatBlockReason()
+    if not mq.TLO or not mq.TLO.Me or not safeValue(function() return mq.TLO.Me() end, nil) then
+        return 'no_character'
+    end
+    if safeBool(function() return mq.TLO.Me.Dead() end) then return 'self_dead' end
+    if safeBool(function() return mq.TLO.Me.Hovering() end) then return 'hovering' end
+    if safeBool(function() return mq.TLO.Me.Combat() end) then return 'melee_combat' end
+    if safeBool(function() return mq.TLO.Me.AutoFire() end) then return 'autofire' end
+    if safeString(function() return mq.TLO.Me.CombatState() end, ''):upper() == 'COMBAT' then
+        return 'combat_state'
+    end
+    if safeNum(function() return mq.TLO.Me.XTHaterCount() end, 0) > 0 then
+        return 'active_haters'
+    end
+    if safeValue(function() return mq.TLO.Me.Pet() end, nil)
+        and safeBool(function() return mq.TLO.Me.Pet.Combat() end)
+    then
+        return 'pet_combat'
+    end
+
+    local casting = safeString(function() return mq.TLO.Me.Casting() end, '')
+    if casting ~= '' and casting:upper() ~= 'NULL' then return 'casting' end
+    return nil
+end
+
+local function preflight(settings)
+    settings = settings or {}
+    if settings.ChaseEnabled ~= true then return nil, 'disabled' end
+    if M.state.userPaused then return nil, 'user_paused' end
+    if settings.AutomationPaused == true then return nil, 'automation_paused' end
+    if tostring(settings.AutomationLevel or 'auto'):lower() ~= 'auto' then
+        return nil, 'movement_not_auto'
+    end
+
+    local distance = tonumber(settings.ChaseDistance) or 30
+    if not M.validateDistance(distance) then return nil, 'invalid_distance' end
+    local combatReason = M.combatBlockReason()
+    if combatReason then return nil, combatReason end
+
+    local fingerprint, reason = M.fingerprint(settings)
+    if not fingerprint then return nil, reason end
+    local spawn, validateReason = M.validateFingerprint(fingerprint)
+    if not spawn then return nil, validateReason end
+    return {
+        fingerprint = fingerprint,
+        spawn = spawn,
+        baseDistance = distance,
+    }, nil
+end
+
+function M.selectIntent(settings, opts)
+    opts = opts or {}
+    M.applySettings(settings)
+    local candidate, reason = preflight(settings)
+    if not candidate then
         clearChaseRoll()
-        _lastReason = string.format('in_range:%.1f<=%.1f', dist, maxDist)
-        return
+        _lastIntent = nil
+        _lastReason = tostring(reason or 'not_ready')
+        return nil, _lastReason
     end
 
-    if navActive then
-        if checkStuck() then
-            doStuckRecovery()
-            _lastReason = 'stuck_recovery'
-        else
-            _lastReason = string.format('nav_active:%.1f>%.1f', dist, maxDist)
-        end
-        return
+    if opts.externalMovementReason then
+        _lastIntent = nil
+        _lastReason = tostring(opts.externalMovementReason)
+        return nil, _lastReason
     end
 
-    local cleanName = spawn.CleanName and spawn.CleanName() or ''
-    if cleanName == '' then _lastReason = 'empty_target_name'; return end
-
-    local now = os.clock()
-    if isUnderwater() then
-        local id = spawn.ID and spawn.ID()
-        if id and id > 0 then
-            mq.cmdf('/stick 15 id %d uw moveback', id)
-            _navState.lastNavAt = now
-            _lastReason = string.format('stick_underwater:%s', cleanName)
-        end
-        return
+    local distance = M.distanceTo(candidate.spawn)
+    if not distance then
+        _lastIntent = nil
+        _lastReason = 'no_distance'
+        return nil, _lastReason
     end
 
-    if (now - _navState.lastNavAt) < 2.0 then _lastReason = 'nav_cooldown'; return end
-
-    local pathOk = navMeshLoaded() and mq.TLO.Navigation and mq.TLO.Navigation.PathExists
-        and mq.TLO.Navigation.PathExists(string.format('spawn pc =%s', cleanName))
-    if pathOk then
-        mq.cmdf('/nav spawn pc =%s | dist=10 log=off', cleanName)
-        _navState.initiatedNav = true
-        _navState.lastNavAt = now
-        _lastReason = string.format('nav_to:%s dist=%.1f', cleanName, dist)
-        return
+    local triggerDistance = effectiveMaxDistance(candidate.baseDistance)
+    if distance <= triggerDistance then
+        clearChaseRoll()
+        _lastIntent = nil
+        _lastReason = string.format('in_range:%.1f<=%.1f', distance, triggerDistance)
+        return nil, _lastReason
     end
 
-    local hasMoveTo = mq.TLO.MoveTo and mq.TLO.MoveTo.Moving
-    if hasMoveTo then
-        local id = spawn.ID and spawn.ID()
-        if id and id > 0 then
-            mq.cmdf('/moveto id %d uw mdist 10', id)
-            _navState.initiatedNav = true
-            _navState.lastNavAt = now
-            _lastReason = string.format('moveto:%s dist=%.1f', cleanName, dist)
-        end
-        return
+    local arrivalDistance = math.max(10, math.min(candidate.baseDistance - 2, candidate.baseDistance * 0.8))
+    local intent = {
+        kind = 'chase_slice',
+        name = 'Out-of-combat chase',
+        fingerprint = candidate.fingerprint,
+        baseDistance = candidate.baseDistance,
+        triggerDistance = triggerDistance,
+        arrivalDistance = arrivalDistance,
+        observedDistance = distance,
+        createdAtMs = nowMs(),
+    }
+    _lastIntent = intent
+    _lastReason = string.format('ready:%s:%.1f>%.1f',
+        candidate.fingerprint.cleanName, distance, triggerDistance)
+    return intent, nil
+end
+
+function M.revalidateIntent(intent, settings)
+    if type(intent) ~= 'table' or type(intent.fingerprint) ~= 'table' then
+        return nil, nil, 'missing_intent'
     end
 
-    local id = spawn.ID and spawn.ID()
-    if id and id > 0 then
-        mq.cmdf('/stick 20 id %d uw moveback', id)
-        _navState.lastNavAt = now
-        _lastReason = string.format('stick:%s dist=%.1f', cleanName, dist)
+    local candidate, reason = preflight(settings)
+    if not candidate then return nil, nil, reason end
+    local expected = intent.fingerprint
+    local current = candidate.fingerprint
+    if tonumber(expected.id) ~= tonumber(current.id)
+        or not sameText(expected.cleanName, current.cleanName)
+        or not sameText(expected.uniqueName, current.uniqueName)
+        or tonumber(expected.zoneId) ~= tonumber(current.zoneId)
+        or tonumber(expected.instanceId) ~= tonumber(current.instanceId)
+    then
+        return nil, nil, 'configured_target_changed'
     end
+    if tonumber(intent.baseDistance) ~= tonumber(candidate.baseDistance) then
+        return nil, nil, 'distance_setting_changed'
+    end
+
+    local spawn, validateReason = M.validateFingerprint(expected)
+    if not spawn then return nil, nil, validateReason end
+    local distance = M.distanceTo(spawn)
+    if not distance then return nil, nil, 'no_distance' end
+    return spawn, distance, nil
+end
+
+-- Kept as a sensor-only compatibility entry point until all callers have
+-- migrated to the dedicated worker.
+function M.tick()
+    local settings = (_Core and _Core.Settings) or {
+        ChaseEnabled = M.enabled,
+        ChaseRole = M.state.role,
+        ChaseTarget = M.state.target,
+        ChaseDistance = M.state.distance,
+        AutomationLevel = 'auto',
+    }
+    M.selectIntent(settings, { externalMovementReason = 'worker_owned' })
 end
 
 function M.status()
-    local spawn = M.resolveSpawn()
-    local name = nil
-    local id = 0
-    local dist = nil
-    if spawn and spawn() then
-        name = spawn.CleanName and spawn.CleanName() or tostring(spawn.Name and spawn.Name() or '')
-        id = spawn.ID and spawn.ID() or 0
-        dist = M.distanceTo(spawn)
-    end
-    local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
-        or (mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active())
+    local settings = (_Core and _Core.Settings) or {
+        ChaseEnabled = M.enabled,
+        ChaseRole = M.state.role,
+        ChaseTarget = M.state.target,
+        ChaseDistance = M.state.distance,
+    }
+    M.applySettings(settings)
+    local fingerprint = M.fingerprint(settings)
+    local spawn = fingerprint and mq.TLO.Spawn(fingerprint.id) or nil
+    local distance = spawn and M.distanceTo(spawn) or nil
+    local navActive = safeBool(function()
+        return mq.TLO.Navigation and mq.TLO.Navigation.Active
+            and mq.TLO.Navigation.Active()
+    end)
     return {
         enabled = M.enabled == true,
         userPaused = M.state.userPaused == true,
         role = M.state.role,
         target = M.state.target,
         distance = M.state.distance,
-        resolvedName = name,
-        resolvedId = id,
-        resolvedDistance = dist,
-        navActive = navActive == true,
-        initiatedNav = _navState.initiatedNav == true,
+        resolvedName = fingerprint and fingerprint.cleanName or nil,
+        resolvedId = fingerprint and fingerprint.id or 0,
+        resolvedDistance = distance,
+        navActive = navActive,
+        initiatedNav = false,
         reason = _lastReason,
+        intent = _lastIntent,
     }
 end
 

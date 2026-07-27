@@ -54,7 +54,7 @@ function M.draw(settings, themeNames, onChange)
             pullId = telemetry.pullId,
             campSet = telemetry.campSet,
             config = cfg,
-            ownsTarget = telemetry.ownsTarget,
+            ownsLease = telemetry.ownsLease,
         }
     end
 

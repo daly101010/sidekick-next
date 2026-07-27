@@ -6,66 +6,88 @@
 The supervisor owns the lifetime of the coordinator and every worker listed in
 `sk_lib.lua`.
 It also checks coordinator process liveness on its normal heartbeat cadence and
-restarts an exited coordinator before worker state leases reach their absence
-timeout. This closes the asynchronous `/lua stop` then `/lua run` race that can
-otherwise leave all still-running workers reporting `state_stale`.
+restarts an exited coordinator before worker coordinator-state snapshots reach
+their absence timeout. This closes the asynchronous `/lua stop` then `/lua run`
+race that can otherwise leave all still-running workers reporting
+`state_stale`.
 For the first state-TTL window after startup, the coordinator also seeds state
 directly to every canonical worker script instead of waiting for the reverse
 heartbeat route to discover recipients. Duplicate routes are coalesced per
 broadcast.
 Every state payload includes a coordinator boot ID. Workers apply tick-order
-guards only within that boot, reset local claims when a new boot appears, and
-tombstone the retired boot so delayed pre-restart packets cannot switch them
-back. Supervisor coordinator recovery uses the same capped restart count,
+guards only within that boot, reset local lease state when a new boot appears,
+and tombstone the retired boot so delayed pre-restart packets cannot switch
+them back. Supervisor coordinator recovery uses the same capped restart count,
 cooldown, and stable-period reset as worker recovery.
 
-The UI host owns presentation, user input, settings writes, chase movement,
-manual button actions, coordinated item requests, rez-dialog acceptance, and
-spell-set memorization. In coordinated mode it must not initialize an automatic
-cast subsystem merely to
-display status. Worker telemetry and coordinator state are the read-only UI
-data sources.
+The UI host owns presentation, user input, settings writes, and submission of
+manual requests. In coordinated mode it does not tick automatic casting,
+targeting, movement, meditation, or spell-scribing behavior merely to display
+status. The dedicated workers own those effects; worker telemetry and
+coordinator state are read-only UI data sources.
 
-`sk_coordinator.lua` is the exclusive cast/target arbiter. Automatic action
-selection can happen in a worker only; targeting or casting starts after that
-worker receives the matching claim. The current workers are:
+`sk_coordinator.lua` grants exactly one local action lease at a time. The lease
+is deliberately action-blind: it serializes any game-changing episode, whether
+that episode casts, targets, moves, attacks, clicks an item, sits, or memorizes
+a spell. A worker selects and retains its action locally. Its
+`lease:request` contains protocol and identity/session/request data, not the
+action or a worker-selected priority. Lease request/withdraw operations also
+carry a worker-session monotonic `operationSeq`; a withdrawal advances the
+sequence even when its request has not arrived, preventing delayed packets from
+resurrecting abandoned intent.
 
-| Worker | Priority | Ownership |
-|---|---:|---|
-| `sk_emergency.lua` | 0 | Non-heal emergency actions |
-| `sk_healing.lua` | 0/1 | Emergency and normal healing |
-| `sk_cures.lua` | 2 | Cure target selection and casts |
-| `sk_resurrection.lua` | 2 | Group/Actor-Team resurrection, resource/gem workflow, corpse navigation, and distributed corpse intents |
-| `sk_cc.lua` | 3 | Mez selection and casts |
-| `sk_tank.lua` | 0/2.5/3.25/4 | Tank emergency defenses, loose-mob recovery, routine hate tools, stable kill-target engagement, and Actor target broadcasts |
-| `sk_pull.lua` | 3.5 | Read-only target scan followed by claimed navigation, targeting, and pull execution |
-| `sk_assist.lua` | 4 | Target-only melee assist, positioning, and auto-attack |
-| `sk_dps.lua` | 4 | Combat rotation |
-| `sk_items.lua` | 4/6 | Configured clicky selection plus queued manual item-bar uses |
-| `sk_resources.lua` | 5 | Resource conversion |
-| `sk_buffs.lua` | 6 | OOC buffs and buff spell swaps |
-| `sk_meditation.lua` | 7 | Sit/stand state |
-| `sk_disciplines.lua` | varies | Class discipline actions |
-| `sk_fidget.lua` | 5 auxiliary | Humanize profile/fidget timing; never requests target or cast ownership |
+The coordinator derives a fixed tier and deterministic order from the single
+`sk_lib.lua` worker registry. Lower tiers run first; registry order breaks ties
+within a tier independently of request arrival. Workers cannot transmit or
+override either value.
 
-The coordinator broadcasts stunned, mezzed, silenced, and feared state and
-revokes both cast and target ownership while the local character is
-incapacitated, dead, or zoning. Workers also sample the local control state in
-their normal tick immediately before executing a granted action.
+| Order | Worker | Fixed tier | Owned behavior |
+|---:|---|---:|---|
+| 1 | `sk_emergency.lua` | 0 EMERGENCY | Non-heal emergency actions |
+| 2 | `sk_healing.lua` | 1 HEALING | Healing selection and execution |
+| 3 | `sk_cures.lua` | 1 HEALING | Cure selection and execution |
+| 4 | `sk_resurrection.lua` | 2 RESURRECTION | Group/Actor-Team rez, corpse movement, resource/gem workflow |
+| 5 | `sk_tank.lua` | 3 TANK | Tank targeting, positioning, defenses, hate tools, and Actor target broadcasts |
+| 6 | `sk_cc.lua` | 4 CROWD_CONTROL | Mez selection and execution |
+| 7 | `sk_debuff.lua` | 5 DEBUFF | Automatic debuff selection and execution |
+| 8 | `sk_pull.lua` | 6 PULL | Pull workflow (mechanical lease migration only; see below) |
+| 9 | `sk_assist.lua` | 7 DPS | Melee assist, positioning, and auto-attack |
+| 10 | `sk_chase.lua` | 7 DPS | Out-of-combat chase movement |
+| 11 | `sk_resources.lua` | 7 DPS | Resource conversion |
+| 12 | `sk_disciplines.lua` | 7 DPS | Class discipline actions |
+| 13 | `sk_items.lua` | 7 DPS | Configured clickies and queued manual item-bar uses |
+| 14 | `sk_dps.lua` | 7 DPS | Combat rotation |
+| 15 | `sk_buffs.lua` | 8 BUFF | OOC buffs and bounded buff spell swaps |
+| 16 | `sk_meditation.lua` | 9 MEDITATION | Sit/stand resource recovery |
+| 17 | `sk_scribing.lua` | 10 SCRIBING | Automatic spell-gem and scribing workflow |
+| 18 | `sk_fidget.lua` | 11 AMBIENT | Safe idle-humanization episodes |
 
-Spell claims have two lease phases. Ordinary spell actions must produce an
-observable cast bar within 1000 ms of the grant or the coordinator revokes the
-claim. Deliberate pre-cast workflows declare their own bounded window: DPS/CC
-humanization, corpse preparation, and buff gem memorization. Once a cast is
-observed, the normal action TTL starts; an active cast is allowed to finish,
-then stale ownership is cleared. Repeated need hints never extend ownership.
-Workers retain a tombstone for the last claim they released so an older Actor
-snapshot cannot resurrect and execute that claim again.
+Tier 99 IDLE is reserved for internal scheduler state and is not a worker tier.
+Because there is one lease, an Assist targeting episode and a DPS casting
+episode cannot run concurrently.
+
+The worker keeps the selected action beside its request ID and crosses the
+final mutation boundary only after `ownsLease()` validates the coordinator
+boot, lease token, holder module, worker session, and request ID. Workers renew
+long-running episodes and finalize owned effects before releasing the lease.
+The coordinator broadcasts incapacitation, death, zoning, pause, and lifecycle
+state; workers also sample local control state immediately before execution.
+
+Urgent preemption is coordinator-owned and can be disabled with
+`LeasePreemptionEnabled` ("Allow Urgent Lease Preemption"). Only the registered
+Emergency, Healing, Cures, Resurrection, and Tank workers may trigger it, and
+only when their fixed tier is numerically lower than the active holder's tier.
+The coordinator marks the current lease `revoking`; it never issues
+`/stopcast`. The holder observes that state, cancels or drains its own effects
+through its finalizer, and releases. If the revocation grace or lease TTL
+expires, the scheduler fences the old token and grants a recovery lease before
+new work. Recovery requests outrank ordinary requests.
 
 Coordinator-state freshness is measured from the worker's local Actor receipt
 time, not the coordinator's `sentAtMs`; the processes may have different clock
-origins and transport latency. Within one coordinator boot, workers reject
-decreasing `tickId` values before updating state or its freshness window. The
+origins and transport latency. Workers require the exact local coordinator
+sender route and protocol version, clamp the advertised TTL, and reject
+non-increasing `tickId` values before updating state or its freshness window. The
 five-second state window tolerates
 normal background-client frame throttling while the ten-second process watchdog
 remains the hard coordinator-failure boundary. If a Lua loop resumes after a
@@ -80,20 +102,18 @@ coordinator never treats the mailbox prefix `sk` as a script name.
 `/sk_coord status` reports state-send attempts and immediate routing failures.
 Worker heartbeats advertise `ready=false` whenever their coordinator snapshot
 is stale or they are waiting for a post-resume snapshot. The coordinator cannot
-promote an old need from a not-ready worker, and the worker actively clears that
-need instead of leaving a long cast-time TTL displayed as actionable. Healing
-heartbeats additionally expose the selected pre-claim spell as
-`waiting_priority`, `awaiting_claim`, or `claim_pending`, so an empty executor is
-not mistaken for an empty healing decision.
+grant a stale request from a not-ready worker, and the worker withdraws obsolete
+intent rather than leaving it displayed as actionable.
 
-`utils/action_executor.lua` owns the local lifecycle after a claim is granted.
+`utils/action_executor.lua` owns the local lifecycle after a lease is granted.
 Every cast-capable coordinated worker opts in through
 `ModuleBase:enableUnifiedExecutor()`. Actions advance through `queued`,
 `dispatching`, `waiting_start`, `running`, and one terminal state
 (`completed`, `failed`, or `cancelled`). `ModuleBase` ticks this lifecycle from
-the worker coroutine, releases the claim on every terminal result, and includes
-the current or most recent result in its heartbeat. Actor callbacks only copy
-state; they never tick or dispatch the executor.
+the worker coroutine and releases the lease on every terminal result. The
+result remains local to the worker; only aggregate activity counters ride the
+heartbeat for diagnostics. Actor callbacks only copy state; they never tick or
+dispatch the executor.
 
 Spell, AA, discipline, item, and skill actions use the executor's native
 dispatch and monitoring. Healing adds hooks for incoming-heal registration,
@@ -102,36 +122,34 @@ their existing bounded multi-phase state machines as custom executor adapters;
 their steps still run once per worker tick, so memorization, navigation, and
 gem restoration do not block heartbeats. Incapacitation cancels a queued or
 running lifecycle immediately. Cross-module preemption remains coordinator
-owned; a worker may request cancellation of its own cast for ducking or safety.
+owned; a worker may cancel only effects that it owns for ducking or safety.
 The shared spell-event registry is reference-counted so a custom adapter and the
 native spell executor can observe the same event set without duplicate names.
 
-Healing action construction requires a positive spawn ID before advertising a
-need. If a target-monitor entry has only a name, it attempts an exact visible
+Healing action construction requires a positive spawn ID before requesting a
+lease. If a target-monitor entry has only a name, it attempts an exact visible
 PC, mercenary, or pet resolution and verifies the returned clean name. An
 unresolved target is skipped so `priority_targets` cannot remain asserted while
-`ModuleBase:getAction()` silently returns no claim.
+`ModuleBase:getAction()` silently returns no lease request.
 
-Before a worker sends a coordinator claim, ModuleBase copies the action into an
-Actors-safe scalar/table payload; runtime functions, userdata, cyclic references,
-and unsupported keys cannot poison claim delivery. Immediate serialization or
-routing failures clear `claimPending` and are exposed by the worker status.
-`/sk_coord status` reports aggregate claim receipts, grants, rejections, and the
-last admission result without requiring per-tick debug-file logging.
+Actions are never serialized into the local lease protocol. Immediate routing
+failures leave the local action unexecuted and are exposed by worker status.
+`/sk_coord status` reports aggregate request receipts, grants, rejections, and
+the last admission result without requiring per-tick debug-file logging.
 
 `sk_items.lua` is the sole coordinated owner of configured item clicks. Combat,
 out-of-combat, and saved-condition modes are selected in its normal worker tick;
 the UI item bar sends a local `item:manual` Actor request instead of issuing
 `/useitem` from the ImGui callback. Manual requests are bounded, revalidated for
 inventory readiness, and prioritized ahead of automatic item candidates, but
-still wait for the coordinator's cast lease. Monolithic mode retains the direct
-item compatibility path.
+still wait for the coordinator's single action lease. Monolithic mode retains
+the direct item compatibility path.
 
 Resurrection is a non-blocking pre-cast workflow. Targeting, corpse dragging,
 optional MQ2Nav movement, temporary spell memorization, spell/item/AA use, and
 gem restoration each advance as bounded phases while worker heartbeats remain
-live. Its action may request a longer bounded `claimTtlMs`; the coordinator
-still revokes on heartbeat loss, incapacitation, or a higher-priority claim.
+live and the worker renews its lease. The coordinator still starts revocation
+on heartbeat loss, incapacitation, or an eligible higher-tier urgent request.
 Corpse distance is validated against the selected resource before Actor election
 or coordinator admission. Only OOC navigation candidates within
 `RezNavMaxDistance` may proceed while outside the resource's direct range.
@@ -156,19 +174,28 @@ from persisting the temporary rez spell. A small recovery record stores the
 displaced gem and is consumed after a worker restart. Combat never
 auto-memorizes or initiates navigation.
 
-`automation/cc.lua` and `automation/cures.lua` expose side-effect-free
-selection functions plus explicit execution functions used by `sk_cc.lua`
-and `sk_cures.lua` workers. `automation/meditation.lua` is a no-op shim;
-the `sk_meditation.lua` worker is the only meditation owner.
-`sk_disciplines.lua` excludes all mez predicates so it cannot become a
-second CC caster.
+`automation/cc.lua`, `automation/cures.lua`, and `automation/debuff.lua`
+provide domain selection/execution helpers. Their automatic execution owners
+are `sk_cc.lua`, `sk_cures.lua`, and the separate `sk_debuff.lua` worker,
+respectively. `automation/meditation.lua` is a no-op shim;
+`sk_meditation.lua` is the only meditation owner. Automatic spell-gem/scribing
+work belongs to the separate `sk_scribing.lua` worker. `sk_disciplines.lua`
+excludes mez and debuff predicates owned by those domain workers.
 
 `sk_assist.lua` is the coordinated owner of melee assist targeting and
-positioning. It requests only the target resource at DPS priority, allowing
-`sk_dps.lua` to hold the cast resource concurrently. Higher-priority healing,
-cure, resurrection, or CC work revokes the assist target lease before those
-workers retarget. `automation/assist.lua` is a helper library — it must not
-run automatic assist actions from the UI host; the worker owns that.
+positioning. It holds the one action lease for the entire owned episode, so
+`sk_dps.lua` cannot cast during that Assist episode.
+`automation/assist.lua` is a helper library — it must not run automatic
+assist actions from the UI host; the worker owns that.
+
+`sk_chase.lua` is the dedicated out-of-combat chase worker. It uses
+`automation/chase.lua` for read-only intent selection, records an exact target
+fingerprint, and requests its fixed DPS-tier lease only when movement is
+needed. A granted movement slice is bounded to 15 seconds. Stalls, start
+failures, and timeouts use a 500 ms requeue backoff, with at most two recovery
+attempts. Finalization stops Nav, MoveTo, follow/stick, and any held movement
+keys before release. Chase is not a catch-all utility worker, and the UI host
+does not tick chase movement.
 
 `sk_tank.lua` is the coordinated owner of tank-mode targeting, auto-attack,
 positioning stick commands, tank emergency/defensive abilities, hate tools,
@@ -182,11 +209,12 @@ per second so background assisters do not age out a still-valid target.
 Tank class predicates in the `emergency`, `defenses`, and `aggro` categories
 are excluded from `sk_disciplines.lua` while the character is in tank mode;
 `sk_tank.lua` is their sole owner and permits AA, discipline, and memorized
-spell resources. Emergency/defense actions claim at priority 0, loose-mob
-recovery at 2.5, routine hate at 3.25, and ordinary engagement at 4. Active mez
-is an unconditional AE prohibition and mezzed mobs are never fallback kill
-targets. `TankSafeAECheck` additionally suppresses AE hate when the nearby NPC
-count exceeds the active XTarget-hater count.
+spell resources. Emergency/defense, loose-mob recovery, routine hate, and
+ordinary engagement may retain internal action rankings, but all requests
+enter the coordinator at the fixed Tank tier. Active mez is an unconditional
+AE prohibition and mezzed mobs are never fallback kill targets.
+`TankSafeAECheck` additionally suppresses AE hate when the nearby NPC count
+exceeds the active XTarget-hater count.
 
 The primary `status:update` Actor heartbeat and coordinator-owned Actor Team
 state include the sender's current target ID/type/name.
@@ -202,29 +230,26 @@ manual target is already covered by local fallbacks. A fresh remote member's
 OOG clients that do not share local XTarget state. Team leader election remains
 a presence responsibility and does not designate the combat main assist.
 
-`sk_pull.lua` separates candidate selection from side effects. The underlying
-pull state machine may scan and enter `READY` without ownership, but it cannot
-stand, navigate, retarget, attack, or use the configured pull ability until the
-worker receives its target claim. Pull priority sits just above normal DPS
-assist, so Assist releases its target lease for the complete outbound/return
-workflow. The worker retains bounded target validation and navigation/targeting
-timeouts, and the `pullRespectMedState` gate prevents a new pull from standing a
-character that is intentionally meditating.
-`READY` claim wait is bounded, cancellation or ownership loss records the normal
-pull cooldown, and a humanize `SKIP` refreshes the short pull-command window so
-delay rolls cannot manufacture a target timeout.
+`sk_pull.lua` was mechanically migrated to the same one-lease lifecycle.
+Candidate selection remains read-only before admission; standing, navigation,
+retargeting, attacking, and the configured pull ability may run only while the
+worker holds the fixed Pull-tier lease. The pull worker finalizes its owned
+movement and targeting effects before release.
+
+This migration deliberately did not redesign pull behavior. Candidate
+selection, election, pathing, state-machine strategy, and pull-specific tuning
+remain as they were and are deferred behind the core coordination work.
 The worker publishes local-only `pull:telemetry` so the Pull settings tab shows
 the authoritative worker phase, target, reason, and ownership state rather than
 the UI process's inert compatibility copy.
 
-`sk_fidget.lua` is a supervised auxiliary worker. It heartbeats through
-`ModuleBase` but never advertises actionable coordinator work. This keeps idle
-humanization alive in coordinated mode without competing for target or cast
-ownership. The fidget state machine uses the documented chat edit-box
-`Highlighted` and `Text` members to block new synthetic input. A movement key
-that was already held is always released even if chat gains focus, humanize is
-disabled, or the worker exits; chained movement and other follow-up input remain
-suppressed.
+`sk_fidget.lua` is the supervised lowest-tier Ambient worker. It plans
+read-only, bounded idle-humanization episodes and requests the single action
+lease before producing input. The fidget state machine uses the documented
+chat edit-box `Highlighted` and `Text` members to block new synthetic input. A
+movement key that was already held is always released even if chat gains focus,
+humanize is disabled, its lease is revoked, or the worker exits; chained
+movement and other follow-up input remain suppressed.
 
 Adaptive resist tracking is initialized by each process-local spell engine.
 Cast-result listeners record resisted combat/support spells, normal completion
@@ -308,13 +333,15 @@ callbacks. It waits for a stable layout with the spellbook closed, excludes the
 reserved OOC-buff gem, and saves changes to the active set. The buff worker may
 close the spellbook only for a recent `/memspell` request it owns; unrelated
 manual memorization events are observational and must not change buff-swap
-state.
+state. This manual-observation path is separate from automatic spell-gem and
+scribing actions, which are owned by `sk_scribing.lua` under the action lease.
 
-The coordinated DPS worker accepts only `direct_damage`, `dot`, and `debuff`
-spell-set entries. Beneficial `buff` entries remain visible in their physical
-gem slots but are routed away from DPS; automatic maintenance requires explicit
-selection in the OOC Buffs list. Pet and other utility spells similarly require
-their explicit utility mode and are owned by the resource worker.
+The coordinated DPS worker accepts only `direct_damage` and `dot` spell-set
+entries. `debuff` entries are routed to the separate `sk_debuff.lua` worker.
+Beneficial `buff` entries remain visible in their physical gem slots but are
+routed away from DPS; automatic maintenance requires explicit selection in the
+OOC Buffs list. Pet and other utility spells similarly require their explicit
+utility mode and are owned by the resource worker.
 
 ## Healing persistence and telemetry
 
@@ -369,7 +396,8 @@ plugin-query hot path without allowing stale spawn IDs to linger.
 `utils/actors_team.lua` is owned and ticked exclusively by `sk_coordinator.lua`.
 It adds a versioned `sk:team` protocol above the existing feature-specific
 Actor messages. A team member publishes character identity, zone, class, role,
-local coordinator priority, active action, and summarized worker readiness.
+the active lease's fixed tier and holder identity, and summarized worker
+readiness. The action itself remains private to the local worker.
 Peers expire after four seconds without a heartbeat.
 
 Team identity defaults to the current raid leader, then group leader, then the
@@ -379,8 +407,8 @@ leader when available and otherwise use a deterministic server/character key.
 The team snapshot is included in coordinator state and rendered under
 Coordinator > Actor Team. `/sk_coord team` prints the local summary.
 
-The Actor Team protocol itself is presence and shared state only; it does not
-grant remote cast rights. Resurrection probes fresh team members for an exact
+The Actor Team protocol itself is presence and shared state only; it cannot
+grant a local action lease. Resurrection probes fresh team members for an exact
 PC corpse visible in the rezzer's current zone instead of requiring the Actor
 death or zone hints, while its per-corpse rezzer election continues using the
 feature-specific intent transport. Existing heal, cure, CC, and buff messages
@@ -394,65 +422,77 @@ is drained in the normal worker loop rather than the non-yieldable Actor callbac
 
 ## Actor callback safety
 
-Actor callbacks validate the local server/character identity and copy message
-state only. They must not call `mq.delay`, reload files, target, cast, or invoke
-other yielding code. Normal worker ticks consume the copied state and perform
-all yielding work.
+Actor callbacks perform only non-yielding envelope checks and bounded
+copy/enqueue work. They must not read TLOs, call `mq.delay`, reload files,
+target, cast, issue gameplay commands, or invoke other yielding code. Normal
+coordinator/worker ticks consume the copied state, validate identity,
+authorization, freshness, and sequence, and perform all yielding work.
 
 ## Adding a worker
 
 1. Implement selection without game-changing side effects.
-2. Create a `ModuleBase` worker and send a need hint only when an action exists.
-3. Include a stable idempotency key in its requested action.
-4. Call `enableUnifiedExecutor()` and provide hooks only for behavior the
+2. Register the worker once in `sk_lib.lua` with a fixed tier, deterministic
+   order, script route, and any urgent-preemption/enable metadata.
+3. Create a `ModuleBase` worker. Keep the selected action local, expose intent
+   with `setIntent()`, and request a lease only while that action remains valid.
+4. Include a stable idempotency key in the local action.
+5. Call `enableUnifiedExecutor()` and provide hooks only for behavior the
    native spell/AA/disc/item/skill paths cannot represent.
-5. Execute only after `ownsClaim()` admission; the executor follows the cast
-   lease and releases it on every terminal path.
-6. Add the script to `sk_lib.lua`, the coordinator debug ordering, and this
-   document.
-7. Confirm the UI host does not also initialize or tick the subsystem.
+6. Cross the final mutation boundary only after exact `ownsLease()` validation.
+   Use `onLeaseFinalizing()` to stop or drain owned effects before every release,
+   and mark dirty effects that require a recovery lease after a crash or timeout.
+7. Confirm the UI host does not also initialize or tick the subsystem, update
+   this document, and add lifecycle/failure-path tests.
 
 ## Actor topic conventions
 
 sidekick-next currently uses two disjoint Actors planes; keeping them apart
 is intentional but the split is easy to miss on first read.
 
-**`sk:*` control plane.** Mailbox `sk:supervisor` / `sk:state` / `sk:claim`
-/ `sk:release` / `sk:interrupt` / `sk:hb` / `sk:need` / `sk:team`. Used by
-the coordinator + workers for claim arbitration, priority tiers, supervisor
-heartbeats. Envelope key is `msgType`. Handled entirely inside
-`sk_coordinator.lua`, `sk_module_base.lua`, `utils/actors_team.lua`. If you
-are adding claim / need / interrupt semantics, this is the plane.
+**Local control plane.** Mailboxes `lease:request`, `lease:withdraw`,
+`lease:renew`, `lease:release`, `lease:recovered`, `sk:state`, `sk:hb`,
+`sk:supervisor`, and `sk:team`. The coordinator and workers use this plane for
+the action-blind local lease lifecycle, fixed registry tiers, state,
+supervision, and presence. Envelope key is `msgType`; a lease request carries
+identity/session/request fields but never the action or a caller-selected
+priority. It is handled inside `sk_coordinator.lua`, `sk_module_base.lua`, and
+`utils/actors_team.lua`.
 
 **`sidekick` peer plane.** Mailbox `sidekick`, ~30 topics fanned out via
 `ActorsCoordinator.broadcastFleet(topic, payload)`. Envelope key is `id`.
-This is the plane for cross-character state that isn't a coordinator
-claim — target selection, mez lists, buff status, cure requests, tank
-positioning, charm-pet identity, healing HoT snapshots, etc. If you are
-adding "everyone should know X", this is the plane.
+This is the plane for cross-character feature state — target selection, mez
+lists, buff status, cure requests, tank positioning, charm-pet identity,
+healing HoT snapshots, and domain-specific `heal:claim`, `buff:claim`,
+`debuff:claim`, and `cc:claim` messages. These claims coordinate peer intent;
+they neither grant nor subdivide the coordinator's one local action lease. If
+you are adding "everyone should know X", this is the plane.
 
 Full protocol unification (single envelope, single topic namespace) is
-deferred; both planes carry `from = <char name>` so callers can identify
-the sender uniformly.
+deferred. The local plane validates the Actor sender route together with
+module, script, owner, session, and request identity; the peer plane uses
+`from = <char name>` plus its feature-specific identity and sequencing rules.
 
 ### Guarded topics — sender identity + sequence
 
 A subset of peer-plane topics is last-write-wins state that would flip if
 same-sender packets arrived out of order (network jitter, MQ delay):
 
-- `target:primary` — tank identity + primary kill target
+- `target:primary` — tank identity + authoritative group kill target. The
+  tank's temporary working target for taunts/hate tools is never a DPS target;
+  a fresh `targetId = 0` explicitly suppresses live-target fallbacks.
 - `tank:repositioning`, `tank:settled`, `tank:taunt_run`, `tank:taunt_done`
 - `tank:mode`
 - `tank:camp_anchor` — tank's live idle position
 - `cc:charmpet` — the enchanter's protected charm pet
 - `pull:intent` — cooperative puller election
 
-`ActorsCoordinator.broadcastFleet` auto-augments payloads on these topics
-with `sessionId` (per-sender lifetime ID) and monotonic `sequence`.
+`ActorsCoordinator.broadcastFleet` wraps SideKick peer payloads in the v2
+Actor envelope with a per-sender session and monotonic sequence.
 Receivers call `isStaleGuardedMessage(id, content, sender)` and drop same-
 session packets with sequence ≤ last accepted. A new `sessionId` (sender
-restart) resets the sequence gate. Missing fields → accepted (rolling
-restarts stay safe).
+restart) resets the sequence gate. SideKick peer messages without a valid
+envelope, canonical sender script/mailbox, and coordinator-owned team context
+fail closed.
 
 To add a new guarded topic:
 1. Add the id to `GUARDED_TOPICS` in `utils/actors_coordinator.lua`.

@@ -1063,7 +1063,7 @@ function M.tick(settings)
     tickLog('2-IncomingHeals')
     IncomingHeals.tick()
     tickLog('3-CombatAssessor')
-    CombatAssessor.tick()
+    CombatAssessor.tick({ readOnly = true })
     tickLog('4-SpellEvents')
     SpellEvents.tick()
     tickLog('5-HealTracker')
@@ -1087,7 +1087,7 @@ function M.tick(settings)
 
         tickLog('9-MobAssessor')
         local ma = getMobAssessor()
-        if ma and ma.tick then ma.tick() end
+        if ma and ma.tick then ma.tick({ readOnly = true }) end
     end
     tickLog('10-OptionalDone')
 

@@ -1,6 +1,5 @@
--- F:\lua\SideKick\automation\debuff.lua
 -- Debuff coordination: Actor-based claim system to prevent duplicate debuffs
--- Tracks slow, cripple, malo/tash across shamans, enchanters, mages
+-- Tracks slow, cripple, tash, malo, and snare independently across peers.
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
@@ -17,7 +16,8 @@ local getCache = lazy('sidekick-next.utils.runtime_cache')
 M.DEBUFF_TYPES = {
     'slow',      -- Shaman, Enchanter
     'cripple',   -- Shaman
-    'malo',      -- Shaman (malo), Enchanter (tash), Mage (malo)
+    'tash',      -- Enchanter
+    'malo',      -- Shaman, Mage
     'snare',     -- Various
 }
 
@@ -41,11 +41,12 @@ local DEBUFF_DURATION_DEFAULT = 60  -- Default debuff duration
 
 local _selfName = ''
 local _isDebuffer = false
+local _lastClaimBroadcast = {}
 
 -- Debuff classes
 local DEBUFFER_CLASSES = {
     SHM = { slow = true, cripple = true, malo = true },
-    ENC = { slow = true, malo = true },  -- tash = malo equivalent
+    ENC = { slow = true, tash = true },
     MAG = { malo = true },
 }
 
@@ -54,6 +55,7 @@ function M.init()
     M.remoteDebuffs = {}
     M.localClaims = {}
     M.remoteClaims = {}
+    _lastClaimBroadcast = {}
 
     _selfName = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or ''
 
@@ -140,7 +142,7 @@ end
 --- Claim a debuff target (broadcast to other debuffers)
 -- Call BEFORE casting debuff to prevent duplicates
 -- @param mobId number Mob spawn ID
--- @param debuffType string 'slow', 'cripple', 'malo', 'snare'
+-- @param debuffType string 'slow', 'cripple', 'tash', 'malo', 'snare'
 -- @return boolean True if claim successful
 function M.claimDebuff(mobId, debuffType)
     if not mobId or mobId == 0 then return false end
@@ -171,6 +173,31 @@ function M.claimDebuff(mobId, debuffType)
     return true
 end
 
+--- Return true only while this process still owns the peer reservation.
+function M.ownsClaim(mobId, debuffType)
+    local id = tonumber(mobId)
+    debuffType = tostring(debuffType or ''):lower()
+    if not id or id <= 0 or debuffType == '' then return false end
+    local claim = M.localClaims[id] and M.localClaims[id][debuffType]
+    return claim ~= nil and (os.clock() - (claim.claimedAt or 0)) < CLAIM_TIMEOUT
+end
+
+--- Refresh an owned reservation while waiting for or holding the local lease.
+function M.renewClaim(mobId, debuffType)
+    local id = tonumber(mobId)
+    debuffType = tostring(debuffType or ''):lower()
+    if not id or id <= 0 or debuffType == '' then return false end
+    local claim = M.localClaims[id] and M.localClaims[id][debuffType]
+    if not claim then return false end
+    claim.claimedAt = os.clock()
+    local key = tostring(id) .. ':' .. debuffType
+    if (os.clock() - (_lastClaimBroadcast[key] or 0)) >= 2.0 then
+        _lastClaimBroadcast[key] = os.clock()
+        M.broadcastClaim(id, debuffType)
+    end
+    return true
+end
+
 --- Release a claim
 -- @param mobId number Mob spawn ID
 -- @param debuffType string|nil Debuff type (nil = all)
@@ -181,14 +208,24 @@ function M.releaseClaim(mobId, debuffType)
 
     if debuffType then
         debuffType = tostring(debuffType):lower()
+        local owned = M.localClaims[id] and M.localClaims[id][debuffType] ~= nil
         if M.localClaims[id] then
             M.localClaims[id][debuffType] = nil
             if not next(M.localClaims[id]) then
                 M.localClaims[id] = nil
             end
         end
+        if owned then
+            _lastClaimBroadcast[tostring(id) .. ':' .. debuffType] = nil
+            M.broadcastRelease(id, debuffType)
+        end
     else
+        local released = M.localClaims[id]
         M.localClaims[id] = nil
+        for ownedType in pairs(released or {}) do
+            _lastClaimBroadcast[tostring(id) .. ':' .. tostring(ownedType)] = nil
+            M.broadcastRelease(id, ownedType)
+        end
     end
 end
 
@@ -238,6 +275,20 @@ function M.broadcastClaim(mobId, debuffType)
     })
 end
 
+function M.broadcastRelease(mobId, debuffType)
+    local Actors = getActors()
+    if not Actors or not Actors.broadcast then return end
+    local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName
+        and mq.TLO.Zone.ShortName() or nil
+    if myZone == '' or myZone == 'NULL' then myZone = nil end
+    Actors.broadcast('debuff:release', {
+        mobId = mobId,
+        debuffType = debuffType,
+        claimer = _selfName,
+        zone = myZone,
+    })
+end
+
 --- Receive a claim from another debuffer
 -- @param payload table Message payload
 function M.receiveClaim(payload)
@@ -250,11 +301,36 @@ function M.receiveClaim(payload)
     local claimer = payload.claimer or payload.from or 'unknown'
     if claimer == _selfName then return end
 
+    -- Simultaneous broadcasts are resolved deterministically. The lower
+    -- normalized character name keeps the reservation; the loser must fail
+    -- its worker preflight before it can cast.
+    if M.ownsClaim(mobId, debuffType) then
+        if tostring(_selfName):lower() <= tostring(claimer):lower() then
+            return
+        end
+        if M.localClaims[mobId] then
+            M.localClaims[mobId][debuffType] = nil
+            if not next(M.localClaims[mobId]) then M.localClaims[mobId] = nil end
+        end
+    end
+
     M.remoteClaims[mobId] = M.remoteClaims[mobId] or {}
     M.remoteClaims[mobId][debuffType] = {
         claimedAt = os.clock(),
         claimer = claimer,
     }
+end
+
+function M.receiveRelease(payload)
+    local mobId = tonumber(payload and payload.mobId)
+    local debuffType = tostring(payload and payload.debuffType or ''):lower()
+    local claimer = tostring(payload and (payload.claimer or payload.from) or '')
+    if not mobId or mobId <= 0 or debuffType == '' or claimer == '' then return end
+    local claim = M.remoteClaims[mobId] and M.remoteClaims[mobId][debuffType]
+    if claim and tostring(claim.claimer or ''):lower() == claimer:lower() then
+        M.remoteClaims[mobId][debuffType] = nil
+        if not next(M.remoteClaims[mobId]) then M.remoteClaims[mobId] = nil end
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -263,7 +339,7 @@ end
 
 --- Track a debuff we just applied
 -- @param mobId number Mob spawn ID
--- @param debuffType string 'slow', 'cripple', 'malo', 'snare'
+-- @param debuffType string 'slow', 'cripple', 'tash', 'malo', 'snare'
 -- @param spellName string|nil Spell name
 -- @param duration number|nil Duration in seconds
 function M.trackDebuff(mobId, debuffType, spellName, duration)
@@ -433,11 +509,18 @@ function M.isSlowed(mobId)
     return M.hasDebuff(mobId, 'slow')
 end
 
---- Check if mob has malo/tash
+--- Check if mob has malo
 -- @param mobId number Mob spawn ID
 -- @return boolean
 function M.hasMalo(mobId)
     return M.hasDebuff(mobId, 'malo')
+end
+
+--- Check if mob has tash
+-- @param mobId number
+-- @return boolean
+function M.hasTash(mobId)
+    return M.hasDebuff(mobId, 'tash')
 end
 
 --- Check if mob is crippled

@@ -13,6 +13,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local SafeLoad = require('sidekick-next.utils.safe_load')
 
 local M = {}
 
@@ -72,7 +73,8 @@ function M.loadDatabase()
     M.currentZone = ''
     M.zoneEstimates = {}
 
-    local file = io.open(getDbPath(), 'r')
+    local path = getDbPath()
+    local file = io.open(path, 'r')
     if not file then
         M.database = {}
         return
@@ -81,14 +83,12 @@ function M.loadDatabase()
     file:close()
 
     if content and content ~= '' then
-        local fn = loadstring('return ' .. content)
-        if fn then
-            local ok, data = pcall(fn)
-            if ok and type(data) == 'table' then
-                M.database = data
-                return
-            end
+        local data, err = SafeLoad.tableLiteral(content, path)
+        if type(data) == 'table' then
+            M.database = data
+            return
         end
+        print(string.format('\ar[MobHP]\ax load failed: %s', tostring(err or 'invalid data')))
     end
     M.database = {}
 end

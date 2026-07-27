@@ -15,6 +15,51 @@ local coordinatorRecoveryExhaustedLogged = false
 local sessionId = nil
 local lastGameState = ''
 local latestState = {}
+local pendingMessages = {}
+local MAX_PENDING_MESSAGES = 16
+local shutdownDrained = false
+local lastCoordinatorBootId = nil
+
+local function enqueueSupervisorMessage(message)
+    -- Actor callbacks are non-yieldable. Copy the small scalar acknowledgement
+    -- and validate/apply it from tick()/stop().
+    local content = message()
+    if type(content) ~= 'table' then return end
+    local sender = message.sender or {}
+    if #pendingMessages >= MAX_PENDING_MESSAGES then table.remove(pendingMessages, 1) end
+    pendingMessages[#pendingMessages + 1] = {
+        msgType = tostring(content.msgType or ''),
+        ownerName = tostring(content.ownerName or ''),
+        ownerServer = tostring(content.ownerServer or ''),
+        sessionId = tostring(content.sessionId or ''),
+        coordinatorBootId = tostring(content.coordinatorBootId or ''),
+        senderCharacter = tostring(sender.character or ''),
+        senderServer = tostring(sender.server or ''),
+        senderScript = tostring(sender.script or ''),
+        senderMailbox = tostring(sender.mailbox or ''),
+    }
+end
+
+local function drainSupervisorMessages()
+    if #pendingMessages == 0 then return end
+    local pending = pendingMessages
+    pendingMessages = {}
+    local myName, myServer = lib.getMyName(), lib.getMyServer()
+    for _, content in ipairs(pending) do
+        local logicalMailbox = content.senderMailbox:lower():match('([^:]+)$')
+        if content.msgType == 'supervisor_shutdown_drained'
+            and content.sessionId == tostring(sessionId or '')
+            and content.ownerName == tostring(myName or '')
+            and content.ownerServer == tostring(myServer or '')
+            and content.senderCharacter == tostring(myName or '')
+            and content.senderServer == tostring(myServer or '')
+            and content.senderScript == tostring(lib.Scripts.COORDINATOR or '')
+            and logicalMailbox == 'coordinator' then
+            shutdownDrained = true
+            lastCoordinatorBootId = content.coordinatorBootId
+        end
+    end
+end
 
 local function isRunning(script)
     return lib.isLuaScriptRunning(script)
@@ -66,6 +111,12 @@ end
 local function send(msgType)
     if not dropbox then return false end
     local ownerName, ownerServer = identity()
+    local revision = tonumber(latestState.settingsRevision) or 0
+    local settings = lib.refreshSettings(revision) or lib.getSettings() or {}
+    local preemptionEnabled = latestState.leasePreemptionEnabled
+    if preemptionEnabled == nil then
+        preemptionEnabled = settings.LeasePreemptionEnabled ~= false
+    end
     local payload = {
         msgType = msgType,
         module = 'supervisor',
@@ -74,13 +125,15 @@ local function send(msgType)
         sessionId = sessionId,
         sentAtMs = lib.getTimeMs(),
         automationPaused = latestState.automationPaused == true,
-        settingsRevision = tonumber(latestState.settingsRevision) or 0,
+        settingsRevision = revision,
         humanizeOverride = humanizeOverride(),
+        leasePreemptionEnabled = preemptionEnabled ~= false,
     }
-    return pcall(function()
+    local ok, result = pcall(function()
         dropbox:send({ mailbox = lib.Mailbox.SUPERVISOR, script = lib.Scripts.COORDINATOR,
             character = lib.localCharacter() }, payload)
     end)
+    return ok and result ~= false
 end
 
 function M.start()
@@ -88,7 +141,10 @@ function M.start()
     started = true
     lastGameState = lib.getGameState()
     sessionId = string.format('%s:%s:%d', lib.getMyServer(), lib.getMyName(), lib.getTimeMs())
-    dropbox = actors.register('supervisor', function() end)
+    pendingMessages = {}
+    shutdownDrained = false
+    lastCoordinatorBootId = nil
+    dropbox = actors.register('supervisor', enqueueSupervisorMessage)
 
     -- A previous UI can be force-stopped without running Lua cleanup. Clear
     -- managed scripts before starting a new coordinated session, but wait for
@@ -112,6 +168,7 @@ end
 function M.tick(state)
     if not started then return end
     if type(state) == 'table' then latestState = state end
+    drainSupervisorMessages()
     local now = lib.getTimeMs()
 
     -- The parent owns coordinator lifetime. MQ2Lua stop/run commands complete
@@ -170,8 +227,21 @@ end
 
 function M.stop()
     if not started then return end
+    shutdownDrained = false
     send('supervisor_shutdown')
-    mq.delay(50)
+    local drainDeadline = lib.getTimeMs()
+        + lib.Timing.LEASE_REVOCATION_GRACE_MS
+        + lib.Timing.LEASE_RECOVERY_TTL_MS
+        + 1000
+    while not shutdownDrained
+        and isRunning(lib.Scripts.COORDINATOR)
+        and lib.getTimeMs() < drainDeadline do
+        drainSupervisorMessages()
+        if not shutdownDrained then mq.delay(50) end
+    end
+    if not shutdownDrained and isRunning(lib.Scripts.COORDINATOR) then
+        printf('\ar[SK Supervisor]\ax Lease drain acknowledgement timed out; stopping fleet in safety-fault state')
+    end
     for _, script in ipairs(lib.Scripts.WORKERS) do
         stopScript(script, 3000)
     end
@@ -188,6 +258,9 @@ function M.stop()
     coordinatorStableSince = 0
     coordinatorRecoveryExhaustedLogged = false
     latestState = {}
+    pendingMessages = {}
+    shutdownDrained = false
+    lastCoordinatorBootId = nil
 end
 
 function M.sessionId()

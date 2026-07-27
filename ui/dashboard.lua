@@ -87,15 +87,6 @@ function M.toggle() M.setVisible(not M.isVisible()) end
 -- Helpers
 -- ---------------------------------------------------------------------------
 
-local function tierColor(tier)
-    if tier == 'emergency' then return 1.0, 0.35, 0.35
-    elseif tier == 'priority' then return 1.0, 0.7, 0.3
-    elseif tier == 'group' or tier == 'groupHot' then return 0.4, 0.85, 1.0
-    elseif tier == 'hot' then return 0.6, 1.0, 0.6
-    end
-    return 0.85, 0.85, 0.85
-end
-
 local function spawnName(id)
     local n = tonumber(id)
     if not n or n == 0 then return tostring(id) end
@@ -212,28 +203,6 @@ end)
 -- Panels: HEALING
 -- ---------------------------------------------------------------------------
 
--- Parse a `details` string from heal_selector. Format is pipe-separated
--- segments, each segment is whitespace-separated key=value pairs:
---   "trigger=efficient category=single eff=12.34 net=200.0 | trigger=emergency"
--- Returns a list of segments, each a list of {key, value} pairs.
-local function parseDetails(s)
-    if type(s) ~= 'string' or s == '' then return {} end
-    local segments = {}
-    for seg in string.gmatch(s, '([^|]+)') do
-        local trimmed = (seg:gsub('^%s+', ''):gsub('%s+$', ''))
-        if trimmed ~= '' then
-            local pairs_list = {}
-            for token in string.gmatch(trimmed, '%S+') do
-                local k, v = string.match(token, '^([^=]+)=(.*)$')
-                if k then table.insert(pairs_list, { k, v })
-                else table.insert(pairs_list, { token, '' }) end
-            end
-            table.insert(segments, pairs_list)
-        end
-    end
-    return segments
-end
-
 M.register('Healing', 'Decision', function()
     local state = coordinatorState()
     if not state then
@@ -244,51 +213,22 @@ M.register('Healing', 'Decision', function()
     local worker = state.moduleDiag and state.moduleDiag.healing or nil
     if worker then
         safeBool('Worker ready', worker.ready == true and not worker.stale)
-        safeBool('Needs action', worker.needValid == true)
-        if worker.reason and worker.reason ~= '' then safeText('Reason', worker.reason) end
+        safeBool('Lease requested', worker.requestId ~= nil)
+        safeText('Fixed tier', tostring(worker.tier or '-'))
+        safeText('Request age / TTL', string.format('%d / %d ms',
+            tonumber(worker.requestAge) or 0, tonumber(worker.requestTtl) or 0))
     else
         imgui.TextDisabled('Healing worker not registered')
     end
 
-    local owner = state.castOwner
-    local action = owner and owner.module == 'healing' and owner.action or nil
-    if not action then
-        imgui.TextDisabled('No coordinator-owned healing action')
-        return
+    local lease = state.lease
+    if lease and lease.holderModule == 'healing' then
+        safeText('Lease', string.format('%s (%s)',
+            tostring(lease.status or 'active'), tostring(lease.requestId or '?')))
+    else
+        imgui.TextDisabled('Healing does not hold the local lease')
     end
-    local r, g, b = tierColor(action.tier)
-    imgui.TextColored(r, g, b, 1.0, tostring(action.tier or '?'):upper())
-    imgui.SameLine()
-    imgui.Text(string.format('-> %s on %s', tostring(action.spellName or '?'), tostring(action.targetName or '?')))
-    if action.expected then
-        imgui.TextDisabled(string.format('expected: %s%s', tostring(action.expected), action.isHoT and ' (HoT)' or ''))
-    end
-    if action.reason and action.reason ~= '' then
-        imgui.TextDisabled('reason: ' .. tostring(action.reason))
-    end
-
-    -- Parsed details: each `|`-separated segment becomes its own row of
-    -- key/value chips so a long debug string is actually readable.
-    if action.details and action.details ~= '' then
-        if imgui.TreeNode('details##healdetails') then
-            local segments = parseDetails(action.details)
-            for i, seg in ipairs(segments) do
-                if #segments > 1 then
-                    imgui.TextDisabled(string.format('[%d]', i))
-                    imgui.SameLine()
-                end
-                local first = true
-                for _, kv in ipairs(seg) do
-                    if not first then imgui.SameLine() end
-                    first = false
-                    imgui.TextDisabled(kv[1] .. '=')
-                    imgui.SameLine(0, 0)
-                    imgui.Text(kv[2] ~= '' and kv[2] or '?')
-                end
-            end
-            imgui.TreePop()
-        end
-    end
+    imgui.TextDisabled('Spell and target details remain local to sk_healing by design.')
 end)
 
 M.register('Healing', 'Alternates Considered', function()

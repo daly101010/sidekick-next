@@ -290,7 +290,7 @@ function M.buildPlan(config)
     local meleeOn = toBool(readKey(data, 'Melee', 'MeleeOn'))
     local dpsOn = toBool(readKey(data, 'DPS', 'DPSOn'))
     if dpsOn ~= nil then
-        addSetting(plan, 'SpellRotationEnabled', dpsOn, 'DPS.DPSOn')
+        addSetting(plan, 'DpsEnabled', dpsOn, 'DPS.DPSOn')
     end
     if role == 'tank' then
         addSetting(plan, 'CombatMode', 'tank', 'General.Role')

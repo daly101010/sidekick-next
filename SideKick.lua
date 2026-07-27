@@ -1584,10 +1584,6 @@ local function tickAutomation()
     -- Global pause check - stop all automation when paused
     if Core.Settings.AutomationPaused == true then return end
 
-    local playStyle = tostring(Core.Settings.AutomationLevel or 'auto'):lower()
-    local allowAbilityAutomation = (playStyle ~= 'manual')
-    local allowMovementAutomation = (playStyle == 'auto')
-
     PerfMonitor.beginFrame()
 
     -- Update runtime cache (before other automation)
@@ -1604,18 +1600,8 @@ local function tickAutomation()
     -- Process events for cast result detection
     mq.doevents()
 
-    -- Chase is local movement controlled by the UI host. Worker scripts handle
-    -- casts and claims but do not own follower movement.
-    PerfMonitor.begin('Chase')
-    if allowMovementAutomation then
-        Chase.tick()
-    elseif Chase and Chase.stopNav then
-        Chase.stopNav()
-    end
-    PerfMonitor.finish('Chase')
-
-    -- This script is the UI/state host only. Automatic combat/cast actions
-    -- are executed exclusively by claimed worker modules.
+    -- This script is the UI/state host only. Automatic gameplay mutations are
+    -- executed exclusively by leased worker modules.
     PerfMonitor.finishFrame()
 end
 
@@ -1815,6 +1801,18 @@ local function main()
     pcall(require, 'sidekick-next.humanize')
 
     ActorsCoordinator.init()
+    do
+        local Memorize = LZ.getSpellSetMemorize()
+        if Memorize and Memorize.initializeClient then
+            Memorize.initializeClient()
+        end
+    end
+    do
+        local CoordinatorDebug = LZ.getCoordinatorDebug()
+        if CoordinatorDebug and CoordinatorDebug.init then
+            CoordinatorDebug.init()
+        end
+    end
     LZ.getRezAccept()
     do
         local monitor = LZ.getHealingMonitor()
@@ -1839,7 +1837,7 @@ local function main()
                 reason = tostring(content.reason or ''),
                 pullId = tonumber(content.pullId) or 0,
                 campSet = content.campSet == true,
-                ownsTarget = content.ownsTarget == true,
+                ownsLease = content.ownsLease == true,
                 receivedAt = mq.gettime(),
             }
             return true
@@ -1983,7 +1981,7 @@ local function main()
                     tostring(Core.Settings.ChaseEnabled == true),
                     tostring(Core.Settings.BuffingEnabled ~= false),
                     tostring(Core.Settings.DoHeals == true),
-                    tostring(Core.Settings.SpellRotationEnabled == true))
+                    tostring(Core.Settings.DpsEnabled ~= false))
             end)
         elseif a1 == 'import' or a1 == 'importini' then
             local importArgs = {}
@@ -2186,7 +2184,7 @@ local function main()
     _bindCmd('/sk_next_set_burn', function(rawValue)
         local value = tostring(rawValue or ''):lower()
         local enabled = value == 'on' or value == '1' or value == 'true'
-        Core.set('BurnNow', enabled)
+        Core.set('BurnActive', enabled)
         Core.forceSave()
     end)
 
@@ -2263,7 +2261,7 @@ local function main()
                 tostring(Core.Settings.ChaseEnabled == true),
                 tostring(Core.Settings.BuffingEnabled ~= false),
                 tostring(Core.Settings.DoHeals == true),
-                tostring(Core.Settings.SpellRotationEnabled == true))
+                tostring(Core.Settings.DpsEnabled ~= false))
         end)
     end)
     _bindCmd('/skactors', function()
@@ -2682,9 +2680,8 @@ local function main()
         do local M = LZ.getRezAccept() if M and M.tick then M.tick() end end
         tickAutomation()
 
-        -- Process pending spell set memorization (must be in main loop, not
-        -- ImGui). Worker scripts read the active spell set but the UI script
-        -- owns safe /memspell driving.
+        -- Forward spell-set intent and drain async worker status from the main
+        -- loop. The UI process never drives /memspell or gem mutations.
         local Memorize = LZ.getSpellSetMemorize()
         if Memorize and Memorize.processPending then
             Memorize.processPending()
@@ -2719,6 +2716,13 @@ local function main()
         do local M = LZ.getAggroWarning() if M and M.update then M.update() end end
 
         -- Actors + GT dock/status updates (runs in main loop so yields are allowed elsewhere).
+        do
+            local debugState = LZ.getCoordinatorDebug()
+            local coordinatorState = debugState and debugState.getLastState
+                and debugState.getLastState() or nil
+            ActorsCoordinator.setTeamContext(
+                coordinatorState and coordinatorState.team or nil)
+        end
         if Core.Settings.ActorsEnabled ~= false then
             -- Docked when configured to anchor to GroupTarget (even if GT bounds aren't available yet).
             -- This avoids a deadlock where GT only broadcasts bounds after seeing sidekick:docked=true.
@@ -2758,6 +2762,11 @@ local function main()
                 local okVH, VH = pcall(require, 'sidekick-next.utils.vitals_hub')
                 if okVH and VH then VH.tick() end
             end
+        else
+            -- Local worker commands and acknowledgements still use the Actor
+            -- transport. Drain only same-character messages and suppress all
+            -- peer state handling/broadcasts while Actors are disabled.
+            ActorsCoordinator.tick({ localOnly = true, transportOnly = true })
         end
 
         -- Flush pending settings writes (debounced, max once/sec)

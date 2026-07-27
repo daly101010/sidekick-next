@@ -358,7 +358,7 @@ local function publicStatus(job)
         finishedAtMs = job.finishedAtMs,
         elapsedMs = math.max(0, (job.finishedAtMs or nowMs()) - (job.submittedAtMs or nowMs())),
         reason = job.reason,
-        claimId = action.claimId,
+        requestId = action.requestId,
         idempotencyKey = action.idempotencyKey,
     }
 end

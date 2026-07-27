@@ -438,7 +438,8 @@ local function calcTotalIncomingDps()
     return total
 end
 
-function M.tick()
+function M.tick(opts)
+    opts = opts or {}
     local now = mq.gettime()
     if (now - _lastUpdate) < UPDATE_INTERVAL then return end
     _lastUpdate = now
@@ -486,7 +487,7 @@ function M.tick()
             table.insert(mobIds, mob.id)
 
             -- Check newly engaged mobs for named status (event spawns, etc.)
-            if not _checkedMobIds[mob.id] then
+            if opts.readOnly ~= true and not _checkedMobIds[mob.id] then
                 _checkedMobIds[mob.id] = true
                 -- checkEngagedMob will do an immediate consider if it's an uncached named
                 if ma.checkEngagedMob then

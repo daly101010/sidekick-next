@@ -182,6 +182,12 @@ end
 --- @param settings table Core settings (reads BandolierEnabled)
 --- @param skip boolean|nil Skip evaluation entirely (e.g. pull owns the char)
 function M.tick(settings, skip)
+    local selected = M.selectSet(settings, skip)
+    if selected then M.activateSet(selected) end
+end
+
+--- Select the first eligible set without changing equipment.
+function M.selectSet(settings, skip)
     if skip then return end
     if not settings or settings.BandolierEnabled ~= true then return end
     M.load()
@@ -196,8 +202,8 @@ function M.tick(settings, skip)
 
     for _, set in ipairs(M.Config.sets) do
         if set and set.name and set.name ~= '' and conditionPasses(set.condition) then
-            M.activateSet(set.name)
-            return
+            if not M.isSetWorn(set.name) then return set.name end
+            return nil
         end
     end
 end

@@ -20,7 +20,7 @@ A comprehensive automation framework for EverQuest via MacroQuest. SideKick prov
 - [Part 2 - Architecture Guide](#part-2---architecture-guide)
   - [System Overview](#system-overview)
   - [Startup Flow](#startup-flow)
-  - [Priority Coordinator](#priority-coordinator)
+  - [Single-Lease Coordinator](#single-lease-coordinator)
   - [Main Loop](#main-loop)
   - [Healing Intelligence Pipeline](#healing-intelligence-pipeline)
   - [Actors Communication](#actors-communication)
@@ -114,7 +114,11 @@ Discipline-specific bar for melee/tank classes. Shows active and available disci
 
 ### Item Bar
 
-Clickable items (clicky gear) with cooldown tracking. Configure its contents under Options > Items and its layout under Options > UI > Item Bar. In coordinated mode, a click is queued through the item worker and waits for cast ownership, so it cannot collide with a heal, cure, resurrection, or another cast.
+Clickable items (clicky gear) with cooldown tracking. Configure its contents
+under Options > Items and its layout under Options > UI > Item Bar. In
+coordinated mode, a click is queued through the item worker and waits for the
+one local action lease, so it cannot overlap another worker's cast, movement,
+targeting, or item use.
 
 ### Skill Bar
 
@@ -188,6 +192,13 @@ Controls all automated behaviors.
 | Target | (empty) | Character name if Role = byname |
 | Distance | 30 | Units to maintain from chase target |
 
+Chase is owned by a dedicated out-of-combat worker. It selects the destination
+without changing game state, then requests the same single action lease used by
+every other worker before movement starts. Each movement slice is bounded to
+15 seconds. On completion, cancellation, or preemption it stops Nav, MoveTo,
+follow/stick, and held movement keys before releasing the lease. Chase is not a
+general utility module and it never runs from the UI render loop.
+
 **Combat Mode Section**
 
 `CombatMode` is the single role and enable control. Select `off`, `tank`, or
@@ -200,7 +211,7 @@ not a second persisted gate.
 |---------|---------|---------|
 | Assist Source | group | Fallback source: group, raid1-3, or byname |
 | Assist Name | (empty) | Character name if Assist Source = byname |
-| Target Mode | sticky | Keep the selected target until dead or follow tank switches |
+| Target Source | coordinated primary | Follow only the published group kill target |
 | Engage Condition | hp | Engage by HP threshold or after the tank has aggro |
 | Engage HP | 97% | Target HP% to start attacking when using the HP condition |
 | Assist Range | 100 | Maximum fallback assist range |
@@ -281,7 +292,7 @@ class battle-rez AA and an already-memorized spell. Out of combat it falls
 back to the best learned spell and may memorize it on demand. SideKick never
 auto-memorizes or starts corpse navigation during combat.
 
-Before entering Actor election or requesting coordinator ownership, the worker
+Before entering Actor election or requesting the local action lease, the worker
 checks the corpse against the selected spell/item/AA range. An out-of-range
 corpse is ignored unless OOC navigation is enabled and the corpse is within the
 configured navigation limit.
@@ -298,13 +309,17 @@ disconnected primary rezzer automatically yields to the next eligible character.
 
 Configure out-of-combat buff automation and each spell's condition and target.
 Pet-only buffs are controlled by their spell profiles; there is no global
-pet-buff switch. Actor claims prevent duplicate work automatically.
+pet-buff switch. Cross-character Actor claims prevent duplicate peer work;
+those messages are separate from the coordinator's one local action lease.
 
 ### Spell Sets and Manual Memorization
 
 When SideKick is idle and out of combat, a manual gem change is adopted into
 the active spell set shortly after the spellbook closes. SideKick saves the new
 layout instead of restoring the old gem on the former 30-second watchdog.
+Manual gem observation does not authorize automatic gameplay. Automatic
+spell-gem and scribing work runs in the dedicated scribing worker and waits for
+the one local action lease.
 
 Automation settings are archived by spell ID. If a configured spell is removed
 and later memorized manually or dragged back into any combat gem, its condition,
@@ -372,11 +387,15 @@ intentionally hidden — the Pause button and per-domain toggles in the
 Automation tab are the user-facing knobs.
 
 Pull runs in its own coordinated worker. The Pull tab or `/sk_pull start` saves
-the configuration through the main SideKick process; scanning is harmless, and
-the character will not navigate, retarget, or fire the selected pull ability
-until the worker owns the pull target. `/sk_pull status`, `camp`, `pulltarget`,
-and `clearignore` are forwarded to that worker. Pull yields normal melee Assist
-for the complete outbound and return-to-camp workflow.
+the configuration through the main SideKick process. Candidate scanning remains
+read-only; the character will not stand, navigate, retarget, attack, or fire
+the selected pull ability until the worker holds the single action lease.
+`/sk_pull status`, `camp`, `pulltarget`, and `clearignore` are forwarded to
+that worker.
+
+Pull was mechanically migrated to the lease lifecycle but was not redesigned.
+Its candidate selection, election, pathing, state-machine strategy, and tuning
+remain intentionally deferred while the core coordination path is stabilized.
 
 Idle Humanize fidgets also run under a supervised worker in coordinated mode.
 They remain disabled by the Humanize/fidget toggles and are suppressed while
@@ -425,6 +444,9 @@ the same non-destructive merge also runs when the healing worker starts.
 - **Task Mob Debuffing**: Apply debuffs to all task mobs
 - **Actor Coordination**: Prevents duplicate debuffs across characters
 
+Automatic debuff selection and execution runs in its own fixed Debuff-tier
+worker. The DPS worker does not also execute debuff entries.
+
 ### Melee DPS (BER, MNK, ROG, RNG)
 
 - **Discipline Bar**: Visual display of available discs with cooldowns
@@ -442,6 +464,9 @@ the same non-destructive merge also runs when the healing worker starts.
 ## Multi-Box Coordination
 
 SideKick uses the **Actors** messaging system for real-time inter-character communication. No external tools needed beyond MacroQuest's built-in Actors.
+The claims below are short-lived peer intents used to avoid duplicate work
+across characters. They are distinct from each character's action-blind local
+lease and cannot authorize gameplay on their own.
 
 ### What Gets Coordinated
 
@@ -455,7 +480,7 @@ SideKick uses the **Actors** messaging system for real-time inter-character comm
 | Target updates | Shares current target for assist chains |
 | Tank broadcasts | Tank announces primary target to all assisters |
 | Window bounds | Share window positions for UI anchoring |
-| Team presence | Share coordinator state, active action, role, and module readiness |
+| Team presence | Share coordinator state, active lease holder/phase, role, and module readiness |
 
 The generic Actors peer count and Actor Team peer count are different. Generic
 peers are every live SideKick status sender visible through Actors. Actor Team
@@ -517,8 +542,8 @@ SideKick checks targets against raid members and actor peers before engaging, pr
 | `/skchaseoff` | Disable chase (broadcastable with `/dgge`) |
 | `/skassistme` | Broadcast assist request |
 | `/skactors` | Toggle actors debug window |
-| `/sk_assist status\|stop` | Inspect the coordinated melee-assist target, lease owner, priority, and last decision |
-| `/sk_tank status\|stop` | Inspect the tank primary target, pending action, coordinator ownership, hater/deficit counts, and last action |
+| `/sk_assist status\|stop` | Inspect the coordinated melee-assist target, lease owner, fixed tier, and last decision |
+| `/sk_tank status\|stop` | Inspect the tank primary target, pending action, coordinator lease, hater/deficit counts, and last action |
 | `/sk_items status\|list\|stop` | Inspect queued/manual item work, list each configured clicky's eligibility, or stop the coordinated item worker |
 | `/skspells [sub]` | Spellbook scanner commands |
 | `/skcd [on\|off\|clear\|debug]` | Cooldown debugging |
@@ -548,128 +573,37 @@ SideKick checks targets against raid members and actor peers before engaging, pr
 
 ## System Overview
 
-SideKick is a priority-based automation framework where independent modules compete for casting authority through a central coordinator.
+SideKick uses a supervised fleet of independent workers and one local,
+action-blind coordinator. Every automatic game-changing episode passes through
+the same lease, regardless of whether it casts, targets, moves, attacks, clicks
+an item, sits, or changes a spell gem.
 
 ```mermaid
 graph TB
-    subgraph "Entry Points"
-        INIT["init.lua"]
-        SKSTART["sk_start.lua<br/>(multi-script launcher)"]
-    end
+    INIT["init.lua"] --> SUP["utils/supervisor.lua"]
+    SUP --> UI["SideKick.lua<br/>UI, input, settings, status"]
+    SUP --> COORD["sk_coordinator.lua<br/>one action-blind local lease"]
+    SUP --> REG["sk_lib.lua<br/>fixed worker registry"]
+    REG --> WORKERS["Supervised workers<br/>Emergency through Ambient"]
+    WORKERS --> BASE["sk_module_base.lua<br/>lease lifecycle and exact ownership"]
+    BASE <-->|"request / state / renew / release"| COORD
 
-    subgraph "Core"
-        SK["SideKick.lua<br/>Main Loop & UI"]
-        COORD["sk_coordinator.lua<br/>Priority Arbiter"]
-        LIB["sk_lib.lua<br/>Constants & Types"]
-        BASE["sk_module_base.lua<br/>Module Base Class"]
-        REG["registry.lua<br/>Settings Registry"]
-    end
+    WORKERS --> COMBAT["Combat domains<br/>heal, cure, rez, tank, CC,<br/>debuff, assist, DPS"]
+    WORKERS --> OOC["OOC and utility domains<br/>pull, chase, buffs, meditation,<br/>items, resources, scribing, fidget"]
+    COMBAT --> HELPERS["Read-only selectors<br/>and bounded executors"]
+    OOC --> HELPERS
 
-    subgraph "Priority Modules"
-        EMERG["sk_emergency.lua<br/>Priority 0"]
-        HEAL["sk_healing.lua<br/>Priority 1"]
-        CURES["sk_cures.lua<br/>Priority 2"]
-        REZ["sk_resurrection.lua<br/>Priority 2"]
-        CCWORKER["sk_cc.lua<br/>Priority 3"]
-        ASSISTWORKER["sk_assist.lua<br/>Priority 4"]
-        DPS["sk_dps.lua<br/>Priority 4"]
-        ITEMS["sk_items.lua<br/>Priority 4/6"]
-        RESOURCES["sk_resources.lua<br/>Priority 5"]
-        BUFFS["sk_buffs.lua<br/>Priority 6"]
-        MED["sk_meditation.lua<br/>Priority 7"]
-    end
+    UI -->|"manual requests; no automatic ticks"| WORKERS
+    UI -->|"read-only telemetry"| COORD
 
-    subgraph "Healing Intelligence (healer classes)"
-        HINIT["healing/init.lua"]
-        HSEL["heal_selector.lua"]
-        HTRK["heal_tracker.lua"]
-        HTGT["target_monitor.lua"]
-        HCOMBAT["combat_assessor.lua"]
-        HMOB["mob_assessor.lua"]
-        HHOT["hot_analyzer.lua"]
-        HDMG["damage_attribution.lua"]
-    end
-
-    subgraph "Automation"
-        ASSIST["automation/assist.lua"]
-        CHASE["automation/chase.lua"]
-        TANK["automation/tank.lua"]
-        CC["automation/cc.lua"]
-        DEBUFF["automation/debuff.lua"]
-        CURES["automation/cures.lua"]
-        BUFF["automation/buff.lua"]
-        BURN["automation/burn.lua"]
-    end
-
-    subgraph "UI Layer"
-        BAR["bar_animated.lua"]
-        SBAR["special_bar_animated.lua"]
-        DBAR["disc_bar_animated.lua"]
-        IBAR["item_bar_animated.lua"]
-        SETTINGS["ui/settings/init.lua"]
-        MONITOR["healing/ui/monitor.lua"]
-    end
-
-    subgraph "Communication"
-        ACTORS["utils/actors_coordinator.lua"]
-        SHARED["actors/shareddata.lua"]
-    end
-
-    INIT --> SK
-    SKSTART -->|spawns| COORD
-    SKSTART -->|spawns| EMERG
-    SKSTART -->|spawns| HEAL
-    SKSTART -->|spawns| CURES
-    SKSTART -->|spawns| REZ
-    SKSTART -->|spawns| CCWORKER
-    SKSTART -->|spawns| ASSISTWORKER
-    SKSTART -->|spawns| DPS
-    SKSTART -->|spawns| ITEMS
-    SKSTART -->|spawns| RESOURCES
-    SKSTART -->|spawns| BUFFS
-    SKSTART -->|spawns| MED
-
-    SK --> BAR
-    SK --> SBAR
-    SK --> DBAR
-    SK --> IBAR
-    SK --> SETTINGS
-    SK --> MONITOR
-
-    SK --> ASSIST
-    SK --> CHASE
-    SK --> TANK
-    SK --> CC
-    SK --> DEBUFF
-    SK --> BUFF
-    SK --> BURN
-
-    EMERG --> BASE
-    HEAL --> BASE
-    DPS --> BASE
-    ITEMS --> BASE
-    BUFFS --> BASE
-    MED --> BASE
-    BASE --> LIB
-
-    HEAL --> HINIT
-    HINIT --> HSEL
-    HINIT --> HTRK
-    HINIT --> HTGT
-    HINIT --> HCOMBAT
-    HINIT --> HMOB
-    HINIT --> HHOT
-    HINIT --> HDMG
-
-    COORD <-->|Actors| EMERG
-    COORD <-->|Actors| HEAL
-    COORD <-->|Actors| DPS
-    COORD <-->|Actors| ITEMS
-    COORD <-->|Actors| BUFFS
-    COORD <-->|Actors| MED
-
-    ACTORS <-->|cross-character| SHARED
+    PEERS["Cross-character Actor peer plane<br/>heal/buff/debuff/CC intent and team state"]
+    WORKERS <-->|"feature messages"| PEERS
 ```
+
+The coordinator never receives a worker's action or a caller-selected priority.
+It knows only registered worker identity, request/lease identity, fixed tier and
+order, readiness, and lifecycle state. The selected action stays inside its
+worker until exact lease ownership is validated.
 
 ## Startup Flow
 
@@ -681,9 +615,9 @@ flowchart TD
     USER["/lua run sidekick-next"]
     USER2["/lua run sidekick-next/sk_start<br/>(compatibility alias)"]
     INIT["init.lua + supervisor"]
-    COORD["sk_coordinator.lua<br/>(priority arbiter)"]
-    UI["SideKick.lua<br/>(UI, settings, state, Actors)"]
-    WORKERS["Priority workers<br/>(emergency, healing, rez, tank, DPS,<br/>items, disciplines, buffs, meditation)"]
+    COORD["sk_coordinator.lua<br/>(single local lease)"]
+    UI["SideKick.lua<br/>(UI, settings, telemetry)"]
+    WORKERS["Registry workers<br/>(emergency, healing, cures, rez, tank, CC,<br/>debuff, pull, assist, chase, resources, disciplines,<br/>items, DPS, buffs, meditation, scribing, fidget)"]
 
     USER --> INIT
     USER2 --> USER
@@ -691,105 +625,109 @@ flowchart TD
     INIT --> WORKERS
     INIT --> UI
     UI -->|"500ms heartbeat"| COORD
-    WORKERS <-->|"claims + state"| COORD
+    WORKERS <-->|"action-blind lease + state"| COORD
 ```
 
 The UI process supervises the session. Normal shutdown stops every managed
 worker and the coordinator; loss of the UI heartbeat also causes the
-coordinator and workers to shut down. Automatic casting and targeting belong
-to claimed workers, while the UI process remains responsible for presentation,
-configuration, cached state, and cross-character status.
+coordinator and workers to shut down. Automatic casting, targeting, movement,
+item use, meditation, and scribing belong to leased workers. The UI process
+remains responsible for presentation, configuration, manual request submission,
+cached state, and cross-character status.
 
-## Priority Coordinator
+## Single-Lease Coordinator
 
-The coordinator ensures only one module casts at a time, with higher-priority modules interrupting lower ones.
+The coordinator grants one local lease at a time and does not discriminate by
+action type. A cast, target change, movement run, item click, attack, sit/stand,
+or spell-gem change all use the same lease. The worker chooses and keeps the
+action locally; its request sends identity and request data only.
 
-After a claim is granted, the unified action executor shows the action moving
-through queued, dispatching, cast-start, running, and terminal phases. These
-phases appear in Coordinator > Module Status. Hover the Action cell to see the
-terminal reason and elapsed time. A stun, mez, silence, fear, stale claim, or
-failed cast start cancels the lifecycle and releases its cast rights instead
-of leaving another module waiting on a long lease.
+Scheduling policy comes from the worker registry in `sk_lib.lua`. Each worker
+has one fixed tier and one deterministic order within that tier. A worker
+cannot select or transmit its scheduling priority, and simultaneous requests
+in the same tier are ordered by the registry rather than arrival timing.
+
+After a lease is granted, the unified action executor shows supported actions
+moving through queued, dispatching, cast-start, running, and terminal phases.
+These phases appear in Coordinator > Module Status. Hover the Action cell to
+see the terminal reason and elapsed time. Incapacitation, stale state, a failed
+start, cancellation, or revocation sends the holder through its own finalizer
+before the exact lease is released.
 
 ```mermaid
 sequenceDiagram
-    participant E as Emergency (P0)
-    participant H as Healing (P1)
-    participant D as DPS (P4)
+    participant H as Healing worker
+    participant D as DPS worker
     participant C as Coordinator
 
-    Note over C: Idle state - no active cast
+    D->>D: Select nuke locally
+    D->>C: lease:request(module, session, requestId)
+    Note over C: Registry supplies DPS tier 7/order 14
+    C->>D: state: active lease + token
+    D->>D: Validate exact lease, then execute
 
-    D->>C: claim_request(DPS, nuke, priority=4)
-    C->>D: claim_granted(DPS)
-    Note over D: Begins casting nuke...
-
-    H->>C: claim_request(HEALING, groupheal, priority=1)
-    Note over C: Priority 1 < 4 → preempt DPS
-    C->>D: claim_revoked(DPS)
-    C-->>D: /stopcast issued
-    C->>H: claim_granted(HEALING)
-    Note over H: Begins casting group heal...
-
-    E->>C: claim_request(EMERGENCY, divine_arb, priority=0)
-    Note over C: Priority 0 < 1 → preempt Healing
-    C->>H: claim_revoked(HEALING)
-    C-->>H: /stopcast issued
-    C->>E: claim_granted(EMERGENCY)
-    Note over E: Fires Divine Arbitration (instant)
-    E->>C: claim_released(EMERGENCY)
-
-    Note over C: Resume highest pending...
-    C->>H: claim_granted(HEALING)
-    Note over H: Re-casts group heal
-    H->>C: claim_released(HEALING)
-    C->>D: claim_granted(DPS)
-    Note over D: Resumes nuke rotation
+    H->>H: Select heal locally
+    H->>C: lease:request(module, session, requestId)
+    Note over C: Registry supplies Healing tier 1<br/>and permits urgent preemption
+    C->>D: state: lease status = revoking
+    D->>D: Cancel/drain owned effect and finalize
+    D->>C: lease:release(exact token)
+    C->>H: state: active lease + token
+    H->>H: Validate exact lease, then execute
+    H->>C: lease:release(exact token)
 ```
 
-**Key rule**: The coordinator owns all cross-module preemption. A worker can
-request cancellation of its own cast for healing ducking or a local safety
-condition, but it cannot stop another module's cast directly.
+Urgent preemption is controlled by **Allow Urgent Lease Preemption**
+(`LeasePreemptionEnabled`). Only Emergency, Healing, Cures, Resurrection, and
+Tank are registered as urgent candidates, and only when the candidate's tier
+number is lower than the current holder's. The coordinator marks the lease
+`revoking`; it never sends a gameplay command such as `/stopcast`. The current
+holder cleans up effects it owns before release. If it misses the grace period
+or TTL, the old token is fenced and a recovery lease runs before new work.
 
 ## Main Loop
 
-The main tick loop in `SideKick.lua` runs at approximately 60 FPS.
+There is no single automation loop. The UI host, coordinator, and each worker
+yield and advance independently.
 
 ```mermaid
-flowchart TD
-    START["Main Loop Tick<br/>(every ~16ms)"]
-    SETTINGS["Refresh settings<br/>(check INI changes)"]
-    CLASS["Check class/abilities<br/>(reload if changed)"]
-    QUEUE["Drain action queue<br/>(execute pending actions)"]
-    PAUSED{"Automation<br/>paused?"}
-    COMBAT{"In combat?"}
-
-    subgraph "Combat Tick"
-        ASSIST["Update assist target"]
-        TANK["Tank broadcast check"]
-        ROTATION["Combat spell executor<br/>(priority-based spell selection)"]
-        HEAL["Healing module tick"]
-        CC["Crowd control tick"]
-        DEBUFF["Debuff tick"]
+flowchart LR
+    subgraph "UI host"
+        UIINPUT["Drain input and manual requests"]
+        UISET["Commit settings"]
+        UIRENDER["Render ImGui and telemetry"]
+        UIINPUT --> UISET --> UIRENDER
     end
 
-    subgraph "OOC Tick"
-        CHASE["Chase/follow tick"]
-        MED["Meditation tick"]
-        BUFF["OOC buff executor"]
-        MEMGEMS["Memorize spell gems"]
+    subgraph "Coordinator loop"
+        MSG["Drain copied Actor messages"]
+        SCHED["Validate identity and schedule<br/>one fixed-tier lease"]
+        STATE["Broadcast lease and lifecycle state"]
+        MSG --> SCHED --> STATE
     end
 
-    RENDER["Render all ImGui windows<br/>(bars, settings, monitor)"]
-    DELAY["mq.delay(16)<br/>yield to MQ"]
+    subgraph "Each worker loop"
+        SENSE["Drain state and select locally<br/>(read-only)"]
+        REQUEST["Request or renew lease<br/>(no action payload)"]
+        OWN{"Exact lease<br/>owned?"}
+        EXEC["Execute bounded local action"]
+        CLEAN["Finalize owned effects<br/>then release"]
+        SENSE --> REQUEST --> OWN
+        OWN -->|yes| EXEC --> CLEAN
+        OWN -->|no| SENSE
+    end
 
-    START --> SETTINGS --> CLASS --> QUEUE --> PAUSED
-    PAUSED -->|yes| RENDER
-    PAUSED -->|no| COMBAT
-    COMBAT -->|yes| ASSIST --> TANK --> ROTATION --> HEAL --> CC --> DEBUFF --> RENDER
-    COMBAT -->|no| CHASE --> MED --> BUFF --> MEMGEMS --> RENDER
-    RENDER --> DELAY --> START
+    UISET -->|"revision and supervisor heartbeat"| MSG
+    REQUEST --> MSG
+    STATE --> SENSE
+    CLEAN --> MSG
+    CLEAN -->|"telemetry"| UIRENDER
 ```
+
+The UI loop renders and submits requests; it does not run automatic gameplay
+subsystems. Combat debuffing, out-of-combat Chase, and automatic spell
+scribing/gem work have separate `sk_debuff.lua`, `sk_chase.lua`, and
+`sk_scribing.lua` workers rather than falling through a shared utility loop.
 
 ## Healing Intelligence Pipeline
 
@@ -820,8 +758,8 @@ flowchart TD
     end
 
     subgraph "Stage 4: Execution"
-        CLAIM["Request cast claim<br/>from coordinator"]
-        GRANTED{"Claim<br/>granted?"}
+        LEASE["Request the one local lease<br/>(action stays in worker)"]
+        GRANTED{"Exact lease<br/>owned?"}
         CAST["Execute heal"]
         TRACK["Update heal tracker<br/>+ analytics"]
     end
@@ -831,7 +769,7 @@ flowchart TD
     TM & IH & HA --> HS
     HS --> SPELLS & AA & DISC
     SPELLS & AA & DISC --> PICK
-    PICK --> CLAIM --> GRANTED
+    PICK --> LEASE --> GRANTED
     GRANTED -->|yes| CAST --> TRACK
     GRANTED -->|no, wait| TICK
 ```
@@ -863,6 +801,10 @@ Healing Monitor exposes the estimate and its source.
 ## Actors Communication
 
 Cross-character messaging uses MacroQuest's Actors system (mailbox-based message passing).
+Feature messages such as `heal:claim`, `buff:claim`, `debuff:claim`, and
+`cc:claim` coordinate intent between characters; they do not grant execution
+rights. Each character's separate local control plane still requires that
+character's one coordinator lease before any game-changing action.
 
 ```mermaid
 sequenceDiagram
@@ -876,7 +818,7 @@ sequenceDiagram
     C3->>MB: target:primary<br/>{targetName: "a_gnoll_01", targetId: 42}
     MB->>C1: target:primary
     MB->>C2: target:primary
-    Note over C1,C2: Both switch assist target
+    Note over C1,C2: Both pin the group kill target;<br/>the tank's temporary peel target is private
 
     C1->>MB: heal:claim<br/>{target: "Warrior", spell: "Complete Heal"}
     MB->>C2: heal:claim
@@ -900,126 +842,105 @@ sequenceDiagram
 | `heal:claim` | Broadcast | "I'm healing this target" |
 | `heal:hots` | Broadcast | "I applied or am maintaining these HoTs" |
 | `buff:list` / `buff:claim` / `buff:landed` | Broadcast | Buff availability, intent, and completion |
-| `target:primary` | Broadcast | "This is the primary target" |
+| `target:primary` | Broadcast | Authoritative group kill target; fresh ID 0 means do not acquire |
 | `debuff:claim` | Broadcast | "I'm debuffing this mob" |
 | `cc:claim` | Broadcast | "I'm mezzing this mob" |
 | `window:bounds:req` / `window:bounds` | Request/Reply | UI window position sharing |
 
 ## Spell Execution Flow
 
-From spell selection to landing, including gem management.
+The selected spell remains local, and all mutations — including temporary gem
+work — occur only inside the one action lease.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
+    Idle --> SelectLocal: Read-only selection
+    SelectLocal --> PeerIntent: Optional feature-specific Actor intent
+    SelectLocal --> RequestLease: No peer coordination needed
+    PeerIntent --> RequestLease: Keep action local
+    RequestLease --> WaitLease: Send module/session/request identity
+    WaitLease --> VerifyLease: Lease snapshot received
+    WaitLease --> Idle: Intent changes or request expires
+    VerifyLease --> Prepare: Exact boot/token/module/session/request match
+    VerifyLease --> Idle: Ownership mismatch
 
-    Idle --> SpellSelected: Action queued
+    Prepare --> Targeting: Target if required
+    Prepare --> Memorizing: Temporary gem work if required
+    Prepare --> Dispatch: Already prepared
+    Targeting --> Dispatch
+    Memorizing --> Dispatch
 
-    SpellSelected --> CheckGem: Spell selected
-
-    CheckGem --> GemReady: Spell memorized in gem
-    CheckGem --> NeedMemorize: Wrong spell in gem
-
-    NeedMemorize --> Memorizing: /memorize spell gem#
-    Memorizing --> WaitMemorize: Wait up to 25s
-    WaitMemorize --> GemReady: Memorized
-    WaitMemorize --> Failed: Timeout
-
-    GemReady --> RequestClaim: Request cast from coordinator
-    RequestClaim --> WaitClaim: Waiting for grant
-    WaitClaim --> Casting: Claim granted
-    WaitClaim --> Idle: Claim denied (preempted)
-
-    Casting --> CastCheck: /cast gem#
-    CastCheck --> Success: Spell landed
-    CastCheck --> Fizzled: Fizzled
-    CastCheck --> Resisted: Resisted
-    CastCheck --> Interrupted: Interrupted
-    CastCheck --> Interrupted: Target died
-    CastCheck --> Interrupted: Out of range
-
-    Fizzled --> RetryCheck: Retry enabled?
-    Resisted --> RetryCheck
-    Interrupted --> RetryCheck
-
-    RetryCheck --> SpellSelected: Retries remaining
-    RetryCheck --> Failed: Max retries (3)
-
-    Success --> CooldownTracking: Track reuse timer
-    CooldownTracking --> ReleaseClaim: Release cast claim
-    Failed --> ReleaseClaim
-    ReleaseClaim --> Idle
+    Dispatch --> Running: Action starts
+    Dispatch --> Finalize: Start fails
+    Running --> Finalize: Completed, failed, cancelled, or revoked
+    Finalize --> ReleaseLease: Stop/drain owned effects
+    ReleaseLease --> Idle: Release exact token
 ```
+
+The optional peer intent is coordination between characters, not local
+scheduling authority. Long multi-phase workflows renew their lease. If a
+worker exits with dirty effects or a token is fenced, its recovery lease cleans
+those effects before the coordinator admits ordinary work.
 
 ## Module Architecture
 
-All priority modules inherit from `ModuleBase`.
+All supervised workers use `ModuleBase` for the same lease lifecycle. Domain
+code decides what to do; scheduler policy stays in the registry/coordinator.
 
 ```mermaid
 classDiagram
     class ModuleBase {
         +name: string
-        +priority: number
-        +state: "idle" | "claiming" | "casting"
-        +create(name, priority) ModuleBase
+        +workerSessionId: string
+        +currentRequestId: string
+        +currentAction: local Action
+        +setIntent(active, reason)
         +shouldAct() bool
         +getAction() Action
-        +executeAction(action)
-        +onTick()
-        +requestClaim()
-        +releaseClaim()
-        +handleMessage(msg)
+        +requestLease(action)
+        +ownsLease(requestId) bool
+        +getLeaseAction() Action
+        +renewLease()
+        +finishAction(result)
+        +onLeaseFinalizing(action, reason)
     }
 
-    class Emergency {
-        +priority: 0
-        +shouldAct() "multi-member critical HP"
-        +getAction() "Divine Arb / Celestial Regen / Sanctuary"
+    class WorkerRegistry {
+        +module: string
+        +script: string
+        +tier: fixed number
+        +order: fixed number
+        +canPreempt: bool
     }
-
-    class Healing {
-        +priority: 1
-        +healingInit: HealingIntelligence
-        +shouldAct() "any member below threshold"
-        +getAction() "best heal for best target"
-    }
-
-    class DPS {
-        +priority: 4
-        +combatExecutor: CombatSpellExecutor
-        +shouldAct() "valid target, in combat"
-        +getAction() "next spell in rotation"
-    }
-
-    class Buffs {
-        +priority: 6
-        +oocExecutor: OOCBuffExecutor
-        +shouldAct() "out of combat, buffs missing"
-        +getAction() "next buff to cast"
-    }
-
-    class Meditation {
-        +priority: 7
-        +shouldAct() "resources below threshold"
-        +getAction() "sit or stand command"
-    }
-
-    ModuleBase <|-- Emergency
-    ModuleBase <|-- Healing
-    ModuleBase <|-- DPS
-    ModuleBase <|-- Buffs
-    ModuleBase <|-- Meditation
 
     class Coordinator {
-        +activeClaim: Claim?
-        +pendingClaims: Claim[]
-        +grantClaim(module, priority)
-        +revokeClaim(module)
-        +processClaims()
+        +activeLease: Lease or nil
+        +pendingRequests: registered modules
+        +validateIdentity(request)
+        +scheduleByTierAndOrder()
+        +markRevoking()
+        +fenceExpiredToken()
     }
 
-    Coordinator --> ModuleBase : manages
+    class DomainWorkers {
+        +combat and healing workers
+        +pull and OOC workers
+        +dedicated chase worker
+        +dedicated debuff worker
+        +dedicated scribing worker
+    }
+
+    DomainWorkers --> ModuleBase : share lifecycle
+    WorkerRegistry --> Coordinator : supplies policy
+    WorkerRegistry --> DomainWorkers : supervises and routes
+    ModuleBase --> Coordinator : identity-only lease messages
+    Coordinator --> ModuleBase : lease/state snapshots
 ```
+
+The exact ownership check includes coordinator boot ID, token, holder module,
+worker session, and request ID. No `Action` crosses the ModuleBase-to-coordinator
+arrow.
 
 ## Settings Data Flow
 
@@ -1106,6 +1027,7 @@ suffixes are:
 |-----|------|---------|-------------|
 | AutomationLevel | text | auto | Play style (`manual` / `hybrid` / `auto`) — controls cast vs. movement gating |
 | AutomationPaused | bool | false | Global pause |
+| LeasePreemptionEnabled | bool | true | Allow registered urgent workers to revoke a lower-tier local lease |
 | ChaseEnabled | bool | false | Chase toggle |
 | ChaseRole | text | ma | Chase target role |
 | ChaseDistance | int | 30 | Chase distance |
@@ -1159,61 +1081,82 @@ when Healing Intelligence is active:
 
 ## Priority Tiers
 
-| Priority | Name | Module | Behavior |
-|----------|------|--------|----------|
-| 0 | EMERGENCY | sk_emergency | Divine Arbitration, Celestial Regen, Sanctuary. Fires when multiple members are critical. |
-| 1 | HEALING | sk_healing | Group and single-target heals. Interrupts DPS/buffs to heal. |
-| 2 | RESURRECTION | sk_cures / sk_resurrection | Cures and rez. Lower than healing but above combat. |
-| 3 | DEBUFF | sk_cc | Crowd control casting. |
-| 4 | DPS | sk_dps | Nukes, stuns, combat spell rotations. |
-| 5 | IDLE | (internal) | Idle-state actions when nothing else is needed. |
-| 6 | BUFF | sk_buffs | OOC buff casting with gem swapping. |
-| 7 | MEDITATION | sk_meditation | Sit/stand for resource regen. Lowest priority. |
+| Tier | Name | Workers in deterministic registry order |
+|---:|---|---|
+| 0 | EMERGENCY | `sk_emergency.lua` |
+| 1 | HEALING | `sk_healing.lua`, `sk_cures.lua` |
+| 2 | RESURRECTION | `sk_resurrection.lua` |
+| 3 | TANK | `sk_tank.lua` |
+| 4 | CROWD_CONTROL | `sk_cc.lua` |
+| 5 | DEBUFF | `sk_debuff.lua` |
+| 6 | PULL | `sk_pull.lua` |
+| 7 | DPS | `sk_assist.lua`, `sk_chase.lua`, `sk_resources.lua`, `sk_disciplines.lua`, `sk_items.lua`, `sk_dps.lua` |
+| 8 | BUFF | `sk_buffs.lua` |
+| 9 | MEDITATION | `sk_meditation.lua` |
+| 10 | SCRIBING | `sk_scribing.lua` |
+| 11 | AMBIENT | `sk_fidget.lua` |
+| 99 | IDLE | Internal scheduler state only |
 
-Higher priority (lower number) always preempts lower priority. The coordinator issues `/stopcast` when preempting.
+These are fixed coordinator tiers; workers do not choose them. Lower numbers
+are selected first when the lease is free, and the listed registry order
+breaks ties without relying on message arrival. Preemption is narrower:
+Emergency, Healing, Cures, Resurrection, and Tank are the only urgent
+candidates, the feature toggle must be enabled, and the candidate must have a
+numerically lower tier than the current holder. The coordinator marks the
+lease for revocation; the holder performs its own cleanup and release.
 
 ## File Map
 
 | Path | Purpose |
 |------|---------|
 | `init.lua` | Main entry point |
-| `SideKick.lua` | Main loop, UI rendering, automation orchestration |
-| `sk_start.lua` | Multi-script launcher |
-| `sk_coordinator.lua` | Priority-based cast claim arbiter |
-| `sk_lib.lua` | Shared constants, types, mailbox names |
-| `sk_module_base.lua` | Base class for priority modules |
-| `sk_emergency.lua` | Emergency AA module (priority 0) |
-| `sk_healing.lua` | Authoritative normal and emergency healing (dynamic priority 0/1) |
-| `sk_cures.lua` | Coordinator-owned cure selection and casting (priority 2) |
-| `sk_resurrection.lua` | Resurrection module (priority 2) |
-| `sk_cc.lua` | Coordinator-owned mez selection and casting (priority 3) |
-| `sk_assist.lua` | Coordinator-owned melee targeting and positioning (priority 4) |
-| `sk_dps.lua` | DPS/combat module (priority 4) |
-| `sk_items.lua` | Configured automatic and queued manual clickies (priority 4 in combat/manual, 6 OOC) |
-| `sk_resources.lua` | Resource conversion module (priority 5) |
-| `sk_buffs.lua` | OOC buff module (priority 6) |
-| `sk_meditation.lua` | Meditation module (priority 7) |
-| `registry.lua` | Authoritative settings schema and ownership registry (currently 238 defaults) |
+| `SideKick.lua` | UI/state host, settings writer, telemetry, and manual request submission |
+| `sk_start.lua` | Compatibility alias for the canonical entry point |
+| `sk_coordinator.lua` | Action-blind arbiter for exactly one local lease |
+| `sk_lib.lua` | Fixed worker registry, tiers/order, protocol constants, and mailbox names |
+| `sk_module_base.lua` | Worker request, exact ownership, renewal, finalization, and recovery lifecycle |
+| `sk_emergency.lua` | Emergency worker (fixed tier 0) |
+| `sk_healing.lua` | Healing worker (fixed tier 1) |
+| `sk_cures.lua` | Cure worker (fixed tier 1) |
+| `sk_resurrection.lua` | Resurrection worker (fixed tier 2) |
+| `sk_tank.lua` | Tank targeting, positioning, and abilities (fixed tier 3) |
+| `sk_cc.lua` | Crowd-control worker (fixed tier 4) |
+| `sk_debuff.lua` | Dedicated automatic debuff worker (fixed tier 5) |
+| `sk_pull.lua` | Mechanically migrated pull worker (fixed tier 6; behavior not redesigned) |
+| `sk_assist.lua` | Melee targeting and positioning worker (fixed tier 7) |
+| `sk_chase.lua` | Dedicated bounded OOC Chase worker (fixed tier 7) |
+| `sk_resources.lua` | Resource conversion worker (fixed tier 7) |
+| `sk_disciplines.lua` | Discipline worker (fixed tier 7) |
+| `sk_items.lua` | Automatic and queued manual clicky worker (fixed tier 7) |
+| `sk_dps.lua` | DPS/combat worker (fixed tier 7) |
+| `sk_buffs.lua` | OOC buff worker (fixed tier 8) |
+| `sk_meditation.lua` | Meditation worker (fixed tier 9) |
+| `sk_scribing.lua` | Dedicated automatic spell-gem/scribing worker (fixed tier 10) |
+| `sk_fidget.lua` | Bounded idle-humanization worker (fixed tier 11) |
+| `registry.lua` | Authoritative settings schema and ownership registry |
 | `themes.lua` | Color theme presets |
-| `healing/` | Healer-class intelligence (15 modules) |
+| `healing/` | Healer-class intelligence modules |
 | `healing/init.lua` | Healing orchestrator |
 | `healing/heal_selector.lua` | Heal selection logic |
 | `healing/combat_assessor.lua` | Fight phase assessment |
 | `healing/target_monitor.lua` | Group HP tracking |
 | `healing/ui/monitor.lua` | Healing monitor window |
-| `automation/` | Automation subsystems (13 modules) |
+| `automation/` | Domain selection and execution helpers |
 | `automation/assist.lua` | Assist targeting |
-| `automation/chase.lua` | Chase/follow |
+| `automation/chase.lua` | Read-only Chase intent and route helper used by `sk_chase.lua` |
 | `automation/tank.lua` | Tank logic |
 | `automation/cc.lua` | Crowd control |
-| `automation/debuff.lua` | Debuffing |
+| `automation/debuff.lua` | Debuff domain helper used by `sk_debuff.lua` |
 | `automation/cures.lua` | Cure/cleanse |
 | `automation/buff.lua` | Buff management |
 | `automation/burn.lua` | Burn mode |
 | `automation/meditation.lua` | Retired no-op compatibility shim |
-| `utils/` | Core utilities (28 modules) |
+| `utils/` | Core utilities |
 | `utils/core.lua` | Settings I/O, INI parsing |
-| `utils/actors_coordinator.lua` | Cross-character Actors messaging (fleet fan-out, guarded topics, camp/pull peer state) |
+| `utils/lease_scheduler.lua` | Pure fixed-tier single-lease scheduling and recovery state machine |
+| `utils/action_boundary.lua` | Final game-mutation ownership boundary |
+| `utils/chase_movement.lua` | Chase movement ownership and cleanup helper |
+| `utils/actors_coordinator.lua` | Cross-character peer Actors messaging, separate from the local lease protocol |
 | `utils/actors_team.lua` | Coordinator-owned Actor Team presence and leader election |
 | `utils/class_roles.lua` | Canonical TANK / PURE_CASTERS / HYBRID_MELEE / PURE_MELEE / HEALER_CLASSES sets |
 | `utils/combat_spell_executor.lua` | Combat spell selection |
@@ -1243,7 +1186,7 @@ Higher priority (lower number) always preempts lower priority. The coordinator i
 | **Anchor** | Snapping a window's position relative to another window |
 | **Burn** | Timed mode where all DPS cooldowns are used aggressively |
 | **CC** | Crowd Control - mesmerize, root, snare to neutralize mobs |
-| **Claim** | Cast ownership token granted by the coordinator to a module |
+| **Claim** | Feature-specific cross-character Actor intent, such as `heal:claim`; it does not grant local execution rights |
 | **DanNet** | MacroQuest plugin for cross-character data observation |
 | **Disc** | Discipline - melee/tank special abilities with shared timers |
 | **Gem** | Spell memorization slot (typically 8-13 slots) |
@@ -1252,12 +1195,13 @@ Higher priority (lower number) always preempts lower priority. The coordinator i
 | **ImGui** | Dear ImGui - immediate-mode graphics library used for all UI |
 | **INI** | Configuration file format used by MacroQuest |
 | **KS** | Kill Stealing - attacking another player's target (prevented by Safe Targeting) |
+| **Lease** | The coordinator's single local, action-blind execution token, validated by boot/token/module/session/request identity |
 | **MA** | Main Assist - the designated player whose target everyone assists |
 | **Medley** | Companion MQ Lua script for bard song twist automation |
 | **MQ** | MacroQuest - the EverQuest automation platform |
 | **MT** | Main Tank - the designated tank in a group/raid |
 | **OOC** | Out of Combat - state where no enemies are engaged |
-| **Preempt** | Higher priority module interrupting a lower priority one |
+| **Preempt** | An eligible urgent worker causing the coordinator to mark a lower-tier lease revoking; the holder cleans up its own effects |
 | **Rotation** | Ordered sequence of spells to cast during combat |
 | **Spell Set** | Named collection of spell gem assignments |
 | **Stick** | MQ command that makes your character follow/position relative to target |

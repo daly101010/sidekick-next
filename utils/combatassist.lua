@@ -412,6 +412,9 @@ local function get_assist_target()
           return pid, dist, spawn
         end
       end
+      -- A fresh publication, including targetId=0 or an invalidated spawn, is
+      -- authoritative. Do not follow the tank's temporary live peel target.
+      return nil, nil, nil
     end
   end
 

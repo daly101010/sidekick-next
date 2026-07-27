@@ -2,11 +2,12 @@
 -- Coordinated owner for configured clickies and queued manual item-bar uses.
 
 local mq = require('mq')
-local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
+local ActionExecutor = require('sidekick-next.utils.action_executor')
 local Items = require('sidekick-next.utils.items')
 local Bandolier = require('sidekick-next.utils.bandolier')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 
 local module = ModuleBase.create('items', lib.Priority.DPS)
 
@@ -22,11 +23,77 @@ local Runtime = {
     reason = 'init',
     lastResult = 'none',
     lastItem = '',
+    actorCallbacksRegistered = false,
 }
-local manualDropbox = nil
 
 local function trim(value)
     return tostring(value or ''):gsub('^%s+', ''):gsub('%s+$', '')
+end
+
+local function hasValidV2Envelope(content)
+    local envelope = type(content) == 'table'
+        and type(content.envelope) == 'table' and content.envelope or nil
+    local sequence = envelope and tonumber(envelope.sequence) or 0
+    local ttlMs = envelope and tonumber(envelope.ttlMs) or 0
+    return envelope ~= nil
+        and tonumber(envelope.version) == ActorsCoordinator.ENVELOPE_VERSION
+        and tostring(envelope.session or '') ~= ''
+        and sequence > 0
+        and sequence == math.floor(sequence)
+        and ttlMs > 0 and ttlMs <= 30000
+        and tonumber(envelope.sentAtMs) ~= nil
+end
+
+local function isLocalUiSender(sender, fromMe)
+    if fromMe ~= true or type(sender) ~= 'table' then return false end
+    local script = tostring(sender.script or ''):gsub('\\', '/'):lower()
+    local scripts = type(lib.Scripts.UI) == 'table'
+        and lib.Scripts.UI or { lib.Scripts.UI }
+    local allowed = false
+    for _, scriptName in ipairs(scripts) do
+        if script == tostring(scriptName or ''):gsub('\\', '/'):lower() then
+            allowed = true
+            break
+        end
+    end
+    if not allowed then return false end
+    local mailbox = tostring(sender.mailbox or ''):lower()
+    return (mailbox:match('([^:]+)$') or mailbox) == 'sidekick'
+end
+
+local function receiveManualMessage(content, sender, fromMe)
+    if type(content) ~= 'table'
+        or tostring(content.id or ''):lower() ~= 'item:manual'
+        or not hasValidV2Envelope(content)
+        or not isLocalUiSender(sender, fromMe) then
+        return true
+    end
+
+    local itemName = tostring(content.itemName or content.name or '')
+    local requestId = tostring(content.requestId or '')
+    local slotKey = tostring(content.slotKey or '')
+    if trim(itemName) == '' or #itemName > 256
+        or #requestId > 128 or #slotKey > 128 then
+        return true
+    end
+    if #Runtime.incomingManual >= MAX_MANUAL_QUEUE then
+        table.remove(Runtime.incomingManual, 1)
+    end
+    Runtime.incomingManual[#Runtime.incomingManual + 1] = {
+        requestId = requestId,
+        requestedAtMs = tonumber(content.requestedAtMs),
+        itemName = itemName,
+        slotKey = slotKey,
+        from = tostring(sender.character or ''),
+    }
+    return true
+end
+
+local function ensureActorCallbacks(coordinator)
+    if Runtime.actorCallbacksRegistered or not coordinator then return end
+    if not coordinator.registerMessageCallback then return end
+    coordinator.registerMessageCallback('item:manual', receiveManualMessage)
+    Runtime.actorCallbacksRegistered = true
 end
 
 local function echo(fmt, ...)
@@ -130,8 +197,6 @@ local function actionFor(entry, manualRequest, context)
 
     return {
         kind = lib.ActionKind.USE_ITEM,
-        type = lib.ClaimType.CAST,
-        wants = { 'cast' },
         name = itemName,
         itemName = itemName,
         itemSlot = entry and entry.slot or nil,
@@ -143,7 +208,6 @@ local function actionFor(entry, manualRequest, context)
         expectsCastStart = false,
         settleMs = castTimeMs > 0 and 500 or 200,
         timeoutMs = math.max(5000, castTimeMs + 5000),
-        claimTtlMs = math.max(5000, castTimeMs + 5000),
         idempotencyKey = requestId or string.format('item:%s:%d', slotKey, math.floor(lib.getTimeMs() / 1000)),
         reason = string.format('%s item %s', manualRequest and 'manual' or 'automatic', itemName),
     }
@@ -205,20 +269,31 @@ local function finishAction(action, result, removeManual)
 end
 
 module.onTick = function(self)
+    ensureActorCallbacks(self.peerActors)
     drainManualMessages()
 
-    -- Conditional bandolier swapping lives in this worker (equipment domain).
-    -- Weapon swaps are instant and claim-free; skip while the pull module
-    -- owns the character so its forced pull set is never fought over.
-    local pullOwns = self.state and self.state.targetOwner
-        and self.state.targetOwner.module == 'pull'
-    Bandolier.tick(lib.getSettings(), pullOwns == true)
+    local lease = self.state and self.state.lease
+    local pullOwns = lease and lease.holderModule == 'pull'
+    local bandolierSet = Bandolier.selectSet(lib.getSettings(), pullOwns == true)
 
     local action, reason = selectItem()
+    if bandolierSet then
+        action = {
+            kind = 'bandolier',
+            name = bandolierSet,
+            bandolierSet = bandolierSet,
+            breaksInvis = false,
+            idempotencyKey = 'bandolier:' .. bandolierSet,
+            reason = 'conditional_bandolier',
+        }
+        reason = 'bandolier_ready'
+    end
     Runtime.selected = action
-    self.priority = action and tonumber(action.itemPriority) or lib.Priority.DPS
-    Runtime.reason = action and string.format('ready:%s', tostring(action.itemName)) or tostring(reason or 'none')
-    self:sendNeed(action ~= nil, action and 1000 or nil, Runtime.reason)
+    Runtime.reason = action
+        and string.format('ready:%s',
+            tostring(action.itemName or action.bandolierSet or action.name))
+        or tostring(reason or 'none')
+    self:setIntent(action ~= nil, nil, Runtime.reason)
 end
 
 module.shouldAct = function(self)
@@ -231,6 +306,11 @@ end
 
 module:enableUnifiedExecutor({
     preflight = function(action)
+        if action.kind == 'bandolier' then
+            local name = trim(action.bandolierSet or action.name)
+            if name == '' then return false, 'bandolier_name_missing' end
+            return not Bandolier.isSetWorn(name), 'bandolier_already_worn'
+        end
         local itemName = trim(action and (action.itemName or action.name))
         if itemName == '' then return false, 'item_name_missing' end
         if action.manualRequestId then
@@ -262,6 +342,14 @@ module:enableUnifiedExecutor({
         end
         return true
     end,
+    dispatch = function(action)
+        if action.kind == 'bandolier' then
+            local issued = Bandolier.activateSet(action.bandolierSet or action.name)
+            return issued, issued and 'issued' or 'bandolier_not_changed', 'none'
+        end
+        local issued = ActionExecutor.executeItem(action.itemName or action.name)
+        return issued, issued and 'issued' or 'item_not_ready', 'cast_or_settle'
+    end,
     onComplete = function(action, _, _, result)
         finishAction(action, result, true)
     end,
@@ -276,23 +364,10 @@ module:enableUnifiedExecutor({
     end,
 })
 
--- This mailbox is addressed as sidekick-next/sk_items:sidekick by the UI host.
--- Actor callbacks are non-yieldable, so copy only serializable scalar fields;
--- the worker validates and processes them from module.onTick.
-manualDropbox = actors.register('sidekick', function(message)
-    local content = message()
-    if type(content) ~= 'table' or tostring(content.id or ''):lower() ~= 'item:manual' then return end
-    if #Runtime.incomingManual >= MAX_MANUAL_QUEUE then
-        table.remove(Runtime.incomingManual, 1)
-    end
-    Runtime.incomingManual[#Runtime.incomingManual + 1] = {
-        requestId = tostring(content.requestId or ''),
-        requestedAtMs = tonumber(content.requestedAtMs),
-        itemName = tostring(content.itemName or content.name or ''),
-        slotKey = tostring(content.slotKey or ''),
-        from = tostring(content.from or ''),
-    }
-end)
+module:enablePeerActors()
+-- Register before ModuleBase initializes the Actor mailbox so a click sent
+-- during worker startup cannot be validated and drained before this receiver exists.
+ensureActorCallbacks(ActorsCoordinator)
 
 mq.bind('/sk_items', function(cmd)
     cmd = trim(cmd):lower()
@@ -309,15 +384,15 @@ mq.bind('/sk_items', function(cmd)
                 tostring(entry.itemName), tostring(entry.mode), tostring(ready), tostring(reason))
         end
     elseif cmd == 'bando' then
-        local pullOwns = module.state and module.state.targetOwner
-            and module.state.targetOwner.module == 'pull'
+        local lease = module.state and module.state.lease
+        local pullOwns = lease and lease.holderModule == 'pull'
         Bandolier.debugDump(lib.getSettings(), pullOwns == true)
     elseif cmd == '' or cmd == 'status' then
-        local owner = module.state and module.state.castOwner or nil
+        local owner = module.state and module.state.lease or nil
         echo('reason=%s queue=%d selected=%s owner=%s last=%s/%s',
             tostring(Runtime.reason), #Runtime.manualQueue,
             tostring(Runtime.selected and Runtime.selected.itemName or 'none'),
-            tostring(owner and owner.module or 'none'),
+            tostring(owner and owner.holderModule or 'none'),
             tostring(Runtime.lastItem ~= '' and Runtime.lastItem or 'none'),
             tostring(Runtime.lastResult))
     else

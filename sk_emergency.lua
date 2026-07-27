@@ -118,11 +118,11 @@ module.getAction = function(self)
 end
 
 module.executeAction = function(self)
-    if not self:ownsAction() then
+    if not self:ownsLease() then
         return false, 'no_ownership'
     end
 
-    local action = self.state.castOwner and self.state.castOwner.action
+    local action = self:getLeaseAction()
     if not action then
         return false, 'no_action'
     end
@@ -163,18 +163,12 @@ end
 -- the coordinated executor is being rolled out to every worker.
 module:enableUnifiedExecutor()
 
--- Emergency module should also request interrupt when it detects emergency
 module.onTick = function(self)
     if not self:hasValidState() then return end
 
-    -- If we detect an emergency and someone else is casting, request interrupt
     local kind, _ = detectEmergency()
-    self:sendNeed(kind ~= nil, kind and 500 or nil, kind and ('emergency_' .. kind) or 'no_emergency')
-    if kind and self.state.castBusy and not self:ownsCast() then
-        if self.state.castOwner and self.state.castOwner.priority > lib.Priority.EMERGENCY then
-            self:requestInterrupt(string.format('emergency_%s', kind))
-        end
-    end
+    self:setIntent(kind ~= nil, kind and 500 or nil,
+        kind and ('emergency_' .. kind) or 'no_emergency')
 end
 
 -------------------------------------------------------------------------------

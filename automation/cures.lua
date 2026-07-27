@@ -836,27 +836,54 @@ function M.castCure(targetId, debuffType, cureSpell)
         _state.lastCureCastAt = os.clock()
 
         -- Track local cure
-        _state.recentCures[targetId] = _state.recentCures[targetId] or {}
-        _state.recentCures[targetId][debuffType] = {
-            curedAt = os.clock(),
-            curer = _state.selfName,
+        -- Effect confirmation is deferred until the cast resolves.
+        _state.pendingConfirmation = {
+            targetId = targetId,
+            debuffType = debuffType,
+            cureSpell = cureSpell,
         }
 
         -- The buff bar we cached is now stale — force the next scan to refresh
         -- so we don't keep targeting the same already-cured debuff.
-        _invalidateDebuffScan()
 
         -- Broadcast that we cured
-        broadcastCureLanded(targetId, debuffType, cureSpell)
 
         -- Release claim
-        releaseClaim(targetId, debuffType)
     else
         -- Release claim on failure
         releaseClaim(targetId, debuffType)
     end
 
     return success, reason
+end
+
+--- Publish a cure only after a fresh scan confirms the requested effect left.
+function M.confirmCureEffect(targetId, debuffType, cureSpell)
+    targetId = tonumber(targetId) or 0
+    debuffType = tostring(debuffType or '')
+    if targetId <= 0 or debuffType == '' then return false end
+
+    _invalidateDebuffScan()
+    local observed = scanGroupForDebuffs()
+    local targetDebuffs = observed[targetId]
+    local stillPresent = targetDebuffs and targetDebuffs[debuffType]
+        and #targetDebuffs[debuffType] > 0
+    if not stillPresent then
+        _state.recentCures[targetId] = _state.recentCures[targetId] or {}
+        _state.recentCures[targetId][debuffType] = {
+            curedAt = os.clock(),
+            curer = _state.selfName,
+        }
+        broadcastCureLanded(targetId, debuffType, cureSpell)
+    end
+    _state.pendingConfirmation = nil
+    releaseClaim(targetId, debuffType)
+    return not stillPresent
+end
+
+function M.cancelCureAttempt(targetId, debuffType)
+    _state.pendingConfirmation = nil
+    releaseClaim(targetId, debuffType)
 end
 
 --------------------------------------------------------------------------------

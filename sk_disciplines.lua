@@ -18,7 +18,7 @@
 -- DPS slot with sk_dps.
 --
 -- Burn semantics: predicates that gate on `ctx.burn` only fire when the
--- user's BurnNow setting is on. Toggle it with /sk_burn (registered in
+-- user's BurnActive setting is on. Toggle it with /sk_burn (registered in
 -- this module's main loop body).
 
 local mq = require('mq')
@@ -56,7 +56,7 @@ end
 
 local function getBurn()
     local settings = getSettings()
-    return settings.BurnNow == true or false
+    return settings.BurnActive == true
 end
 
 -------------------------------------------------------------------------------
@@ -290,16 +290,15 @@ module.onTick = function(self)
     -- CC.getBestMezTarget, which reads Cache.xtarget.haters in THIS process
     -- — empty forever unless someone ticks it.
     Cache.tick()
-    -- Send need hints so the coordinator knows whether disciplines can act.
     if not disciplinesEnabled() then
-        self:sendNeed(false, nil, 'disabled')
+        self:setIntent(false, nil, 'disabled')
         return
     end
     local action = refreshPending(self)
     if action then
-        self:sendNeed(true, 500, string.format('%s:%s', action.kind, action.setName))
+        self:setIntent(true, nil, string.format('%s:%s', action.kind, action.setName))
     else
-        self:sendNeed(false, nil, 'no_ready_ability')
+        self:setIntent(false, nil, 'no_ready_ability')
     end
 end
 
@@ -384,13 +383,16 @@ module.getAction = function(self)
     }
 end
 
-local function awaitNotCasting(maxMs)
+local function awaitNotCasting(self, maxMs)
     local start = lib.getTimeMs()
     mq.delay(150)
     while lib.isCasting() do
         mq.delay(50)
+        if not self:ownsLease() then return false end
+        self:renewLease()
         if (lib.getTimeMs() - start) > maxMs then break end
     end
+    return true
 end
 
 --- Ensure /target id <id> locks in the requested target before we cast.
@@ -411,8 +413,8 @@ local function ensureTarget(targetId)
 end
 
 module.executeAction = function(self)
-    if not self:ownsAction() then return false, 'no_ownership' end
-    local action = self.state.castOwner and self.state.castOwner.action
+    if not self:ownsLease() then return false, 'no_lease' end
+    local action = self:getLeaseAction()
     if not action then return false, 'no_action' end
 
     -- Discard the cached pick now that we've committed to it; the next
@@ -445,7 +447,7 @@ module.executeAction = function(self)
     -- the cast bar where applicable so we don't immediately try to fire
     -- another ability on top of an in-progress one.
     if action.engineKind == 'aa' or action.engineKind == 'spell' then
-        awaitNotCasting(8000)
+        if not awaitNotCasting(self, 8000) then return true, 'lease_lost' end
     else
         -- Disciplines fire instantly; tiny settle delay so ActiveDisc
         -- updates before the next tick's predicate evaluation.
@@ -495,7 +497,7 @@ module:enableUnifiedExecutor({
 })
 
 -------------------------------------------------------------------------------
--- /sk_burn slash command — toggles BurnNow.
+-- /sk_burn slash command — toggles BurnActive.
 -------------------------------------------------------------------------------
 
 local function registerBurnBind()
@@ -530,7 +532,7 @@ _classConfig = loadClassConfig()
 if not shouldRunForClass(_classConfig, myClassShort()) then
     -- This class is handled by other modules (healers / casters / pet
     -- classes own their rotations elsewhere). Register the /sk_burn
-    -- bind anyway so the user can flip BurnNow on any character — it's
+    -- bind anyway so the user can flip BurnActive on any character — it's
     -- consumed by clickies and other features beyond just disciplines.
     registerBurnBind()
     return module

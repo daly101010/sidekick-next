@@ -5,6 +5,7 @@
 local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
+local OffensiveTarget = require('sidekick-next.utils.offensive_target')
 
 local module = ModuleBase.create('dps', lib.Priority.DPS)
 
@@ -106,13 +107,11 @@ local function isUtilityGem(config)
     return utility and (utility.combat == true or utility.ooc == true)
 end
 
--- Coordinated DPS owns offensive and support rotation spells only. Beneficial
--- buffs are configured/executed by sk_buffs, while pet/other utility spells
--- require an explicit utility flag and are handled by sk_resources.
+-- DPS owns damage spells only. Persistent debuffs and dispels are selected by
+-- sk_debuff at its fixed, higher coordinator tier.
 local function dpsOwnsSpellType(spellType)
     spellType = tostring(spellType or ''):lower()
-    return spellType == 'direct_damage' or spellType == 'dot' or spellType == 'debuff'
-        or spellType == 'dispel'
+    return spellType == 'direct_damage' or spellType == 'dot'
 end
 
 local function ownerForSpellType(spellType)
@@ -120,6 +119,7 @@ local function ownerForSpellType(spellType)
     if spellType == 'buff' then return 'buffs' end
     if spellType == 'pet' then return 'resources_when_enabled' end
     if spellType == 'heal' then return 'healing' end
+    if spellType == 'debuff' or spellType == 'dispel' then return 'debuff' end
     return dpsOwnsSpellType(spellType) and 'dps' or 'unassigned'
 end
 
@@ -196,36 +196,7 @@ local function validateNpcTarget(targetId, source, remember, coordinatedCombat)
 end
 
 local function isCombatTargetActive(target)
-    if not target or not target.id or target.id <= 0 then return false end
-
-    -- A fresh Actor Team/main-assist report that the peer is in combat is
-    -- authoritative for OOG healers that may have no local XTarget hater slot.
-    if target.coordinatedCombat == true then return true end
-
-    -- XTarget hater/auto slots are direct evidence that the client is aware of
-    -- combat. This is the most reliable local signal for casters/healers.
-    if lib.inCombat() then return true end
-
-    local source = tostring(target.source or ''):lower()
-    if source:find('xtarget', 1, true) then return true end
-
-    local spawn = mq.TLO.Spawn(target.id)
-    if not (spawn and spawn()) then return false end
-
-    -- A damaged NPC is enough to consider the encounter active even if this
-    -- character has not entered local combat yet.
-    local hp = lib.safeNum(function() return spawn.PctHPs() end, 100)
-    if hp > 0 and hp < 100 then return true end
-
-    -- If the NPC is targeting a player/pet/merc, it is probably engaged. This
-    -- keeps multi-group casters working without treating a group member's idle
-    -- NPC target as combat.
-    local targetType = tostring(lib.safeTLO(function() return spawn.Target.Type() end, '') or ''):lower()
-    if targetType == 'pc' or targetType == 'pet' or targetType == 'mercenary' then
-        return true
-    end
-
-    return false
+    return OffensiveTarget.isCombatActive(target)
 end
 
 local function addXTargetCandidates(candidates, seen)
@@ -250,7 +221,6 @@ local function addActorTargetCandidates(candidates, seen, maId)
     local tankState = Actors.getTankState and Actors.getTankState() or nil
     local tankUpdatedAt = type(tankState) == 'table' and tonumber(tankState.updatedAt) or nil
     if tankUpdatedAt and (os.clock() - tankUpdatedAt) <= Config.actorTargetTtlSeconds then
-        addCandidate(candidates, seen, tankState.currentTargetId, 'actor_current')
         addCandidate(candidates, seen, tankState.primaryTargetId, 'actor_primary')
     end
 
@@ -341,39 +311,10 @@ local function addActorTargetCandidates(candidates, seen, maId)
 end
 
 local function getMATarget()
-    local maId = lib.getMainAssistId()
-    local candidates = {}
-    local seen = {}
-    addActorTargetCandidates(candidates, seen, maId)
-    if maId > 0 then
-        local ma = mq.TLO.Spawn(maId)
-        addSpawnTargetCandidates(candidates, seen, ma, 'mainassist')
-    end
-
-    addSpawnTargetCandidates(candidates, seen, mq.TLO.Group.MainAssist, 'group_ma')
-    addSpawnTargetCandidates(candidates, seen, mq.TLO.Group.MainTank, 'group_mt')
-    addSpawnTargetCandidates(candidates, seen, mq.TLO.Group.Leader, 'group_leader')
-
-    local currentTarget = mq.TLO.Target
-    if currentTarget and currentTarget() then
-        addCandidate(candidates, seen, lib.safeNum(function() return currentTarget.ID() end, 0), 'current')
-        addSpawnTargetCandidates(candidates, seen, currentTarget, 'current')
-    end
-
-    addXTargetCandidates(candidates, seen)
-
-    for _, candidate in ipairs(candidates) do
-        local target = validateNpcTarget(candidate.id, candidate.source, true, candidate.coordinatedCombat)
-        if target then return target end
-    end
-
-    if _lastValidTarget and (lib.getTimeMs() - (_lastValidTarget.seenAt or 0)) <= Config.targetCacheMs then
-        local target = validateNpcTarget(_lastValidTarget.id, 'cache:' .. tostring(_lastValidTarget.source), false,
-            _lastValidTarget.coordinatedCombat)
-        if target then return target end
-    end
-
-    return nil
+    return OffensiveTarget.select(module, {
+        actorTargetTtlSeconds = Config.actorTargetTtlSeconds,
+        targetCacheMs = Config.targetCacheMs,
+    })
 end
 
 local function spellNeedsNpcTarget(entry)
@@ -500,7 +441,7 @@ local function selectSpell()
     if not target then return nil, 'no_target' end
     local combatActive = isCombatTargetActive(target)
     if not combatActive then
-        _lastValidTarget = nil
+        OffensiveTarget.clear(module)
         return nil, 'no_combat'
     end
     if target.hp < Config.minTargetHpPct then return nil, 'target_low_hp' end
@@ -508,9 +449,8 @@ local function selectSpell()
     local mana = lib.safeNum(function() return mq.TLO.Me.PctMana() end, 0)
     if mana < Config.minManaPct then return nil, 'low_mana' end
 
-    -- DPS mana floor (DpsMinManaPct, UI: Automation tab): below the floor
-    -- every DPS cast is skipped EXCEPT the tash line — tash enables
-    -- charm/mez landing, and CC outranks DPS for mana. 0 = disabled.
+    -- DPS mana floor (DpsMinManaPct, UI: Automation tab). Debuffs have their
+    -- own worker and are not suppressed by this damage-only threshold.
     local manaFloor = 0
     do
         local okCore, Core = pcall(require, 'sidekick-next.utils.core')
@@ -534,7 +474,7 @@ local function selectSpell()
     local firstSkip = nil
     for _, entry in ipairs(castList) do
         if entry and entry.slot and not isUtilityGem(entry.config) and dpsOwnsSpellType(entry.spellType) then
-            if manaLow and not tostring(entry.spellName or ''):lower():find('tash', 1, true) then
+            if manaLow then
                 firstSkip = firstSkip or ('mana_floor:' .. tostring(entry.spellName))
                 goto continue_entry
             end
@@ -997,7 +937,7 @@ module.onTick = function(self)
     local action, reason = selectSpell()
     _lastReason = action and ('ready:' .. tostring(action.spellName)) or tostring(reason or 'none')
     sendIntelTelemetry(self, action, _lastReason)
-    self:sendNeed(action ~= nil, action and 500 or nil, _lastReason)
+    self:setIntent(action ~= nil, action and 500 or nil, _lastReason)
 end
 
 module.shouldAct = function(self)
@@ -1012,15 +952,14 @@ module.getAction = function(self)
 
     return {
         kind = lib.ActionKind.CAST_SPELL,
-        -- DPS only needs exclusive cast ownership. It briefly targets the MA's
-        -- mob immediately before casting; requiring a target claim can deadlock
-        -- behind stale movement/assist target ownership even though no cast is
-        -- happening.
-        type = lib.ClaimType.CAST,
         name = action.spellName,
         spellName = action.spellName,
         gemSlot = action.slot,
         targetId = action.targetId,
+        targetType = 'NPC',
+        targetName = action.targetName,
+        combatAction = true,
+        allowBreakInvis = true,
         -- Targeting plus the configured humanized reaction window happens
         -- before /cast, so this workflow needs an explicit bounded exception.
         castStartTimeoutMs = 4000,
@@ -1039,12 +978,12 @@ module.getAction = function(self)
 end
 
 module.executeAction = function(self)
-    if not self:ownsClaim() then
+    if not self:ownsLease() then
         _lastExecuteReason = 'no_ownership'
         return false, 'no_ownership'
     end
 
-    local action = self.state and self.state.castOwner and self.state.castOwner.action
+    local action = self:getLeaseAction()
     if not action then
         _lastExecuteReason = 'no_action'
         return false, 'no_action'
@@ -1109,7 +1048,8 @@ module.executeAction = function(self)
     local maxWait = (getSpellCastTime(spellName) + 1) * 1000
     while lib.isCasting() do
         mq.delay(50)
-        if not self:ownsClaim() then
+        self:renewLease()
+        if not self:ownsLease() then
             _lastExecuteReason = 'ownership_lost'
             commandEcho('execute interrupted: ownership lost')
             return true, 'ownership_lost'
@@ -1180,22 +1120,16 @@ mq.bind('/sk_dps', function(cmd)
         local action, actionReason = selectSpell()
         local gemCount = 0
         for _ in pairs((spellSet and spellSet.gems) or {}) do gemCount = gemCount + 1 end
-        local castOwner = module.state and module.state.castOwner
-        local targetOwner = module.state and module.state.targetOwner
+        local lease = module.state and module.state.lease
         commandEcho(
-            'running=%s hasState=%s priority=%s statePrio=%s castBusy=%s ownsClaim=%s ownsCast=%s ownsTarget=%s claimPending=%s claimType=%s castOwner=%s targetOwner=%s activeSet=%s gems=%d target=%s targetHp=%s targetSource=%s actorCombat=%s combatActive=%s next=%s slot=%s lastReason=%s reason=%s lastExec=%s lastAttempt=%s path=%s',
+            'running=%s hasState=%s tier=%s ownsLease=%s leasePending=%s request=%s leaseHolder=%s activeSet=%s gems=%d target=%s targetHp=%s targetSource=%s actorCombat=%s combatActive=%s next=%s slot=%s lastReason=%s reason=%s lastExec=%s lastAttempt=%s path=%s',
             tostring(module.running),
             tostring(module:hasValidState()),
-            tostring(module:isMyPriority()),
-            tostring(module.state and module.state.activePriority),
-            tostring(module.state and module.state.castBusy),
-            tostring(module:ownsClaim()),
-            tostring(module:ownsCast()),
-            tostring(module:ownsTarget()),
-            tostring(module.claimPending),
-            tostring(module.currentClaimType),
-            tostring(castOwner and castOwner.module or 'nil'),
-            tostring(targetOwner and targetOwner.module or 'nil'),
+            tostring(module.priority),
+            tostring(module:ownsLease()),
+            tostring(module.requestPending),
+            tostring(module.currentRequestId or 'none'),
+            tostring(lease and lease.holderModule or 'nil'),
             tostring(Persistence and Persistence.activeSetName or nil),
             gemCount,
             target and tostring(target.id) or 'none',

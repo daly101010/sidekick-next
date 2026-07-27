@@ -16,7 +16,7 @@ local Actors = require('sidekick-next.utils.actors_coordinator')
 local Counters = require('sidekick-next.utils.action_counters')
 local Roles = require('sidekick-next.utils.class_roles')
 
-local module = ModuleBase.create('tank', lib.Priority.DPS)
+local module = ModuleBase.create('tank', lib.Priority.TANK)
 module:enablePeerActors()
 
 local TANK_CLASSES = Roles.TANK_CLASSES
@@ -40,7 +40,6 @@ local _recovery = { mobId = 0, spent = false }
 local _forceEngage = false
 -- Mezzed adds we already pre-taunted (hate secured without breaking mez).
 local _mezPrepped = {}
-local _lastInterruptReqAt = 0
 -- Peel futility tracking: taunting a mob that refuses to come back (rooted
 -- mobs attack by proximity, ignoring hate) just spams Taunt on cooldown.
 -- After 2 peels that didn't bring the mob to us, back off for 30s.
@@ -60,6 +59,7 @@ local _lastAnchorSampleAt = 0
 local _lastRepositionAt = 0
 local _dragBlocked = {}          -- mobId -> time; mobs that would not follow
 local _backHeld = false          -- backpedal key currently held (drag step)
+local _cleanupStableSamples = 0
 local DRAG_BLOCK_TTL_MS = 30000
 local REPO_STEP_SIZE = 15        -- units per drag step toward camp
 local REPO_CAMP_RADIUS = 25      -- mob within this of camp = good enough
@@ -229,7 +229,7 @@ local function choosePrimary()
                 if spawn then
                     local score = (100 - (tonumber(row.hp) or 100))
                         + (tonumber(row.level) or 0) * 3
-                    if HEALER_CLASSES[tostring(row.classShort or ''):upper()] then
+                    if ENEMY_PURE_HEALERS[tostring(row.classShort or ''):upper()] then
                         score = score + 400
                     end
                     if safe(function() return spawn.Named() end, false) == true then score = score + 100 end
@@ -268,7 +268,6 @@ local function setPrimary(spawn)
 end
 
 local function broadcastPrimary(force)
-    if _primaryId <= 0 then return end
     local now = lib.getTimeMs()
     if not force and (now - _lastBroadcastAt) < PRIMARY_BROADCAST_MS then return end
     _lastBroadcastAt = now
@@ -673,21 +672,26 @@ module.onTick = function(self)
     Cache.tick()
     local enabled = refreshSettings()
     if not enabled then
+        if _primaryId > 0 then
+            setPrimary(nil)
+            broadcastPrimary(true)
+        end
         _pending = nil
         _lastReason = TANK_CLASSES[_classShort] and 'mode_off' or 'not_tank_class'
-        self:sendNeed(false, nil, _lastReason)
+        self:setIntent(false, nil, _lastReason)
         return
     end
 
-    if self.currentClaimId or self.claimPending then
-        -- Keep the primary broadcast warm while a claim executes (engage
+    if self.currentRequestId then
+        -- Keep the primary broadcast warm while a lease executes (engage
         -- approaches can run 10s+): the mezzer's exclusion has a freshness
         -- window and must not expire mid-fight.
-        if _primaryId > 0 then broadcastPrimary(false) end
-        self:sendNeed(true, 1000, _lastReason)
+        broadcastPrimary(false)
+        self:setIntent(true, nil, _lastReason)
         return
     end
 
+    local campReturnAction = nil
     -- Camp anchor maintenance while idle (no haters, standing still).
     -- Deadband keeps the anchor stable against combat drift (rgmercs solves
     -- this with an explicit /camp; we infer it):
@@ -718,8 +722,21 @@ module.onTick = function(self)
                         end
                     elseif _settings.TankRepositionEnabled == true
                         and tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
-                        -- Return to camp after combat (rgmercs ReturnToCamp).
-                        mq.cmdf('/nav locyxz %.1f %.1f %.1f', _anchor.y, _anchor.x, _anchor.z)
+                        campReturnAction = {
+                            kind = 'movement',
+                            tankAction = 'return_camp',
+                            name = 'Return to camp',
+                            campX = _anchor.x,
+                            campY = _anchor.y,
+                            campZ = _anchor.z,
+                            skipBoundaryTarget = true,
+                            breaksInvis = false,
+                            timeoutMs = 15000,
+                            idempotencyKey = string.format(
+                                'tank:return-camp:%d:%d',
+                                math.floor(_anchor.x), math.floor(_anchor.y)),
+                            reason = 'return_to_camp',
+                        }
                     end
                 end
             end
@@ -740,30 +757,21 @@ module.onTick = function(self)
     elseif primaryChanged and _primaryId <= 0 then
         announce('Target cleared')
     end
-    if _primaryId > 0 then broadcastPrimary(false) end
+    -- A fresh zero is authoritative "do not acquire", not an absent target.
+    -- Keep broadcasting it while this worker owns target authority so DPS
+    -- cannot fall back to the tank's temporary peel/aggro target.
+    broadcastPrimary(primaryChanged)
 
     local action, priority, reason = computePending()
+    if not action and campReturnAction then
+        action = campReturnAction
+        reason = campReturnAction.reason
+    end
     if not action and _primaryId <= 0 then reason = 'no_unmezzed_hater' end
     _pending = action
-    self.priority = priority
     _lastReason = reason
 
-    -- Aggro control outranks DPS casting: if a taunt is pending while some
-    -- other module's cast is in flight (our own DPS spells included), ask the
-    -- coordinator to interrupt it. The coordinator applies the
-    -- TANK_RECOVERY InterruptThreshold (lets a nearly-finished cast land),
-    -- and without this request the cast owner's claim is undisplacable and
-    -- the taunt waits out the full cast.
-    if action and (action.reason == 'primary_taunt' or action.reason == 'loose_mob_taunt')
-        and lib.isCasting() and not self:ownsCast() then
-        local nowMs = lib.getTimeMs()
-        if (nowMs - _lastInterruptReqAt) >= 1000 then
-            _lastInterruptReqAt = nowMs
-            self:requestInterrupt('taunt_pending')
-        end
-    end
-
-    self:sendNeed(action ~= nil, action and 500 or nil, reason)
+    self:setIntent(action ~= nil, nil, reason)
 end
 
 module.shouldAct = function()
@@ -771,6 +779,13 @@ module.shouldAct = function()
 end
 
 module.getAction = function()
+    if _pending and tonumber(_pending.targetId) and tonumber(_pending.targetId) > 0 then
+        local spawn = spawnById(_pending.targetId)
+        if spawn then
+            _pending.targetName = tostring(safe(function() return spawn.CleanName() end, '') or '')
+            _pending.targetType = tostring(safe(function() return spawn.Type() end, '') or '')
+        end
+    end
     return _pending
 end
 
@@ -803,6 +818,15 @@ end
 module:enableUnifiedExecutor({
     preflight = function(action)
         _pending = nil
+        if action.tankAction == 'return_camp' then
+            if Cache.inCombat() or (Cache.xtarget.count or 0) > 0 then
+                return false, 'combat_resumed'
+            end
+            return tonumber(action.campX) ~= nil
+                and tonumber(action.campY) ~= nil
+                and tonumber(action.campZ) ~= nil,
+                'camp_anchor_missing'
+        end
         if action.tankAction == 'ability' then
             if action.requiresSelfTarget then return ensureSelfTarget(), 'self_target_lost' end
             if action.requiresHostileTarget or action.tier == 'aggro' then
@@ -816,7 +840,17 @@ module:enableUnifiedExecutor({
         return ensureTarget(action.targetId, allowMezzed), 'target_lost'
     end,
     dispatch = function(action, _, job)
-        if action.tankAction == 'engage' then
+        if action.tankAction == 'return_camp' then
+            module:markDirtyEffects(true)
+            mq.cmdf('/nav locyxz %.1f %.1f %.1f',
+                tonumber(action.campY), tonumber(action.campX), tonumber(action.campZ))
+            job.tank = {
+                phase = 'return_camp',
+                deadline = lib.getTimeMs() + 12000,
+            }
+            _lastAction = 'return_camp'
+            return true, 'returning_to_camp', 'custom'
+        elseif action.tankAction == 'engage' then
             _lastEngageAt = lib.getTimeMs()
             _forceEngage = false
             broadcastPrimary(true)
@@ -843,6 +877,7 @@ module:enableUnifiedExecutor({
             }
             return true, 'engage_approach', 'custom'
         elseif action.tankAction == 'reposition' then
+            module:markDirtyEffects(true)
             _lastRepositionAt = lib.getTimeMs()
             -- Root check at dispatch time (needs the mob targeted for cached
             -- buffs). Unknown reads as not-rooted; the follow-check below
@@ -948,7 +983,10 @@ module:enableUnifiedExecutor({
             local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt')
             local distance = spawn and tonumber(safe(function() return spawn.Distance3D() end,
                 safe(function() return spawn.Distance() end, 999))) or 999
-            if distance > Aggro.TAUNT_RANGE then mq.cmdf('/nav id %d', action.targetId) end
+            if distance > Aggro.TAUNT_RANGE then
+                module:markDirtyEffects(true)
+                mq.cmdf('/nav id %d', action.targetId)
+            end
             _lastAction = 'taunt:' .. tostring(action.targetId)
             return true, 'taunt_approach', 'custom'
         elseif action.tankAction == 'ability' then
@@ -962,6 +1000,25 @@ module:enableUnifiedExecutor({
         return false, 'unsupported_tank_action'
     end,
     onTick = function(action, _, job)
+        if action.tankAction == 'return_camp' then
+            local runtime = job.tank or {}
+            if Cache.inCombat() or (Cache.xtarget.count or 0) > 0 then
+                return true, 'combat_resumed', 'failed'
+            end
+            local x = tonumber(safe(function() return mq.TLO.Me.X() end, nil))
+            local y = tonumber(safe(function() return mq.TLO.Me.Y() end, nil))
+            if not (x and y) then return true, 'position_unavailable', 'failed' end
+            local dx = x - tonumber(action.campX)
+            local dy = y - tonumber(action.campY)
+            if (dx * dx + dy * dy) <= 64 then
+                navStop()
+                return true, 'at_camp', 'completed'
+            end
+            if lib.getTimeMs() >= (runtime.deadline or 0) then
+                return true, 'return_camp_timeout', 'failed'
+            end
+            return true, 'returning_to_camp'
+        end
         if action.tankAction == 'reposition' then
             local runtime = job.tank or {}
             if runtime.phase ~= 'drag_step' then return true end
@@ -1044,6 +1101,7 @@ module:enableUnifiedExecutor({
             -- /stick from range. Re-issue at most every 2s.
             if (now - (runtime.navIssuedAt or 0)) >= 2000 then
                 runtime.navIssuedAt = now
+                module:markDirtyEffects(true)
                 mq.cmdf('/nav id %d', action.targetId)
             end
             return true, 'approaching'
@@ -1087,7 +1145,9 @@ module:enableUnifiedExecutor({
         return true, 'taunt_wait'
     end,
     onComplete = function(action)
-        if action.tankAction == 'reposition' then
+        if action.tankAction == 'return_camp' then
+            navStop()
+        elseif action.tankAction == 'reposition' then
             endDragStep(action)
         end
         if action.tankAction == 'taunt' then
@@ -1108,7 +1168,8 @@ module:enableUnifiedExecutor({
             navStop()
             Actors.broadcastTauntDone()
             _forceEngage = true
-        elseif action and action.tankAction == 'engage' then
+        elseif action and (action.tankAction == 'engage'
+            or action.tankAction == 'return_camp') then
             navStop()
         elseif action and action.tankAction == 'reposition' then
             endDragStep(action)
@@ -1120,7 +1181,8 @@ module:enableUnifiedExecutor({
             navStop()
             Actors.broadcastTauntDone()
             _forceEngage = true
-        elseif action and action.tankAction == 'engage' then
+        elseif action and (action.tankAction == 'engage'
+            or action.tankAction == 'return_camp') then
             navStop()
         elseif action and action.tankAction == 'reposition' then
             endDragStep(action)
@@ -1128,6 +1190,30 @@ module:enableUnifiedExecutor({
         restorePrimary(action)
     end,
 })
+
+module.onLeaseFinalizing = function(self, action, reason)
+    if _backHeld then
+        endDragStep(action)
+    end
+
+    local navActive = safe(function() return mq.TLO.Navigation.Active() end, false) == true
+    if navActive then
+        navStop()
+        _cleanupStableSamples = 0
+        return false, 'stopping_navigation'
+    end
+
+    if self.dirtyEffects or reason == 'orphan_recovery' then
+        _cleanupStableSamples = _cleanupStableSamples + 1
+        if _cleanupStableSamples < 2 then
+            return false, 'confirming_navigation_stopped'
+        end
+    end
+
+    _cleanupStableSamples = 0
+    self:markDirtyEffects(false)
+    return true
+end
 
 mq.bind('/sk_tank', function(command)
     command = tostring(command or 'status'):lower()
@@ -1137,22 +1223,23 @@ mq.bind('/sk_tank', function(command)
         echo('Stop requested')
         return
     end
-    local owner = module.state and module.state.targetOwner
-    echo('running=%s class=%s mode=%s priority=%s ownsTarget=%s ownsCast=%s pending=%s reason=%s',
+    local owner = module.state and module.state.lease
+    echo('running=%s class=%s mode=%s tier=%s ownsLease=%s pending=%s reason=%s',
         tostring(module.running), tostring(_classShort), tostring(_settings.CombatMode or 'off'),
-        tostring(module.priority), tostring(module:ownsTarget()), tostring(module:ownsCast()),
+        tostring(module.priority), tostring(module:ownsLease()),
         tostring(_pending and _pending.name or '-'), tostring(_lastReason))
-    echo('primary=%s(%d) coordinatorTargetOwner=%s last=%s haters=%d deficits=%d',
+    echo('primary=%s(%d) coordinatorLeaseHolder=%s last=%s haters=%d deficits=%d',
         _primaryName ~= '' and _primaryName or '-', _primaryId,
-        tostring(owner and owner.module or '-'), tostring(_lastAction),
+        tostring(owner and owner.holderModule or '-'), tostring(_lastAction),
         tonumber(Cache.xtarget.count) or 0, tonumber(Cache.xtarget.aggroDeficitCount) or 0)
     local stateAge = (module.stateReceivedAt and module.stateReceivedAt > 0)
         and (lib.getTimeMs() - module.stateReceivedAt) or -1
     local result = module.lastActionResult or {}
-    echo('stateValid=%s stateAgeMs=%d boot=%s claimPending=%s lastClaimOk=%s claimErr=%s lastResult=%s:%s',
+    echo('stateValid=%s stateAgeMs=%d boot=%s leasePending=%s lastRequestOk=%s requestErr=%s lastResult=%s:%s',
         tostring(module:hasValidState()), stateAge, tostring(module.coordinatorBootId or '-'),
-        tostring(module.claimPending), tostring(module.lastClaimSendOk),
-        tostring(module.lastClaimSendError or '-'),
+        tostring(module.currentRequestId ~= nil and not module:ownsLease()),
+        tostring(module.lastRequestSendOk),
+        tostring(module.lastRequestSendError or '-'),
         tostring(result.phase or '-'), tostring(result.reason or '-'))
 end)
 

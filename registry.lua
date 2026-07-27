@@ -15,6 +15,7 @@ M.removed = {
     BuffRaidEnabled = true,
     BuffRebuffWindow = true,
     BuffSelfOnly = true,
+    BurnNow = true,
     CooldownSweepEnabled = true,
     DoCombatRez = true,
     DoOutOfCombatRez = true,
@@ -26,6 +27,7 @@ M.removed = {
     ResourceHpAbovePctOOC = true,
     ResourceManaBelowPct = true,
     SpecialEnabled = true,
+    SpellRotationEnabled = true,
 
     TravelBrokerEnabled = true,
     Humanize_RestickAfterMs = true,
@@ -155,8 +157,10 @@ M.defaults = {
 
     AutomationLevel = { type = 'text', Default = 'auto', Category = 'Automation', DisplayName = 'Play Style (manual/hybrid/auto)', Options = { 'manual', 'hybrid', 'auto' } },
     AutomationPaused = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Global Pause' },
+    LeasePreemptionEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Allow Urgent Lease Preemption' },
     AutoAbilitiesEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Abilities (AAs/Discs)' },
     AutoItemsEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'Auto Items (Clickies)' },
+    DpsEnabled = { type = 'bool', Default = true, Category = 'Automation', DisplayName = 'DPS Enabled' },
 
     MeditationMode = { type = 'text', Default = 'off', Category = 'Automation', DisplayName = 'Meditation (off/ooc/in combat)', Options = { 'off', 'ooc', 'always', 'in combat' }, Aliases = { on = 'ooc', incombat = 'in combat', inout = 'always' } },
     MeditationAfterCombatDelay = { type = 'number', Default = 2, Category = 'Automation', DisplayName = 'Meditation After Combat Delay (sec)' },
@@ -236,8 +240,7 @@ M.defaults = {
     CasterStandoffMax = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Standoff Max Distance' },
     PreferredResistType = { type = 'text', Default = 'Any', Category = 'Combat', DisplayName = 'Preferred Resist Type' },
 
-    -- Spell Rotation Settings
-    SpellRotationEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Spell Rotation Enabled' },
+    -- Spell execution and rotation retry settings
     RotationResetWindow = { type = 'number', Default = 2, Category = 'Combat', DisplayName = 'Rotation Reset Window (sec)' },
     RetryOnFizzle = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Retry on Fizzle' },
     RetryOnResist = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Retry on Resist' },
@@ -331,9 +334,6 @@ M.defaults = {
     -- Discipline / burn ability framework — evaluates per-class config
     -- predicates and fires the matching disc/AA on combat ticks.
     DisciplinesEnabled = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Use Class Disciplines/AAs' },
-    -- Mid-fight toggle for "spend cooldowns now". Flipped via /sk_burn.
-    BurnNow = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Burn Now (long-CD AAs/discs)' },
-
     -- Mez Casting Settings (ENC, BRD, NEC)
     MezzingEnabled = { type = 'bool', Default = false, Category = 'CC', DisplayName = 'Mezzing Enabled' },
     MezMinLevel = { type = 'number', Default = 0, Category = 'CC', DisplayName = 'Mez Min Level (skip grey cons)' },
@@ -552,7 +552,7 @@ local MODULE_KEYS = {
         StaggerAnimationEnabled LowResourceWarningEnabled DamageFlashEnabled
     ]],
     main = [[
-        AutomationLevel AutomationPaused AutoAbilitiesEnabled AutoItemsEnabled AutostartPromptShown
+        AutomationLevel AutomationPaused LeasePreemptionEnabled AutoAbilitiesEnabled AutoItemsEnabled AutostartPromptShown
     ]],
     chase = [[
         ChaseEnabled ChaseRole ChaseTarget ChaseDistance
@@ -570,7 +570,7 @@ local MODULE_KEYS = {
         AssistOutsideGroup AssistOutsideRaid AssistOutsidePeers
     ]],
     dps = [[
-        BurnActive BurnDuration BurnNow SpellRotationEnabled RotationResetWindow
+        DpsEnabled BurnActive BurnDuration RotationResetWindow
         UseDpsIntelligence DpsMinManaPct DpsNukeLandMargin DpsDotBreakevenPct DpsDefaultNukeCastTime
         DpsDefaultDotDuration DpsOverkillFactor DpsRainPayoffSec DpsRainSafetyMode
         DpsRainSafetyRadius UseResistTracker ResistAvoidPct ResistMinSamples

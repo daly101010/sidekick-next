@@ -1,11 +1,12 @@
 -- F:/lua/sidekick-next/sk_buffs.lua
 -- Buff module for SideKick multi-script system
--- Priority 6: OOC buff casting through coordinator claims
+-- Priority 6: OOC buff casting through the single local coordinator lease
 -- Maintains cross-character coordination via Actors
 
 local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
+local ActionExecutor = require('sidekick-next.utils.action_executor')
 local lazy = require('sidekick-next.utils.lazy_require')
 local Logger = require('sidekick-next.utils.logger')
 
@@ -63,6 +64,16 @@ local _buffMemEvent = {
     endAtMs = 0,
     abortAtMs = 0,
     pendingBookClose = false,
+}
+
+-- Cross-character buff coordination is a separate domain from the local
+-- coordinator lease.  Reserve the target/category with peers before asking the
+-- local coordinator for its one lease, then retain that reservation until the
+-- local action is finalized.
+local _actorBuffClaim = {
+    targetId = 0,
+    category = nil,
+    acquired = false,
 }
 
 -- Buff definitions from spell set
@@ -123,6 +134,96 @@ end
 local getBuff = lazy('sidekick-next.automation.buff')
 local getSpellsetMemorize = lazy('sidekick-next.utils.spellset_memorize')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
+local traceLog
+
+local function actorClaimCoordinates(action)
+    if type(action) ~= 'table' then return 0, nil end
+    local targetId = tonumber(action.needTargetId) or tonumber(action.targetId) or 0
+    local category = tostring(action.category or '')
+    if targetId <= 0 or category == '' then return 0, nil end
+    return targetId, category
+end
+
+local function actorClaimMatches(action)
+    local targetId, category = actorClaimCoordinates(action)
+    return targetId > 0
+        and targetId == tonumber(_actorBuffClaim.targetId)
+        and category == tostring(_actorBuffClaim.category or '')
+end
+
+local function releaseActorBuffClaim(reason)
+    local targetId = tonumber(_actorBuffClaim.targetId) or 0
+    local category = _actorBuffClaim.category
+    if targetId > 0 and category and _actorBuffClaim.acquired then
+        local Buff = getBuff()
+        if Buff and Buff.releaseClaim then
+            pcall(Buff.releaseClaim, targetId, category)
+        end
+        traceLog('info', 'coordination',
+            'actor_claim_release_' .. tostring(category), 0,
+            'Released peer buff reservation: target=%d category=%s reason=%s',
+            targetId, tostring(category), tostring(reason or 'finalized'))
+    end
+    _actorBuffClaim.targetId = 0
+    _actorBuffClaim.category = nil
+    _actorBuffClaim.acquired = false
+end
+
+local function acquireActorBuffClaim(action)
+    local targetId, category = actorClaimCoordinates(action)
+    if targetId <= 0 or not category then return false, 'invalid_actor_claim' end
+
+    local Buff = getBuff()
+    if actorClaimMatches(action) then
+        if _actorBuffClaim.acquired and Buff and Buff.renewClaim then
+            local ok, renewed = pcall(Buff.renewClaim, targetId, category)
+            if ok and renewed == true then return true end
+        elseif _actorBuffClaim.acquired then
+            return true
+        end
+        -- The local peer reservation aged out. Reacquire it before retaining
+        -- or requesting a local coordinator lease.
+        _actorBuffClaim.acquired = false
+    else
+        releaseActorBuffClaim('action_changed')
+    end
+
+    -- Keep the worker usable if peer Actors are unavailable, matching the
+    -- previous best-effort behavior. When the coordination API is present it
+    -- must grant the domain reservation before local lease admission.
+    if not (Buff and Buff.claimBuff) then
+        _actorBuffClaim.targetId = targetId
+        _actorBuffClaim.category = category
+        _actorBuffClaim.acquired = true
+        return true
+    end
+
+    local ok, acquired = pcall(Buff.claimBuff, targetId, category)
+    if not ok or acquired ~= true then
+        return false, ok and 'peer_claimed' or ('actor_claim_error:' .. tostring(acquired))
+    end
+
+    _actorBuffClaim.targetId = targetId
+    _actorBuffClaim.category = category
+    _actorBuffClaim.acquired = true
+    traceLog('info', 'coordination',
+        'actor_claim_acquire_' .. tostring(category), 0,
+        'Reserved buff with peers before local lease: target=%d category=%s',
+        targetId, tostring(category))
+    return true
+end
+
+local function renewActorBuffClaim()
+    local targetId = tonumber(_actorBuffClaim.targetId) or 0
+    local category = _actorBuffClaim.category
+    if targetId <= 0 or not category then return false end
+    if not _actorBuffClaim.acquired then return false end
+
+    local Buff = getBuff()
+    if not (Buff and Buff.renewClaim) then return true end
+    local ok, renewed = pcall(Buff.renewClaim, targetId, category)
+    return ok and renewed == true
+end
 
 -------------------------------------------------------------------------------
 -- Helper Functions
@@ -158,7 +259,7 @@ local function diagLog(key, intervalSec, fmt, ...)
     end
 end
 
-local function traceLog(level, category, key, intervalSec, fmt, ...)
+traceLog = function(level, category, key, intervalSec, fmt, ...)
     local now = os.clock()
     key = tostring(key or category or 'trace')
     intervalSec = tonumber(intervalSec) or 0
@@ -1486,6 +1587,17 @@ local function clearActiveBuff()
     _activeBuff.state = nil
 end
 
+local function clearOwnedMemorizationState()
+    _buffMemEvent.active = false
+    _buffMemEvent.requestedSpell = ''
+    _buffMemEvent.beginSpell = ''
+    _buffMemEvent.beginAtMs = 0
+    _buffMemEvent.endSpell = ''
+    _buffMemEvent.endAtMs = 0
+    _buffMemEvent.abortAtMs = 0
+    _buffMemEvent.pendingBookClose = false
+end
+
 local function setActiveBuff(category, spellName, targetId, state)
     _activeBuff.category = category
     _activeBuff.spellName = spellName
@@ -1857,7 +1969,7 @@ local function findBuffNeed()
                     -- Preserve the candidate that caused a group spell to be
                     -- selected. Group casts target self, so targetId alone
                     -- cannot detect that the original recipient died while a
-                    -- hot-swap or coordinator claim was pending.
+                    -- hot-swap or local coordinator lease was pending.
                     needTargetId = target.id,
                     needTargetName = target.name,
                     isSelfOnly = false,
@@ -1884,15 +1996,6 @@ module.onTick = function(self)
 
     registerMemorizationEvents()
     pcall(mq.doevents)
-    if _buffMemEvent.pendingBookClose then
-        if closeSpellBookIfOpen('mem_event_end') then
-            traceLog('info', 'action', 'mem_event_book_close', 1,
-                'Closing spellbook after memorization event: spell=%s',
-                tostring(_buffMemEvent.endSpell or _buffMemEvent.requestedSpell))
-        else
-            _buffMemEvent.pendingBookClose = false
-        end
-    end
 
     local settings = syncSettings()
     local Cache = getCache()
@@ -1902,10 +2005,63 @@ module.onTick = function(self)
     end
     local Buff = getBuff()
     if Buff and Buff.tick then Buff.tick() end
+
+    local hasActiveBuff = _activeBuff.category and _activeBuff.spellName
+    local ownsLease = self.currentRequestId ~= nil
+        and self:ownsLease(self.currentRequestId)
+    local isCasting = lib.isCasting()
+
+    if hasActiveBuff or (_buffGemSwap.active and _buffGemSwap.requestedSpell ~= '') then
+        holdSpellsetMemorizer('buff_hotswap_active', BUFF_SPELLSET_LEASE_MS)
+    end
+
+    -- Once admitted, the executor owns the entire bounded workflow.  The
+    -- sensor tick may renew the already-acquired peer reservation, but it must
+    -- not rescan, retarget, memorize, close windows, or otherwise mutate game
+    -- state outside the exact lease boundary.
+    if ownsLease then
+        local action = self:getLeaseAction()
+        if not actorClaimMatches(action) or not renewActorBuffClaim() then
+            self:setIntent(false, nil, 'peer_buff_reservation_lost')
+        else
+            self:setIntent(true, nil,
+                hasActiveBuff and 'buff_workflow_active' or 'buff_lease_granted')
+        end
+        return
+    end
+
+    -- A local memorize/cast effect without the exact lease is quarantined for
+    -- coordinator recovery. Do not issue cleanup commands here; a recovery
+    -- lease will invoke onLeaseFinalizing before any other worker mutates.
+    local previouslyHeldLease = self.activeLeaseSnapshot ~= nil
+    if hasActiveBuff or _buffGemSwap.active or previouslyHeldLease then
+        local dirtyEffects = (hasActiveBuff and isCasting)
+            or _buffGemSwap.active
+            or _buffMemEvent.active == true
+            or _buffMemEvent.pendingBookClose == true
+            or tostring(_buffMemEvent.requestedSpell or '') ~= ''
+        _pendingAction = nil
+        _pendingReason = nil
+        releaseActorBuffClaim('lease_lost')
+        self:markDirtyEffects(dirtyEffects)
+        if not dirtyEffects then
+            self:cancelUnifiedAction('lease_lost')
+            ActionExecutor.consumeResult()
+            maybeRestoreBuffGem()
+            clearActiveBuff()
+            clearOwnedMemorizationState()
+        end
+        self:setIntent(false, nil,
+            dirtyEffects and 'buff_effects_need_recovery' or 'buff_lease_lost')
+        return
+    end
+
     if not settings then
         debugLog('onTick: No settings, returning')
         _pendingAction = nil
-        self:sendNeed(false, nil, 'no_settings')
+        _pendingReason = nil
+        releaseActorBuffClaim('no_settings')
+        self:setIntent(false, nil, 'no_settings')
         return
     end
 
@@ -1913,67 +2069,55 @@ module.onTick = function(self)
     local buffingEnabled = settings.BuffingEnabled
     if buffingEnabled == false or buffingEnabled == 0 then
         _pendingAction = nil
+        _pendingReason = nil
+        releaseActorBuffClaim('buffing_disabled')
         maybeRestoreBuffGem()
-        self:sendNeed(false, nil, 'buffing_disabled')
+        self:setIntent(false, nil, 'buffing_disabled')
         return
-    end
-
-    -- IMPORTANT: Check if we're actively casting a buff BEFORE anything else
-    -- This ensures we keep sending need hints while casting, regardless of ownership state
-    local isCasting = lib.isCasting()
-    local hasActiveBuff = _activeBuff.category and _activeBuff.spellName
-    local ownsCast = self:ownsCast()
-
-    if hasActiveBuff or (_buffGemSwap.active and _buffGemSwap.requestedSpell ~= '') then
-        holdSpellsetMemorizer('buff_hotswap_active', BUFF_SPELLSET_LEASE_MS)
     end
 
     if manualSpellBookOpen() and not hasActiveBuff then
         _pendingAction = nil
-        self:sendNeed(false, nil, 'manual_spellbook_open')
+        _pendingReason = nil
+        releaseActorBuffClaim('manual_spellbook_open')
+        self:setIntent(false, nil, 'manual_spellbook_open')
         return
     end
 
-    debugLog('onTick: isCasting=%s hasActiveBuff=%s ownsCast=%s activeBuff=%s',
-        tostring(isCasting), tostring(hasActiveBuff), tostring(ownsCast),
+    debugLog('onTick: isCasting=%s hasActiveBuff=%s ownsLease=%s activeBuff=%s',
+        tostring(isCasting), tostring(hasActiveBuff), tostring(ownsLease),
         tostring(_activeBuff.spellName or 'nil'))
 
-    if hasActiveBuff and isCasting then
-        debugLog('onTick: Sending NEED=true (actively casting)')
-        self:sendNeed(true, 5000, 'casting_buff')  -- Long TTL while casting
+    -- Keep a queued request bound to the exact locally-selected action. This
+    -- avoids replacing its peer reservation while the coordinator is deciding
+    -- when to grant the local lease.
+    if self.currentRequestId then
+        local reserved = _pendingAction
+            and actorClaimMatches(_pendingAction)
+            and acquireActorBuffClaim(_pendingAction)
+        if not reserved then
+            _pendingAction = nil
+            _pendingReason = nil
+        end
+        self:setIntent(reserved == true, nil,
+            reserved and 'buff_lease_pending' or 'peer_buff_reservation_lost')
         return
     end
 
-    -- An active local action is only allowed to live while its coordinator
-    -- claim does. If the coordinator revoked/expired the claim before the cast
-    -- began, discard the orphaned state so the next scan starts a clean attempt.
-    if hasActiveBuff and not ownsCast then
-        traceLog('warn', 'action', 'active_ownership_lost_' .. tostring(_activeBuff.category), 0,
-            'Clearing orphaned buff action after ownership loss: spell=%s category=%s state=%s waitReason=%s',
-            tostring(_activeBuff.spellName), tostring(_activeBuff.category), tostring(_activeBuff.state),
-            tostring(_activeBuff.waitReason))
-        _pendingAction = nil
-        _pendingReason = nil
-        _buffGemSwap.requestedSpell = ''
-        clearActiveBuff()
-        self:sendNeed(false, nil, 'buff_ownership_lost')
-        return
-    end
-
-    -- Also check cast ownership (in case _activeBuff got cleared but we still own)
-    if ownsCast then
-        debugLog('onTick: Sending NEED=true (owns cast)')
-        self:sendNeed(true, 5000, 'owns_cast')  -- Long TTL while casting
-        return
-    end
-
-    -- Rate limit buff tick (only for finding new buffs, not for maintaining cast ownership)
+    -- Rate limit selection while keeping a pre-lease peer reservation alive.
     local now = os.clock()
     if (now - _lastBuffTick) < BUFF_TICK_INTERVAL then
-        -- Still send need if we have pending action
         if _pendingAction then
-            self:sendNeed(true, 1000, 'pending_buff')
+            local reserved, reserveReason = acquireActorBuffClaim(_pendingAction)
+            if not reserved then
+                _pendingAction = nil
+                _pendingReason = nil
+                self:setIntent(false, nil, reserveReason or 'peer_buff_reserved')
+                return
+            end
         end
+        self:setIntent(_pendingAction ~= nil, nil,
+            _pendingAction and 'pending_buff' or 'scan_throttled')
         return
     end
     _lastBuffTick = now
@@ -1981,32 +2125,27 @@ module.onTick = function(self)
     -- Find if we have buff work to do
     local need, noNeedReason = findBuffNeed()
 
-    _pendingAction = need
-    _pendingReason = need and 'buff_needed' or nil
+    if need then
+        local reserved, reserveReason = acquireActorBuffClaim(need)
+        if reserved then
+            _pendingAction = need
+            _pendingReason = 'buff_needed'
+        else
+            _pendingAction = nil
+            _pendingReason = nil
+            noNeedReason = reserveReason or 'peer_buff_reserved'
+        end
+    else
+        _pendingAction = nil
+        _pendingReason = nil
+        releaseActorBuffClaim(noNeedReason or 'no_buff_needed')
+    end
 
-    local needsAction = need ~= nil
+    local needsAction = _pendingAction ~= nil
     debugLog('onTick: findBuffNeed=%s needsAction=%s',
         need and need.spellName or 'nil', tostring(needsAction))
-    self:sendNeed(needsAction, needsAction and 1500 or nil, needsAction and 'buff_needed' or (noNeedReason or 'no_buff_needed'))
-
-    -- Handle gem memorization while waiting
-    if _buffGemSwap.active and _buffGemSwap.requestedSpell ~= '' then
-        local reservedGem = getReservedBuffGem()
-        local current = getGemSpellName(reservedGem)
-        if current ~= _buffGemSwap.requestedSpell then
-            if _activeBuff.category and _activeBuff.spellName then
-                if activeBuffTimedOut() then return end
-            end
-            local _, waitReason = ensureBuffSpellMemorized(_buffGemSwap.requestedSpell)
-            _activeBuff.waitReason = waitReason
-            return
-        end
-    end
-
-    -- Handle active buff timeout
-    if _activeBuff.category and _activeBuff.spellName then
-        if activeBuffTimedOut() then return end
-    end
+    self:setIntent(needsAction, nil,
+        needsAction and 'buff_needed' or (noNeedReason or 'no_buff_needed'))
 
     -- Restore buff gem if no work
     if not needsAction then
@@ -2015,17 +2154,15 @@ module.onTick = function(self)
 end
 
 module.shouldAct = function(self)
-    local hasState = self:hasValidState()
-    local isMyPrio = hasState and self:isMyPriority() or false
     local hasPending = _pendingAction ~= nil
-    local result = hasState and isMyPrio and hasPending
     if hasPending then
-        debugLog('shouldAct: hasState=%s isMyPriority=%s hasPending=%s -> %s',
-            tostring(hasState), tostring(isMyPrio), tostring(hasPending), tostring(result))
+        debugLog('shouldAct: hasState=%s hasPending=%s actorReserved=%s',
+            tostring(self:hasValidState()), tostring(hasPending),
+            tostring(actorClaimMatches(_pendingAction)))
     end
-    if not hasState then return false end
-    if not isMyPrio then return false end
-    return hasPending
+    return self:hasValidState()
+        and hasPending
+        and actorClaimMatches(_pendingAction)
 end
 
 module.getAction = function(self)
@@ -2039,20 +2176,8 @@ module.getAction = function(self)
         return nil
     end
 
-    local me = mq.TLO.Me
-    local myId = me and me.ID and me.ID() or 0
-
-    -- Determine claim type:
-    -- - Self/group buffs: CAST-only (target is self or doesn't matter)
-    -- - Single-target on others: Full ACTION claim (need target)
-    local claimType = lib.ClaimType.CAST
-    if not action.isSelfOnly and not action.isGroup and targetId ~= myId then
-        claimType = lib.ClaimType.ACTION
-    end
-
     return {
         kind = lib.ActionKind.CAST_SPELL,
-        type = claimType,
         name = spellName,
         spellName = spellName,
         targetId = targetId,
@@ -2062,7 +2187,8 @@ module.getAction = function(self)
         category = action.category,
         isSelfOnly = action.isSelfOnly,
         isGroup = action.isGroup,
-        timeoutMs = BUFF_PRECAST_TIMEOUT_MS + BUFF_CAST_START_TIMEOUT_MS + 5000,
+        breaksInvis = true,
+        timeoutMs = BUFF_PRECAST_TIMEOUT_MS + BUFF_CAST_TIMEOUT_MS + 5000,
         idempotencyKey = string.format('buff:%s:%d', action.category or 'buff', targetId),
         reason = _pendingReason or 'buff',
     }
@@ -2071,25 +2197,21 @@ end
 module.executeAction = function(self)
     debugLog('executeAction: ENTERED')
 
-    -- For buff claims, we need to handle differently based on claim type
-    -- NOTE: explicit nil checks required — actors state can update between
-    -- the ownsAction() guard in module_base and this access (file I/O in
-    -- debugLog above can allow actors callbacks to deliver new state).
-    if not self.state then
-        debugLog('executeAction: no state')
-        traceLog('info', 'action', 'action_no_state', 10, 'No buff action: coordinator state unavailable')
-        return false, 'no_action'
+    -- Revalidate the exact request/lease pair at the execution boundary.
+    if not self.currentRequestId or not self:ownsLease(self.currentRequestId) then
+        debugLog('executeAction: exact lease not held')
+        traceLog('info', 'action', 'action_no_lease', 5,
+            'Skipping buff action: exact local lease not held')
+        return false, 'no_lease'
     end
-    local castOwner = self.state.castOwner
-    if not castOwner then
-        debugLog('executeAction: no castOwner in state')
-        traceLog('info', 'action', 'action_no_cast_owner', 10, 'No buff action: no cast owner in coordinator state')
-        return false, 'no_action'
-    end
-    local action = castOwner.action
+
+    -- The coordinator is action-blind. The selected spell and target remain in
+    -- this worker and are recovered only through the exact local request.
+    local action = self:getLeaseAction()
     if not action then
-        debugLog('executeAction: no action in castOwner')
-        traceLog('info', 'action', 'action_no_payload', 10, 'No buff action: cast owner has no action payload')
+        debugLog('executeAction: no local action for lease')
+        traceLog('info', 'action', 'action_no_payload', 10,
+            'No buff action: local request payload unavailable')
         return false, 'no_action'
     end
 
@@ -2098,26 +2220,16 @@ module.executeAction = function(self)
         tonumber(action.targetId) or 0,
         tostring(action.category))
 
-    -- Check ownership based on what we requested
-    local needsTargetOwnership = action.type == lib.ClaimType.ACTION
-    if needsTargetOwnership then
-        if not self:ownsAction() then
-            debugLog('executeAction: no action ownership')
-            traceLog('info', 'action', 'action_no_ownership_' .. tostring(action.category), 5,
-                'Skipping buff action: no action ownership spell=%s category=%s target=%s',
-                tostring(action.spellName or action.name), tostring(action.category), tostring(action.targetId))
-            return false, 'no_ownership'
-        end
-    else
-        if not self:ownsCast() then
-            debugLog('executeAction: no cast ownership')
-            traceLog('info', 'action', 'action_no_cast_ownership_' .. tostring(action.category), 5,
-                'Skipping buff action: no cast ownership spell=%s category=%s target=%s',
-                tostring(action.spellName or action.name), tostring(action.category), tostring(action.targetId))
-            return false, 'no_cast_ownership'
-        end
+    if not actorClaimMatches(action) or not renewActorBuffClaim() then
+        traceLog('warn', 'coordination',
+            'actor_claim_lost_' .. tostring(action.category), 0,
+            'Buff action cancelled: peer reservation lost before mutation spell=%s category=%s target=%s',
+            tostring(action.spellName or action.name), tostring(action.category),
+            tostring(action.needTargetId or action.targetId))
+        return true, 'peer_buff_reservation_lost'
     end
-    debugLog('executeAction: ownership OK')
+    self:renewLease()
+    debugLog('executeAction: exact lease and peer reservation OK')
 
     local settings = syncSettings()
     if not settings or settings.BuffingEnabled == false or settings.BuffingEnabled == 0 then
@@ -2151,7 +2263,7 @@ module.executeAction = function(self)
             _buffGemSwap.requestedSpell = ''
             maybeRestoreBuffGem()
             clearActiveBuff()
-            self:sendNeed(false, nil, 'buff_target_invalid:' .. tostring(recipientReason))
+            self:setIntent(false, nil, 'buff_target_invalid:' .. tostring(recipientReason))
             return true, recipientReason
         end
     end
@@ -2166,7 +2278,7 @@ module.executeAction = function(self)
         _pendingReason = nil
         _buffGemSwap.requestedSpell = ''
         clearActiveBuff()
-        self:sendNeed(false, nil, 'buff_level_too_low')
+        self:setIntent(false, nil, 'buff_level_too_low')
         traceLog('warn', 'action', 'action_level_too_low_' .. tostring(category), 0,
             'Buff action rejected before cast: spell=%s category=%s requiredLevel=%d currentLevel=%d',
             tostring(spellName), tostring(category), requiredLevel, currentLevel)
@@ -2177,13 +2289,12 @@ module.executeAction = function(self)
 
     -- Check if we're already working on this buff (subsequent tick calls)
     if _activeBuff.category == category and _activeBuff.spellName == spellName then
-        if Buff and Buff.renewClaim then
-            Buff.renewClaim(_activeBuff.targetId, category)
-        end
+        renewActorBuffClaim()
+        self:renewLease()
         if activeBuffTimedOut() then
             local waitReason = _activeBuff.waitReason or _activeBuff.state or 'unknown'
             lib.log('warn', self.name,
-                'Buff timed out: %s (state=%s reason=%s); releasing cast claim and backing off',
+                'Buff timed out: %s (state=%s reason=%s); releasing lease and backing off',
                 spellName, tostring(_activeBuff.state), tostring(waitReason))
             traceLog('warn', 'action', 'timeout_' .. tostring(category), 0,
                 'Buff action timed out: spell=%s category=%s target=%d state=%s waitReason=%s elapsedMs=%d',
@@ -2193,8 +2304,7 @@ module.executeAction = function(self)
             _pendingAction = nil
             _pendingReason = nil
             _buffGemSwap.requestedSpell = ''
-            clearActiveBuff()
-            self:sendNeed(false, nil, 'buff_timeout:' .. tostring(spellName))
+            self:setIntent(false, nil, 'buff_timeout:' .. tostring(spellName))
             return true, 'buff_timeout'
         end
 
@@ -2402,18 +2512,6 @@ module.executeAction = function(self)
         tostring(spellName), tostring(category), targetId, tostring(action.targetName),
         tostring(action.isGroup), tostring(action.fromRequest))
 
-    -- Claim buff in cross-character system
-    if Buff and Buff.claimBuff then
-        if not Buff.claimBuff(targetId, category) then
-            -- Already claimed by someone else
-            debugLog('executeAction: Buff already claimed by another character')
-            traceLog('info', 'action', 'already_claimed_' .. tostring(category), 5,
-                'Buff already claimed by another character: spell=%s category=%s target=%d',
-                tostring(spellName), tostring(category), targetId)
-            return true, 'buff_claimed'
-        end
-    end
-
     -- Set active buff state to 'memorizing' - the state machine above will handle the rest
     setActiveBuff(category, spellName, targetId, 'memorizing')
     debugLog('executeAction: Active buff set, starting memorization')
@@ -2478,117 +2576,84 @@ module.executeAction = function(self)
     return false, castWaitReason or 'spell_not_ready'
 end
 
--------------------------------------------------------------------------------
--- Custom requestClaim that handles both CAST-only and ACTION claims
--------------------------------------------------------------------------------
-
-local originalRequestClaim = module.requestClaim
-
-module.requestClaim = function(self, action)
-    debugLog('requestClaim: ENTERED for action=%s', tostring(action and (action.spellName or action.name) or 'nil'))
-
-    if not self:hasValidState() then
-        lib.log('debug', self.name, 'Cannot claim: no valid state')
-        debugLog('requestClaim: No valid state')
-        return false
-    end
-
-    if self.claimPending then
-        local elapsed = lib.getTimeMs() - self.claimRequestedAt
-        if elapsed < 200 then
-            debugLog('requestClaim: Claim still pending (elapsed=%dms)', elapsed)
-            return false
-        end
-        self.claimPending = false
-    end
-
-    self.claimCounter = self.claimCounter + 1
-    self.currentClaimId = lib.generateClaimId(self.name, self.claimCounter)
-    debugLog('requestClaim: Generated claimId=%s', self.currentClaimId)
-
-    -- Determine claim type from action
-    local claimType = action.type or lib.ClaimType.CAST
-    self.currentClaimType = claimType
-    local wants = claimType == lib.ClaimType.ACTION and { 'target', 'cast' } or { 'cast' }
-
-    -- Calculate TTL based on spell cast time (buff casts can take several seconds)
-    -- Keep the coordinator lease longer than the worker's complete pre-cast
-    -- timeout. A shorter lease orphaned waiting_ready actions before their local
-    -- timeout could release them, causing an endless claim/backoff cycle.
-    local ttlMs = BUFF_PRECAST_TIMEOUT_MS + BUFF_CAST_START_TIMEOUT_MS + 2000
-    local spellName = action.spellName or action.name
-    if spellName then
-        local spell = mq.TLO.Spell(spellName)
-        if spell and spell() and spell.MyCastTime then
-            local castTimeMs = tonumber(spell.MyCastTime()) or 3000
-            ttlMs = math.max(ttlMs, BUFF_PRECAST_TIMEOUT_MS + castTimeMs + 2000)
-        end
-    end
-
-    local claim = {
-        msgType = 'claim',
-        type = claimType,
-        wants = wants,
-        module = self.name,
-        ownerName = lib.getMyName(),
-        ownerServer = lib.getMyServer(),
-        priority = self.priority,
-        claimId = self.currentClaimId,
-        epochSeen = self.state.epoch,
-        ttlMs = ttlMs,
-        -- Buffs may need to memorize a gem before the cast bar can appear, so
-        -- use the operation's bounded TTL instead of the ordinary 1s window.
-        expectsCastStart = true,
-        castStartTimeoutMs = ttlMs,
-        reason = action.reason or 'buff',
-        action = action,
-    }
-
-    self.claimPending = true
-    self.claimRequestedAt = lib.getTimeMs()
-    self.claimEpochAtRequest = self.state.epoch
-
-    local ok, err = pcall(function()
-        self.dropbox:send({ mailbox = lib.Mailbox.CLAIM, script = lib.Scripts.COORDINATOR }, claim)
-    end)
-
-    if ok then
-        debugLog('requestClaim: Claim sent successfully: %s type=%s epoch=%d ttlMs=%d',
-            self.currentClaimId, claimType, self.state.epoch, ttlMs)
-        traceLog('info', 'claim', 'claim_sent_' .. tostring(self.currentClaimId), 0,
-            'Claim requested: id=%s type=%s spell=%s target=%s epoch=%d ttlMs=%d',
-            tostring(self.currentClaimId), tostring(claimType), tostring(spellName),
-            tostring(action.targetId), tonumber(self.state.epoch) or 0, ttlMs)
-    else
-        debugLog('requestClaim: Claim send FAILED: %s', tostring(err))
-        traceLog('error', 'claim', 'claim_send_failed', 0,
-            'Claim request failed: spell=%s target=%s error=%s',
-            tostring(spellName), tostring(action.targetId), tostring(err))
-    end
-
-    lib.log('debug', self.name, 'Claim requested: %s (type=%s, epoch=%d)', self.currentClaimId, claimType, self.state.epoch)
-    return true
-end
-
--- Override ownsAction to handle CAST-only claims (buff module only needs cast, not target)
-module.ownsAction = function(self)
-    -- For CAST-only claims, we only need cast ownership (not target)
-    local ownsCast = self:ownsCast()
-    if not ownsCast then
-        return false
-    end
-
-    -- Check if this is a CAST-only claim
-    local owner = self.state.castOwner
-    if owner and owner.action and owner.action.type == lib.ClaimType.CAST then
-        debugLog('ownsAction: CAST-only claim, returning true')
+local function ownedBuffCastInProgress()
+    if not lib.isCasting() or not _activeBuff.category then return false end
+    if _activeBuff.state == 'casting' or _activeBuff.state == 'cast_starting' then
         return true
     end
 
-    -- For ACTION claims, also need target ownership
-    local ownsTarget = self:ownsTarget()
-    debugLog('ownsAction: ACTION claim, ownsTarget=%s', tostring(ownsTarget))
-    return ownsTarget
+    local expected = normalizeSpellName(_activeBuff.spellName)
+    local actual = normalizeSpellName(lib.safeTLO(function()
+        return mq.TLO.Me.Casting()
+    end, ''))
+    return expected ~= ''
+        and actual ~= ''
+        and (actual == expected
+            or actual:find(expected, 1, true) ~= nil
+            or expected:find(actual, 1, true) ~= nil)
+end
+
+module.onLeaseFinalizing = function(self, _, reason)
+    local exactLease = self.currentRequestId ~= nil
+        and self:ownsLease(self.currentRequestId)
+    local ownedCasting = ownedBuffCastInProgress()
+    local ownsSpellbookEffect = _buffGemSwap.active
+        or _buffMemEvent.active == true
+        or _buffMemEvent.pendingBookClose == true
+        or tostring(_buffMemEvent.requestedSpell or '') ~= ''
+    local spellbookOpen = ownsSpellbookEffect and isWindowOpen('SpellBookWnd')
+
+    -- A stale snapshot is sufficient to report/release an old lease, but not
+    -- to mutate the game. Preserve effect markers and ask the coordinator for
+    -- a recovery lease; that lease will re-enter this finalizer with exact
+    -- ownership.
+    if not exactLease and (ownedCasting or spellbookOpen or _buffGemSwap.active) then
+        self:markDirtyEffects(true)
+        releaseActorBuffClaim(reason or 'lease_lost')
+        return true
+    end
+
+    if exactLease and ownedCasting then
+        self:markDirtyEffects(true)
+        lib.safeTLO(function()
+            local me = mq.TLO.Me
+            if me and me() and me.StopCast then me.StopCast() end
+            return true
+        end, false)
+        return false, 'stopping_buff_cast'
+    end
+
+    if exactLease and spellbookOpen then
+        self:markDirtyEffects(true)
+        closeSpellBookIfOpen('lease_finalizing')
+        if isWindowOpen('SpellBookWnd') then
+            return false, 'closing_buff_spellbook'
+        end
+    end
+
+    if exactLease and ActionExecutor.hasActiveJob() then
+        ActionExecutor.cancel(reason or 'lease_finalized')
+    end
+    if exactLease then ActionExecutor.consumeResult() end
+
+    releaseActorBuffClaim(reason or 'lease_finalized')
+    _pendingAction = nil
+    _pendingReason = nil
+    maybeRestoreBuffGem()
+    clearActiveBuff()
+    clearOwnedMemorizationState()
+    self:markDirtyEffects(false)
+    return true
+end
+
+local baseWithdrawLeaseRequest = module.withdrawLeaseRequest
+module.withdrawLeaseRequest = function(self, reason)
+    if not self.currentRequestId or not self:ownsLease(self.currentRequestId) then
+        releaseActorBuffClaim(reason or 'lease_request_withdrawn')
+        _pendingAction = nil
+        _pendingReason = nil
+    end
+    return baseWithdrawLeaseRequest(self, reason)
 end
 
 -------------------------------------------------------------------------------
@@ -2620,11 +2685,19 @@ mq.bind('/sk_buffs', function(cmd, arg)
                 tostring(_activeBuff.state or 'unknown'),
                 tostring(_activeBuff.waitReason or _activeBuff.spellName or 'unknown'))
         end
-        lib.log('info', module.name, 'running=%s, hasState=%s, isMyPriority=%s, ownsCast=%s, buffingEnabled=%s, defs=%d, reason=%s, active=%s:%s/%s, failures=%d',
+        local ownsLease = module:ownsLease(module.currentRequestId)
+        local actorClaim = string.format('%s:%s/%s',
+            tostring(_actorBuffClaim.targetId or 0),
+            tostring(_actorBuffClaim.category or 'none'),
+            tostring(_actorBuffClaim.acquired))
+        lib.log('info', module.name, 'running=%s, hasState=%s, tier=%s, requestId=%s, leasePending=%s, ownsLease=%s, actorClaim=%s, buffingEnabled=%s, defs=%d, reason=%s, active=%s:%s/%s, failures=%d',
             tostring(module.running),
             tostring(module:hasValidState()),
-            tostring(module:isMyPriority()),
-            tostring(module:ownsCast()),
+            tostring(module.priority),
+            tostring(module.currentRequestId),
+            tostring(module.requestPending),
+            tostring(ownsLease),
+            actorClaim,
             tostring(settings.BuffingEnabled),
             defCount,
             tostring(statusReason),
@@ -2632,11 +2705,14 @@ mq.bind('/sk_buffs', function(cmd, arg)
             tostring(_activeBuff.spellName),
             tostring(_activeBuff.state),
             failureCount)
-        commandEcho('running=%s hasState=%s priority=%s ownsCast=%s enabled=%s defs=%d reason=%s active=%s:%s/%s wait=%s failures=%d debug=%s',
+        commandEcho('running=%s hasState=%s tier=%s requestId=%s leasePending=%s ownsLease=%s actorClaim=%s enabled=%s defs=%d reason=%s active=%s:%s/%s wait=%s failures=%d debug=%s',
             tostring(module.running),
             tostring(module:hasValidState()),
-            tostring(module:isMyPriority()),
-            tostring(module:ownsCast()),
+            tostring(module.priority),
+            tostring(module.currentRequestId),
+            tostring(module.requestPending),
+            tostring(ownsLease),
+            actorClaim,
             tostring(settings.BuffingEnabled),
             defCount,
             tostring(statusReason),
@@ -2652,9 +2728,10 @@ mq.bind('/sk_buffs', function(cmd, arg)
                 math.max(0, (tonumber(failure.retryAtMs) or 0) - lib.getTimeMs()))
         end
         traceLog('info', 'command', 'status', 0,
-            'Status requested: running=%s hasState=%s isMyPriority=%s ownsCast=%s buffingEnabled=%s defs=%d reason=%s active=%s:%s state=%s wait=%s failures=%d',
-            tostring(module.running), tostring(module:hasValidState()), tostring(module:isMyPriority()),
-            tostring(module:ownsCast()), tostring(settings.BuffingEnabled), defCount, tostring(statusReason),
+            'Status requested: running=%s hasState=%s tier=%s requestId=%s leasePending=%s ownsLease=%s actorClaim=%s buffingEnabled=%s defs=%d reason=%s active=%s:%s state=%s wait=%s failures=%d',
+            tostring(module.running), tostring(module:hasValidState()), tostring(module.priority),
+            tostring(module.currentRequestId), tostring(module.requestPending), tostring(ownsLease),
+            actorClaim, tostring(settings.BuffingEnabled), defCount, tostring(statusReason),
             tostring(_activeBuff.category), tostring(_activeBuff.spellName), tostring(_activeBuff.state),
             tostring(_activeBuff.waitReason), failureCount)
     elseif cmd == 'reload' then
@@ -2673,8 +2750,30 @@ mq.bind('/sk_buffs', function(cmd, arg)
         if not lib.isCasting() then
             _pendingAction = nil
             _pendingReason = nil
-            clearActiveBuff()
-            module:releaseClaim('manual_buff_retry')
+            module:setIntent(false, nil, 'manual_buff_retry')
+            module:cancelUnifiedAction('manual_buff_retry')
+            if module.currentRequestId then
+                if module:ownsLease(module.currentRequestId) then
+                    module:finishAction({
+                        phase = 'cancelled',
+                        reason = 'manual_buff_retry',
+                    })
+                else
+                    module:withdrawLeaseRequest('manual_buff_retry')
+                end
+            else
+                releaseActorBuffClaim('manual_buff_retry')
+                if (_buffGemSwap.active
+                        or _buffMemEvent.active == true
+                        or _buffMemEvent.pendingBookClose == true)
+                    and isWindowOpen('SpellBookWnd') then
+                    closeSpellBookIfOpen('manual_buff_retry')
+                end
+                maybeRestoreBuffGem()
+                clearActiveBuff()
+                clearOwnedMemorizationState()
+                module:markDirtyEffects(false)
+            end
         end
         commandEcho('Cleared %d buff backoff(s); buff scan will retry', clearedFailures)
         traceLog('info', 'command', 'retry', 0,
@@ -2730,17 +2829,15 @@ module:enableUnifiedExecutor({
         if completed then return true, reason or 'completed', 'completed' end
         return true, reason
     end,
-    onFailure = function()
+    onFailure = function(_, self)
         _pendingAction = nil
         _pendingReason = nil
-        maybeRestoreBuffGem()
-        clearActiveBuff()
+        self:setIntent(false, nil, 'buff_executor_failed')
     end,
-    onCancel = function()
+    onCancel = function(_, self)
         _pendingAction = nil
         _pendingReason = nil
-        maybeRestoreBuffGem()
-        clearActiveBuff()
+        self:setIntent(false, nil, 'buff_executor_cancelled')
     end,
 })
 

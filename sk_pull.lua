@@ -2,26 +2,76 @@
 -- the pull ability begin only after the coordinator grants target ownership.
 
 local mq = require('mq')
-local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local Pull = require('sidekick-next.automation.pull')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 
 local module = ModuleBase.create('pull', lib.Priority.PULL)
+local MAX_MANUAL_QUEUE = 20
 local _snapshot = nil
 local _hadOwnership = false
 local _manualRequests = {}
 local _lastTelemetryAt = 0
+local _actorCallbacksRegistered = false
 
-local manualDropbox = actors.register('sidekick', function(message)
-    local content = message()
-    if type(content) ~= 'table' or tostring(content.id or ''):lower() ~= 'pull:manual' then return end
-    if #_manualRequests >= 20 then table.remove(_manualRequests, 1) end
+local function hasValidV2Envelope(content)
+    local envelope = type(content) == 'table'
+        and type(content.envelope) == 'table' and content.envelope or nil
+    local sequence = envelope and tonumber(envelope.sequence) or 0
+    local ttlMs = envelope and tonumber(envelope.ttlMs) or 0
+    return envelope ~= nil
+        and tonumber(envelope.version) == ActorsCoordinator.ENVELOPE_VERSION
+        and tostring(envelope.session or '') ~= ''
+        and sequence > 0
+        and sequence == math.floor(sequence)
+        and ttlMs > 0 and ttlMs <= 30000
+        and tonumber(envelope.sentAtMs) ~= nil
+end
+
+local function isLocalUiSender(sender, fromMe)
+    if fromMe ~= true or type(sender) ~= 'table' then return false end
+    local script = tostring(sender.script or ''):gsub('\\', '/'):lower()
+    local scripts = type(lib.Scripts.UI) == 'table'
+        and lib.Scripts.UI or { lib.Scripts.UI }
+    local allowed = false
+    for _, scriptName in ipairs(scripts) do
+        if script == tostring(scriptName or ''):gsub('\\', '/'):lower() then
+            allowed = true
+            break
+        end
+    end
+    if not allowed then return false end
+    local mailbox = tostring(sender.mailbox or ''):lower()
+    return (mailbox:match('([^:]+)$') or mailbox) == 'sidekick'
+end
+
+local function receiveManualRequest(content, sender, fromMe)
+    if type(content) ~= 'table'
+        or tostring(content.id or ''):lower() ~= 'pull:manual'
+        or not hasValidV2Envelope(content)
+        or not isLocalUiSender(sender, fromMe) then
+        return true
+    end
+    local command = tostring(content.command or ''):lower()
+    if command ~= 'pulltarget' and command ~= 'clearignore'
+        and command ~= 'camp' and command ~= 'status' then
+        return true
+    end
+    if #_manualRequests >= MAX_MANUAL_QUEUE then table.remove(_manualRequests, 1) end
     _manualRequests[#_manualRequests + 1] = {
-        command = tostring(content.command or ''):lower(),
+        command = command,
         targetId = tonumber(content.targetId) or 0,
     }
-end)
+    return true
+end
+
+local function ensureActorCallbacks(coordinator)
+    if _actorCallbacksRegistered or not coordinator then return end
+    if not coordinator.registerMessageCallback then return end
+    coordinator.registerMessageCallback('pull:manual', receiveManualRequest)
+    _actorCallbacksRegistered = true
+end
 
 local function drainManualRequests()
     if #_manualRequests == 0 then return end
@@ -40,7 +90,7 @@ local function drainManualRequests()
             local state = Pull.getState()
             print(string.format('\ag[SK Pull]\ax state=%s reason=%s target=%s owns=%s',
                 tostring(state.state), tostring(state.reason), tostring(state.pullId),
-                tostring(module:ownsTarget())))
+                tostring(module:ownsLease())))
         end
     end
 end
@@ -55,16 +105,18 @@ local function publishTelemetry(state)
     local now = lib.getTimeMs()
     if (now - _lastTelemetryAt) < 250 then return end
     _lastTelemetryAt = now
-    pcall(function()
-        manualDropbox:send({ mailbox = 'sidekick', script = 'sidekick-next' }, {
-            id = 'pull:telemetry',
+    if not module.peerActors or not module.peerActors.sendToLocalScript then return end
+    local scripts = type(lib.Scripts.UI) == 'table'
+        and lib.Scripts.UI or { lib.Scripts.UI }
+    for _, scriptName in ipairs(scripts) do
+        pcall(module.peerActors.sendToLocalScript, scriptName, 'pull:telemetry', {
             state = tostring(state.state or ''),
             reason = tostring(state.reason or ''),
             pullId = tonumber(state.pullId) or 0,
             campSet = state.campSet == true,
-            ownsTarget = module:ownsTarget(),
+            ownsLease = module:ownsLease(),
         })
-    end)
+    end
 end
 
 module.onSettingsReload = function()
@@ -72,16 +124,17 @@ module.onSettingsReload = function()
 end
 
 module.onTick = function(self)
+    ensureActorCallbacks(self.peerActors)
     drainManualRequests()
     local before = Pull.getState()
     local active = before.state == Pull.STATES.NAV_TO_TARGET
         or before.state == Pull.STATES.PULLING
         or before.state == Pull.STATES.RETURN_CAMP
         or before.state == Pull.STATES.WAITING_MOB
-    if active and _hadOwnership and not self:ownsTarget() then
-        Pull.cancel('ownership_lost')
+    if active and _hadOwnership and not self:ownsLease() then
+        Pull.cancel('lease_lost')
     end
-    _hadOwnership = self:ownsTarget()
+    _hadOwnership = self:ownsLease()
 
     local state = refresh()
     publishTelemetry(state)
@@ -90,7 +143,7 @@ module.onTick = function(self)
         or state.state == Pull.STATES.PULLING
         or state.state == Pull.STATES.RETURN_CAMP
         or state.state == Pull.STATES.WAITING_MOB
-    self:sendNeed(needs, needs and 5000 or nil,
+    self:setIntent(needs, nil,
         needs and ('pull:' .. tostring(state.state)) or tostring(state.reason or state.state))
 end
 
@@ -104,20 +157,25 @@ end
 
 module.getAction = function()
     if not _snapshot or tonumber(_snapshot.pullId) <= 0 then return nil end
+    local targetId = tonumber(_snapshot.pullId)
+    local spawn = mq.TLO.Spawn(targetId)
+    local targetName = spawn and spawn() and tostring(spawn.CleanName() or '') or ''
+    local targetType = spawn and spawn() and tostring(spawn.Type() or '') or ''
     return {
-        kind = 'pull_target',
-        type = lib.ClaimType.TARGET,
+        kind = 'movement',
         name = 'Pull target',
-        targetId = tonumber(_snapshot.pullId),
+        targetId = targetId,
+        targetName = targetName,
+        targetType = targetType,
         expectsCastStart = false,
-        claimTtlMs = 240000,
-        idempotencyKey = string.format('pull:%d', tonumber(_snapshot.pullId)),
+        idempotencyKey = string.format('pull:%d', targetId),
         reason = 'pull:' .. tostring(_snapshot.state),
     }
 end
 
 module.executeAction = function(self)
     _hadOwnership = true
+    self:markDirtyEffects(true)
     Pull.tick({ allowActions = true })
     _snapshot = Pull.getState()
     if _snapshot.state == Pull.STATES.IDLE or _snapshot.state == Pull.STATES.WAITING_GATE then
@@ -126,16 +184,23 @@ module.executeAction = function(self)
     return false, 'pull:' .. tostring(_snapshot.state)
 end
 
-module.onClaimReleased = function(_, reason)
+module.onLeaseFinalizing = function(self, _, reason)
     local state = Pull.getState()
     if state.state ~= Pull.STATES.IDLE and state.state ~= Pull.STATES.WAITING_GATE then
-        Pull.cancel('claim_released:' .. tostring(reason or 'unknown'))
+        Pull.cancel('lease_released:' .. tostring(reason or 'unknown'))
     end
+    self:markDirtyEffects(false)
+    _hadOwnership = false
+    return true
 end
+
+module:enablePeerActors()
+-- Register before ModuleBase initializes the Actor mailbox so a command sent
+-- during worker startup cannot be validated and drained before this receiver exists.
+ensureActorCallbacks(ActorsCoordinator)
 
 Pull.init()
 module:run(50)
 Pull.cancel('worker_exit')
-if manualDropbox and manualDropbox.unregister then pcall(function() manualDropbox:unregister() end) end
 
 return module

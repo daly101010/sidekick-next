@@ -89,6 +89,8 @@ local Fidget = {
     lastFidgetAt = 0,
     lastTickAt   = 0,
     pending      = nil,   -- { kind='turn'|'pitch'|'med', releaseAt=ms, releaseKey=keybind }
+    planned      = nil,
+    planCounter  = 0,
 }
 
 local function flagOn()
@@ -221,9 +223,10 @@ local function emit(kind)
             releaseKey = releaseKey,
             resitAfter = wasSitting,
         }
+        return true
     elseif kind == 'pitch' then
         -- Skip if no keybinds configured (EQ has no defaults).
-        if not Keybinds.look_up or not Keybinds.look_down then return end
+        if not Keybinds.look_up or not Keybinds.look_down then return false end
         local up = math.random() < 0.5
         local pressKey = up and Keybinds.look_up or Keybinds.look_down
         local releaseKey = up and Keybinds.look_down or Keybinds.look_up
@@ -235,8 +238,9 @@ local function emit(kind)
             releaseKey = releaseKey,
             resitAfter = wasSitting,
         }
+        return true
     elseif kind == 'jump' then
-        if not Keybinds.jump then return end
+        if not Keybinds.jump then return false end
         -- Single tap; jump is instantaneous. If we were sitting, sit back down
         -- after a brief beat so the jump animation can play.
         mq.cmdf('/keypress %s', Keybinds.jump)
@@ -248,8 +252,9 @@ local function emit(kind)
                 resitAfter = true,
             }
         end
+        return true
     elseif kind == 'strafe' then
-        if not Keybinds.strafe_left or not Keybinds.strafe_right then return end
+        if not Keybinds.strafe_left or not Keybinds.strafe_right then return false end
         -- Always start with left, then chain right via the pending-release path.
         -- Net displacement ~zero.
         local hold = math.floor(Distributions.sample(Config.strafeHoldMs))
@@ -262,9 +267,10 @@ local function emit(kind)
             chainHoldMs = math.floor(Distributions.sample(Config.strafeHoldMs)),
             resitAfter  = wasSitting,             -- carried through to final release
         }
+        return true
     elseif kind == 'window' then
         local key = pickWindowKey()
-        if not key then return end
+        if not key then return false end
         local hold = math.floor(Distributions.sample(Config.windowPeekMs))
         mq.cmdf('/keypress %s', key)
         Fidget.pending = {
@@ -273,8 +279,9 @@ local function emit(kind)
             releaseKey = key,   -- same key toggles the window closed
             -- no resitAfter: opening a window doesn't stand the character
         }
+        return true
     elseif kind == 'med_cycle' then
-        if manaPct() >= Config.medMaxManaPct then return end
+        if manaPct() >= Config.medMaxManaPct then return false end
         local me = mq.TLO.Me
         local sitting = me and me.Sitting and me.Sitting() == true
         if not sitting then
@@ -285,8 +292,11 @@ local function emit(kind)
                 releaseAt = now + hold,
                 releaseKey = nil, -- handled in tick: cmd is /stand
             }
+            return true
         end
+        return false
     end
+    return false
 end
 
 local function pendingHoldsMovement()
@@ -303,9 +313,127 @@ function M.releaseHeldKeys()
     return true
 end
 
+function M.hasPending()
+    return Fidget.pending ~= nil
+end
+
+function M.planAction()
+    if not flagOn() then
+        Fidget.planned = nil
+        return nil, 'humanize_off'
+    end
+    if not Profiles.subsystemEnabled('fidget') then
+        Fidget.planned = nil
+        return nil, 'fidget_off'
+    end
+    if Fidget.pending then return nil, 'episode_active' end
+
+    local now = State.now()
+    if Fidget.planned and (now - (Fidget.planned.plannedAt or 0)) <= 5000 then
+        local blocked, reason = blockedByGameState()
+        if not blocked and Selector.resolve() == 'idle' then
+            return Fidget.planned, 'planned'
+        end
+        Fidget.planned = nil
+        return nil, reason or 'profile_changed'
+    end
+    if (now - Fidget.lastTickAt) < 250 then return nil, 'sensor_throttled' end
+    Fidget.lastTickAt = now
+    if Selector.resolve() ~= 'idle' then return nil, 'not_idle_profile' end
+    if (now - Fidget.lastFidgetAt) < Config.minIntervalMs then
+        return nil, 'minimum_interval'
+    end
+    local blocked, reason = blockedByGameState()
+    if blocked then return nil, reason or 'blocked' end
+
+    local pPerTick = math.min(0.5, (Config.fidgetPerSec * 250) / 1000.0)
+    if not Distributions.chance(pPerTick) then return nil, 'roll_skipped' end
+    local kind = rollAction()
+    if not kind then return nil, 'no_action_rolled' end
+
+    Fidget.planCounter = Fidget.planCounter + 1
+    Fidget.planned = {
+        kind = 'fidget',
+        fidgetKind = kind,
+        planId = string.format('%d:%d', now, Fidget.planCounter),
+        plannedAt = now,
+        breaksInvis = false,
+        skipBoundaryTarget = true,
+        timeoutMs = 10000,
+        idempotencyKey = string.format('fidget:%d:%d', now, Fidget.planCounter),
+        reason = 'idle_fidget:' .. kind,
+    }
+    return Fidget.planned, 'ready'
+end
+
+function M.startAction(action)
+    action = type(action) == 'table' and action or {}
+    local planned = Fidget.planned
+    if not planned
+        or tostring(action.planId or '') ~= tostring(planned.planId or '')
+        or tostring(action.fidgetKind or '') ~= tostring(planned.fidgetKind or '') then
+        return false, 'plan_changed'
+    end
+    local blocked, reason = blockedByGameState()
+    if blocked or Selector.resolve() ~= 'idle' then
+        Fidget.planned = nil
+        return false, reason or 'not_idle_profile'
+    end
+    Fidget.planned = nil
+    return M.tick({
+        allowMutations = true,
+        plannedKind = action.fidgetKind,
+    })
+end
+
+function M.advanceAction()
+    M.tick({ allowMutations = true, advanceOnly = true })
+    return Fidget.pending == nil,
+        Fidget.pending and ('waiting:' .. tostring(Fidget.pending.kind))
+            or 'episode_complete'
+end
+
+function M.cancelAction()
+    Fidget.planned = nil
+    local pending = Fidget.pending
+    if not pending then return true end
+    if pendingHoldsMovement() then
+        M.releaseHeldKeys()
+        return true
+    end
+    Fidget.pending = nil
+    if pending.kind == 'window' and pending.releaseKey then
+        mq.cmdf('/keypress %s', pending.releaseKey)
+    elseif pending.kind == 'med' then
+        mq.cmd('/stand')
+    end
+    return true
+end
+
+function M.recoverHeldKeys()
+    Fidget.pending = nil
+    Fidget.planned = nil
+    local seen = {}
+    for _, name in ipairs({
+        'turn_left', 'turn_right', 'strafe_left', 'strafe_right',
+        'look_up', 'look_down',
+    }) do
+        local key = Keybinds[name]
+        if type(key) == 'string' and key ~= '' and not seen[key] then
+            seen[key] = true
+            mq.cmdf('/keypress %s', key)
+        end
+    end
+    return true
+end
+
 -- Drive the fidget state machine. Call once per main-loop tick. No-op when
 -- humanize is disabled or fidget subsystem is off.
-function M.tick()
+function M.tick(opts)
+    opts = type(opts) == 'table' and opts or {}
+    if opts.allowMutations ~= true then
+        return false, 'lease_required'
+    end
     if not flagOn() then M.releaseHeldKeys(); return end
     if not Profiles.subsystemEnabled('fidget') then M.releaseHeldKeys(); return end
 
@@ -363,6 +491,14 @@ function M.tick()
 
     -- Don't roll a new fidget while one is in progress.
     if Fidget.pending then return end
+    if opts.advanceOnly == true then return true, 'episode_complete' end
+
+    if opts.plannedKind then
+        if blocked then return false, blockedReason or 'blocked' end
+        Fidget.lastFidgetAt = now
+        local emitted = emit(tostring(opts.plannedKind))
+        return emitted, emitted and 'episode_started' or 'emit_refused'
+    end
 
     -- Throttle.
     if (now - Fidget.lastTickAt) < 250 then return end

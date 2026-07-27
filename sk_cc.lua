@@ -98,29 +98,39 @@ local function computePending()
     return nil, lib.Priority.DEBUFF, mezReason or charmReason or 'no_cc_needed'
 end
 
-local _lastInterruptReqAt = 0
-
 module.onTick = function(self)
     -- The runtime cache is per-process and nothing else ticks it here —
     -- without this, Cache.xtarget.haters stays empty forever and every
     -- mez/charm selection returns no_target.
     Cache.tick()
     CC.tick()
-    CC.charmTick(settings())
+    local petAction = CC.charmTick(settings())
     -- Drain the process-local spell engine whenever it's mid-state: once an
     -- executor job ends, nothing else ticks it, and a post-cast state that
     -- never advances leaves isBusy() true forever — selection then starves
     -- on spell_engine_busy and DPS holds the bar by forfeit.
-    do
-        local eng = spellEngine()
-        if eng and eng.isBusy and eng.isBusy() and eng.tick then eng.tick() end
-    end
     if _mobIntel then
         if _mobIntel.loadZone then pcall(_mobIntel.loadZone) end
         if _mobIntel.tick then pcall(_mobIntel.tick) end
     end
     mq.doevents()
-    local action, priority, reason = computePending()
+    local action, _, reason
+    local eng = spellEngine()
+    if not self.currentRequestId and eng and eng.isBusy and eng.isBusy() then
+        action = {
+            kind = 'cc_engine_recovery',
+            reason = 'orphan_spell_engine',
+            targetId = 0,
+            targetName = '',
+        }
+        reason = action.reason
+    else
+        action, _, reason = computePending()
+    end
+    if petAction and (petAction.petCommand == 'backoff' or not action) then
+        action = petAction
+        reason = petAction.reason
+    end
     if action then
         trace('decide: %s spell=%s target=%s(%d) step=%s',
             tostring(action.reason or reason), tostring(action.spellName or '?'),
@@ -131,34 +141,15 @@ module.onTick = function(self)
     end
     if action then
         _pendingAction = action
-        self.priority = priority
     elseif reason ~= 'throttled' then
         _pendingAction = nil
-        self.priority = lib.Priority.DEBUFF
     end
     _pendingReason = reason
 
-    -- CC outranks DPS casting: with a mez or charm-break pending while some
-    -- other module's cast is in flight (our own nukes included), ask the
-    -- coordinator to interrupt. The DEBUFF InterruptThreshold (1s) lets a
-    -- nearly-finished cast land; without this the cast owner's claim is
-    -- undisplacable and the mez waits out every nuke.
-    -- currentClaimId guard: once OUR claim is granted the in-flight cast is
-    -- (or is about to be) our own — ownsCast() lags the state broadcast, and
-    -- an interrupt request from the cast owner is treated as a self-cancel:
-    -- without this guard we stopcast our own mez in a loop.
-    if _pendingAction and self.priority <= lib.Priority.DEBUFF
-        and not self.currentClaimId
-        and lib.isCasting() and not self:ownsCast() then
-        local nowMs = lib.getTimeMs()
-        if (nowMs - _lastInterruptReqAt) >= 1000 then
-            _lastInterruptReqAt = nowMs
-            trace('interrupt-req: cc_pending (someone else casting, cc action waiting)')
-            self:requestInterrupt('cc_pending')
-        end
-    end
-
-    self:sendNeed(_pendingAction ~= nil, _pendingAction and 750 or nil,
+    -- The coordinator alone decides whether this fixed-tier CC request is
+    -- urgent enough to revoke the current lease. This worker advertises only
+    -- local intent and never issues cross-worker interrupts.
+    self:setIntent(_pendingAction ~= nil, _pendingAction and 750 or nil,
         _pendingReason or 'no_cc_needed')
 end
 
@@ -170,14 +161,19 @@ module.getAction = function()
     local action = _pendingAction
     if not action then return nil end
     return {
-        type = lib.ClaimType.ACTION,
-        kind = lib.ActionKind.CAST_SPELL,
+        kind = action.kind == 'cc_engine_recovery'
+            and 'cc_engine_recovery'
+            or (action.kind == 'pet_command'
+                and 'pet_command' or lib.ActionKind.CAST_SPELL),
         name = action.spellName,
         spellName = action.spellName,
         castStartTimeoutMs = 4000,
         targetId = action.targetId,
         targetName = action.targetName,
         charmStep = action.charmStep,
+        petCommand = action.petCommand,
+        skipBoundaryTarget = action.kind == 'cc_engine_recovery',
+        breaksInvis = action.kind ~= 'cc_engine_recovery',
         reason = action.reason or 'mez',
         idempotencyKey = string.format('cc:%s:%d:%s',
             tostring(action.reason or 'mez'),
@@ -188,7 +184,9 @@ end
 local function dispatchAction(action)
     local reasonTag = tostring(action.reason or 'mez')
     local success, reason
-    if reasonTag:find('charm', 1, true) then
+    if action.kind == 'pet_command' or action.petCommand then
+        success, reason = CC.executePetCommand(action)
+    elseif reasonTag:find('charm', 1, true) then
         success, reason = CC.castCharmAction({
             targetId = action.targetId,
             targetName = action.targetName,
@@ -211,9 +209,8 @@ local function dispatchAction(action)
 end
 
 module.executeAction = function(self)
-    if not self:ownsAction() then return false, 'no_ownership' end
-    local owner = self.state and self.state.castOwner
-    local action = owner and owner.action or nil
+    if not self:ownsLease() then return false, 'no_ownership' end
+    local action = self:getLeaseAction()
     if not action then return true, 'no_action' end
 
     local success, reason = dispatchAction(action)
@@ -225,7 +222,8 @@ module.executeAction = function(self)
         mq.delay(25)
         if engine and engine.tick then engine.tick() end
         mq.doevents()
-        if not self:ownsClaim() then return true, 'ownership_lost' end
+        self:renewLease()
+        if not self:ownsLease() then return true, 'ownership_lost' end
     until (not lib.isCasting() and not (engine and engine.isBusy and engine.isBusy()))
         or lib.getTimeMs() >= deadline
 
@@ -235,16 +233,23 @@ end
 
 
 module:enableUnifiedExecutor({
-    dispatch = function(action, _, job)
+    dispatch = function(action)
+        if action.kind == 'cc_engine_recovery' then
+            local engine = spellEngine()
+            if engine and engine.abort then engine.abort() end
+            return true, 'engine_recovered', 'none'
+        end
         local success, reason = dispatchAction(action)
-        if success then return true, reason, 'spell_engine' end
+        if success then
+            return true, reason,
+                (action.kind == 'pet_command' or action.petCommand) and 'none' or 'spell_engine'
+        end
         if reason == 'already_casting' or reason == 'spell_engine_busy' then
             -- A cast (often an OOC buff) is still on the bar when our claim
             -- lands. Hold the claim and wait it out — the cc_pending
             -- interrupt request in onTick clears long casts — instead of
             -- failing and rejoining the claim queue behind everyone else.
-            job.cc = { deadline = lib.getTimeMs() + 8000 }
-            return true, 'waiting_cast_bar', 'custom'
+            return false, 'external_cast_active', 'spell_engine'
         end
         return false, reason, 'spell_engine'
     end,
@@ -273,9 +278,7 @@ module:enableUnifiedExecutor({
         -- OOC buff) still occupies the bar. As the cast owner, our interrupt
         -- request is an owner self-cancel — the coordinator /stopcasts it.
         if not st.interruptSent and lib.isCasting() then
-            st.interruptSent = true
-            trace('interrupt-req: cc_clearing_bar (leftover cast=%s)', tostring(mq.TLO.Me.Casting() or '?'))
-            self:requestInterrupt('cc_clearing_bar')
+            return true, 'external_cast_active', 'failed'
         end
         local success, reason = dispatchAction(action)
         if success then
@@ -337,9 +340,9 @@ mq.bind('/sk_cc', function(cmd)
         tostring(_lastMezReason), tostring(_lastCharmReason))
     local haterCount = 0
     for _ in pairs(Cache.xtarget.haters or {}) do haterCount = haterCount + 1 end
-    echo('mezzes local=%d remote=%d total=%d haters=%d claimHeld=%s claimPending=%s lastDispatch=%s',
+    echo('mezzes local=%d remote=%d total=%d haters=%d requestId=%s leasePending=%s lastDispatch=%s',
         tonumber(localCount) or 0, tonumber(remoteCount) or 0, tonumber(totalCount) or 0,
-        haterCount, tostring(module.currentClaimId or '-'), tostring(module.claimPending or '-'),
+        haterCount, tostring(module.currentRequestId or '-'), tostring(module.requestPending or '-'),
         tostring(_lastDispatch))
 end)
 
