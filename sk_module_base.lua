@@ -306,9 +306,21 @@ function M.create(moduleName, legacyPriority)
     end
 
     function self:setIntent(active, _, reason)
-        self.intent.active = active == true
-        self.intent.reason = tostring(reason or (active and 'ready' or 'idle'))
-        self.intent.updatedAtMs = nowMs()
+        local nextActive = active == true
+        local nextReason = tostring(reason or (nextActive and 'ready' or 'idle'))
+        if self.intent.active ~= nextActive or self.intent.reason ~= nextReason then
+            self.intent.updatedAtMs = nowMs()
+        end
+        self.intent.active = nextActive
+        self.intent.reason = nextReason
+    end
+
+    function self:setIntentReason(reason)
+        local nextReason = tostring(reason or 'idle')
+        if self.intent.reason ~= nextReason then
+            self.intent.updatedAtMs = nowMs()
+            self.intent.reason = nextReason
+        end
     end
 
     function self:_countStateDrop(reason)
@@ -470,7 +482,7 @@ function M.create(moduleName, legacyPriority)
                 -- boundary previously. Without exact ownership, preserve it
                 -- for fenced recovery instead of clearing its identity.
                 self:markDirtyEffects(true, true)
-                self.intent.reason = 'recovery_required:executor_withdraw'
+                self:setIntentReason('recovery_required:executor_withdraw')
                 return false
             end
             local executorResult = ActionExecutor.consumeResult()
@@ -543,6 +555,10 @@ function M.create(moduleName, legacyPriority)
         })
         self.lastFinishedRequestId = requestId
         self.lastFinishedAtMs = nowMs()
+        -- Record activity only after the finalizer has completed and the
+        -- release is being sent. Multi-tick finalizers may call finishAction
+        -- repeatedly and must not keep refreshing this timestamp.
+        self.lastActionAtMs = self.lastFinishedAtMs
         self.lastActionResult = pending.result or {
             phase = pending.reason == 'preempted' and 'preempted' or 'resolved',
             reason = pending.reason,
@@ -566,7 +582,7 @@ function M.create(moduleName, legacyPriority)
                     -- the effects dirty so the coordinator grants the fenced
                     -- recovery lease that is allowed to perform cleanup.
                     self:markDirtyEffects(true, true)
-                    self.intent.reason = 'recovery_required:executor_active'
+                    self:setIntentReason('recovery_required:executor_active')
                     return false
                 end
                 ActionExecutor.cancel('lease_finishing')
@@ -587,10 +603,6 @@ function M.create(moduleName, legacyPriority)
             reason = tostring(normalized.reason or normalized.phase or 'completed'),
             result = normalized,
         }
-        -- Timestamp every completed action for the per-character status HUD.
-        -- Failure phases still count as "did something" — a mez that resisted
-        -- is different from a mez the worker never tried.
-        self.lastActionAtMs = nowMs()
         if not self:_runFinalizer() then return false end
         return self:_sendRelease()
     end
@@ -609,7 +621,7 @@ function M.create(moduleName, legacyPriority)
             -- dirty state and wait for the coordinator's fenced recovery lease
             -- before issuing stop-cast/nav/key-release cleanup mutations.
             self:markDirtyEffects(true, true)
-            self.intent.reason = 'recovery_required:' .. tostring(reason)
+            self:setIntentReason('recovery_required:' .. tostring(reason))
         end
     end
 
@@ -692,6 +704,10 @@ function M.create(moduleName, legacyPriority)
     function self:sendHeartbeat()
         if not self.dropbox then return end
         local inGame = lib.isInGame()
+        local intentActive = self.intent and self.intent.active == true
+        local intentReason = tostring(self.intent and self.intent.reason or 'unknown')
+        local idleSinceAt = not intentActive
+            and tonumber(self.intent and self.intent.updatedAtMs) or 0
         local actorTransport = nil
         if self.peerActors and self.peerActors.getOutboundSummary then
             local metrics = self.peerActors.getOutboundSummary()
@@ -715,11 +731,12 @@ function M.create(moduleName, legacyPriority)
             requestPending = self.requestPending == true,
             dirtyEffects = self.dirtyEffects == true,
             needsRecovery = self.needsRecovery == true,
-            intentActive = self.intent and self.intent.active == true,
-            intentReason = tostring(self.intent and self.intent.reason or 'unknown'),
+            intentActive = intentActive,
+            intentReason = intentReason,
             -- Per-character status HUD signals: 'why isn't this worker acting?'
             -- Both piggyback on the existing HEARTBEAT cadence — no new sends.
-            idleReason = tostring(self.intent and self.intent.reason or ''),
+            idleReason = not intentActive and intentReason or '',
+            idleSinceAt = idleSinceAt,
             lastActionAt = tonumber(self.lastActionAtMs) or 0,
             stateInboxOverflows = tonumber(self.stateInboxOverflows) or 0,
             stateDrops = tonumber(self.stateDrops) or 0,
@@ -792,7 +809,7 @@ function M.create(moduleName, legacyPriority)
                 return true
             end
             if done == false then
-                self.intent.reason = tostring(detail or 'recovery_draining')
+                self:setIntentReason(detail or 'recovery_draining')
                 return true
             end
         end
@@ -804,7 +821,7 @@ function M.create(moduleName, legacyPriority)
                 token = token,
             })
         if not sent then
-            self.intent.reason = 'recovery_report_failed:' .. tostring(sendError)
+            self:setIntentReason('recovery_report_failed:' .. tostring(sendError))
             return true
         end
         self.dirtyEffects = false

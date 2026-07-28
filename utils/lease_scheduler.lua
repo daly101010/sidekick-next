@@ -304,11 +304,59 @@ function M:recovered(content, senderScript, nowMs)
     nowMs = tonumber(nowMs) or 0
     local lease, reason = self:_validateLeaseOperation(content, senderScript,
         { recovering = true })
-    if not lease then return false, reason end
+    if not lease then
+        -- Track validation-reject frequency for the current recovering lease.
+        -- Legitimate recoveries rarely reject; a torrent of rejects for the
+        -- same recovering lease means the worker is sending stale token/
+        -- requestId (transport dropped an update, or the lease was already
+        -- rotated by adoptRecoverySession between broadcast and worker send).
+        -- The tick-time safety valve M:tickRecoveryStuckCheck reads this.
+        local live = self.lease
+        if live and live.status == 'recovering' then
+            live.rejectedRecoveryReports =
+                (tonumber(live.rejectedRecoveryReports) or 0) + 1
+        end
+        return false, reason
+    end
     self.lease = nil
     self.metrics.releases = self.metrics.releases + 1
     self:_transition(nowMs)
     return true, 'recovered'
+end
+
+-- Safety valve: worker's heartbeat is authoritative for its own local state.
+-- When a lease sits in 'recovering' for a module whose freshest heartbeat says
+-- "I have no dirty effects, no pending request, no in-flight action", the
+-- worker considers itself clean but the coordinator disagrees — usually
+-- because a lease:recovered message was dropped by transport dedup or
+-- rejected on a stale token/requestId. Force-clear the lease so the module
+-- can queue fresh work. Only fires against 'recovering' status; active
+-- leases still require an explicit release to prevent stealing in-flight
+-- work from a component that genuinely owns the mutation boundary.
+function M:observeCleanHeartbeat(moduleName, workerSessionId, senderScript, nowMs)
+    nowMs = tonumber(nowMs) or 0
+    moduleName = tostring(moduleName or '')
+    workerSessionId = nonEmpty(workerSessionId)
+    local spec = self.byModule[moduleName]
+    if not spec then return false, 'unregistered_module' end
+    if tostring(senderScript or '') ~= spec.script then
+        return false, 'wrong_sender_script'
+    end
+    if not workerSessionId then return false, 'missing_worker_session' end
+    local lease = self.lease
+    if not lease or lease.status ~= 'recovering' then
+        return false, 'no_recovering_lease'
+    end
+    if lease.holderModule ~= moduleName then return false, 'wrong_holder_module' end
+    if lease.workerSessionId ~= workerSessionId then
+        return false, 'wrong_worker_session'
+    end
+    self.lease = nil
+    self.metrics.releases = self.metrics.releases + 1
+    self.metrics.heartbeatClearedRecoveries =
+        (self.metrics.heartbeatClearedRecoveries or 0) + 1
+    self:_transition(nowMs)
+    return true, 'heartbeat_cleared'
 end
 
 function M:_beginRevocation(reason, nowMs)
@@ -668,6 +716,16 @@ function M:_considerPreemption(nowMs)
     return self:_beginRevocation('preempted_by:' .. tostring(spec.module), nowMs)
 end
 
+-- Threshold for the "stuck recovery loop" safety valve. If a lease has been
+-- in 'recovering' status for this long AND rejected >=2 recovery reports
+-- from the worker (token/requestId mismatch that heartbeat-based clearing
+-- can't resolve), drop the holder record. Chosen to be well above any
+-- legitimate cleanup: real recoveries complete in 1-30ms; the recovery TTL
+-- itself is 5s (LEASE_RECOVERY_TTL_MS), so 8s guarantees at least one
+-- adoptRecoverySession renewal cycle has passed without progress.
+local STUCK_RECOVERY_MS = 8000
+local STUCK_RECOVERY_MIN_REJECTS = 2
+
 function M:tick(nowMs)
     nowMs = tonumber(nowMs) or 0
     self:_expireRequests(nowMs)
@@ -692,6 +750,25 @@ function M:tick(nowMs)
                     self.metrics.recoveryTimeouts + 1
                 lease.recoveryTimedOut = true
             end
+        end
+
+        -- Stuck-recovery safety valve: if the same recovering lease has
+        -- lingered >8s with multiple rejected lease:recovered messages, the
+        -- worker and coordinator are permanently desynced on the current
+        -- token/requestId. Drop the holder record so the module can queue
+        -- fresh work; the worker's next dirty heartbeat (if any) will queue
+        -- a new recovery cleanly. This is aggressive but bounded: only
+        -- fires on recovering leases with actual reject evidence, never on
+        -- active leases doing real work.
+        if lease and lease.status == 'recovering'
+            and (tonumber(lease.rejectedRecoveryReports) or 0)
+                >= STUCK_RECOVERY_MIN_REJECTS
+            and (nowMs - (tonumber(lease.recoveryStartedAtMs) or nowMs))
+                >= STUCK_RECOVERY_MS then
+            self.lease = nil
+            self.metrics.releases = self.metrics.releases + 1
+            self.metrics.stuckRecoveryClears =
+                (self.metrics.stuckRecoveryClears or 0) + 1
         end
     end
 

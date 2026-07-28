@@ -540,6 +540,7 @@ local function processHeartbeat(content, sender, nowMs)
         intentReason = tostring(content.intentReason or ''),
         -- Per-character status HUD signals.
         idleReason = tostring(content.idleReason or content.intentReason or ''),
+        idleSinceAt = tonumber(content.idleSinceAt) or 0,
         lastActionAt = tonumber(content.lastActionAt) or 0,
         stateInboxOverflows = tonumber(content.stateInboxOverflows) or 0,
         stateDrops = tonumber(content.stateDrops) or 0,
@@ -564,6 +565,31 @@ local function processHeartbeat(content, sender, nowMs)
     elseif heartbeatNeedsRecovery then
         State.scheduler:requestRecovery(
             spec.module, workerSessionId, senderScript, nowMs)
+    else
+        -- Safety valve for the stuck-recovering-lease pattern: worker's
+        -- heartbeat reports clean (no dirty effects, no recovery needed)
+        -- but the coordinator's lease still sits in 'recovering' for this
+        -- worker — usually because lease:recovered was dropped by transport
+        -- dedup or rejected on a stale token from a rotated recovery
+        -- session. A pending requestId is fine here (and in fact common):
+        -- it means the worker has already moved on and is asking for
+        -- fresh work, which is exactly the state where the stuck
+        -- recovering lease is actively blocking progress. observeCleanHeartbeat
+        -- only fires against a recovering lease for this exact worker session
+        -- — active leases are untouched.
+        local scheduler = State.scheduler
+        local lease = scheduler and scheduler.lease or nil
+        if lease
+            and tostring(lease.status or '') == 'recovering'
+            and tostring(lease.holderModule or '') == tostring(spec.module)
+            and tostring(lease.workerSessionId or '') == workerSessionId
+            and content.dirtyEffects ~= true
+            and content.needsRecovery ~= true
+        then
+            local ok = scheduler:observeCleanHeartbeat(
+                spec.module, workerSessionId, senderScript, nowMs)
+            if ok then State.pendingBroadcast = true end
+        end
     end
 
     local tracker = _restartTracker[spec.script]
@@ -697,6 +723,7 @@ local function buildModuleDiagnostics(nowMs)
             intentActive = heartbeat and heartbeat.intentActive == true,
             intentReason = heartbeat and heartbeat.intentReason or nil,
             idleReason = heartbeat and heartbeat.idleReason or nil,
+            idleSinceAt = heartbeat and tonumber(heartbeat.idleSinceAt) or 0,
             lastActionAt = heartbeat and tonumber(heartbeat.lastActionAt) or 0,
             requestId = request and request.requestId or nil,
             requestAge = request

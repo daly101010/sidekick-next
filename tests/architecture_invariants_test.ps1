@@ -326,18 +326,42 @@ function Assert-RegisteredTopicsHaveProducer {
 }
 Assert-RegisteredTopicsHaveProducer
 
-# Per-worker heartbeat carries idleReason + lastActionAt so the per-character
-# status HUD can render 'why isn't this worker acting?' without new actor sends.
-# These fields are piggybacked on the existing MODULE_HEARTBEAT cadence.
-Require-Text 'sk_module_base.lua' "idleReason = tostring(self.intent" 'heartbeat idle-reason field'
+# Per-worker heartbeat carries idleReason + idleSinceAt + lastActionAt so the
+# per-character status HUD can render 'why isn't this worker acting?' without
+# new actor sends. These fields piggyback on MODULE_HEARTBEAT cadence.
+Require-Text 'sk_module_base.lua' "idleReason = not intentActive and intentReason or ''" 'heartbeat idle-reason field'
 Require-Text 'sk_module_base.lua' 'lastActionAt = tonumber(self.lastActionAtMs)' 'heartbeat last-action timestamp'
-Require-Text 'sk_module_base.lua' 'self.lastActionAtMs = nowMs()' 'last-action timestamp updated on finishAction'
+Require-Text 'sk_module_base.lua' 'idleSinceAt = idleSinceAt' 'heartbeat idle-since timestamp'
+Require-Text 'sk_module_base.lua' 'function self:setIntentReason' 'idle-reason transition timestamp helper'
+Require-Regex 'sk_module_base.lua' "self\.lastFinishedAtMs = nowMs\(\)[\s\S]{0,300}self\.lastActionAtMs = self\.lastFinishedAtMs" 'last-action timestamp updated after finalization'
+Reject-Text 'sk_module_base.lua' 'self.lastActionAtMs = nowMs()' 'last-action timestamp refresh inside finishAction'
 Require-Text 'sk_coordinator.lua' "idleReason = tostring(content.idleReason" 'coordinator ingests heartbeat idle-reason'
+Require-Text 'sk_coordinator.lua' 'idleSinceAt = tonumber(content.idleSinceAt)' 'coordinator ingests idle-since timestamp'
 Require-Text 'sk_coordinator.lua' 'lastActionAt = tonumber(content.lastActionAt)' 'coordinator ingests last-action timestamp'
+Require-Text 'utils/lease_scheduler.lua' 'function M:observeCleanHeartbeat' 'coordinator-side stuck-recovery safety valve (clean-heartbeat path)'
+Require-Text 'sk_coordinator.lua' 'scheduler:observeCleanHeartbeat(' 'heartbeat-driven stuck-recovery clear wired into processHeartbeat'
+Require-Text 'utils/lease_scheduler.lua' 'rejectedRecoveryReports' 'reject-count tracking on recovering leases'
+Require-Text 'utils/lease_scheduler.lua' 'STUCK_RECOVERY_MS' 'time-bounded stuck-recovery force-clear threshold'
+Require-Text 'utils/lease_scheduler.lua' 'stuckRecoveryClears' 'stuck-recovery force-clear metric'
 Require-Text 'ui/worker_status_hud.lua' 'function M.render' 'per-character worker status HUD entry point'
+Require-Text 'ui/worker_status_hud.lua' "mq.imgui.init('SideKickWorkerStatus', M.render)" 'independent worker HUD ImGui callback'
+Require-Text 'ui/worker_status_hud.lua' 'renderOk, renderError = xpcall(renderRows, debug.traceback)' 'worker HUD render isolation'
+Require-Text 'ui/worker_status_hud.lua' "tostring(diag.workerSessionId or '') ~= ''" 'HUD explicit heartbeat-presence check'
+Require-Text 'ui/worker_status_hud.lua' 'if not imgui.BeginTable' 'HUD guarded BeginTable lifecycle'
+Require-Text 'ui/worker_status_hud.lua' 'math.max(0, now - idleSinceAt)' 'HUD idle-duration clock'
+Require-Text 'ui/worker_status_hud.lua' "tostring(lease.holderModule or '') == tostring(spec.module)" 'HUD active lease-holder classification'
+Reject-Text 'ui/worker_status_hud.lua' 'local idleAge = hbAge' 'heartbeat age reused as idle duration'
 Require-Text 'SideKick.lua' "'sidekick-next.ui.worker_status_hud'" 'worker status HUD lazy-registered in UI process'
-Require-Text 'SideKick.lua' 'LZ.getWorkerStatusHud() if M then M.render()' 'worker status HUD rendered in imgui loop'
+Require-Text 'SideKick.lua' 'LZ.getWorkerStatusHud()' 'worker status HUD initialized outside shared imgui loop'
+Reject-Text 'SideKick.lua' 'LZ.getWorkerStatusHud() if M then M.render()' 'worker status HUD coupled to shared imgui loop'
 Require-Text 'registry.lua' 'WorkerStatusHUDVisible' 'worker status HUD toggle setting'
+Require-Text 'SideKick.lua' 'local mainEnabled = settings.SideKickMainEnabled == true' 'opt-in main command-bar visibility'
+Require-Text 'ui/settings/tab_ui.lua' 'local mainEnabled = settings.SideKickMainEnabled == true' 'main command-bar checkbox default'
+Require-Text 'SideKick.lua' 'Core.Settings.SideKickMainEnabled == true and State.open' 'dock signal gated by visible main command bar'
+Require-Text 'utils/actors_coordinator.lua' "sendToGroupTarget({ id = 'sidekick:docked', docked = false })" 'immediate undocked transition'
+Require-Text 'utils/core.lua' 'function Core.isPrimaryWriter()' 'settings writer ownership exposed to shared-process consumers'
+Require-Text 'sk_lib.lua' 'if not primaryWriter and core.load then pcall(core.load) end' 'supervisor cannot reload primary UI settings writer'
+Reject-Text 'sk_lib.lua' 'if core.load then pcall(core.load) end' 'unconditional shared-process settings reload'
 
 Write-Output "architecture_invariants_test: $checked checks, $($failures.Count) failures"
 $failures | ForEach-Object { Write-Output $_ }

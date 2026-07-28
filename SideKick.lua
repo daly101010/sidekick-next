@@ -64,7 +64,7 @@ LZ.getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
 LZ.getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
 LZ.getActorsDebug = lazy('sidekick-next.ui.actors_debug')
 LZ.getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
-LZ.getWorkerStatusHud = lazy('sidekick-next.ui.worker_status_hud')
+LZ.getWorkerStatusHud = lazy.init('sidekick-next.ui.worker_status_hud')
 LZ.getIntelligenceDebug = lazy.init('sidekick-next.ui.intelligence_debug')
 
 -- Runtime cache, action executor, and spell engine (lazy-loaded)
@@ -693,7 +693,10 @@ end
 
 local function draw()
     local settings = Core.Settings or {}
-    local mainEnabled = settings.SideKickMainEnabled ~= false
+    -- The main command bar is opt-in (registry default=false). Treat a missing
+    -- or transiently unavailable setting as disabled so it cannot flash for a
+    -- frame while settings are loading or refreshing.
+    local mainEnabled = settings.SideKickMainEnabled == true
     if not mainEnabled or not State.open then
         _G.SideKickDockedToGT = false
     end
@@ -1892,6 +1895,9 @@ local function main()
     pcall(require, 'sidekick-next.humanize')
 
     ActorsCoordinator.init()
+    -- The worker HUD owns a separate ImGui callback so a render failure in an
+    -- ability/command bar cannot suppress the diagnostic window for a frame.
+    LZ.getWorkerStatusHud()
     do
         local Memorize = LZ.getSpellSetMemorize()
         if Memorize and Memorize.initializeClient then
@@ -2751,7 +2757,6 @@ local function main()
         do local M = LZ.getAggroWarning() if M then M.draw() end end
         do local M = LZ.getActorsDebug() if M then M.render() end end
         do local M = LZ.getCoordinatorDebug() if M then M.render() end end
-        do local M = LZ.getWorkerStatusHud() if M then M.render() end end
         do local M = LZ.getSpellSetEditor() if M then M.render() end end
         PerfMonitor.draw()
 
@@ -2850,9 +2855,9 @@ local function main()
                 coordinatorState and coordinatorState.team or nil)
         end
         if Core.Settings.ActorsEnabled ~= false then
-            -- Docked when configured to anchor to GroupTarget (even if GT bounds aren't available yet).
-            -- This avoids a deadlock where GT only broadcasts bounds after seeing sidekick:docked=true.
-            local hasGT = (_G.GroupTargetBounds and _G.GroupTargetBounds.loaded)
+            -- Report docking only for bars that can actually be drawn. Disabled
+            -- bars retain their anchor settings but must not make GroupTarget
+            -- hide/show its command controls as dock heartbeats arrive or age.
             local function anchoredToGT(mode, target)
                 mode = tostring(mode or 'none'):lower()
                 if mode == 'none' then return false end
@@ -2860,11 +2865,22 @@ local function main()
                 return target == 'grouptarget' or target == 'gt_commandbar'
             end
             local docked = (
-                anchoredToGT(Core.Settings.SideKickBarAnchor, Core.Settings.SideKickBarAnchorTarget)
-                or anchoredToGT(Core.Settings.SideKickSpecialAnchor, Core.Settings.SideKickSpecialAnchorTarget)
-                or anchoredToGT(Core.Settings.SideKickDiscBarAnchor, Core.Settings.SideKickDiscBarAnchorTarget)
-                or anchoredToGT(Core.Settings.SideKickItemBarAnchor, Core.Settings.SideKickItemBarAnchorTarget)
-                or anchoredToGT(Core.Settings.SideKickMainAnchor, Core.Settings.SideKickMainAnchorTarget)
+                (Core.Settings.SideKickBarEnabled ~= false
+                    and anchoredToGT(Core.Settings.SideKickBarAnchor,
+                        Core.Settings.SideKickBarAnchorTarget))
+                or (Core.Settings.SideKickSpecialEnabled ~= false
+                    and anchoredToGT(Core.Settings.SideKickSpecialAnchor,
+                        Core.Settings.SideKickSpecialAnchorTarget))
+                or (Core.Settings.SideKickDiscBarEnabled ~= false
+                    and tostring(State.classShort or '') == 'BER'
+                    and anchoredToGT(Core.Settings.SideKickDiscBarAnchor,
+                        Core.Settings.SideKickDiscBarAnchorTarget))
+                or (Core.Settings.SideKickItemBarEnabled ~= false
+                    and anchoredToGT(Core.Settings.SideKickItemBarAnchor,
+                        Core.Settings.SideKickItemBarAnchorTarget))
+                or (Core.Settings.SideKickMainEnabled == true and State.open
+                    and anchoredToGT(Core.Settings.SideKickMainAnchor,
+                        Core.Settings.SideKickMainAnchorTarget))
             )
             ActorsCoordinator.setDocked(docked)
 
@@ -2892,6 +2908,7 @@ local function main()
             -- Local worker commands and acknowledgements still use the Actor
             -- transport. Drain only same-character messages and suppress all
             -- peer state handling/broadcasts while Actors are disabled.
+            ActorsCoordinator.setDocked(false)
             ActorsCoordinator.tick({ localOnly = true, transportOnly = true })
         end
 

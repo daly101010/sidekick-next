@@ -2244,7 +2244,15 @@ function M.getTeamSnapshot()
 end
 
 function M.setDocked(docked)
-    M._docked = docked == true
+    local nextDocked = docked == true
+    if M._docked == nextDocked then return end
+    M._docked = nextDocked
+    -- GroupTarget otherwise keeps the previous true value until its staleness
+    -- timeout. Send the false edge immediately so disabling or closing the bar
+    -- cannot leave the companion command controls oscillating.
+    if not nextDocked then
+        sendToGroupTarget({ id = 'sidekick:docked', docked = false })
+    end
 end
 
 local function buildCapabilityOverlay(status)

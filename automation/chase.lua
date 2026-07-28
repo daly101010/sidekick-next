@@ -365,7 +365,11 @@ function M.selectIntent(settings, opts)
 
     local triggerDistance = effectiveMaxDistance(candidate.baseDistance)
     if distance <= triggerDistance then
-        clearChaseRoll()
+        -- Keep the cached _chaseRoll while in-range: it commits us to one
+        -- target distance for this chase evaluation, matching M.endEpisode()
+        -- as the only place that legitimately re-rolls. Re-rolling every
+        -- in-range tick would flicker the displayed threshold and defeat
+        -- the humanize cache.
         _lastIntent = nil
         _lastReason = string.format('in_range:%.1f<=%.1f', distance, triggerDistance)
         return nil, _lastReason
