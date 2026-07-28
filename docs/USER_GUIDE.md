@@ -316,11 +316,6 @@ incoming-heal coordination, and analytics are stored in the character's
 `healing/config_<Server>_<Character>.lua` file and edited under Advanced Healing
 Settings.
 
-The older `MainHealPoint`, `BigHealPoint`, `GroupHealPoint`, `GroupInjureCnt`,
-`HealUseHoTs`, and `HealCoordinateActors` registry keys remain only for
-compatibility with the retired tiered healer. They are not the active controls
-when Healing Intelligence is available.
-
 ### Resurrection
 
 Rez-capable classes (CLR, DRU, SHM, PAL, and NEC) have resurrection settings
@@ -1163,17 +1158,7 @@ fallbacks remain available only in the legacy split-worker A/B profile.
 
 Healing Intelligence stores pet, HoT, heal-selection, incoming-heal, and
 analytics controls in `healing/config_<Server>_<Character>.lua` rather than the
-registry. The following registry keys are compatibility-only and are hidden
-when Healing Intelligence is active:
-
-| Legacy key | Type | Default | Description |
-|------------|------|---------|-------------|
-| MainHealPoint | int | 80 | Main heal HP% |
-| BigHealPoint | int | 50 | Big heal HP% |
-| GroupHealPoint | int | 75 | Group heal HP% |
-| GroupInjureCnt | int | 2 | Members for group heal |
-| HealUseHoTs | bool | true | Use HoT spells |
-| HealCoordinateActors | bool | true | Legacy cross-character heal coordination |
+registry. Edit them under **Options > Healing > Advanced Healing Settings**.
 
 ### Actor Integration Settings
 

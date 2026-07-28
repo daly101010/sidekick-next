@@ -36,7 +36,6 @@ local M = {}
 ---@field lowPressureMinDeficitPct number|nil
 ---@field quickHealsEmergencyOnly boolean|nil
 ---@field quickHealMaxPct number|nil
----@field squishyCoveragePct number|nil
 ---@field groupHealMinCount number|nil
 ---@field bigHotMinMobDps number|nil
 ---@field bigHotMinXTargetCount number|nil

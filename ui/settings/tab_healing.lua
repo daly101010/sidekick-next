@@ -268,19 +268,8 @@ function M.draw(settings, themeNames, onChange)
         doHeals = healVal
     end
 
-    local hiEnabled = doHeals and hiConfig ~= nil
-
     if doHeals then
         Components.SettingGroup.draw('Healing Options', function()
-            -- Priority healing (hidden when HI enabled - HI has its own priority system)
-            if not hiEnabled then
-                local priority = settings.PriorityHealing ~= false
-                local prioVal, prioChanged = Components.CheckboxRow.draw('Priority Healing', 'PriorityHealing', priority, nil, {
-                    tooltip = 'Heal lowest HP targets first',
-                })
-                if prioChanged and onChange then onChange('PriorityHealing', prioVal) end
-            end
-
             -- Break invis OOC
             local breakInvis = hiConfig and hiConfig.breakInvisOOC == true
             local breakVal, breakChanged = Components.CheckboxRow.draw('Break Invis OOC To Heal', 'HealBreakInvisOOC', breakInvis, nil, {
@@ -291,35 +280,6 @@ function M.draw(settings, themeNames, onChange)
                 if hiConfig.save then hiConfig.save() end
             end
         end, { id = 'heal_options', defaultOpen = true })
-
-        -- Heal Points (hidden when HI enabled - HI uses its own thresholds)
-        if not hiEnabled then
-            Components.SettingGroup.draw('Heal Points', function()
-                local mainHeal = tonumber(settings.MainHealPoint) or 80
-                local mainChanged, newMain = Components.SliderRow.percent('Main Heal Point', 'MainHealPoint', mainHeal, nil, {
-                    tooltip = 'Start main heal when HP drops below this',
-                })
-                if mainChanged and onChange then onChange('MainHealPoint', newMain) end
-
-                local bigHeal = tonumber(settings.BigHealPoint) or 50
-                local bigChanged, newBig = Components.SliderRow.percent('Big Heal Point', 'BigHealPoint', bigHeal, nil, {
-                    tooltip = 'Use big/emergency heal when HP drops below this',
-                })
-                if bigChanged and onChange then onChange('BigHealPoint', newBig) end
-
-                local groupHeal = tonumber(settings.GroupHealPoint) or 75
-                local grpChanged, newGrp = Components.SliderRow.percent('Group Heal Point', 'GroupHealPoint', groupHeal, nil, {
-                    tooltip = 'Consider group heal when HP drops below this',
-                })
-                if grpChanged and onChange then onChange('GroupHealPoint', newGrp) end
-
-                local injureCnt = tonumber(settings.GroupInjureCnt) or 2
-                local cntChanged, newCnt = Components.SliderRow.int('Group Injured Count', 'GroupInjureCnt', injureCnt, 1, 5, nil, {
-                    tooltip = 'Number of injured group members to trigger group heal',
-                })
-                if cntChanged and onChange then onChange('GroupInjureCnt', newCnt) end
-            end, { id = 'heal_points', defaultOpen = true })
-        end
     end
 
     -- ========== PET HEALING ==========
@@ -344,55 +304,6 @@ function M.draw(settings, themeNames, onChange)
         if petPtChanged then
             hiConfig.petHealMinPct = newPetPt
             if hiConfig.save then hiConfig.save() end
-        end
-    end
-
-    -- ========== EXTENDED TARGETS ==========
-    if not hiEnabled then
-        imgui.Spacing()
-        Components.SettingGroup.section('Extended Healing', themeName)
-
-    -- Watch MA
-    local watchMA = settings.HealWatchMA == true
-    local maVal, maChanged = Components.CheckboxRow.draw('Watch Main Assist (OOG OK)', 'HealWatchMA', watchMA, nil, {
-        tooltip = 'Heal the MA even if outside group',
-    })
-    if maChanged and onChange then onChange('HealWatchMA', maVal) end
-
-    -- XTarget healing
-    local healXT = settings.HealXTargetEnabled == true
-    local xtVal, xtChanged = Components.CheckboxRow.draw('Heal XTarget Slots', 'HealXTargetEnabled', healXT, nil, {
-        tooltip = 'Heal targets in specific XTarget slots',
-    })
-    if xtChanged and onChange then onChange('HealXTargetEnabled', xtVal) end
-    healXT = xtVal
-
-    if healXT then
-        local xtSlots = settings.HealXTargetSlots or ''
-        local buf = Settings.labeledInputText('XTarget Slots (e.g. 1|2|3)', xtSlots)
-        if buf ~= xtSlots and onChange then
-            onChange('HealXTargetSlots', buf)
-        end
-    end
-    end
-
-    -- ========== HOTS (hidden when HI enabled - HI has its own HoT logic) ==========
-    if not hiEnabled then
-        imgui.Spacing()
-        Components.SettingGroup.section('HoTs', themeName)
-
-        local useHoTs = settings.HealUseHoTs ~= false
-        local hotVal, hotChanged = Components.CheckboxRow.draw('Use HoTs', 'HealUseHoTs', useHoTs, nil, {
-            tooltip = 'Use heal over time spells',
-        })
-        if hotChanged and onChange then onChange('HealUseHoTs', hotVal) end
-
-        if hotVal then
-            local hotRefresh = tonumber(settings.HealHoTMinSeconds) or 6
-            local refreshChanged, newRefresh = Components.SliderRow.int('HoT Refresh Window (sec)', 'HealHoTMinSeconds', hotRefresh, 2, 15, nil, {
-                tooltip = 'Recast HoT when remaining duration is below this',
-            })
-            if refreshChanged and onChange then onChange('HealHoTMinSeconds', newRefresh) end
         end
     end
 

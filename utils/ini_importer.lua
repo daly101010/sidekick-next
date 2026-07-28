@@ -311,15 +311,8 @@ function M.buildPlan(config)
     local healsOn = toBool(readKey(data, 'Heals', 'HealsOn'))
     if healsOn and #(config.entries.Heals or {}) > 0 and not HealerClasses.isSupported(className) then
         plan.warnings[#plan.warnings + 1] = string.format(
-            '%s heal entries will be staged, but coordinated Healing Intelligence supports only CLR, DRU, SHM, and PAL.',
+            'MuleAssist heal entries are ignored: coordinated Healing Intelligence supports only CLR, DRU, SHM, and PAL (this character is %s).',
             className ~= '' and className or 'Non-Cleric')
-    end
-
-    local xTar = trim(readKey(data, 'Heals', 'XTarHeal'))
-    if not isNull(xTar) then
-        local enabled = splitPipe(xTar)[1] ~= '0'
-        addSetting(plan, 'HealXTargetEnabled', enabled, 'Heals.XTarHeal')
-        addSetting(plan, 'HealXTargetSlots', enabled and xTar or '', 'Heals.XTarHeal')
     end
 
     local charmOn = toBool(readKey(data, 'Charm', 'CharmOn'))
@@ -328,22 +321,13 @@ function M.buildPlan(config)
             'Charm.CharmOn was not enabled: SideKick currently stages charm spells but has no automatic charm owner.'
     end
 
-    local thresholds = {}
-    for _, entry in ipairs(config.entries.Heals or {}) do
-        if entry.threshold then thresholds[#thresholds + 1] = entry.threshold end
-    end
-    table.sort(thresholds, function(a, b) return a > b end)
-    if thresholds[1] then addSetting(plan, 'MainHealPoint', thresholds[1], 'Heals.Heals# thresholds') end
-    if #thresholds > 1 then
-        addSetting(plan, 'BigHealPoint', thresholds[#thresholds], 'Heals.Heals# thresholds')
-    end
-
     plan.ignored = {
         'MuleAssist conditions are parsed but are not converted into SideKick condition-builder data.',
         'Pulling, camp, loot, mail, bandolier, mercenary, and invite behavior are not imported in this first pass.',
         'Burn/Aggro/OhShit action lists are parsed but are not auto-enabled without an exact SideKick ability mapping.',
         'DPS.DebuffAllOn is not mapped to task-only DebuffAllTask because their target scopes differ.',
         'Pet.PetBuffsOn and PetBuffs# are not mapped because the buffs worker does not currently target pets.',
+        'MuleAssist Heals#/XTarHeal per-slot thresholds are not imported. Healing Intelligence tunes thresholds per-character in healing/config_*.lua; edit via the Advanced Healing panel.',
     }
     return plan
 end

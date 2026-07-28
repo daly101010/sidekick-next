@@ -1,6 +1,6 @@
 Removed options (sidekick-next)
 Date: 2026-01-22
-Updated: 2026-07-26
+Updated: 2026-07-28
 
 These settings were removed either because they had no functional implementation or because their behavior was consolidated into the canonical setting noted in the implementation history. Do not restore them as independent controls.
 
@@ -57,6 +57,22 @@ Removed setting keys:
 - Healing Intelligence: duckMinCastAgeMs
 - Healing Intelligence: selfHealPct
 - Healing Intelligence: debugLogging
+- Healing Intelligence: squishyCoveragePct  (advanced slider — no runtime reader; @field annotation removed)
+- Healing Intelligence: hotRefreshBufferSec (advanced slider — undeclared default, no runtime reader)
+- Healing Intelligence: burstThresholdSigma (advanced slider — decoy; the real knob is burstStddevMultiplier which stays internal)
+- PetHealPoint          (registry-only; runtime uses Config.petHealMinPct)
+- HealCoordinateActors  (registry-only; docs already noted it as compat-only)
+- HealTrackHoTsViaActors (registry-only; no reader anywhere in the tree)
+- PriorityHealing       (legacy tiered-healer surface; no runtime reader — HI is the only heal path)
+- MainHealPoint         (legacy tiered-healer surface; no runtime reader — HI thresholds live in healing/config_<Server>_<Character>.lua)
+- BigHealPoint          (legacy tiered-healer surface; no runtime reader)
+- GroupHealPoint        (legacy tiered-healer surface; no runtime reader)
+- GroupInjureCnt        (legacy tiered-healer surface; no runtime reader)
+- HealWatchMA           (legacy tiered-healer surface; no runtime reader)
+- HealXTargetEnabled    (legacy tiered-healer surface; no runtime reader)
+- HealXTargetSlots      (legacy tiered-healer surface; no runtime reader)
+- HealUseHoTs           (legacy tiered-healer surface; no runtime reader — HI hotEnabled lives in the healing config)
+- HealHoTMinSeconds     (legacy tiered-healer surface; no runtime reader)
 
 Files updated to remove the UI/registry surfaces:
 - sidekick-next/ui/settings.lua

@@ -26,7 +26,6 @@ local M = {
 
     -- Squishy handling
     squishyClasses = { WIZ = true, ENC = true, NEC = true, MAG = true },
-    squishyCoveragePct = 70,
     nonSquishyMinHealPct = 15,
     nonSquishyHotMinDeficitPct = 20,  -- Non-squishy HoT threshold matches base (20% deficit = 80% HP)
     lowPressureMinDeficitPct = 20,    -- During low pressure, wait for 20% deficit before direct heals

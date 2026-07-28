@@ -40,10 +40,6 @@ function M.draw()
         groupCount, changed = imgui.SliderInt('Group Heal Min Count', groupCount, 2, 5)
         if changed then Config.groupHealMinCount = groupCount end
 
-        local squishyCoverage = (Config.squishyCoveragePct ~= nil) and Config.squishyCoveragePct or 70
-        squishyCoverage, changed = imgui.SliderInt('Squishy Coverage %', squishyCoverage, 50, 90)
-        if changed then Config.squishyCoveragePct = squishyCoverage end
-
         imgui.PopItemWidth()
     end
 
@@ -92,10 +88,6 @@ function M.draw()
             if imgui.IsItemHovered() then
                 imgui.SetTooltip('HoT must cover this fraction of expected damage')
             end
-
-            local refreshBuffer = (Config.hotRefreshBufferSec ~= nil) and Config.hotRefreshBufferSec or 3
-            refreshBuffer, changed = imgui.SliderInt('Refresh Buffer (sec)', refreshBuffer, 1, 10)
-            if changed then Config.hotRefreshBufferSec = refreshBuffer end
 
             local tankOnly = Config.hotTankOnly ~= false
             tankOnly, changed = imgui.Checkbox('Big HoT Tank Only', tankOnly)
@@ -180,10 +172,6 @@ function M.draw()
         local dmgWindow = (Config.damageWindowSec ~= nil) and Config.damageWindowSec or 6
         dmgWindow, changed = imgui.SliderInt('Damage Window (sec)', dmgWindow, 3, 15)
         if changed then Config.damageWindowSec = dmgWindow end
-
-        local burstThresh = (Config.burstThresholdSigma ~= nil) and Config.burstThresholdSigma or 2.0
-        burstThresh, changed = imgui.SliderFloat('Burst Threshold (sigma)', burstThresh, 1.0, 4.0, '%.1f')
-        if changed then Config.burstThresholdSigma = burstThresh end
 
         imgui.PopItemWidth()
     end

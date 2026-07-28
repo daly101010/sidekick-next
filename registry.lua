@@ -305,28 +305,11 @@ M.defaults = {
     HealThreshold = { type = 'number', Default = 80, Category = 'Spells', DisplayName = 'Heal HP Threshold' },
     HealPetsEnabled = { type = 'bool', Default = false, Category = 'Spells', DisplayName = 'Heal Pets' },
 
-    -- Healing (legacy tiers plus Healing Intelligence for healer classes)
+    -- Healing (Healing Intelligence for CLR/DRU/SHM/PAL; per-character tunables
+    -- live in healing/config.lua and are edited via the Advanced Healing panel)
     DoHeals = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Enable Heals' },
-    PriorityHealing = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Priority Healing' },
     HealBreakInvisOOC = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Break Invis OOC To Heal' },
-
-    MainHealPoint = { type = 'number', Default = 80, Category = 'Heal/Rez', DisplayName = 'Main Heal Point (HP %)' },
-    BigHealPoint = { type = 'number', Default = 50, Category = 'Heal/Rez', DisplayName = 'Big Heal Point (HP %)' },
-    GroupHealPoint = { type = 'number', Default = 75, Category = 'Heal/Rez', DisplayName = 'Group Heal Point (HP %)' },
-    GroupInjureCnt = { type = 'number', Default = 2, Category = 'Heal/Rez', DisplayName = 'Group Injured Count' },
-
     DoPetHeals = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Enable Pet Heals' },
-    PetHealPoint = { type = 'number', Default = 50, Category = 'Heal/Rez', DisplayName = 'Pet Heal Point (HP %)' },
-
-    HealWatchMA = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Watch Main Assist (OOG OK)' },
-    HealXTargetEnabled = { type = 'bool', Default = false, Category = 'Heal/Rez', DisplayName = 'Heal XTarget Slots' },
-    HealXTargetSlots = { type = 'text', Default = '', Category = 'Heal/Rez', DisplayName = 'XTarget Slots (e.g. 1|2|3)' },
-
-    HealUseHoTs = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Use HoTs (when available)' },
-    HealHoTMinSeconds = { type = 'number', Default = 6, Category = 'Heal/Rez', DisplayName = 'HoT Refresh Window (sec)' },
-
-    HealCoordinateActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Coordinate Heals via Actors' },
-    HealTrackHoTsViaActors = { type = 'bool', Default = true, Category = 'Heal/Rez', DisplayName = 'Track HoTs via Actors' },
 
     -- CC Settings (Enchanter, Bard, Necro)
 
@@ -501,9 +484,6 @@ local VALIDATORS = {
     MeditationManaStopPct = { min = 0, max = 100 },
     MeditationEndStartPct = { min = 0, max = 100 },
     MeditationEndStopPct = { min = 0, max = 100 },
-    MainHealPoint = { min = 0, max = 100 },
-    BigHealPoint = { min = 0, max = 100 },
-    GroupHealPoint = { min = 0, max = 100 },
     EmergencyHpThreshold = { min = 0, max = 100 },
 }
 
@@ -604,10 +584,8 @@ local MODULE_KEYS = {
         RaidDamageStopHpThreshold GemLockEnabled
     ]],
     healing = [[
-        HealThreshold HealPetsEnabled DoHeals PriorityHealing HealBreakInvisOOC MainHealPoint
-        BigHealPoint GroupHealPoint GroupInjureCnt DoPetHeals PetHealPoint HealWatchMA
-        HealXTargetEnabled HealXTargetSlots HealUseHoTs HealHoTMinSeconds HealCoordinateActors
-        HealTrackHoTsViaActors PrePullHotEnabled PrePullHotEtaSec PrePullHotBigMult
+        HealThreshold HealPetsEnabled DoHeals HealBreakInvisOOC DoPetHeals
+        PrePullHotEnabled PrePullHotEtaSec PrePullHotBigMult
     ]],
     cc = [[
         MezImmunePersistEnabled MezzingEnabled MezMinLevel MezMaxTargets UseAEMez
