@@ -685,6 +685,38 @@ M.register('Diagnostics', 'Coordinator', function()
     end
     safeText('Last GT msg', string.format('%s (%.1fs ago)',
         tostring(s.last_gt_msg_id or '?'), os.clock() - (s.last_gt_msg_at or 0)))
+    if s.messages then
+        safeText('Actor queue', string.format(
+            'pending=%d processed=%d coalesced=%d overflow=%d max=%d drain=%d/%d deferred=%d',
+            tonumber(s.messages.pending) or 0,
+            tonumber(s.messages.processed) or 0,
+            tonumber(s.messages.coalesced) or 0,
+            tonumber(s.messages.overflow) or 0,
+            tonumber(s.messages.maxDepth) or 0,
+            tonumber(s.messages.lastDrainCount) or 0,
+            tonumber(s.messages.maxPerDrain) or 0,
+            tonumber(s.messages.deferred) or 0))
+    end
+    if s.peers then
+        safeText('Peer leases', string.format('fresh=%d stale=%d staleAfter=%dms',
+            tonumber(s.peers.fresh) or 0,
+            tonumber(s.peers.stale) or 0,
+            tonumber(s.peers.staleAfterMs) or 0))
+    end
+    if s.primaryTarget then
+        local p = s.primaryTarget
+        safeText('Primary transport', string.format('%s: %s',
+            tostring(p.stage or 'waiting'),
+            tostring(p.reason or 'no_target_primary_packet')))
+        safeText('Primary sender', string.format('%s @ %s (%s)',
+            tostring(p.senderCharacter or '-'),
+            tostring(p.senderServer or '-'),
+            tostring(p.senderScript or '-')))
+        safeText('Primary IDs', string.format('target=%d tank=%d seq=%d',
+            tonumber(p.targetId) or 0,
+            tonumber(p.claimedTankId) or 0,
+            tonumber(p.sequence) or 0))
+    end
 end)
 
 M.register('Diagnostics', 'Runtime Cache', function()

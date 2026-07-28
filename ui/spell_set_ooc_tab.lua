@@ -260,10 +260,10 @@ function M.renderBuffEntry(spell, spellSet)
             imgui.Separator()
             imgui.Text("Target Override:")
 
-            local targetTypes = { "group", "role", "class", "name" }
-            local targetLabels = { "Group (iterate)", "By Role", "By Class", "By Name" }
+            local targetTypes = { "default", "group", "pet", "role", "class", "name" }
+            local targetLabels = { "(Default)", "Group (iterate)", "Pets", "By Role", "By Class", "By Name" }
 
-            local currentType = buffConfig.buffTarget and buffConfig.buffTarget.type or "group"
+            local currentType = buffConfig.buffTarget and buffConfig.buffTarget.type or "default"
             local currentIdx = 1
             for i, t in ipairs(targetTypes) do
                 if t == currentType then
@@ -275,11 +275,19 @@ function M.renderBuffEntry(spell, spellSet)
             imgui.PushItemWidth(130)
             if imgui.BeginCombo("##buffTarget", targetLabels[currentIdx]) then
                 for i, label in ipairs(targetLabels) do
-                    if imgui.Selectable(label, currentIdx == i) then
-                        buffConfig.buffTarget = buffConfig.buffTarget or {}
-                        buffConfig.buffTarget.type = targetTypes[i]
-                        if targetTypes[i] == "group" then
-                            buffConfig.buffTarget.value = nil
+                    -- MQ ImGui returns (selected, clicked). Acting on the
+                    -- first value re-applies the current row every frame and
+                    -- makes the combo appear stuck.
+                    local _, clicked = imgui.Selectable(label, currentIdx == i)
+                    if clicked then
+                        if targetTypes[i] == "default" then
+                            buffConfig.buffTarget = nil
+                        else
+                            buffConfig.buffTarget = buffConfig.buffTarget or {}
+                            buffConfig.buffTarget.type = targetTypes[i]
+                            if targetTypes[i] == "group" or targetTypes[i] == "pet" then
+                                buffConfig.buffTarget.value = nil
+                            end
                         end
                         saveSpellSets()
                     end
@@ -304,7 +312,8 @@ function M.renderBuffEntry(spell, spellSet)
                 imgui.PushItemWidth(100)
                 if imgui.BeginCombo("##buffRole", roles[roleIdx]) then
                     for i, role in ipairs(roles) do
-                        if imgui.Selectable(role, roleIdx == i) then
+                        local _, clicked = imgui.Selectable(role, roleIdx == i)
+                        if clicked then
                             buffConfig.buffTarget = buffConfig.buffTarget or {}
                             buffConfig.buffTarget.value = role
                             saveSpellSets()

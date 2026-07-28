@@ -322,6 +322,15 @@ function M.hasActiveBuffSongOrAura(def)
     return auraActiveByName(candidates)
 end
 
+-- Manual UI activations must be sent to the coordinated action worker.
+-- Retain a fail-closed compatibility symbol so stale callers cannot issue
+-- commands outside the lease.
+function M.activate()
+    return false, 'direct_activation_disabled'
+end
+
+--[=[
+Legacy direct implementation quarantined during the lease migration:
 function M.activate(def)
     if not def then return end
     local kind = tostring(def.kind or 'aa')
@@ -415,6 +424,7 @@ function M.activate(def)
         return
     end
 end
+]=]
 
 --- Try all abilities in sorted priority order
 -- Note: This is a simplified version for backwards compatibility.

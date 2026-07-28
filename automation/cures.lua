@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 local M = {}
 
@@ -58,11 +59,12 @@ local _state = {
     -- across capable curers so they don't race for the same debuff.
     remoteCapabilities = {},   -- { [charName] = { Curse=true, Disease=true, ... } }
     lastCapsBroadcast = 0,
+    lastPeerBlock = nil,
     shardObservedAt = {},      -- { ['<tid>:<type>'] = os.clock() } — first time we saw a non-shard debuff
 }
 
 local TICK_INTERVAL = 0.25       -- Check for cures every 250ms
-local CLAIM_TIMEOUT = 8.0        -- Claims expire after 8 seconds
+local CLAIM_TIMEOUT = CoordinationPolicy.CLAIM_TTL_SECONDS.CURE
 local RECENT_CURE_WINDOW = 10.0  -- Consider cure "recent" for 10 seconds
 local MAX_BUFF_SLOTS = 42        -- Maximum buff slots to scan
 local CAPS_BROADCAST_INTERVAL = 30.0  -- Re-share cure capabilities every 30s
@@ -81,6 +83,7 @@ function M.init()
     _state.recentCures = {}
     _state.lastTick = 0
     _state.lastCureCastAt = 0
+    _state.lastPeerBlock = nil
 
     _state.selfName = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or ''
 
@@ -111,7 +114,7 @@ end
 --------------------------------------------------------------------------------
 
 local function loadClassConfig(classShort)
-    local ok, config = pcall(require, string.format('data.class_configs.%s', classShort))
+    local ok, config = pcall(require, string.format('sidekick-next.data.class_configs.%s', classShort))
     if ok then return config end
     return nil
 end
@@ -210,78 +213,59 @@ local function isDetrimentalBuff(spawn, buffSlot)
     return false
 end
 
+local function classifyCounterDebuff(counterType, counterNumber)
+    local count = tonumber(counterNumber) or 0
+    if count <= 0 then return nil end
+
+    local counterLower = tostring(counterType or ''):lower()
+    if counterLower:find('disease', 1, true) then return 'Disease' end
+    if counterLower:find('poison', 1, true) then return 'Poison' end
+    if counterLower:find('curse', 1, true) then return 'Curse' end
+    if counterLower:find('corrupt', 1, true) then return 'Corruption' end
+    return nil
+end
+
+-- Exposed for the lightweight Lua regression harness.
+M._classifyCounterDebuff = classifyCounterDebuff
+
 local function getDebuffType(spawn, buffSlot)
     if not (spawn and spawn()) then return nil end
     local buff = spawn.Buff(buffSlot)
     if not (buff and buff()) then return nil end
 
-    -- Check SpellType for cure category
-    local spellType = nil
-    if buff.SpellType then
-        local ok, v = pcall(function() return buff.SpellType() end)
-        if ok then spellType = tostring(v or '') end
-    end
-
-    -- Check CounterType or Category
+    -- CounterType names the cure family, while CounterNumber proves the
+    -- detrimental spell actually carries removable counters. Category and
+    -- subcategory are not safe fallbacks: ordinary uncurable poison-themed
+    -- effects also use those labels and caused endless Abolish Poison casts.
     local counterType = nil
     if buff.CounterType then
         local ok, v = pcall(function() return buff.CounterType() end)
         if ok then counterType = tostring(v or '') end
     end
 
-    -- Check for common debuff types
-    local typeLower = tostring(spellType or ''):lower()
-    local counterLower = tostring(counterType or ''):lower()
-
-    -- Disease detection
-    if typeLower:find('disease') or counterLower:find('disease') then
-        return 'Disease'
+    local counterNumber = nil
+    if buff.CounterNumber then
+        local ok, v = pcall(function() return buff.CounterNumber() end)
+        if ok then counterNumber = tonumber(v) end
     end
 
-    -- Poison detection
-    if typeLower:find('poison') or counterLower:find('poison') then
-        return 'Poison'
-    end
-
-    -- Curse detection
-    if typeLower:find('curse') or counterLower:find('curse') then
-        return 'Curse'
-    end
-
-    -- Corruption detection
-    if typeLower:find('corrupt') or counterLower:find('corrupt') then
-        return 'Corruption'
-    end
-
-    -- Fallback: check spell categories/subcategories
-    local spell = buff.Spell
-    if spell and spell() then
-        local category = nil
-        if spell.Category then
-            local ok, v = pcall(function() return spell.Category() end)
-            if ok then category = tostring(v or ''):lower() end
-        end
-        local subcategory = nil
-        if spell.Subcategory then
-            local ok, v = pcall(function() return spell.Subcategory() end)
-            if ok then subcategory = tostring(v or ''):lower() end
-        end
-
-        if category then
-            if category:find('disease') then return 'Disease' end
-            if category:find('poison') then return 'Poison' end
-            if category:find('curse') then return 'Curse' end
-            if category:find('corrupt') then return 'Corruption' end
-        end
-        if subcategory then
-            if subcategory:find('disease') then return 'Disease' end
-            if subcategory:find('poison') then return 'Poison' end
-            if subcategory:find('curse') then return 'Curse' end
-            if subcategory:find('corrupt') then return 'Corruption' end
+    -- Some cached-buff builds expose these members only through .Spell.
+    if (not counterType or counterType == '' or counterNumber == nil)
+        and buff.Spell then
+        local spell = buff.Spell
+        if spell and spell() then
+            if (not counterType or counterType == '') and spell.CounterType then
+                local ok, v = pcall(function() return spell.CounterType() end)
+                if ok then counterType = tostring(v or '') end
+            end
+            if counterNumber == nil and spell.CounterNumber then
+                local ok, v = pcall(function() return spell.CounterNumber() end)
+                if ok then counterNumber = tonumber(v) end
+            end
         end
     end
 
-    return nil
+    return classifyCounterDebuff(counterType, counterNumber)
 end
 
 local function scanSpawnForDebuffs(spawn)
@@ -460,12 +444,35 @@ function M.isCureClaimed(targetId, debuffType)
     local remoteClaims = _state.remoteClaims[id]
     if remoteClaims and remoteClaims[debuffType] then
         local claim = remoteClaims[debuffType]
-        if (now - claim.claimedAt) < CLAIM_TIMEOUT then
-            return true
+        local active, peer = CoordinationPolicy.evaluateLocalClaim(
+            getActors(), claim, CLAIM_TIMEOUT, now)
+        claim.peerAgeMs = peer.peerAgeMs
+        claim.peerReason = peer.peerReason
+        claim.leaseRemainingMs = peer.leaseRemainingMs
+        if active then
+            _state.lastPeerBlock = {
+                at = now,
+                targetId = id,
+                category = debuffType,
+                blockedBy = claim.claimer,
+                peerAgeMs = peer.peerAgeMs,
+                leaseRemainingMs = peer.leaseRemainingMs,
+            }
+            return true, claim.claimer, peer
         end
+        remoteClaims[debuffType] = nil
+        if not next(remoteClaims) then _state.remoteClaims[id] = nil end
     end
 
     return false
+end
+
+function M.getLastPeerBlockReason(maxAgeSeconds)
+    local block = _state.lastPeerBlock
+    if not block or (os.clock() - (block.at or 0)) > (tonumber(maxAgeSeconds) or 1.0) then
+        return nil
+    end
+    return CoordinationPolicy.formatPeerBlock('claimed_by', block.blockedBy, block)
 end
 
 function M.wasRecentlyCured(targetId, debuffType)
@@ -502,6 +509,9 @@ function M.receiveClaim(payload)
     _state.remoteClaims[targetId][debuffType] = {
         claimedAt = os.clock(),
         claimer = claimer,
+        zone = tostring(payload.zone or ''),
+        server = tostring(payload.server or payload._skActorSenderServer or ''),
+        senderScript = tostring(payload._skActorSenderScript or ''),
     }
 
     -- Owner is acting; reset our fallback timer for this debuff so we don't
@@ -908,7 +918,9 @@ local function cleanupExpired()
     -- Clean expired remote claims
     for targetId, claims in pairs(_state.remoteClaims) do
         for debuffType, data in pairs(claims) do
-            if (now - data.claimedAt) >= CLAIM_TIMEOUT then
+            local active = CoordinationPolicy.evaluateLocalClaim(
+                getActors(), data, CLAIM_TIMEOUT, now)
+            if not active then
                 claims[debuffType] = nil
             end
         end
@@ -969,7 +981,7 @@ function M.selectCureAction(settings)
     -- Find best cure target
     local target = M.getBestCureTarget(settings)
     if not target then
-        return nil, 'no_target'
+        return nil, M.getLastPeerBlockReason() or 'no_target'
     end
 
     return target, 'cure'

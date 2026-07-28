@@ -149,17 +149,12 @@ M.aaLines = {
     ['FocusedMezAA'] = { "Beguiler's Banishment" },
 }
 
--- Disc Lines (Enchanters have very few)
+-- Enchanters do not have combat disciplines.
 M.discLines = {}
 
--- Opt ENC into the discipline engine. Without this, sk_disciplines
--- skips ENC by default (caster classes are off by default).
-M.useDisciplineEngine = true
-
--- Allow spell-kind picks for ENC. Default is {aa, disc} only — but
--- ENC's combat rotation is almost entirely spells (mez, tash, slow,
--- nukes, mana-taps), so we widen the filter for this class.
-M.allowKindsInRotation = { 'aa', 'disc', 'spell' }
+-- Enchanter spells are owned by sk_cc, sk_dps, sk_buffs, and the other
+-- dedicated spell workers. Never start sk_disciplines for ENC.
+M.useDisciplineEngine = false
 
 -- Per-condition target selector. The default selector ('current_target')
 -- casts on the active EQ target. ENC's mez line predicates fire when

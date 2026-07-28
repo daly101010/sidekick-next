@@ -82,6 +82,10 @@ function M.new(options)
         releases = 0,
         revocations = 0,
         recoveries = 0,
+        requestExpiries = 0,
+        leaseTtlExpiries = 0,
+        revocationGraceExpiries = 0,
+        recoveryTimeouts = 0,
     }
     return self
 end
@@ -220,6 +224,17 @@ function M:request(content, senderScript, nowMs)
 
     local ttlMs = clamp(content.requestTtlMs, 250, 10000,
         self.defaultRequestTtlMs)
+    local previous = self.requests[moduleName]
+    local isRefresh = previous
+        and previous.workerSessionId == workerSessionId
+        and previous.requestId == requestId
+    local firstReceivedAtMs = isRefresh
+        and (tonumber(previous.firstReceivedAtMs)
+            or tonumber(previous.receivedAtMs)) or nowMs
+    local blockedByModule = isRefresh and previous.blockedByModule
+        or (self.lease and self.lease.holderModule or nil)
+    local blockedByStatus = isRefresh and previous.blockedByStatus
+        or (self.lease and self.lease.status or nil)
     self.requests[moduleName] = {
         version = self.protocolVersion,
         module = moduleName,
@@ -227,8 +242,14 @@ function M:request(content, senderScript, nowMs)
         requestId = requestId,
         requestTtlMs = ttlMs,
         receivedAtMs = nowMs,
+        firstReceivedAtMs = firstReceivedAtMs,
+        lastReceivedAtMs = nowMs,
         expiresAtMs = nowMs + ttlMs,
         senderScript = spec.script,
+        blockedByModule = blockedByModule,
+        blockedByStatus = blockedByStatus,
+        refreshCount = isRefresh
+            and ((tonumber(previous.refreshCount) or 0) + 1) or 0,
     }
     self:_transition(nowMs)
     return true, 'queued'
@@ -321,6 +342,7 @@ function M:beginRecovery(reason, nowMs)
     lease.requestId = string.format('recovery:%d', self.tokenCounter)
     lease.grantedAtMs = nowMs
     lease.renewedAtMs = nowMs
+    lease.queueTiming = nil
     lease.ttlMs = self.recoveryTtlMs
     lease.recoveryStartedAtMs = nowMs
     lease.recoveryDeadlineAtMs = nowMs + self.recoveryTtlMs
@@ -390,6 +412,22 @@ function M:requestRecovery(moduleName, workerSessionId, senderScript, nowMs)
     end
     self:_transition(nowMs)
     return true, 'recovery_queued'
+end
+
+-- Dirty effects are expected while the exact active lease owns their cleanup.
+-- Recovery is required only when the worker explicitly reports lost authority,
+-- or when dirty effects no longer match the coordinator's active lease.
+function M:heartbeatNeedsRecovery(content, moduleName, workerSessionId)
+    content = content or {}
+    if content.needsRecovery == true then return true end
+    if content.dirtyEffects ~= true then return false end
+
+    local lease = self.lease
+    return not (lease
+        and lease.status == 'active'
+        and tostring(lease.holderModule or '') == tostring(moduleName or '')
+        and tostring(lease.workerSessionId or '') == tostring(workerSessionId or '')
+        and tostring(lease.requestId or '') == tostring(content.requestId or ''))
 end
 
 function M:observeWorkerSession(moduleName, workerSessionId, senderScript, nowMs)
@@ -526,6 +564,7 @@ function M:_expireRequests(nowMs)
     for moduleName, request in pairs(self.requests) do
         if nowMs > (tonumber(request.expiresAtMs) or 0) then
             self.requests[moduleName] = nil
+            self.metrics.requestExpiries = self.metrics.requestExpiries + 1
             changed = true
         end
     end
@@ -594,7 +633,23 @@ function M:_grantNext(nowMs)
         grantedAtMs = nowMs,
         renewedAtMs = nowMs,
         ttlMs = self.defaultLeaseTtlMs,
+        queueTiming = {
+            schedulerWaitMs = math.max(0, nowMs
+                - (tonumber(request.firstReceivedAtMs)
+                    or tonumber(request.receivedAtMs) or nowMs)),
+            blockedByModule = tostring(request.blockedByModule or ''),
+            blockedByStatus = tostring(request.blockedByStatus or ''),
+            requestRefreshes = tonumber(request.refreshCount) or 0,
+        },
     }
+    -- Requests can arrive together while no lease exists. Attribute those
+    -- already waiting requests to the holder selected by this transition.
+    for _, pending in pairs(self.requests) do
+        if not nonEmpty(pending.blockedByModule) then
+            pending.blockedByModule = spec.module
+            pending.blockedByStatus = 'active'
+        end
+    end
     self.metrics.grants = self.metrics.grants + 1
     self:_transition(nowMs)
     return true
@@ -622,13 +677,21 @@ function M:tick(nowMs)
         if lease.status == 'active'
             and (nowMs - (tonumber(lease.renewedAtMs) or 0))
                 > (tonumber(lease.ttlMs) or self.defaultLeaseTtlMs) then
+            self.metrics.leaseTtlExpiries =
+                self.metrics.leaseTtlExpiries + 1
             self:beginRecovery('lease_ttl_expired', nowMs)
         elseif lease.status == 'revoking'
             and nowMs >= (tonumber(lease.revocationDeadlineAtMs) or 0) then
+            self.metrics.revocationGraceExpiries =
+                self.metrics.revocationGraceExpiries + 1
             self:beginRecovery('revocation_grace_expired', nowMs)
         elseif lease.status == 'recovering'
             and nowMs >= (tonumber(lease.recoveryDeadlineAtMs) or math.huge) then
-            lease.recoveryTimedOut = true
+            if lease.recoveryTimedOut ~= true then
+                self.metrics.recoveryTimeouts =
+                    self.metrics.recoveryTimeouts + 1
+                lease.recoveryTimedOut = true
+            end
         end
     end
 
@@ -665,6 +728,7 @@ function M:getSnapshot()
         selfDead = self.selfDead,
         faultReason = self.faultReason,
         lastTransitionAtMs = self.lastTransitionAtMs,
+        metrics = shallowCopy(self.metrics),
     }
 end
 

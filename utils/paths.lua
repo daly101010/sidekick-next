@@ -15,6 +15,24 @@ local _serverName = nil
 local ROOT_NAME = 'SideKick-Next'
 local LEGACY_ROOT_NAME = 'SideKick'
 
+--- Normalize MQ/Windows paths to the forward-slash form Lua accepts on every
+--- supported platform. This prevents paths such as F:\Config/SideKick-Next.
+function M.normalize(path)
+    path = tostring(path or ''):gsub('\\', '/')
+    local prefix = path:sub(1, 2) == '//' and '//' or ''
+    path = path:gsub('/+', '/')
+    if prefix ~= '' and path:sub(1, 1) == '/' then
+        path = '/' .. path
+    end
+    return path
+end
+
+local function join(base, child)
+    base = M.normalize(base):gsub('/+$', '')
+    child = M.normalize(child):gsub('^/+', '')
+    return base .. '/' .. child
+end
+
 --- Get character and server info (cached)
 local function getCharInfo()
     if not _charName then
@@ -30,12 +48,12 @@ end
 
 --- Get the root SideKick directory
 function M.getRootDir()
-    return mq.configDir .. '/' .. ROOT_NAME
+    return join(mq.configDir or 'config', ROOT_NAME)
 end
 
 --- Get the production/legacy root used to seed a new sidekick-next install.
 function M.getLegacyRootDir()
-    return mq.configDir .. '/' .. LEGACY_ROOT_NAME
+    return join(mq.configDir or 'config', LEGACY_ROOT_NAME)
 end
 
 --- Get the config directory
@@ -67,6 +85,18 @@ function M.getDataDir()
     return M.getRootDir() .. '/data'
 end
 
+--- Get the per-character Actor claim-ledger path.
+--- The ledger belongs to this experimental tree and must never write into the
+--- production SideKick root.
+function M.getClaimLedgerPath()
+    local char, server = getCharInfo()
+    local dir = M.getDataDir()
+    M.ensureDir(dir)
+    server = tostring(server or 'Server'):gsub('[^%w_%-]', '_')
+    char = tostring(char or 'Character'):gsub('[^%w_%-]', '_')
+    return string.format('%s/claim_ledger_%s_%s.lua', dir, server, char)
+end
+
 --- Get the logs root directory
 function M.getLogsDir()
     return M.getRootDir() .. '/logs'
@@ -80,30 +110,59 @@ end
 
 --- Ensure a directory exists (creates parent dirs as needed)
 -- @param path string Directory path to create
-function M.ensureDir(path)
-    -- Fast path: check if directory already exists (avoids subprocess spawn)
-    local f = io.open(path .. '/._dircheck', 'w')
-    if f then
-        f:close()
-        os.remove(path .. '/._dircheck')
-        return
+local function directoryExists(path, lfs)
+    if lfs and lfs.attributes then
+        local ok, mode = pcall(lfs.attributes, path, 'mode')
+        if ok and mode == 'directory' then return true end
     end
-    -- Try lfs first for cleaner creation (C call, no subprocess)
+    local ok, _, code = os.rename(path, path)
+    -- Windows can return access denied for an existing protected directory.
+    return ok == true or tonumber(code) == 13
+end
+
+function M.ensureDir(path)
+    path = M.normalize(path):gsub('/+$', '')
+    if path == '' then return false, 'empty_path' end
+
     local ok, lfs = pcall(require, 'lfs')
+    if directoryExists(path, ok and lfs or nil) then return true end
+
+    -- Try lfs first for cleaner creation (C call, no subprocess).
     if ok and lfs and lfs.mkdir then
-        local parts = {}
-        for part in path:gmatch('[^/\\]+') do
-            table.insert(parts, part)
+        local drive, remainder = path:match('^(%a:)/(.*)$')
+        local current
+        if drive then
+            current = drive .. '/'
+        elseif path:sub(1, 2) == '//' then
+            current = '//'
+            remainder = path:sub(3)
+        elseif path:sub(1, 1) == '/' then
+            current = '/'
+            remainder = path:sub(2)
+        else
+            current = ''
+            remainder = path
         end
-        local current = ''
-        for _, part in ipairs(parts) do
-            current = current .. part .. '/'
-            lfs.mkdir(current)
+        for part in remainder:gmatch('[^/]+') do
+            if current == '' then
+                current = part
+            elseif current == '//' then
+                current = current .. part
+            else
+                current = current:gsub('/+$', '') .. '/' .. part
+            end
+            pcall(lfs.mkdir, current)
         end
     else
         -- Last resort: os.execute (spawns cmd.exe, can be slow with antivirus)
-        os.execute('mkdir "' .. path .. '" 2>nul')
+        os.execute('mkdir "' .. path .. '" >nul 2>nul')
     end
+
+    -- Verify creation without a shared marker file. Every worker initializes
+    -- concurrently, so a fixed probe filename creates an avoidable startup
+    -- race between open/remove calls in separate Lua processes.
+    if directoryExists(path, ok and lfs or nil) then return true end
+    return false, 'directory_unavailable:' .. path
 end
 
 local function fileExists(path)

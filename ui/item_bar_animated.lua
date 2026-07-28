@@ -205,9 +205,6 @@ function M.draw(opts)
                     -- The host callback only enqueues transport from this ImGui
                     -- frame; coordinated execution happens in sk_items.
                     opts.onActivate(entry)
-                else
-                    -- Monolithic/backward-compatible callers retain direct use.
-                    Items.useItem(entry.itemName, { throttleKey = tostring(entry.slotKey or entry.itemName), minInterval = 0.25 })
                 end
             end
 

@@ -80,6 +80,9 @@ module.executeAction = function(self)
 end
 
 
+-- The legacy callback above is retained only as migration reference and must
+-- never be selected by ModuleBase.
+module.executeAction = nil
 module:enableUnifiedExecutor({
     dispatch = function(action)
         local success, reason = Cures.castCure(

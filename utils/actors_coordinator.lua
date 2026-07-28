@@ -1,4 +1,6 @@
 local mq = require('mq')
+local lib = require('sidekick-next.sk_lib')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 -- Lazy-loaded so we don't trigger a circular require during actors init.
 local _ledger = nil
@@ -37,7 +39,8 @@ local SESSION_TOMBSTONE_MS = 60000
 local PEER_SESSION_IDLE_MS = 120000
 local MAX_TRACKED_ENDPOINTS = 512
 local MAX_TOMBSTONES_PER_ENDPOINT = 8
-local MAX_PENDING_MESSAGES = 256
+local MAX_PENDING_MESSAGES = math.max(1,
+    tonumber(CoordinationPolicy.MESSAGE_QUEUE.MAX_PENDING) or 256)
 local MAX_PACKET_DEPTH = 8
 local MAX_PACKET_VALUES = 4096
 local MAX_PACKET_STRING = 16384
@@ -48,6 +51,8 @@ local _statusDropbox = nil
 local _selfName = ''
 local _selfServer = ''
 local _selfZone = ''
+local _selfNameLower = ''
+local _selfServerLower = ''
 local _trustedTeamId = ''
 local _trustedTeamMembers = nil
 
@@ -88,6 +93,13 @@ local _transportStats = {
     staleSession = 0,
     controlRejected = 0,
     lastDropReason = '',
+    byReason = {},
+}
+local _primaryTargetDiag = {
+    stage = 'waiting',
+    reason = 'no_target_primary_packet',
+    updatedAtMs = 0,
+    counts = {},
 }
 
 local EXTERNAL_MESSAGE_IDS = {
@@ -238,6 +250,7 @@ local _messageCallbacks = {}
 local _tankState = {
     primaryTargetId = nil,
     primaryTargetName = nil,
+    killAuthorized = false,
     primaryRevision = nil,
     currentTargetId = nil,
     tankMode = nil,
@@ -307,13 +320,180 @@ local function safeInstanceId()
     return ok and (tonumber(value) or 0) or 0
 end
 
+-- Raid.MainAssist returns a raidmember, not a spawn. Resolve its Spawn member
+-- before reading spawn-only fields, while retaining the direct groupmember
+-- path used by Group.MainAssist/MainTank.
+local function assignedMemberSnapshot(member)
+    local result = { id = 0, name = '' }
+    if not member then return result end
+    pcall(function()
+        if not member() then return end
+        result.id = tonumber(member.ID and member.ID() or 0) or 0
+        if member.CleanName then result.name = tostring(member.CleanName() or '') end
+        if result.name == '' and member.Name then
+            result.name = tostring(member.Name() or '')
+        end
+        local spawn = member.Spawn
+        if spawn and spawn() then
+            if result.id <= 0 and spawn.ID then
+                result.id = tonumber(spawn.ID()) or 0
+            end
+            if result.name == '' and spawn.CleanName then
+                result.name = tostring(spawn.CleanName() or '')
+            end
+        end
+    end)
+    return result
+end
+
+local function raidMemberCount()
+    local count = 0
+    pcall(function()
+        count = tonumber(mq.TLO.Raid and mq.TLO.Raid.Members
+            and mq.TLO.Raid.Members() or 0) or 0
+    end)
+    return count
+end
+
+local _selectedAuthorityCache = nil
+local _selectedAuthorityRevision = nil
+local _selectedAuthorityCachedAtMs = 0
+
+-- Resolve exactly one fleet kill-intent publisher. Explicit SideKick assist
+-- settings win; the default group mode adopts Raid Assist 1 while raided,
+-- then Group Main Assist, then Group Main Tank. This prevents two Tank-mode
+-- characters from alternately overwriting the fleet's primary target.
+local function selectedAssistAuthority()
+    local Core = package.loaded['sidekick-next.utils.core']
+    local settings = Core and Core.Settings or {}
+    local revision = Core and Core.getRevision and Core.getRevision() or 0
+    local now = monotonicMs()
+    if _selectedAuthorityCache
+        and _selectedAuthorityRevision == revision
+        and (now - _selectedAuthorityCachedAtMs) < 500 then
+        return _selectedAuthorityCache
+    end
+    local mode = tostring(settings.AssistMode or 'group'):lower()
+    local selected
+
+    if mode == 'byname' then
+        selected = {
+            mode = mode,
+            source = 'configured_name',
+            id = 0,
+            name = tostring(settings.AssistName or ''),
+        }
+    else
+        local raidIndex = tonumber(mode:match('^raid([123])$'))
+        if raidIndex then
+            selected = assignedMemberSnapshot(
+            mq.TLO.Raid and mq.TLO.Raid.MainAssist
+                and mq.TLO.Raid.MainAssist(raidIndex) or nil)
+            selected.mode = mode
+            selected.source = 'raid_assist_' .. tostring(raidIndex)
+        elseif raidMemberCount() > 0 then
+            local raidAssist = assignedMemberSnapshot(
+                mq.TLO.Raid and mq.TLO.Raid.MainAssist
+                    and mq.TLO.Raid.MainAssist(1) or nil)
+            if raidAssist.name ~= '' then
+                selected = raidAssist
+                selected.mode = mode
+                selected.source = 'raid_assist_1'
+            end
+        end
+
+        if not selected then
+            local groupAssist = assignedMemberSnapshot(
+                mq.TLO.Group and mq.TLO.Group.MainAssist or nil)
+            if groupAssist.name ~= '' then
+                selected = groupAssist
+                selected.mode = mode
+                selected.source = 'group_main_assist'
+            end
+        end
+
+        if not selected then
+            selected = assignedMemberSnapshot(
+                mq.TLO.Group and mq.TLO.Group.MainTank or nil)
+            selected.mode = mode
+            selected.source = selected.name ~= ''
+                and 'group_main_tank' or 'none'
+        end
+    end
+
+    _selectedAuthorityCache = selected
+    _selectedAuthorityRevision = revision
+    _selectedAuthorityCachedAtMs = now
+    return selected
+end
+
+local function isEqAssignedTargetLeader(character, claimedId)
+    local selected = selectedAssistAuthority()
+    character = tostring(character or ''):lower()
+    if character == '' or tostring(selected.name or ''):lower() ~= character then
+        return false
+    end
+    claimedId = tonumber(claimedId) or 0
+    if selected.id > 0 then
+        return claimedId > 0 and selected.id == claimedId
+    end
+    -- Explicit by-name authority is bound to the authenticated Actor
+    -- transport character because it may be outside local spawn visibility.
+    return true
+end
+
+local currentTeamId
+
+local function eqAssignmentSnapshots()
+    local mainTank = { id = 0, name = '' }
+    local mainAssist = { id = 0, name = '' }
+    pcall(function()
+        mainTank = assignedMemberSnapshot(mq.TLO.Group.MainTank)
+    end)
+    pcall(function()
+        mainAssist = assignedMemberSnapshot(mq.TLO.Group.MainAssist)
+    end)
+    return mainTank, mainAssist
+end
+
+local function recordPrimaryTargetDiag(stage, reason, content, sender)
+    content = type(content) == 'table' and content or {}
+    sender = type(sender) == 'table' and sender or {}
+    local envelope = type(content.envelope) == 'table' and content.envelope or {}
+    reason = tostring(reason or 'unknown')
+    _primaryTargetDiag.stage = tostring(stage or 'unknown')
+    _primaryTargetDiag.reason = reason
+    _primaryTargetDiag.updatedAtMs = monotonicMs()
+    _primaryTargetDiag.senderCharacter = tostring(sender.character or '')
+    _primaryTargetDiag.senderServer = tostring(sender.server or '')
+    _primaryTargetDiag.senderScript = tostring(sender.script or '')
+    _primaryTargetDiag.senderMailbox = tostring(sender.mailbox or '')
+    _primaryTargetDiag.targetId = tonumber(content.targetId) or 0
+    _primaryTargetDiag.targetName = tostring(content.targetName or '')
+    _primaryTargetDiag.killAuthorized = content.killAuthorized == true
+    _primaryTargetDiag.claimedTankId = tonumber(content.tankId) or 0
+    _primaryTargetDiag.packetZone = tostring(content.zone or envelope.zone or '')
+    _primaryTargetDiag.localZone = safeZone()
+    _primaryTargetDiag.packetTeam = tostring(envelope.team or '')
+    _primaryTargetDiag.localTeam = currentTeamId()
+    _primaryTargetDiag.sessionId = tostring(envelope.session or content.sessionId or '')
+    _primaryTargetDiag.sequence = tonumber(envelope.sequence)
+        or tonumber(content.sequence) or 0
+    _primaryTargetDiag.mainTank, _primaryTargetDiag.mainAssist =
+        eqAssignmentSnapshots()
+    _primaryTargetDiag.selectedAuthority = selectedAssistAuthority()
+    _primaryTargetDiag.counts[reason] =
+        (_primaryTargetDiag.counts[reason] or 0) + 1
+end
+
 local function normalize_sender(sender)
     sender = sender or {}
+    local senderScript = lib.actorSenderEndpoint(sender)
     return {
         character = sender.character or sender.Character or '',
         server = sender.server or sender.Server or '',
         mailbox = sender.mailbox or sender.Mailbox or '',
-        script = sender.script or sender.Script or '',
+        script = senderScript or '',
         account = sender.account or sender.Account or '',
         name = sender.name or sender.Name or '',
         uuid = sender.uuid or sender.UUID or '',
@@ -336,7 +516,7 @@ local function endpointKey(sender)
     }, ':')
 end
 
-local function currentTeamId()
+currentTeamId = function()
     return _trustedTeamId
 end
 
@@ -348,8 +528,6 @@ end
 local function isCanonicalSidekickScript(script)
     script = tostring(script or ''):lower()
     if script == '' then return false end
-    local ok, lib = pcall(require, 'sidekick-next.sk_lib')
-    if not ok or not lib then return false end
     for _, candidate in ipairs(lib.Scripts.WORKERS or {}) do
         if script == tostring(candidate):lower() then return true end
     end
@@ -357,6 +535,17 @@ local function isCanonicalSidekickScript(script)
         if script == tostring(candidate):lower() then return true end
     end
     return false
+end
+
+-- Sender routes are normalized once from MQ's canonical fully-qualified
+-- mailbox. Reuse the parsed endpoint for worker-specific authorization instead
+-- of combining the normalized script with the still-qualified mailbox field.
+local function senderIsWorker(sender, moduleName)
+    local spec = lib.getWorkerSpec and lib.getWorkerSpec(moduleName) or nil
+    if not spec then return false end
+    local script, actor = lib.actorSenderEndpoint(sender)
+    return tostring(script or ''):lower() == tostring(spec.script or ''):lower()
+        and tostring(actor or ''):lower() == 'sidekick'
 end
 
 local function prepareEnvelope(payload, messageId, ttlMs)
@@ -428,8 +617,11 @@ local function senderInSameZone(content, sender)
 end
 
 local function recordTransportDrop(reason, counter)
+    reason = tostring(reason or 'unknown')
     _transportStats.dropped = _transportStats.dropped + 1
-    _transportStats.lastDropReason = tostring(reason or 'unknown')
+    _transportStats.lastDropReason = reason
+    _transportStats.byReason[reason] =
+        (_transportStats.byReason[reason] or 0) + 1
     if counter and _transportStats[counter] ~= nil then
         _transportStats[counter] = _transportStats[counter] + 1
     end
@@ -501,52 +693,66 @@ local function validateInbound(entry)
         recordTransportDrop('malformed_content', 'malformed')
         return nil
     end
+    local id = tostring(content.id or ''):lower()
+    local isPrimary = id == 'target:primary'
+    local function reject(reason, counter)
+        recordTransportDrop(reason, counter)
+        if isPrimary then
+            recordPrimaryTargetDiag('transport_rejected', reason, content, sender)
+        end
+        return nil
+    end
+    if isPrimary then
+        recordPrimaryTargetDiag('transport_received', 'packet_received', content, sender)
+    end
 
     local senderCharacter = tostring(sender.character or '')
     local senderServer = tostring(sender.server or '')
     local senderScript = tostring(sender.script or '')
     if senderCharacter == '' or senderServer == '' or senderScript == '' then
-        recordTransportDrop('incomplete_sender', 'identityRejected')
-        return nil
+        return reject('incomplete_sender', 'identityRejected')
     end
 
     local isLocal = senderCharacter:lower() == tostring(_selfName or ''):lower()
         and senderServer:lower() == tostring(_selfServer or ''):lower()
     if tostring(_selfServer or '') ~= ''
         and senderServer:lower() ~= tostring(_selfServer):lower() then
-        recordTransportDrop('server_mismatch', 'identityRejected')
-        return nil
+        return reject('server_mismatch', 'identityRejected')
     end
-    local id = tostring(content.id or ''):lower()
     local senderScriptLower = senderScript:lower()
     local sidekickSender = isCanonicalSidekickScript(senderScriptLower)
-    local senderMailboxLower = tostring(sender.mailbox or ''):lower()
-    local logicalMailbox = senderMailboxLower:match('([^:]+)$') or senderMailboxLower
-    if sidekickSender and logicalMailbox ~= 'sidekick' then
-        recordTransportDrop('untrusted_sender_mailbox', 'identityRejected')
-        return nil
+    if sidekickSender
+        and not lib.actorSenderMatches(sender, senderScript, 'sidekick') then
+        return reject('untrusted_sender_mailbox', 'identityRejected')
     end
     if not isLocal and not sidekickSender and not EXTERNAL_MESSAGE_IDS[id] then
-        recordTransportDrop('untrusted_sender_script', 'identityRejected')
-        return nil
+        return reject('untrusted_sender_script', 'identityRejected')
     end
     if not isLocal and (id:sub(1, 6) == 'lease:' or id:sub(1, 3) == 'sk:') then
-        recordTransportDrop('remote_control_rejected', 'controlRejected')
-        return nil
+        return reject('remote_control_rejected', 'controlRejected')
     end
+
+    -- Primary kill intent has a second, explicit trust path: an authenticated
+    -- Tank worker belonging to EQ's assigned Main Tank/Main Assist. Keep this
+    -- exception topic- and route-specific; all other peer state still requires
+    -- Actor-Team membership below.
+    local tankSpec = id == 'target:primary' and lib.getWorkerSpec
+        and lib.getWorkerSpec('tank') or nil
+    local assignedTankPrimary = not isLocal
+        and tankSpec ~= nil
+        and senderIsWorker(sender, 'tank')
+        and isEqAssignedTargetLeader(senderCharacter, content.tankId)
 
     -- Payload identity is never authoritative. Reject contradictory claims,
     -- then overwrite the compatibility fields with the transport identity so
     -- every downstream consumer sees the same trusted source.
     if content.from ~= nil and tostring(content.from) ~= ''
         and tostring(content.from):lower() ~= senderCharacter:lower() then
-        recordTransportDrop('payload_character_mismatch', 'identityRejected')
-        return nil
+        return reject('payload_character_mismatch', 'identityRejected')
     end
     if content.server ~= nil and tostring(content.server) ~= ''
         and tostring(content.server):lower() ~= senderServer:lower() then
-        recordTransportDrop('payload_server_mismatch', 'identityRejected')
-        return nil
+        return reject('payload_server_mismatch', 'identityRejected')
     end
     content.from = senderCharacter
     content.server = senderServer
@@ -560,60 +766,50 @@ local function validateInbound(entry)
             or DEFAULT_MESSAGE_TTL_MS, MAX_MESSAGE_TTL_MS))
         or DEFAULT_MESSAGE_TTL_MS
     if (nowMs - receivedAtMs) > queueTtlMs then
-        recordTransportDrop('expired_in_inbox', 'expired')
-        return nil
+        return reject('expired_in_inbox', 'expired')
     end
     if sidekickSender and not envelope then
-        recordTransportDrop('missing_sidekick_envelope', 'identityRejected')
-        return nil
+        return reject('missing_sidekick_envelope', 'identityRejected')
     end
-    if not isLocal and sidekickSender
+    if not isLocal and sidekickSender and not assignedTankPrimary
         and (localTeam == ''
             or not currentTeamMember(senderServer, senderCharacter)) then
-        recordTransportDrop('sender_not_in_trusted_team', 'identityRejected')
-        return nil
+        return reject('sender_not_in_trusted_team', 'identityRejected')
     end
     if envelope then
         if tonumber(envelope.version) ~= ACTOR_ENVELOPE_VERSION then
-            recordTransportDrop('envelope_version_mismatch')
-            return nil
+            return reject('envelope_version_mismatch')
         end
         local sessionId = tostring(envelope.session or '')
         local sequence = tonumber(envelope.sequence) or 0
         if sessionId == '' or sequence <= 0 then
-            recordTransportDrop('envelope_incomplete', 'malformed')
-            return nil
+            return reject('envelope_incomplete', 'malformed')
         end
         if content.teamId ~= nil and tostring(content.teamId) ~= ''
             and tostring(content.teamId) ~= tostring(envelope.team or '') then
-            recordTransportDrop('envelope_team_mismatch', 'identityRejected')
-            return nil
+            return reject('envelope_team_mismatch', 'identityRejected')
         end
         if content.zone ~= nil and tostring(content.zone) ~= ''
             and tostring(envelope.zone or '') ~= ''
             and tostring(content.zone):lower() ~= tostring(envelope.zone):lower() then
-            recordTransportDrop('envelope_zone_mismatch', 'identityRejected')
-            return nil
+            return reject('envelope_zone_mismatch', 'identityRejected')
         end
 
         local packetTeam = tostring(envelope.team or '')
-        if not isLocal and sidekickSender
+        if not isLocal and sidekickSender and not assignedTankPrimary
             and (localTeam == '' or packetTeam ~= localTeam) then
-            recordTransportDrop('team_mismatch', 'identityRejected')
-            return nil
+            return reject('team_mismatch', 'identityRejected')
         end
 
         local endpoint = endpointKey(sender)
         local tombstones = _retiredSessions[endpoint]
         if tombstones and (tombstones[sessionId] or 0) > nowMs then
-            recordTransportDrop('retired_session', 'staleSession')
-            return nil
+            return reject('retired_session', 'staleSession')
         end
         local previous = _peerSessions[endpoint]
         if previous and previous.sessionId == sessionId then
             if sequence <= (previous.sequence or 0) then
-                recordTransportDrop('duplicate_or_out_of_order', 'duplicate')
-                return nil
+                return reject('duplicate_or_out_of_order', 'duplicate')
             end
         elseif previous and previous.sessionId ~= '' then
             tombstoneSession(endpoint, previous.sessionId, nowMs)
@@ -627,6 +823,9 @@ local function validateInbound(entry)
     end
 
     _transportStats.received = _transportStats.received + 1
+    if isPrimary then
+        recordPrimaryTargetDiag('transport_accepted', 'transport_accepted', content, sender)
+    end
     return content, sender, isLocal
 end
 
@@ -748,8 +947,8 @@ function M.init(opts)
     for _, moduleName in ipairs(receiverModules) do
         pcall(require, moduleName)
     end
-    local _selfNameLower = tostring(_selfName or ''):lower()
-    local _selfServerLower = tostring(_selfServer or ''):lower()
+    _selfNameLower = tostring(_selfName or ''):lower()
+    _selfServerLower = tostring(_selfServer or ''):lower()
 
     local function sameLocalCharacter(name, server)
         name = tostring(name or ''):lower()
@@ -758,51 +957,24 @@ function M.init(opts)
         return _selfServerLower == '' or server == '' or server == _selfServerLower
     end
 
-    local function addAssignedName(names, spawn)
-        if not spawn then return end
-        local ok, exists = pcall(function() return spawn() end)
-        if not ok or not exists then return end
-        local name = ''
-        pcall(function()
-            if spawn.CleanName then name = spawn.CleanName() or '' end
-            if name == '' and spawn.Name then name = spawn.Name() or '' end
-        end)
-        name = tostring(name or ''):lower()
-        if name ~= '' then names[name] = true end
-    end
-
-    -- Primary target facts are trusted only from explicit EQ assignments, or
-    -- from the configured OOG assist when it is also in our Actor Team.
+    -- Primary target facts are trusted only from the single selected assist
+    -- authority. Being the receiver's local Tank worker is not sufficient:
+    -- that exception was what allowed a second Tank-mode character to replace
+    -- the raid assist's kill target.
     local function senderIsAuthorizedTargetLeader(content, sender)
         local senderName = tostring(sender and sender.character or ''):lower()
         if senderName == '' then return false end
-        if senderName == _selfNameLower
-            and tostring(sender and sender.server or ''):lower() == _selfServerLower then
+        if isEqAssignedTargetLeader(senderName, content and content.tankId) then
             return true
         end
-
-        local assigned = {}
-        pcall(function() addAssignedName(assigned, mq.TLO.Group.MainTank) end)
-        pcall(function() addAssignedName(assigned, mq.TLO.Group.MainAssist) end)
-        for index = 1, 3 do
-            pcall(function() addAssignedName(assigned, mq.TLO.Raid.MainAssist(index)) end)
-        end
-        if assigned[senderName] then return true end
-
-        local Core = package.loaded['sidekick-next.utils.core']
-        local assistName = tostring(Core and Core.Settings and Core.Settings.AssistName or ''):lower()
-        if assistName == '' or assistName ~= senderName then return false end
-        local localTeam = currentTeamId()
-        local envelope = type(content and content.envelope) == 'table' and content.envelope or {}
-        return localTeam ~= '' and tostring(envelope.team or '') == localTeam
+        local selected = selectedAssistAuthority()
+        return tostring(selected.name or '') == ''
+            and senderName == _selfNameLower
+            and tostring(sender and sender.server or ''):lower() == _selfServerLower
     end
 
     local function senderIsTankWorker(sender)
-        local ok, lib = pcall(require, 'sidekick-next.sk_lib')
-        local spec = ok and lib and lib.getWorkerSpec
-            and lib.getWorkerSpec('tank') or nil
-        return spec ~= nil
-            and tostring(sender and sender.script or '') == tostring(spec.script or '')
+        return senderIsWorker(sender, 'tank')
     end
 
     local function processActorMessage(content, sender)
@@ -863,14 +1035,8 @@ function M.init(opts)
                 }
                 if tostring(sender.uuid or '') ~= '' then address.uuid = sender.uuid end
                 if (tonumber(sender.pid) or 0) > 0 then address.pid = sender.pid end
-                local mailbox = tostring(sender.mailbox or '')
-                if mailbox:find('lua:', 1, true) == 1 then
-                    address.mailbox = mailbox
-                    address.absolute_mailbox = true
-                else
-                    address.mailbox = mailbox
-                    address.script = sender.script
-                end
+                address.mailbox = tostring(sender.mailbox or '')
+                address.absolute_mailbox = true
                 pcall(function() _dropbox:send(address, reply) end)
             end
             return
@@ -976,6 +1142,7 @@ function M.init(opts)
                 id = tonumber(content.characterId or content.spawnId or content.charId) or previous.id or 0,
                 currentHP = tonumber(content.currentHP) or previous.currentHP or 0,
                 maxHP = tonumber(content.maxHP) or previous.maxHP or 0,
+                inGame = update(content.inGame, previous.inGame),
                 dead = update(content.dead, previous.dead) == true,
                 hovering = update(content.hovering, previous.hovering) == true,
                 role = content.role or previous.role,
@@ -1126,13 +1293,37 @@ function M.init(opts)
         -- tank's own sibling workers (its sk_dps, sk_cc, ...) receive this
         -- via the fleet fan-out and need it too. Idempotent last-write-wins.
         if id == 'target:primary' then
-            if not senderIsTankWorker(sender) then return end
-            if not senderIsAuthorizedTargetLeader(content, sender) then return end
-            if not senderInSameZone(content, sender) then return end
-            if isStaleGuardedMessage(id, content, sender) then return end
+            if not senderIsTankWorker(sender) then
+                recordTransportDrop('target_primary_wrong_worker', 'identityRejected')
+                recordPrimaryTargetDiag(
+                    'topic_rejected', 'target_primary_wrong_worker', content, sender)
+                return
+            end
+            if not senderIsAuthorizedTargetLeader(content, sender) then
+                recordTransportDrop('target_primary_unauthorized_leader', 'identityRejected')
+                recordPrimaryTargetDiag(
+                    'topic_rejected', 'target_primary_unauthorized_leader', content, sender)
+                return
+            end
+            if not senderInSameZone(content, sender) then
+                recordTransportDrop('target_primary_zone_or_instance_mismatch')
+                recordPrimaryTargetDiag(
+                    'topic_rejected', 'target_primary_zone_or_instance_mismatch',
+                    content, sender)
+                return
+            end
+            if isStaleGuardedMessage(id, content, sender) then
+                recordTransportDrop('target_primary_stale_topic_sequence', 'duplicate')
+                recordPrimaryTargetDiag(
+                    'topic_rejected', 'target_primary_stale_topic_sequence',
+                    content, sender)
+                return
+            end
 
             _tankState.primaryTargetId = tonumber(content.targetId) or 0
             _tankState.primaryTargetName = tostring(content.targetName or '')
+            _tankState.killAuthorized = content.killAuthorized == true
+                and _tankState.primaryTargetId > 0
             local envelope = type(content.envelope) == 'table' and content.envelope or {}
             _tankState.primaryRevision = tonumber(envelope.sequence)
                 or tonumber(content.sequence) or 0
@@ -1142,6 +1333,7 @@ function M.init(opts)
             _tankState.tankId = senderId > 0 and senderId or _tankState.tankId
             _tankState.tankName = tostring(sender.character or '')
             _tankState.updatedAt = os.clock()
+            recordPrimaryTargetDiag('accepted', 'primary_state_updated', content, sender)
             return
         end
 
@@ -1345,6 +1537,9 @@ function M.init(opts)
                 key = ownerKey,
                 petId = petId,
                 petName = tostring(content.petName or ''),
+                -- Missing on older peers means "active" for fail-closed
+                -- compatibility: never keep attacking an ambiguous pet.
+                active = petId > 0 and content.active ~= false,
                 ownerName = owner,
                 ownerServer = ownerServer,
                 sessionId = tostring(envelope.session or ''),
@@ -1577,21 +1772,27 @@ function M.init(opts)
 
     _processActorMessage = processActorMessage
     local function enqueueActorMessage(message, expectedId)
-        local raw = message and message()
+        local okRaw, raw = pcall(function()
+            return message and message()
+        end)
+        if not okRaw then
+            recordTransportDrop('callback_read_failed', 'malformed')
+            return
+        end
         if type(raw) ~= 'table' then
-            _transportStats.malformed = _transportStats.malformed + 1
+            recordTransportDrop('callback_malformed', 'malformed')
             return
         end
         local id = tostring(raw.id or ''):lower()
         if expectedId and id ~= expectedId then
-            _transportStats.malformed = _transportStats.malformed + 1
+            recordTransportDrop('callback_unexpected_message_id', 'malformed')
             return
         end
         local sender = normalize_sender(message.sender)
         if tostring(sender.character or '') == ''
             or tostring(sender.server or '') == ''
             or tostring(sender.script or '') == '' then
-            _transportStats.identityRejected = _transportStats.identityRejected + 1
+            recordTransportDrop('callback_incomplete_sender', 'identityRejected')
             return
         end
         local senderCharacter = tostring(sender.character or ''):lower()
@@ -1599,13 +1800,12 @@ function M.init(opts)
         local isLocal = senderCharacter ~= '' and senderServer ~= ''
             and senderCharacter == _selfNameLower and senderServer == _selfServerLower
         if not isLocal and (id:sub(1, 6) == 'lease:' or id:sub(1, 3) == 'sk:') then
-            _transportStats.controlRejected = _transportStats.controlRejected + 1
+            recordTransportDrop('callback_remote_control', 'controlRejected')
             return
         end
         local content, copyErr = boundedCopy(raw)
         if not content then
-            _transportStats.malformed = _transportStats.malformed + 1
-            _transportStats.lastDropReason = tostring(copyErr or 'copy_failed')
+            recordTransportDrop(tostring(copyErr or 'copy_failed'), 'malformed')
             return
         end
         local envelope = type(content.envelope) == 'table' and content.envelope or {}
@@ -1617,12 +1817,12 @@ function M.init(opts)
                 tostring(envelope.sequence),
             }, '|')
             if _pendingActorKeys[pendingKey] then
-                _transportStats.duplicate = _transportStats.duplicate + 1
+                recordTransportDrop('callback_duplicate', 'duplicate')
                 return
             end
         end
         if #_pendingActorMessages >= MAX_PENDING_MESSAGES then
-            _transportStats.queueOverflow = _transportStats.queueOverflow + 1
+            recordTransportDrop('callback_queue_overflow', 'queueOverflow')
             return
         end
         if pendingKey then _pendingActorKeys[pendingKey] = true end
@@ -1651,6 +1851,10 @@ function M.init(opts)
 end
 
 function M.getDebugState()
+    local primaryDiag = {}
+    for key, value in pairs(_primaryTargetDiag) do primaryDiag[key] = value end
+    primaryDiag.ageMs = _primaryTargetDiag.updatedAtMs > 0
+        and math.max(0, monotonicMs() - _primaryTargetDiag.updatedAtMs) or nil
     return {
         actors_loaded = _actors ~= nil,
         dropbox_ready = _dropbox ~= nil,
@@ -1662,6 +1866,7 @@ function M.getDebugState()
         last_gt_msg_at = _lastGroupTargetMsgAt or 0,
         last_gt_msg_id = _lastGroupTargetMsgId or '',
         last_bounds_req_at = _lastBoundsReqAt or 0,
+        primaryTarget = primaryDiag,
         transport = {
             received = _transportStats.received,
             dropped = _transportStats.dropped,
@@ -1673,6 +1878,7 @@ function M.getDebugState()
             staleSession = _transportStats.staleSession,
             controlRejected = _transportStats.controlRejected,
             lastDropReason = _transportStats.lastDropReason,
+            byReason = _transportStats.byReason,
             pending = #_pendingActorMessages,
         },
     }
@@ -1710,19 +1916,31 @@ function M.tick(opts)
     -- main coroutine, where receiver code may safely perform normal work.
     if _processActorMessage and #_pendingActorMessages > 0 then
         local pending = _pendingActorMessages
-        _pendingActorMessages = {}
-        for _, entry in ipairs(pending) do
-            if entry.pendingKey then _pendingActorKeys[entry.pendingKey] = nil end
-            local content, sender = validateInbound(entry)
-            local isLocal = sender
-                and tostring(sender.character or ''):lower()
-                    == tostring(_selfName or ''):lower()
-                and tostring(sender.server or ''):lower()
-                    == tostring(_selfServer or ''):lower()
-            if content and (opts.localOnly ~= true or isLocal) then
-                pcall(_processActorMessage, content, sender)
+        local remaining = {}
+        local maxDrain = math.max(1,
+            tonumber(CoordinationPolicy.MESSAGE_QUEUE.MAX_PER_DRAIN) or 64)
+        for index, entry in ipairs(pending) do
+            if index <= maxDrain then
+                if entry.pendingKey then _pendingActorKeys[entry.pendingKey] = nil end
+                local content, sender = validateInbound(entry)
+                local isLocal = sender
+                    and tostring(sender.character or ''):lower()
+                        == tostring(_selfName or ''):lower()
+                    and tostring(sender.server or ''):lower()
+                        == tostring(_selfServer or ''):lower()
+                if content and (opts.localOnly ~= true or isLocal) then
+                    -- Preserve validated transport provenance for consumers
+                    -- that need exact worker-route checks.
+                    content._skActorSenderScript = tostring(sender.script or '')
+                    content._skActorSenderServer = tostring(sender.server or '')
+                    content._skActorReceivedAt = os.clock()
+                    pcall(_processActorMessage, content, sender)
+                end
+            else
+                remaining[#remaining + 1] = entry
             end
         end
+        _pendingActorMessages = remaining
     end
 
     -- Keep same-character command/status transport alive when peer Actors are
@@ -1757,24 +1975,32 @@ function M.tick(opts)
     end
 
     -- Status broadcast — rate limited + dedup (skip if nothing meaningful changed)
-    if opts.status and (now - _lastStatusSendAt) >= 0.2 then
+    local statusElapsed = now - _lastStatusSendAt
+    local statusMinInterval = opts.peerOnly and not opts.healthResponsive and 2.0 or 0.2
+    if opts.status and statusElapsed >= statusMinInterval then
         local prev = _lastStatusPayload
-        local changed = not prev
-            or (opts.status.hp or 0) ~= (prev.hp or 0)
-            or (opts.status.currentHP or 0) ~= (prev.currentHP or 0)
-            or (opts.status.maxHP or 0) ~= (prev.maxHP or 0)
-            or (opts.status.mana or 0) ~= (prev.mana or 0)
-            or (opts.status.endur or 0) ~= (prev.endur or 0)
-            or (opts.status.dead == true) ~= (prev.dead == true)
-            or (opts.status.hovering == true) ~= (prev.hovering == true)
-            or (opts.status.characterId or 0) ~= (prev.characterId or 0)
-            or (opts.status.zone or '') ~= (prev.zone or '')
-            or (opts.status.targetId or 0) ~= (prev.targetId or 0)
-            or (opts.status.combat) ~= (prev.combat)
-            or (opts.status.casting or '') ~= (prev.casting or '')
-            or (opts.status.automationPaused == true) ~= (prev.automationPaused == true)
-            or (opts.status.chase == true) ~= (prev.chase == true)
-            or (now - _lastStatusSendAt) >= 2.0  -- Force send every 2s as heartbeat
+        local changed
+        if opts.peerOnly and not opts.healthResponsive then
+            changed = not prev or statusElapsed >= 2.0
+        else
+            changed = not prev
+                or (opts.status.hp or 0) ~= (prev.hp or 0)
+                or (opts.status.currentHP or 0) ~= (prev.currentHP or 0)
+                or (opts.status.maxHP or 0) ~= (prev.maxHP or 0)
+                or (opts.status.mana or 0) ~= (prev.mana or 0)
+                or (opts.status.endur or 0) ~= (prev.endur or 0)
+                or (opts.status.inGame == true) ~= (prev.inGame == true)
+                or (opts.status.dead == true) ~= (prev.dead == true)
+                or (opts.status.hovering == true) ~= (prev.hovering == true)
+                or (opts.status.characterId or 0) ~= (prev.characterId or 0)
+                or (opts.status.zone or '') ~= (prev.zone or '')
+                or (opts.status.targetId or 0) ~= (prev.targetId or 0)
+                or (opts.status.combat) ~= (prev.combat)
+                or (opts.status.casting or '') ~= (prev.casting or '')
+                or (opts.status.automationPaused == true) ~= (prev.automationPaused == true)
+                or (opts.status.chase == true) ~= (prev.chase == true)
+                or statusElapsed >= 2.0
+        end
         if changed then
             _lastStatusSendAt = now
             _lastStatusPayload = boundedCopy(opts.status) or opts.status
@@ -1796,22 +2022,113 @@ function M.tick(opts)
 end
 
 function M.getRemoteCharacters()
-    -- Prune stale entries (not seen in 10 seconds)
+    -- Keep previously-observed peer identity long enough that a crashed sender
+    -- cannot become "unknown" and therefore fail open while one of its short
+    -- distributed claims is still being considered. Only fresh status rows are
+    -- returned to legacy UI consumers.
     local now = os.clock()
-    for key, data in pairs(_remoteCharacters) do
-        if (now - (data.lastSeen or 0)) > 10 then
-            _remoteCharacters[key] = nil
-        end
-    end
-    -- Preserve the legacy character-name view for existing consumers while
-    -- retaining collision-safe server:character keys internally.
     local view = {}
     for key, data in pairs(_remoteCharacters) do
-        local name = tostring(data.character or '')
-        if name == '' or view[name] ~= nil then name = key end
-        view[name] = data
+        local age = now - (data.lastSeen or 0)
+        if age > CoordinationPolicy.PEER_ACTIVITY_RETENTION_SECONDS then
+            _remoteCharacters[key] = nil
+        elseif age <= CoordinationPolicy.REMOTE_STATUS_RETENTION_SECONDS then
+            local name = tostring(data.character or '')
+            if name == '' or view[name] ~= nil then name = key end
+            view[name] = data
+        end
     end
     return view
+end
+
+--- Describe whether a previously observed trusted SideKick peer is still
+--- advancing. Unknown peers fail open for first-contact coordination; once a
+--- peer is observed, stale/unavailable/team/zone mismatches fail closed until
+--- the bounded activity-retention window expires.
+function M.getPeerLiveness(character, expectedZone, expectedServer)
+    local wantedName = tostring(character or ''):lower()
+    local wantedServer = tostring(expectedServer or ''):lower()
+    if wantedName == '' then
+        return { known = false, fresh = true, reason = 'identity_unknown' }
+    end
+    if wantedName == _selfNameLower
+        and (wantedServer == '' or wantedServer == _selfServerLower) then
+        return {
+            known = true,
+            fresh = true,
+            ageMs = 0,
+            reason = 'self',
+            name = _selfName,
+            server = _selfServer,
+            zone = safeZone(),
+        }
+    end
+
+    local peer = nil
+    if wantedServer ~= '' then
+        peer = _remoteCharacters[peerKey(wantedServer, wantedName)]
+    else
+        for _, candidate in pairs(_remoteCharacters) do
+            if tostring(candidate.character or ''):lower() == wantedName then
+                if peer then
+                    return {
+                        known = false,
+                        fresh = false,
+                        reason = 'server_ambiguous',
+                        name = character,
+                    }
+                end
+                peer = candidate
+            end
+        end
+    end
+    if not peer then
+        return {
+            known = false,
+            fresh = true,
+            reason = 'not_observed',
+            name = character,
+        }
+    end
+
+    local ageSeconds = math.max(0, os.clock() - (tonumber(peer.lastSeen) or 0))
+    local peerServer = tostring(peer.server or '')
+    local peerZone = tostring(peer.zone or '')
+    local wantedZone = tostring(expectedZone or '')
+    local fresh, reason = true, 'fresh'
+    if not currentTeamMember(peerServer, peer.character) then
+        fresh, reason = false, 'team_untrusted'
+    elseif wantedServer ~= '' and peerServer:lower() ~= wantedServer then
+        fresh, reason = false, 'server_mismatch'
+    elseif wantedZone ~= '' and peerZone == '' then
+        fresh, reason = false, 'zone_unknown'
+    elseif wantedZone ~= '' and peerZone:lower() ~= wantedZone:lower() then
+        fresh, reason = false, 'zone_mismatch'
+    elseif peer.inGame == false then
+        fresh, reason = false, 'peer_unavailable'
+    elseif peer.dead == true or peer.hovering == true then
+        fresh, reason = false, 'peer_dead'
+    elseif ageSeconds > CoordinationPolicy.PEER_STALE_SECONDS then
+        fresh, reason = false, 'heartbeat_stale'
+    end
+
+    return {
+        known = true,
+        fresh = fresh,
+        ageMs = math.floor(ageSeconds * 1000),
+        reason = reason,
+        name = tostring(peer.character or character or ''),
+        server = peerServer,
+        zone = peerZone,
+        inGame = peer.inGame,
+        dead = peer.dead == true,
+        hovering = peer.hovering == true,
+    }
+end
+
+function M.isPeerLeaseFresh(character, expectedZone, expectedServer)
+    local info = M.getPeerLiveness(character, expectedZone, expectedServer)
+    return info.fresh ~= false, info
 end
 
 --- Return the number of live SideKick status peers currently known to this UI.
@@ -2063,20 +2380,33 @@ function M.broadcastFleet(msgId, payload)
         payload.sessionId = payload.envelope.session
         payload.sequence = payload.envelope.sequence
     end
+    local sendSummary = {
+        attempts = 0,
+        failures = 0,
+        lastError = '',
+        sequence = tonumber(payload.envelope and payload.envelope.sequence) or 0,
+    }
     for _, script in ipairs(fleetScripts()) do
-        pcall(function()
-            _dropbox:send({
+        sendSummary.attempts = sendSummary.attempts + 1
+        local ok, result = pcall(function()
+            return _dropbox:send({
                 mailbox = 'sidekick',
                 script = script,
                 server = _selfServer,
             }, payload)
         end)
+        if not ok or result == false
+            or (type(result) == 'number' and result < 0) then
+            sendSummary.failures = sendSummary.failures + 1
+            sendSummary.lastError = tostring(ok and result or result)
+        end
     end
     local cat = CLAIM_CATEGORIES[msgId]
     if cat then
         local L = ledger()
         if L then L.record(payload.from, cat) end
     end
+    return sendSummary
 end
 
 --- Send to a logical mailbox owned by a specific Lua script. Omitting a
@@ -2130,9 +2460,9 @@ function M.sendToCharacter(scriptName, character, server, msgId, payload)
     end)
 end
 
---- Broadcast the primary kill target to assisters
+--- Broadcast the tank's declared primary and whether offense is authorized.
 -- Includes zone information so receivers can filter by same zone
-function M.broadcastTargetPrimary(targetId, targetName)
+function M.broadcastTargetPrimary(targetId, targetName, killAuthorized)
     if not _dropbox then return end
     local me = mq.TLO.Me
     local tankId = (me and me() and me.ID and me.ID()) or nil
@@ -2141,13 +2471,27 @@ function M.broadcastTargetPrimary(targetId, targetName)
     -- Fleet fan-out: mezzers (sk_cc/sk_disciplines), assisters, and charm
     -- upkeep all live in OTHER scripts; a plain mailbox send would only reach
     -- other characters' sk_tank.
-    M.broadcastFleet('target:primary', {
+    local content = {
         targetId = tonumber(targetId) or 0,
         targetName = tostring(targetName or ''),
+        killAuthorized = killAuthorized == true
+            and (tonumber(targetId) or 0) > 0,
         tankId = tankId,
         tankName = _selfName,
         zone = _selfZone,
-    })
+    }
+    local result = M.broadcastFleet('target:primary', content)
+    _primaryTargetDiag.lastSend = {
+        atMs = monotonicMs(),
+        attempts = tonumber(result and result.attempts) or 0,
+        failures = tonumber(result and result.failures) or 0,
+        lastError = tostring(result and result.lastError or ''),
+        sequence = tonumber(result and result.sequence) or 0,
+        targetId = tonumber(targetId) or 0,
+        killAuthorized = killAuthorized == true,
+        tankId = tonumber(tankId) or 0,
+    }
+    return result
 end
 
 --- Broadcast that tank is repositioning (assisters enter soft-pause)
@@ -2192,9 +2536,17 @@ end
 
 --- Get the current tank state (for assisters to read)
 function M.getTankState()
-    if _tankState.updatedAt > 0 and (os.clock() - _tankState.updatedAt) > 5 then
+    local selected = selectedAssistAuthority()
+    local selectedName = tostring(selected.name or ''):lower()
+    local stateName = tostring(_tankState.tankName or ''):lower()
+    local authorityChanged = _tankState.updatedAt > 0
+        and selectedName ~= ''
+        and stateName ~= selectedName
+    if _tankState.updatedAt > 0
+        and ((os.clock() - _tankState.updatedAt) > 5 or authorityChanged) then
         _tankState.primaryTargetId = nil
         _tankState.primaryTargetName = nil
+        _tankState.killAuthorized = false
         _tankState.primaryRevision = nil
         _tankState.currentTargetId = nil
         _tankState.tankId = nil
@@ -2202,6 +2554,32 @@ function M.getTankState()
         _tankState.updatedAt = 0
     end
     return _tankState
+end
+
+--- Return the Tank's current positive kill authorization.
+--- A fresh zero is a deliberate hold, and stale/absent state is not
+--- authorization. Callers still validate the spawn immediately before use.
+--- @param maxAgeSec number|nil Maximum publication age (default 5 seconds)
+--- @return number|nil targetId
+--- @return table|nil state
+--- @return string reason
+function M.getPrimaryKillAuthorization(maxAgeSec)
+    local state = M.getTankState()
+    local updatedAt = tonumber(state and state.updatedAt) or 0
+    local maxAge = math.max(0.1, tonumber(maxAgeSec) or 5)
+    if updatedAt <= 0 then return nil, state, 'primary_absent' end
+    if (os.clock() - updatedAt) > maxAge then
+        return nil, state, 'primary_stale'
+    end
+    local id = tonumber(state.primaryTargetId) or 0
+    if id <= 0 then return nil, state, 'primary_hold' end
+    if M.isCharmPet(id) then
+        return nil, state, 'primary_charm_protected'
+    end
+    if state.killAuthorized ~= true then
+        return nil, state, 'primary_not_engaged'
+    end
+    return id, state, 'authorized'
 end
 
 --- Get the tank's live camp anchor if one has been broadcast recently, else
@@ -2264,6 +2642,7 @@ function M.getCharmState()
     return newest or {
         petId = 0,
         petName = '',
+        active = false,
         ownerName = '',
         ownerServer = '',
         updatedAt = 0,
@@ -2274,6 +2653,25 @@ end
 function M.getCharmStates()
     M.getCharmState()
     return _charmStates
+end
+
+--- True only while the protected spawn is currently in its owner's pet slot.
+--- A protected but inactive ID is a just-broken pet under recharm recovery.
+function M.isActiveCharmPet(id)
+    id = tonumber(id) or 0
+    if id <= 0 then return false end
+    local now = os.clock()
+    for key, state in pairs(_charmStates) do
+        if (now - (state.updatedAt or 0)) >= 30 then
+            _charmStates[key] = nil
+        elseif (tonumber(state.petId) or 0) == id and state.active == true then
+            -- Do not return on an inactive match. During a session handoff an
+            -- older owner record can briefly overlap the current publication;
+            -- any active match must keep this spawn fully protected.
+            return true
+        end
+    end
+    return false
 end
 
 --- True if this spawn ID is a group charm pet (or a just-broken one still

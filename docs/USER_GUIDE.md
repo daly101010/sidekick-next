@@ -106,11 +106,16 @@ The primary ability bar showing your class's AAs, disciplines, and spells as ico
 
 ### Special Bar
 
-Class-specific special abilities displayed separately from the main bar. Berserker disciplines, tank defensives, etc. Supports single-row, single-column, or grid layouts.
+Class-specific special abilities displayed separately from the main bar.
+Berserker disciplines, tank defensives, and other manual activations are queued
+through the action worker and wait for the one local lease. Supports single-row,
+single-column, or grid layouts.
 
 ### Disc Bar
 
-Discipline-specific bar for melee/tank classes. Shows active and available disciplines with cooldown tracking.
+Discipline-specific bar for melee/tank classes. Shows active and available
+disciplines with cooldown tracking. Clicks use the same leased manual-action
+queue as the other ability bars.
 
 ### Item Bar
 
@@ -122,14 +127,19 @@ targeting, or item use.
 
 ### Skill Bar
 
-Learned combat skills displayed as buttons with readiness and cooldown state. Configure visibility and layout under Options > Buttons > Skills.
+Learned combat skills displayed as buttons with readiness and cooldown state.
+Clicks are queued through the leased action worker. Configure visibility and
+layout under Options > Buttons > Skills.
 
 ### Settings Window
 
-The SideKick Options window contains top-level Buttons, Options, Spell Set,
-Healing or Resurrection, Items, and Buffs surfaces. The nested Options surface
-contains modular UI, Automation, Resurrection, Integration, Animations,
-Humanize, Pull, Remote, Logging, and diagnostic tabs.
+The SideKick Options window uses the SideKick-Next chapter rail to group the
+existing modular settings under Combat, Support, Pulling, Interface, System,
+Presence, and Diagnostics. This is a visual shell only: the mounted settings
+modules, registry keys, validation, and per-module INI persistence remain the
+same. If the redesign cannot load, SideKick falls back to the legacy tab shell.
+Top-level Spell Set, Healing or Resurrection, Items, and Buffs surfaces remain
+available where applicable.
 
 The Logging tab controls the general logger for the UI host, coordinator, and
 every coordinated worker. Level, file output, and the optional text filter are
@@ -197,7 +207,9 @@ without changing game state, then requests the same single action lease used by
 every other worker before movement starts. Each movement slice is bounded to
 15 seconds. On completion, cancellation, or preemption it stops Nav, MoveTo,
 follow/stick, and held movement keys before releasing the lease. Chase is not a
-general utility module and it never runs from the UI render loop.
+general utility module and it never runs from the UI render loop. If SideKick
+restarts with a chase-owned movement marker still present, cleanup obtains a
+fenced recovery lease even when Chase is disabled or automation is paused.
 
 **Combat Mode Section**
 
@@ -216,6 +228,15 @@ not a second persisted gate.
 | Engage HP | 97% | Target HP% to start attacking when using the HP condition |
 | Assist Range | 100 | Maximum fallback assist range |
 
+**Ranged Standoff** is available to pure casters and Rangers and does not
+require Combat Mode `assist`. Enabling it alone wakes only the coordinated
+caster targeting/movement path; it does not enable `/attack`, `/stick`, or
+fallback melee assisting. A fresh coordinated Tank primary gives Assist one
+movement lease to establish the configured retreat distance before DPS
+casting. It retreats again only when the mob crosses the minimum distance; it
+never moves inward toward a distant mob. Chase or another movement backend is
+stopped only after this movement action owns the Combat lease.
+
 **Tank Settings** (shown when Combat Mode is `tank`)
 
 | Setting | Default | Purpose |
@@ -227,11 +248,43 @@ not a second persisted gate.
 | Moveback Positioning | off | Use tank-facing moveback stick positioning to keep mobs in front |
 | Position Refresh | 5s | Refresh cadence for moveback positioning |
 | Taunt Chase Range | 60 | Maximum distance for a bounded loose-mob Taunt recovery run |
+| Hand Off Fleeing Mobs | on | Keep DPS on a fleeing low-HP primary while Tank opens another add |
+| Handoff Below HP | 20% | Maximum primary HP for a runner handoff |
+| Minimum Recede Speed | 2.25 units/s | Required outward movement rate before the primary counts as fleeing |
+| Minimum Haters | 2 | Eligible haters required, including the runner |
+| Handoff Window | 15s | Maximum time Tank works the next add before returning to a surviving runner |
 
 The tank keeps its primary kill target stable for assisters. A loose mob is a
 separate temporary recovery target: the tank may switch to it, approach within
 Taunt range, use Taunt or a hate tool, and then restore the primary target.
 Mezzed mobs are never selected or hit with automatic AE hate abilities.
+Configure XTarget slot 1 as **Auto Hater**. A populated slot 1 wakes Tank's
+full discovery scan; when it clears, SideKick prevents new tank combat actions
+and the costly scan sleeps. Range, mez, charm protection, and target choice are
+evaluated by the full scan rather than the cheap slot-1 wake-up check.
+A fresh Tank primary declaration independently wakes Combat on DPS clients, so
+they do not need local aggro before they can engage. A charmed mob remains
+protected by its published spawn ID across
+charm breaks. Tank may damageless-Taunt it while broken, but immediately
+disengages and clears it when recharm succeeds; it is never declared as the
+group kill target. A non-tank may target its own charm pet normally without
+waking the supervised Tank worker.
+
+CC does not mez when its heavy XTarget snapshot contains only one live hater;
+that mob is left for the group to kill. Charm acquisition is evaluated first
+and may still deliberately charm a valid lone mob.
+
+Runner handoff never leaves a named primary. For ordinary mobs, Tank first
+chooses an unmezzed alternative. If none exists and **Break Mez When Camp
+Clear** is enabled, it may open one mezzed add early while the published kill
+target and group DPS remain on the runner. Tank keeps its own action lease for
+the full handoff window while it approaches, attacks, and sticks to the private
+working add. This prevents the Tank character's local Combat worker from
+retargeting the runner while movement still belongs to Tank; DPS on the other
+characters is unaffected. When the runner dies, the window expires, the
+working add disappears, or the action is cancelled/preempted, Tank stops only
+the Stick still bound to that working add, restores the published primary, and
+releases the lease.
 
 **Meditation Section**
 | Setting | Default | Purpose |
@@ -293,9 +346,11 @@ back to the best learned spell and may memorize it on demand. SideKick never
 auto-memorizes or starts corpse navigation during combat.
 
 Before entering Actor election or requesting the local action lease, the worker
-checks the corpse against the selected spell/item/AA range. An out-of-range
-corpse is ignored unless OOC navigation is enabled and the corpse is within the
-configured navigation limit.
+checks every eligible corpse against the selected spell/item/AA range. A corpse
+already in casting range is preferred over one that requires navigation, and an
+out-of-range corpse does not prevent the worker from trying another nearby
+corpse. Navigation is considered only when no direct-range candidate exists,
+OOC navigation is enabled, and the corpse is within the configured limit.
 
 The worker prefers group-member corpses, then checks fresh peers from the current
 Actor Team for an exact PC corpse visible in the rezzer's zone. That corpse is
@@ -309,7 +364,10 @@ disconnected primary rezzer automatically yields to the next eligible character.
 
 Configure out-of-combat buff automation and each spell's condition and target.
 Pet-only buffs are controlled by their spell profiles; there is no global
-pet-buff switch. Cross-character Actor claims prevent duplicate peer work;
+pet-buff switch. Use `Buff Target is Pet` as a condition, or select `Pets` as
+the target override, to evaluate the caster's pet and each visible group
+member's pet without adding pets to ordinary player buff rotations.
+Cross-character Actor claims prevent duplicate peer work;
 those messages are separate from the coordinator's one local action lease.
 
 ### Spell Sets and Manual Memorization
@@ -380,6 +438,8 @@ Coordinated mode uses explicit feature settings: Assist, Chase, Healing, Cures,
 Buffing, Mezzing, Resurrection, Pull, and the relevant spell/AA/disc toggles.
 The Pause button, `/sk pause`, and `/sk resume` control the global
 `AutomationPaused` setting and apply to every coordinated worker.
+Pause is session-scoped: launching SideKick starts resumed even when the
+previous session shut down while paused.
 
 `AutomationLevel` (`manual`/`hybrid`/`auto`) is read by the coordinated
 workers to gate cast vs. movement actions. Its historical UI presence is
@@ -397,10 +457,21 @@ Pull was mechanically migrated to the lease lifecycle but was not redesigned.
 Its candidate selection, election, pathing, state-machine strategy, and tuning
 remain intentionally deferred while the core coordination path is stabilized.
 
-Idle Humanize fidgets also run under a supervised worker in coordinated mode.
-They remain disabled by the Humanize/fidget toggles and are suppressed while
-combat, navigation, casting, group combat, nearby mez, or chat input makes a
-synthetic keypress unsafe.
+Monk and Necromancer feign is treated as a protected state. While either class
+is feigning, all ordinary workers withdraw or finish their work. A dedicated
+worker evaluates HP and living group support, requests the same single action
+lease, rechecks the decision, and only then stands. A survival feign remains
+down below the emergency HP threshold, when a known group wipe is detected, or
+when combat continues without living configured tank/healer support.
+
+Automatic acceptance of an incoming resurrection also uses the coordinator.
+The Resurrection worker detects the offer on every class, requests the single
+lease, revalidates the dialog and setting, and then clicks Yes. The UI process
+does not accept the offer directly.
+
+Idle Humanize fidgets are disabled in this build. The source and tuning values
+remain for later work, but no Fidget worker is supervised and no idle input is
+emitted.
 
 ## Class-Specific Features
 
@@ -458,8 +529,15 @@ worker. The DPS worker does not also execute debuff entries.
 
 - **Spell Rotation**: Cycle through configured spells by priority
 - **Resist Type Preference**: Target specific resist types
+- **DPS Intelligence**: Gate nukes, DoTs, and rains using time-to-die, payoff, overkill, resist, and mez-footprint evidence
+- **Rotation Fairness**: Rotate equally prioritized spells instead of permanently favoring the first slot
 - **Escape Range**: Back away from mobs when too close
 - **Interrupt on Emergency**: Stop casting if self-HP drops critically low
+
+The Diagnostics > DPS Intelligence page shows the authoritative target,
+candidate-by-candidate rotation decisions, TTD/remaining-HP estimates, resist
+evidence, and the effective gating settings. This intelligence remains inside
+the DPS worker; it does not change coordinator priority or bypass the lease.
 
 ## Multi-Box Coordination
 
@@ -478,7 +556,7 @@ lease and cannot authorize gameplay on their own.
 | Debuff claims | Prevents duplicate slows/tashs/malos |
 | Mez claims | Prevents double-mezzing |
 | Target updates | Shares current target for assist chains |
-| Tank broadcasts | Tank announces primary target to all assisters |
+| Assist authority | One selected tank/assist announces the kill target; secondary tanks may peel without redirecting DPS |
 | Window bounds | Share window positions for UI anchoring |
 | Team presence | Share coordinator state, active lease holder/phase, role, and module readiness |
 
@@ -486,6 +564,10 @@ The generic Actors peer count and Actor Team peer count are different. Generic
 peers are every live SideKick status sender visible through Actors. Actor Team
 peers share the same trusted raid, group, or manual team identity and are the
 only OOG peers eligible for automated resurrection.
+
+If Coordinator diagnostics has not received a state snapshot, it shows the
+coordinator Lua process status, received packet count, and last route/protocol
+rejection instead of only displaying a waiting message.
 
 ### Setup
 
@@ -541,6 +623,7 @@ SideKick checks targets against raid members and actor peers before engaging, pr
 | `/skchaseon` | Enable chase (broadcastable with `/dgge`) |
 | `/skchaseoff` | Disable chase (broadcastable with `/dgge`) |
 | `/skassistme` | Broadcast assist request |
+| `/sk_next_set_raid_assist <name>` | Select a named assist for the current raid (normally invoked by GroupTarget's **MA** button); leaving the raid restores Group Main Assist |
 | `/skactors` | Toggle actors debug window |
 | `/sk_assist status\|stop` | Inspect the coordinated melee-assist target, lease owner, fixed tier, and last decision |
 | `/sk_tank status\|stop` | Inspect the tank primary target, pending action, coordinator lease, hater/deficit counts, and last action |
@@ -584,12 +667,12 @@ graph TB
     SUP --> UI["SideKick.lua<br/>UI, input, settings, status"]
     SUP --> COORD["sk_coordinator.lua<br/>one action-blind local lease"]
     SUP --> REG["sk_lib.lua<br/>fixed worker registry"]
-    REG --> WORKERS["Supervised workers<br/>Emergency through Ambient"]
+    REG --> WORKERS["Ten supervised domain workers"]
     WORKERS --> BASE["sk_module_base.lua<br/>lease lifecycle and exact ownership"]
     BASE <-->|"request / state / renew / release"| COORD
 
-    WORKERS --> COMBAT["Combat domains<br/>heal, cure, rez, tank, CC,<br/>debuff, assist, DPS"]
-    WORKERS --> OOC["OOC and utility domains<br/>pull, chase, buffs, meditation,<br/>items, resources, scribing, fidget"]
+    WORKERS --> COMBAT["Combat domains<br/>Support, Tank, Combat"]
+    WORKERS --> OOC["OOC and utility domains<br/>Pull, Chase, Maintenance,<br/>Items, Meditation, Scribing"]
     COMBAT --> HELPERS["Read-only selectors<br/>and bounded executors"]
     OOC --> HELPERS
 
@@ -617,7 +700,7 @@ flowchart TD
     INIT["init.lua + supervisor"]
     COORD["sk_coordinator.lua<br/>(single local lease)"]
     UI["SideKick.lua<br/>(UI, settings, telemetry)"]
-    WORKERS["Registry workers<br/>(emergency, healing, cures, rez, tank, CC,<br/>debuff, pull, assist, chase, resources, disciplines,<br/>items, DPS, buffs, meditation, scribing, fidget)"]
+    WORKERS["Registry workers<br/>(Emergency, Support, Tank, Combat, Pull,<br/>Chase, Maintenance, Items, Meditation, Scribing)"]
 
     USER --> INIT
     USER2 --> USER
@@ -649,26 +732,29 @@ in the same tier are ordered by the registry rather than arrival timing.
 
 After a lease is granted, the unified action executor shows supported actions
 moving through queued, dispatching, cast-start, running, and terminal phases.
-These phases appear in Coordinator > Module Status. Hover the Action cell to
-see the terminal reason and elapsed time. Incapacitation, stale state, a failed
+These phases appear in Coordinator > Action Trace with the owning domain
+component, target, queue/hold time, terminal reason, and elapsed time.
+Incapacitation, stale state, a failed
 start, cancellation, or revocation sends the holder through its own finalizer
-before the exact lease is released.
+before the exact lease is released. The finalizer also drains the unified
+executor so a completed, cancelled, or rejected job cannot leak into the next
+lease.
 
 ```mermaid
 sequenceDiagram
-    participant H as Healing worker
-    participant D as DPS worker
+    participant H as Support worker
+    participant D as Combat worker
     participant C as Coordinator
 
     D->>D: Select nuke locally
     D->>C: lease:request(module, session, requestId)
-    Note over C: Registry supplies DPS tier 7/order 14
+    Note over C: Registry supplies Combat tier 4/order 4
     C->>D: state: active lease + token
     D->>D: Validate exact lease, then execute
 
     H->>H: Select heal locally
     H->>C: lease:request(module, session, requestId)
-    Note over C: Registry supplies Healing tier 1<br/>and permits urgent preemption
+    Note over C: Registry supplies Support tier 1<br/>and permits urgent preemption
     C->>D: state: lease status = revoking
     D->>D: Cancel/drain owned effect and finalize
     D->>C: lease:release(exact token)
@@ -678,17 +764,22 @@ sequenceDiagram
 ```
 
 Urgent preemption is controlled by **Allow Urgent Lease Preemption**
-(`LeasePreemptionEnabled`). Only Emergency, Healing, Cures, Resurrection, and
-Tank are registered as urgent candidates, and only when the candidate's tier
+(`LeasePreemptionEnabled`). Only Emergency, Support, and Tank are registered
+as urgent candidates, and only when the candidate's tier
 number is lower than the current holder's. The coordinator marks the lease
 `revoking`; it never sends a gameplay command such as `/stopcast`. The current
 holder cleans up effects it owns before release. If it misses the grace period
 or TTL, the old token is fenced and a recovery lease runs before new work.
+This toggle affects ordinary urgent preemption only. Mandatory dirty-effect
+recovery can still revoke a lease because it must restore the single-action
+safety boundary before normal work resumes.
 
 ## Main Loop
 
-There is no single automation loop. The UI host, coordinator, and each worker
-yield and advance independently.
+There is no single automation loop. The UI host, coordinator, and each of the
+ten domain workers yield and advance independently. Support hosts Healing,
+Cures, and Resurrection; Combat hosts CC, Feign, Debuff, Assist, Disciplines,
+and DPS; Maintenance hosts Resources and Buffs.
 
 ```mermaid
 flowchart LR
@@ -725,9 +816,9 @@ flowchart LR
 ```
 
 The UI loop renders and submits requests; it does not run automatic gameplay
-subsystems. Combat debuffing, out-of-combat Chase, and automatic spell
-scribing/gem work have separate `sk_debuff.lua`, `sk_chase.lua`, and
-`sk_scribing.lua` workers rather than falling through a shared utility loop.
+subsystems. Combat debuffing and protected-feign recovery are Combat
+components. Out-of-combat Chase and automatic spell scribing/gem work retain
+their own workers.
 
 ## Healing Intelligence Pipeline
 
@@ -842,7 +933,7 @@ sequenceDiagram
 | `heal:claim` | Broadcast | "I'm healing this target" |
 | `heal:hots` | Broadcast | "I applied or am maintaining these HoTs" |
 | `buff:list` / `buff:claim` / `buff:landed` | Broadcast | Buff availability, intent, and completion |
-| `target:primary` | Broadcast | Authoritative group kill target; fresh ID 0 means do not acquire |
+| `target:primary` | Broadcast | Declared tank primary plus verified kill authorization; ID 0 or unverified means do not acquire |
 | `debuff:claim` | Broadcast | "I'm debuffing this mob" |
 | `cc:claim` | Broadcast | "I'm mezzing this mob" |
 | `window:bounds:req` / `window:bounds` | Request/Reply | UI window position sharing |
@@ -924,11 +1015,11 @@ classDiagram
     }
 
     class DomainWorkers {
-        +combat and healing workers
-        +pull and OOC workers
-        +dedicated chase worker
-        +dedicated debuff worker
-        +dedicated scribing worker
+        +Support composite worker
+        +Combat composite worker
+        +Maintenance composite worker
+        +Tank, Pull, Chase, Items
+        +Emergency, Meditation, Scribing
     }
 
     DomainWorkers --> ModuleBase : share lifecycle
@@ -1017,7 +1108,6 @@ suffixes are:
 | UseSpells | bool | true | Enable spell usage |
 | UseAAs | bool | true | Enable AA usage |
 | UseDiscs | bool | true | Enable disc usage |
-| SpellRotationEnabled | bool | false | Enable spell rotation |
 | SpellAutoMemorize | bool | true | Auto-memorize spells |
 | InterruptOnTargetDeath | bool | true | Stop cast if target dies |
 
@@ -1027,7 +1117,7 @@ suffixes are:
 |-----|------|---------|-------------|
 | AutomationLevel | text | auto | Play style (`manual` / `hybrid` / `auto`) — controls cast vs. movement gating |
 | AutomationPaused | bool | false | Global pause |
-| LeasePreemptionEnabled | bool | true | Allow registered urgent workers to revoke a lower-tier local lease |
+| LeasePreemptionEnabled | bool | true | Allow registered urgent workers to revoke a lower-tier local lease; mandatory dirty-effect recovery remains enabled |
 | ChaseEnabled | bool | false | Chase toggle |
 | ChaseRole | text | ma | Chase target role |
 | ChaseDistance | int | 30 | Chase distance |
@@ -1041,11 +1131,14 @@ suffixes are:
 An Actor Team leader is elected only to give the team a stable coordination
 identity; it is not automatically the combat main assist. For an OOG main
 assist, select **Assist Source: By Name** and enter that SideKick character's
-name. DPS ignores the healer's own Actor Team target when voting, prefers the
-configured main assist or a member in `tank` combat mode, and otherwise uses
-fresh same-zone remote NPC targets. Remote `inCombat` state is accepted as
-engagement evidence because an OOG healer may not receive the same XTarget
-hater slot.
+name. A fresh tank primary becomes authoritative for Assist and DPS only after
+the tank verifies its target, attack state, melee position, and configured
+Stick; the earlier declaration remains available to CC for exclusion. A fresh
+zero, unverified declaration, stale/absent publication, or protected charm ID tells the default
+consolidated Combat worker not to acquire anything. This keeps damage on the
+declared kill target while the tank temporarily peels, taunts, or opens another
+add. Configured-main-assist, Actor-vote, local-group, XTarget, and cached-target
+fallbacks remain available only in the legacy split-worker A/B profile.
 
 ### Current Healing and Cure Settings
 
@@ -1084,23 +1177,19 @@ when Healing Intelligence is active:
 | Tier | Name | Workers in deterministic registry order |
 |---:|---|---|
 | 0 | EMERGENCY | `sk_emergency.lua` |
-| 1 | HEALING | `sk_healing.lua`, `sk_cures.lua` |
-| 2 | RESURRECTION | `sk_resurrection.lua` |
+| 1 | HEALING | `sk_support.lua` (Healing, Cures, Resurrection) |
 | 3 | TANK | `sk_tank.lua` |
-| 4 | CROWD_CONTROL | `sk_cc.lua` |
-| 5 | DEBUFF | `sk_debuff.lua` |
+| 4 | CROWD_CONTROL | `sk_combat.lua` (CC, Feign, Debuff, Assist, Disciplines, DPS) |
 | 6 | PULL | `sk_pull.lua` |
-| 7 | DPS | `sk_assist.lua`, `sk_chase.lua`, `sk_resources.lua`, `sk_disciplines.lua`, `sk_items.lua`, `sk_dps.lua` |
-| 8 | BUFF | `sk_buffs.lua` |
+| 7 | DPS | `sk_chase.lua`, `sk_maintenance.lua` (Resources, Buffs), `sk_items.lua` |
 | 9 | MEDITATION | `sk_meditation.lua` |
 | 10 | SCRIBING | `sk_scribing.lua` |
-| 11 | AMBIENT | `sk_fidget.lua` |
 | 99 | IDLE | Internal scheduler state only |
 
 These are fixed coordinator tiers; workers do not choose them. Lower numbers
 are selected first when the lease is free, and the listed registry order
 breaks ties without relying on message arrival. Preemption is narrower:
-Emergency, Healing, Cures, Resurrection, and Tank are the only urgent
+Emergency, Support, and Tank are the only urgent
 candidates, the feature toggle must be enabled, and the candidate must have a
 numerically lower tier than the current holder. The coordinator marks the
 lease for revocation; the holder performs its own cleanup and release.
@@ -1116,23 +1205,19 @@ lease for revocation; the holder performs its own cleanup and release.
 | `sk_lib.lua` | Fixed worker registry, tiers/order, protocol constants, and mailbox names |
 | `sk_module_base.lua` | Worker request, exact ownership, renewal, finalization, and recovery lifecycle |
 | `sk_emergency.lua` | Emergency worker (fixed tier 0) |
-| `sk_healing.lua` | Healing worker (fixed tier 1) |
-| `sk_cures.lua` | Cure worker (fixed tier 1) |
-| `sk_resurrection.lua` | Resurrection worker (fixed tier 2) |
+| `sk_support.lua` | Support host for Healing, Cures, and Resurrection (fixed tier 1) |
+| `sk_healing.lua`, `sk_cures.lua`, `sk_resurrection.lua` | Support component implementations and legacy A/B entry points |
 | `sk_tank.lua` | Tank targeting, positioning, and abilities (fixed tier 3) |
-| `sk_cc.lua` | Crowd-control worker (fixed tier 4) |
-| `sk_debuff.lua` | Dedicated automatic debuff worker (fixed tier 5) |
+| `sk_combat.lua` | Combat host for CC, Feign, Debuff, Assist, Disciplines, and DPS (fixed tier 4) |
+| `sk_cc.lua`, `sk_feign.lua`, `sk_debuff.lua`, `sk_assist.lua`, `sk_disciplines.lua`, `sk_dps.lua` | Combat component implementations and legacy A/B entry points |
 | `sk_pull.lua` | Mechanically migrated pull worker (fixed tier 6; behavior not redesigned) |
-| `sk_assist.lua` | Melee targeting and positioning worker (fixed tier 7) |
 | `sk_chase.lua` | Dedicated bounded OOC Chase worker (fixed tier 7) |
-| `sk_resources.lua` | Resource conversion worker (fixed tier 7) |
-| `sk_disciplines.lua` | Discipline worker (fixed tier 7) |
-| `sk_items.lua` | Automatic and queued manual clicky worker (fixed tier 7) |
-| `sk_dps.lua` | DPS/combat worker (fixed tier 7) |
-| `sk_buffs.lua` | OOC buff worker (fixed tier 8) |
+| `sk_maintenance.lua` | Maintenance host for Resources and Buffs (fixed tier 7) |
+| `sk_resources.lua`, `sk_buffs.lua` | Maintenance component implementations and legacy A/B entry points |
+| `sk_items.lua` | Automatic clickies and queued manual UI actions (fixed tier 7) |
 | `sk_meditation.lua` | Meditation worker (fixed tier 9) |
 | `sk_scribing.lua` | Dedicated automatic spell-gem/scribing worker (fixed tier 10) |
-| `sk_fidget.lua` | Bounded idle-humanization worker (fixed tier 11) |
+| `sk_fidget.lua` | Retained source only; execution disabled and unsupervised |
 | `registry.lua` | Authoritative settings schema and ownership registry |
 | `themes.lua` | Color theme presets |
 | `healing/` | Healer-class intelligence modules |
@@ -1144,7 +1229,7 @@ lease for revocation; the holder performs its own cleanup and release.
 | `automation/` | Domain selection and execution helpers |
 | `automation/assist.lua` | Assist targeting |
 | `automation/chase.lua` | Read-only Chase intent and route helper used by `sk_chase.lua` |
-| `automation/tank.lua` | Tank logic |
+| `utils/aggro.lua` | Tank aggro assessment and hate-tool helpers used by `sk_tank.lua` |
 | `automation/cc.lua` | Crowd control |
 | `automation/debuff.lua` | Debuff domain helper used by `sk_debuff.lua` |
 | `automation/cures.lua` | Cure/cleanse |

@@ -6,6 +6,7 @@ local imgui = require('ImGui')
 local actors = require('actors')
 local lib = require('sidekick-next.sk_lib')
 local lazy = require('sidekick-next.utils.lazy_require')
+local ActorsCoordinator = require('sidekick-next.utils.actors_coordinator')
 
 local M = {}
 
@@ -21,6 +22,14 @@ local State = {
     inbox = {},
     coordinatorBootId = nil,
     lastTickId = 0,
+    actionLatest = {},
+    actionHistory = {},
+    actionSessions = {},
+    actionSequences = {},
+    statePacketsReceived = 0,
+    statePacketsAccepted = 0,
+    statePacketsRejected = 0,
+    lastStateRejectReason = '',
 }
 local renderRezTelemetry
 
@@ -137,23 +146,15 @@ local priorityNames = {
 
 local moduleOrder = {
     emergency = 1,
-    healing = 2,
-    cures = 3,
-    resurrection = 4,
-    tank = 5,
-    cc = 6,
-    debuff = 7,
-    pull = 8,
-    assist = 9,
-    chase = 10,
-    resources = 11,
-    disciplines = 12,
-    items = 13,
-    dps = 14,
-    buffs = 15,
-    meditation = 16,
-    scribing = 17,
-    fidget = 18,
+    support = 2,
+    tank = 3,
+    combat = 4,
+    pull = 5,
+    chase = 6,
+    maintenance = 7,
+    items = 8,
+    meditation = 9,
+    scribing = 10,
 }
 
 local function formatBool(v)
@@ -249,11 +250,10 @@ local function drainStateInbox()
     for _, entry in ipairs(inbox) do
         local content = entry.content
         local sender = entry.sender or {}
-        local logicalMailbox = tostring(sender.mailbox or ''):lower():match('([^:]+)$')
         local transportValid = tostring(sender.character or '') == myName
             and tostring(sender.server or '') == myServer
-            and tostring(sender.script or '') == tostring(lib.Scripts.COORDINATOR or '')
-            and logicalMailbox == 'coordinator'
+            and lib.actorSenderMatches(sender,
+                lib.Scripts.COORDINATOR, 'coordinator')
         local bootId = tostring(content and content.coordinatorBootId or '')
         local tickId = tonumber(content and content.tickId) or 0
         if transportValid and bootId ~= ''
@@ -261,7 +261,21 @@ local function drainStateInbox()
             State.coordinatorBootId = bootId
             State.lastTickId = 0
         end
-        if tostring(content.ownerName or '') == myName
+        local rejectReason = nil
+        if not transportValid then
+            rejectReason = 'sender_route'
+        elseif tostring(content.ownerName or '') ~= myName
+            or tostring(content.ownerServer or '') ~= myServer then
+            rejectReason = 'owner_identity'
+        elseif tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then
+            rejectReason = 'protocol_version'
+        elseif tickId <= State.lastTickId then
+            rejectReason = 'stale_tick'
+        elseif not content.epoch then
+            rejectReason = 'missing_epoch'
+        end
+        if not rejectReason
+            and tostring(content.ownerName or '') == myName
             and tostring(content.ownerServer or '') == myServer
             and transportValid
             and tonumber(content.version) == tonumber(lib.LEASE_PROTOCOL_VERSION)
@@ -270,6 +284,10 @@ local function drainStateInbox()
             State.last = content
             State.lastTickId = tickId
             State.receivedAtMs = mq.gettime()
+            State.statePacketsAccepted = State.statePacketsAccepted + 1
+        else
+            State.statePacketsRejected = State.statePacketsRejected + 1
+            State.lastStateRejectReason = tostring(rejectReason or 'unknown')
         end
     end
 end
@@ -327,13 +345,15 @@ local function renderModuleDiagnostics(moduleDiag)
         )
     end
 
-    if imgui.BeginTable('##module_diag', 7, flags) then
+    if imgui.BeginTable('##module_diag', 9, flags) then
         imgui.TableSetupColumn('Module', ImGuiTableColumnFlags.WidthFixed, 130)
         imgui.TableSetupColumn('HB', ImGuiTableColumnFlags.WidthFixed, 55)
+        imgui.TableSetupColumn('Active', ImGuiTableColumnFlags.WidthFixed, 55)
         imgui.TableSetupColumn('Queued', ImGuiTableColumnFlags.WidthFixed, 55)
         imgui.TableSetupColumn('Tier', ImGuiTableColumnFlags.WidthFixed, 95)
         imgui.TableSetupColumn('Order', ImGuiTableColumnFlags.WidthFixed, 45)
         imgui.TableSetupColumn('Request Age', ImGuiTableColumnFlags.WidthFixed, 90)
+        imgui.TableSetupColumn('Reason', ImGuiTableColumnFlags.WidthFixed, 150)
         imgui.TableSetupColumn('Worker Session', ImGuiTableColumnFlags.WidthStretch)
         imgui.TableHeadersRow()
 
@@ -367,6 +387,15 @@ local function renderModuleDiagnostics(moduleDiag)
                 imgui.TextColored(1.0, 0.3, 0.3, 1, string.format('%.1fs', hbAge / 1000))
             end
 
+            -- Current worker intent. A worker process can be healthy while its
+            -- feature is disabled; heartbeat freshness is not activation.
+            imgui.TableNextColumn()
+            if diag.intentActive then
+                imgui.TextColored(0.3, 1.0, 0.3, 1, 'YES')
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, 'no')
+            end
+
             -- Pending lease request
             imgui.TableNextColumn()
             if diag.requestId then
@@ -396,6 +425,17 @@ local function renderModuleDiagnostics(moduleDiag)
                 else
                     imgui.TextColored(1.0, 0.3, 0.3, 1, string.format('%d/%d', age, ttl))
                 end
+            else
+                imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
+            end
+
+            -- Last intent reason reported by the worker. For example, Tank on
+            -- a non-tank displays mode_off/not_tank_class rather than looking
+            -- active merely because its supervised process is healthy.
+            imgui.TableNextColumn()
+            local intentReason = tostring(diag.intentReason or '')
+            if intentReason ~= '' then
+                imgui.Text(intentReason)
             else
                 imgui.TextColored(0.6, 0.6, 0.6, 1, '-')
             end
@@ -515,7 +555,8 @@ local function getHealingDecision()
 
     local state = State.last
     local moduleDiag = state and state.moduleDiag or nil
-    local worker = moduleDiag and moduleDiag.healing or nil
+    local worker = moduleDiag
+        and (moduleDiag.support or moduleDiag.healing) or nil
     if not worker then
         _healDiagCache.result = nil
         _healDiagCache.reason = 'worker not registered'
@@ -533,17 +574,18 @@ local function getHealingDecision()
         return _healDiagCache
     end
 
-    -- Worker action details are deliberately local and never sent through the
-    -- action-blind coordinator. This view reports queue/lease state only.
+    -- The coordinator remains action-blind; transition detail arrives on the
+    -- direct worker-to-UI action trace channel.
     local lease = state and state.lease or nil
     local reason = worker.requestId and 'lease requested'
-        or (lease and lease.holderModule == 'healing' and 'lease active')
-        or 'no healing lease request'
+        or (lease and (lease.holderModule == 'support'
+            or lease.holderModule == 'healing') and 'lease active')
+        or 'no support lease request'
     _healDiagCache.result = nil
     _healDiagCache.reason = reason
     _healDiagCache.emergencyResult = nil
     _healDiagCache.emergencyReason =
-        'Emergency action detail is local to sk_emergency'
+        'See Action Trace for emergency and support transitions'
 
     return _healDiagCache
 end
@@ -729,15 +771,17 @@ function M.init()
     M._stateDropbox = actors.register(lib.Mailbox.STATE, function(message)
         local content = message()
         if type(content) ~= 'table' then return end
+        State.statePacketsReceived = State.statePacketsReceived + 1
         local copied = copyStateValue(content)
         if not copied then return end
         local sender = message.sender or {}
+        local senderScript = lib.actorSenderEndpoint(sender)
         local entry = {
             content = copied,
             sender = {
                 character = tostring(sender.character or ''),
                 server = tostring(sender.server or ''),
-                script = tostring(sender.script or ''),
+                script = tostring(senderScript or ''),
                 mailbox = tostring(sender.mailbox or ''),
             },
         }
@@ -755,6 +799,14 @@ function M.drawContent()
 
     if not State.last then
         imgui.TextColored(0.7, 0.7, 0.7, 1, 'Waiting for coordinator state...')
+        imgui.Text(string.format('Coordinator process: %s',
+            tostring(lib.getLuaScriptStatus(lib.Scripts.COORDINATOR) or 'UNKNOWN')))
+        imgui.Text(string.format('State packets: %d received, %d rejected',
+            State.statePacketsReceived, State.statePacketsRejected))
+        if State.lastStateRejectReason ~= '' then
+            imgui.TextColored(1.0, 0.55, 0.3, 1,
+                'Last rejection: ' .. State.lastStateRejectReason)
+        end
         return
     end
 
@@ -764,8 +816,20 @@ function M.drawContent()
     local ttlMs = State.last.ttlMs or 0
     local stale = ttlMs > 0 and ageMs > ttlMs
 
+    local priorityName =
+        tostring(priorityNames[State.last.activePriority] or State.last.activePriority or '?')
+    local schedulingState
+    if State.last.lease then
+        schedulingState = 'Lease: ' .. priorityName
+    elseif (tonumber(State.last.recoveryRequestCount) or 0) > 0 then
+        schedulingState = 'Recovery pending: ' .. priorityName
+    elseif (tonumber(State.last.requestCount) or 0) > 0 then
+        schedulingState = 'Pending: ' .. priorityName
+    else
+        schedulingState = 'Idle'
+    end
     local rows = {
-        { 'Active Priority', tostring(priorityNames[State.last.activePriority] or State.last.activePriority or '?') },
+        { 'Scheduling Priority', schedulingState },
         { 'Lifecycle', tostring(State.last.lifecycle or '?') },
         { 'Lease Requests', tostring(State.last.requestCount or 0) },
         { 'Recovery Requests', tostring(State.last.recoveryRequestCount or 0) },
@@ -776,6 +840,10 @@ function M.drawContent()
         { 'Settings Revision', tostring(State.last.settingsRevision or 0) },
         { 'Epoch', tostring(State.last.epoch or '?') },
         { 'Tick ID', tostring(State.last.tickId or '?') },
+        { 'Counted Drops', tostring(State.last.transportDiag
+            and State.last.transportDiag.totalDrops or 0) },
+        { 'Request TTL Expiries', tostring(State.last.schedulerMetrics
+            and State.last.schedulerMetrics.requestExpiries or 0) },
         { 'Age (s)', string.format('%.2f', ageMs / 1000) },
         { 'Stale', formatBool(stale) },
     }
@@ -792,6 +860,8 @@ function M.drawContent()
 
     imgui.Text('World State')
     local ws = State.last.worldState or {}
+    local killTargetId, _, killReason =
+        ActorsCoordinator.getPrimaryKillAuthorization(5)
     local wrows = {
         { 'In Combat', formatBool(ws.inCombat) },
         { 'My HP %', tostring(ws.myHpPct or '?') },
@@ -803,9 +873,70 @@ function M.drawContent()
         { 'Stunned / Mezzed', string.format('%s / %s', formatBool(ws.stunned), formatBool(ws.mezzed)) },
         { 'Silenced / Feared', string.format('%s / %s', formatBool(ws.silenced), formatBool(ws.feared)) },
         { 'Dead Count', tostring(ws.deadCount or '?') },
-        { 'Main Assist ID', tostring(ws.mainAssistId or '?') },
+        { 'Main Assist Character ID', tostring(ws.mainAssistId or '?') },
+        { 'Authorized Kill Target ID', tostring(killTargetId or 'none') },
+        { 'Kill Authorization', tostring(killReason or 'unknown') },
     }
     renderTable('##coord_world', wrows)
+
+    imgui.Spacing()
+    imgui.Separator()
+
+    if imgui.CollapsingHeader('Primary Target Transport##primarytransport') then
+        local actorDebug = ActorsCoordinator.getDebugState
+            and ActorsCoordinator.getDebugState() or {}
+        local primary = actorDebug.primaryTarget or {}
+        local mainTank = primary.mainTank or {}
+        local mainAssist = primary.mainAssist or {}
+        local selectedAuthority = primary.selectedAuthority or {}
+        local lastSend = primary.lastSend or {}
+        local reasonCounts = {}
+        for reason, count in pairs(primary.counts or {}) do
+            reasonCounts[#reasonCounts + 1] =
+                string.format('%s=%d', tostring(reason), tonumber(count) or 0)
+        end
+        table.sort(reasonCounts)
+        renderTable('##coord_primary_transport', {
+            { 'Stage', tostring(primary.stage or 'waiting') },
+            { 'Reason', tostring(primary.reason or 'no_target_primary_packet') },
+            { 'Age', primary.ageMs
+                and string.format('%.2fs', primary.ageMs / 1000) or 'never' },
+            { 'Sender', string.format('%s @ %s',
+                tostring(primary.senderCharacter or '-'),
+                tostring(primary.senderServer or '-')) },
+            { 'Sender Route', string.format('%s:%s',
+                tostring(primary.senderScript or '-'),
+                tostring(primary.senderMailbox or '-')) },
+            { 'Target', string.format('%s (%d)',
+                tostring(primary.targetName or '-'),
+                tonumber(primary.targetId) or 0) },
+            { 'Claimed Tank ID', tostring(primary.claimedTankId or 0) },
+            { 'EQ Main Tank', string.format('%s (%d)',
+                tostring(mainTank.name or '-'), tonumber(mainTank.id) or 0) },
+            { 'EQ Main Assist', string.format('%s (%d)',
+                tostring(mainAssist.name or '-'), tonumber(mainAssist.id) or 0) },
+            { 'Selected Assist Authority', string.format('%s (%d) via %s',
+                tostring(selectedAuthority.name or '-'),
+                tonumber(selectedAuthority.id) or 0,
+                tostring(selectedAuthority.source or '-')) },
+            { 'Zone (packet / local)', string.format('%s / %s',
+                tostring(primary.packetZone or '-'),
+                tostring(primary.localZone or '-')) },
+            { 'Team (packet / local)', string.format('%s / %s',
+                tostring(primary.packetTeam or '-'),
+                tostring(primary.localTeam or '-')) },
+            { 'Session / Sequence', string.format('%s / %d',
+                tostring(primary.sessionId or '-'),
+                tonumber(primary.sequence) or 0) },
+            { 'Local Send Attempts / Failures', string.format('%d / %d',
+                tonumber(lastSend.attempts) or 0,
+                tonumber(lastSend.failures) or 0) },
+            { 'Local Send Error', tostring(
+                lastSend.lastError ~= '' and lastSend.lastError or '-') },
+            { 'Event Counts', #reasonCounts > 0
+                and table.concat(reasonCounts, ', ') or '-' },
+        })
+    end
 
     imgui.Spacing()
     imgui.Separator()
@@ -821,6 +952,39 @@ function M.drawContent()
 
     if imgui.CollapsingHeader('Resurrection Status##rezstatus') then
         renderRezTelemetry()
+    end
+
+    if imgui.CollapsingHeader('Action Trace##actiontrace') then
+        local workers = {}
+        for worker in pairs(State.actionLatest) do workers[#workers + 1] = worker end
+        table.sort(workers, function(a, b)
+            return (moduleOrder[a] or 99) < (moduleOrder[b] or 99)
+        end)
+        if #workers == 0 then
+            imgui.TextDisabled('No worker action transitions received')
+        else
+            for _, worker in ipairs(workers) do
+                local trace = State.actionLatest[worker]
+                local blocker = tostring(trace.blockedByModule or '')
+                if blocker ~= '' and tostring(trace.blockedByStatus or '') ~= '' then
+                    blocker = blocker .. '/' .. tostring(trace.blockedByStatus)
+                end
+                if blocker == '' then blocker = 'none' end
+                imgui.BulletText(string.format(
+                    '%s / %s: %s %s -> %s (%s, queue=%dms hold=%dms)',
+                    worker, tostring(trace.component or worker),
+                    tostring(trace.kind or ''), tostring(trace.name or ''),
+                    tostring(trace.phase or '?'), tostring(trace.reason or '-'),
+                    tonumber(trace.queueMs) or 0,
+                    tonumber(trace.holdMs) or 0))
+                imgui.TextDisabled(string.format(
+                    '    Queue: scheduler=%dms  transport+observe=%dms  blocker=%s  refreshes=%d',
+                    tonumber(trace.schedulerWaitMs) or 0,
+                    tonumber(trace.transportObserveMs) or 0,
+                    blocker,
+                    tonumber(trace.requestRefreshes) or 0))
+            end
+        end
     end
 
     imgui.Spacing()
@@ -874,6 +1038,8 @@ renderRezTelemetry = function()
         { 'Target', string.format('%s (%s)', tostring(rez.targetName or '-'), tostring(rez.targetClass or '-')) },
         { 'Target Source', tostring(rez.targetSource or '-') },
         { 'Corpse ID', tostring(rez.corpseId or 0) },
+        { 'Candidates', tostring(rez.candidateCount or 0) },
+        { 'Range Rejected', tostring(rez.rangeRejectedCount or 0) },
         { 'Resource', string.format('%s: %s', tostring(rez.resourceKind or '-'), tostring(rez.resourceName or '-')) },
         { 'Actor Winner', tostring(rez.winner or '-') },
         { 'OOC Policy', string.format('%s / %s', formatBool(rez.oocEnabled), tostring(rez.oocMethod or '-')) },
@@ -887,6 +1053,30 @@ function M.setRezTelemetry(telemetry)
     if type(telemetry) == 'table' then
         State.rezTelemetry = telemetry
     end
+end
+
+function M.setActionTrace(trace)
+    if type(trace) ~= 'table' or tonumber(trace.version) ~= 1 then return false end
+    local worker = tostring(trace.worker or '')
+    local session = tostring(trace.workerSessionId or '')
+    local sequence = tonumber(trace.sequence)
+    if worker == '' or session == '' or not sequence then return false end
+    if State.actionSessions[worker] ~= session then
+        State.actionSessions[worker] = session
+        State.actionSequences[worker] = 0
+    end
+    if sequence <= (State.actionSequences[worker] or 0) then return false end
+    State.actionSequences[worker] = sequence
+    State.actionLatest[worker] = trace
+    local history = State.actionHistory[worker] or {}
+    history[#history + 1] = trace
+    while #history > 100 do table.remove(history, 1) end
+    State.actionHistory[worker] = history
+    return true
+end
+
+function M.getActionTraces()
+    return State.actionLatest, State.actionHistory
 end
 
 --- Latest coordinator snapshot for any UI consumer. Draining here keeps

@@ -6,6 +6,8 @@ local mq = require('mq')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local OffensiveTarget = require('sidekick-next.utils.offensive_target')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
+local Cache = require('sidekick-next.utils.runtime_cache')
 
 local module = ModuleBase.create('dps', lib.Priority.DPS)
 
@@ -17,8 +19,8 @@ local Config = {
     minManaPct = 0,
     minTargetHpPct = 1,
     spellSetReloadSeconds = 5,
-    targetCacheMs = 5000,
-    actorTargetTtlSeconds = 5,
+    targetCacheMs = CoordinationPolicy.STATE_TTL_SECONDS.ACTOR_TARGET * 1000,
+    actorTargetTtlSeconds = CoordinationPolicy.STATE_TTL_SECONDS.ACTOR_TARGET,
 }
 
 local _lastSpellSetLoadAt = 0
@@ -27,7 +29,9 @@ local _lastReason = 'init'
 local _lastExecuteReason = 'none'
 local _lastExecuteAt = 0
 local _lastCastAttempt = 'none'
-local _lastValidTarget = nil
+local _lastCandidateDecisions = {}
+local _lastCompletedRotation = {}
+local _selectionCache = { atMs = 0, valid = false, action = nil, reason = nil }
 
 local function commandEcho(fmt, ...)
     local msg
@@ -37,7 +41,9 @@ local function commandEcho(fmt, ...)
     else
         msg = tostring(fmt)
     end
-    pcall(function() print(string.format('\ag[SK DPS]\ax %s', msg)) end)
+    pcall(function()
+        print(string.format('%s \ag[SK DPS]\ax %s', lib.timestampPrefix(), msg))
+    end)
 end
 
 -------------------------------------------------------------------------------
@@ -127,187 +133,8 @@ end
 -- Target Selection
 -------------------------------------------------------------------------------
 
-local function addCandidate(candidates, seen, id, source, coordinatedCombat)
-    id = tonumber(id) or 0
-    if id <= 0 then return end
-    local existing = seen[id]
-    if existing then
-        if coordinatedCombat == true then existing.coordinatedCombat = true end
-        return
-    end
-    -- Candidates must be live, attackable NPCs. Peer broadcasts advertise
-    -- LIVE targets, so a tank or healer momentarily targeting a group member
-    -- for a heal would otherwise drag assist DPS off the kill target.
-    local spawn = mq.TLO.Spawn(id)
-    if not (spawn and spawn()) then return end
-    local spawnType = tostring(lib.safeTLO(function() return spawn.Type() end, '') or ''):lower()
-    if spawnType ~= 'npc' then return end
-    if lib.safeTLO(function() return spawn.Dead() end, false) == true then return end
-    -- The group's broadcast charm pet (or a just-broken one mid-recovery)
-    -- must never become a DPS target.
-    do
-        local okA, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if okA and Actors and Actors.isCharmPet and Actors.isCharmPet(id) then return end
-    end
-    local candidate = {
-        id = id,
-        source = source or 'unknown',
-        coordinatedCombat = coordinatedCombat == true,
-    }
-    seen[id] = candidate
-    candidates[#candidates + 1] = candidate
-end
-
-local function addSpawnTargetCandidates(candidates, seen, spawn, source)
-    if not (spawn and spawn()) then return end
-    addCandidate(candidates, seen, lib.safeNum(function() return spawn.Target.ID() end, 0), source .. '_target')
-    addCandidate(candidates, seen, lib.safeNum(function() return spawn.TargetOfTarget.ID() end, 0), source .. '_tot')
-end
-
-local function validateNpcTarget(targetId, source, remember, coordinatedCombat)
-    targetId = tonumber(targetId) or 0
-    if targetId <= 0 then return nil end
-
-    local target = mq.TLO.Spawn(targetId)
-    if not (target and target()) then return nil end
-
-    local targetType = lib.safeTLO(function() return target.Type() end, '') or ''
-    local dead = lib.safeTLO(function() return target.Dead() end, false) == true
-    if targetType:lower() ~= 'npc' or dead then return nil end
-
-    local result = {
-        id = targetId,
-        hp = lib.safeNum(function() return target.PctHPs() end, 100),
-        source = source or 'unknown',
-        coordinatedCombat = coordinatedCombat == true,
-    }
-
-    if remember ~= false then
-        _lastValidTarget = {
-            id = result.id,
-            hp = result.hp,
-            source = result.source,
-            coordinatedCombat = result.coordinatedCombat,
-            seenAt = lib.getTimeMs(),
-        }
-    end
-
-    return result
-end
-
 local function isCombatTargetActive(target)
     return OffensiveTarget.isCombatActive(target)
-end
-
-local function addXTargetCandidates(candidates, seen)
-    local xtCount = lib.safeNum(function() return mq.TLO.Me.XTarget() end, 0)
-    for i = 1, xtCount do
-        local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt() then
-            local xtType = tostring(lib.safeTLO(function() return xt.TargetType() end, '') or ''):lower()
-            if xtType:find('hater', 1, true) or xtType:find('auto', 1, true) then
-                addCandidate(candidates, seen, lib.safeNum(function() return xt.ID() end, 0), 'xtarget' .. tostring(i))
-            end
-        end
-    end
-end
-
-local function addActorTargetCandidates(candidates, seen, maId)
-    local Actors = module.peerActors
-    if not Actors then return end
-
-    -- Explicit target broadcasts are authoritative and work for Actor Team
-    -- members that are not in this character's EQ group.
-    local tankState = Actors.getTankState and Actors.getTankState() or nil
-    local tankUpdatedAt = type(tankState) == 'table' and tonumber(tankState.updatedAt) or nil
-    if tankUpdatedAt and (os.clock() - tankUpdatedAt) <= Config.actorTargetTtlSeconds then
-        addCandidate(candidates, seen, tankState.primaryTargetId, 'actor_primary')
-    end
-
-    -- The main SideKick heartbeat also advertises each character's current
-    -- target. Match only the configured/designated main assist; a healer's own
-    -- heal target must never become its DPS target.
-    local assistNames = {}
-    local function rememberName(name)
-        name = tostring(name or '')
-        if name ~= '' then assistNames[name:lower()] = true end
-    end
-
-    local settings = lib.getSettings() or {}
-    rememberName(settings.AssistName)
-    if maId and maId > 0 then
-        local ma = mq.TLO.Spawn(maId)
-        if ma and ma() then
-            rememberName(lib.safeTLO(function() return ma.CleanName() end, ''))
-        end
-    end
-    local groupMA = mq.TLO.Group.MainAssist
-    if groupMA and groupMA() then
-        rememberName(lib.safeTLO(function() return groupMA.CleanName() end, ''))
-    end
-
-    if next(assistNames) and Actors.getRemoteCharacters then
-        for name, data in pairs(Actors.getRemoteCharacters() or {}) do
-            if assistNames[tostring(name):lower()] then
-                local updatedAt = tonumber(data.targetUpdatedAt) or 0
-                if updatedAt > 0 and (os.clock() - updatedAt) <= Config.actorTargetTtlSeconds then
-                    addCandidate(candidates, seen, data.targetId,
-                        'actor_mainassist:' .. tostring(name), data.combat == true)
-                end
-            end
-        end
-    end
-
-    -- Actor Team is the trusted scope for OOG automation. Prefer a named main
-    -- assist or tank-role member, then use a deterministic vote across fresh
-    -- team members currently targeting an NPC.
-    local team = module.state and module.state.team or nil
-    local votes = {}
-    if type(team) == 'table' and team.enabled == true then
-        local myZone = tostring(lib.getZone() or ''):lower()
-        for _, member in ipairs(team.members or {}) do
-            local ageMs = tonumber(member.ageMs) or 0
-            local memberZone = tostring(member.zone or ''):lower()
-            local targetType = tostring(member.targetType or ''):lower()
-            local targetId = tonumber(member.targetId) or 0
-            if member.self ~= true and ageMs <= (Config.actorTargetTtlSeconds * 1000)
-                and memberZone == myZone and targetType == 'npc' and targetId > 0 then
-                local name = tostring(member.character or '')
-                local vote = votes[targetId] or {
-                    id = targetId,
-                    count = 0,
-                    preferred = false,
-                    leader = false,
-                    inCombat = false,
-                    sourceName = name,
-                }
-                vote.count = vote.count + 1
-                vote.preferred = vote.preferred
-                    or assistNames[name:lower()] == true
-                    or tostring(member.role or ''):lower() == 'tank'
-                vote.leader = vote.leader or member.key == team.leaderKey
-                vote.inCombat = vote.inCombat or member.inCombat == true
-                if name ~= '' and (vote.sourceName == '' or name:lower() < vote.sourceName:lower()) then
-                    vote.sourceName = name
-                end
-                votes[targetId] = vote
-            end
-        end
-    end
-
-    local ranked = {}
-    for _, vote in pairs(votes) do ranked[#ranked + 1] = vote end
-    table.sort(ranked, function(a, b)
-        if a.preferred ~= b.preferred then return a.preferred end
-        if a.count ~= b.count then return a.count > b.count end
-        if a.leader ~= b.leader then return a.leader end
-        if a.sourceName ~= b.sourceName then return a.sourceName:lower() < b.sourceName:lower() end
-        return a.id < b.id
-    end)
-    for _, vote in ipairs(ranked) do
-        addCandidate(candidates, seen, vote.id,
-            string.format('actor_team:%s:votes%d', vote.sourceName, vote.count), vote.inCombat)
-    end
 end
 
 local function getMATarget()
@@ -433,7 +260,53 @@ local function buildConditionContext(targetId, combatActive)
     return ctx
 end
 
-local function selectSpell()
+local function rotationKey(entry)
+    return string.format('%s:%s', tostring(entry and entry.spellId or 0),
+        tostring(entry and entry.slot or 0))
+end
+
+local function rotationGroup(activeSet, priority)
+    return string.format('%s:%s', tostring(activeSet or ''), tostring(priority or 0))
+end
+
+-- Equal-priority entries are round-robin after a successful cast. Explicit
+-- priority differences remain strict, while default same-type entries no longer
+-- let the lowest gem slot monopolize the rotation.
+local function getFairCastList(castList, activeSet)
+    local result = {}
+    local index = 1
+    while index <= #castList do
+        local groupEnd = index
+        local priority = castList[index].priority
+        while groupEnd < #castList and castList[groupEnd + 1].priority == priority do
+            groupEnd = groupEnd + 1
+        end
+
+        local start = index
+        local group = rotationGroup(activeSet, priority)
+        local lastKey = _lastCompletedRotation[group]
+        if lastKey then
+            for i = index, groupEnd do
+                if rotationKey(castList[i]) == lastKey then
+                    start = i + 1
+                    if start > groupEnd then start = index end
+                    break
+                end
+            end
+        end
+
+        for offset = 0, groupEnd - index do
+            local source = start + offset
+            if source > groupEnd then source = index + (source - groupEnd - 1) end
+            result[#result + 1] = castList[source]
+        end
+        index = groupEnd + 1
+    end
+    return result
+end
+
+local function computeSpellSelection()
+    _lastCandidateDecisions = {}
     local spellSet, reason, Persistence = getActiveSpellSet()
     if not spellSet then return nil, reason end
 
@@ -445,6 +318,15 @@ local function selectSpell()
         return nil, 'no_combat'
     end
     if target.hp < Config.minTargetHpPct then return nil, 'target_low_hp' end
+    local moving = lib.safeTLO(function() return mq.TLO.Me.Moving() end, false) == true
+    local navActive = lib.safeTLO(function()
+        return mq.TLO.Navigation and mq.TLO.Navigation.Active
+            and mq.TLO.Navigation.Active()
+    end, false) == true
+    local class = tostring(lib.safeTLO(function()
+        return mq.TLO.Me.Class.ShortName()
+    end, '') or ''):upper()
+    if class ~= 'BRD' and (moving or navActive) then return nil, 'moving' end
 
     local mana = lib.safeNum(function() return mq.TLO.Me.PctMana() end, 0)
     if mana < Config.minManaPct then return nil, 'low_mana' end
@@ -470,44 +352,125 @@ local function selectSpell()
         return nil, 'empty_cast_list:' .. tostring(Persistence and Persistence.activeSetName or '')
     end
 
+    local activeSet = Persistence and Persistence.activeSetName or nil
+    castList = getFairCastList(castList, activeSet)
     local ctx = buildConditionContext(target.id, combatActive)
     local firstSkip = nil
+    local selectedAction = nil
     for _, entry in ipairs(castList) do
-        if entry and entry.slot and not isUtilityGem(entry.config) and dpsOwnsSpellType(entry.spellType) then
+        local decision = {
+            slot = tonumber(entry and entry.slot) or 0,
+            spellName = tostring(entry and entry.spellName or ''),
+            spellType = tostring(entry and entry.spellType or ''),
+            priority = tonumber(entry and entry.priority) or 0,
+            ready = false,
+            condition = false,
+            allowed = false,
+            selected = false,
+            reason = 'invalid_entry',
+        }
+        _lastCandidateDecisions[#_lastCandidateDecisions + 1] = decision
+
+        if not entry or not entry.slot then
+            firstSkip = firstSkip or 'invalid_entry'
+        elseif isUtilityGem(entry.config) then
+            decision.reason = 'utility'
+            firstSkip = firstSkip or ('utility:' .. tostring(entry.spellName))
+        elseif not dpsOwnsSpellType(entry.spellType) then
+            decision.reason = 'owned_by_' .. ownerForSpellType(entry.spellType)
+            firstSkip = firstSkip or (decision.reason .. ':' .. tostring(entry.spellName))
+        else
             if manaLow then
+                decision.reason = 'mana_floor'
                 firstSkip = firstSkip or ('mana_floor:' .. tostring(entry.spellName))
                 goto continue_entry
             end
             local targetId = spellNeedsNpcTarget(entry) and target.id or nil
-            if isSpellReady(entry.slot, entry.spellName) then
+            decision.ready = isSpellReady(entry.slot, entry.spellName)
+            if decision.ready then
                 local conditionOk = true
                 if CombatExec.evaluateCondition then
-                    conditionOk = CombatExec.evaluateCondition(entry.config, ctx)
+                    local ok, value = pcall(CombatExec.evaluateCondition, entry.config, ctx)
+                    conditionOk = ok and value == true
+                    if not ok then decision.conditionError = tostring(value) end
                 end
+                decision.condition = conditionOk
                 if conditionOk then
                     local skipEffect, effectReason = shouldSkipExistingEffect(entry, targetId)
                     if skipEffect then
+                        decision.reason = effectReason or 'effect_present'
                         firstSkip = firstSkip or (effectReason .. ':' .. tostring(entry.spellName))
                     else
-                        return {
-                            slot = entry.slot,
-                            spellName = entry.spellName,
-                            spellType = entry.spellType,
-                            targetId = targetId,
-                            activeSet = Persistence and Persistence.activeSetName or nil,
-                        }, nil
+                        local allowed, intelReason, intelDetails = true, 'eligible', nil
+                        if CombatExec.evaluateDamageCandidate then
+                            local ok, value, why, details = pcall(
+                                CombatExec.evaluateDamageCandidate,
+                                entry.spellType, entry.spellName, targetId)
+                            if ok then
+                                allowed = value == true
+                                intelReason = tostring(why or (allowed and 'eligible' or 'intelligence_rejected'))
+                                intelDetails = details
+                            else
+                                -- Intelligence must fail open; record the error for diagnostics.
+                                intelReason = 'intelligence_error'
+                                decision.intelligenceError = tostring(value)
+                            end
+                        end
+                        decision.intelligence = intelReason
+                        decision.intel = intelDetails
+                        if not allowed then
+                            decision.reason = intelReason
+                            firstSkip = firstSkip
+                                or (intelReason .. ':' .. tostring(entry.spellName))
+                        elseif not selectedAction then
+                            decision.allowed = true
+                            decision.selected = true
+                            decision.reason = 'selected'
+                            selectedAction = {
+                                slot = entry.slot,
+                                spellName = entry.spellName,
+                                spellType = entry.spellType,
+                                targetId = targetId,
+                                targetName = target.name,
+                                activeSet = activeSet,
+                                rotationGroup = rotationGroup(activeSet, entry.priority),
+                                rotationKey = rotationKey(entry),
+                                rotationPriority = entry.priority,
+                            }
+                        else
+                            decision.allowed = true
+                            decision.reason = 'eligible_after_selected'
+                        end
                     end
                 else
+                    decision.reason = decision.conditionError and 'condition_error' or 'condition_false'
                     firstSkip = firstSkip or ('condition_false:' .. tostring(entry.spellName))
                 end
             else
+                decision.reason = 'not_ready'
                 firstSkip = firstSkip or ('not_ready:' .. tostring(entry.spellName))
             end
         end
         ::continue_entry::
     end
 
+    if selectedAction then return selectedAction, nil end
     return nil, firstSkip or 'no_eligible_spell'
+end
+
+local function selectSpell()
+    local now = lib.getTimeMs()
+    if _selectionCache.valid and (now - (_selectionCache.atMs or 0)) <= 75 then
+        return _selectionCache.action, _selectionCache.reason
+    end
+    local action, reason = computeSpellSelection()
+    _selectionCache = {
+        atMs = now,
+        valid = true,
+        action = action,
+        reason = reason,
+    }
+    return action, reason
 end
 
 local function debugList()
@@ -527,6 +490,7 @@ local function debugList()
     local combatActive = target and isCombatTargetActive(target) or false
     local ctx = target and buildConditionContext(target.id, combatActive) or nil
     local castList = CombatExec.getSortedCastList(spellSet)
+    castList = getFairCastList(castList, Persistence and Persistence.activeSetName or nil)
     commandEcho('list: activeSet=%s gems=%d target=%s targetHp=%s targetSource=%s actorCombat=%s combatActive=%s path=%s',
         tostring(Persistence and Persistence.activeSetName or nil),
         #castList,
@@ -575,6 +539,19 @@ local function debugList()
                         conditionReason = effectReason or 'effect_present'
                     else
                         conditionReason = 'eligible'
+                        if CombatExec.evaluateDamageCandidate then
+                            local ok, allowed, intelReason = pcall(
+                                CombatExec.evaluateDamageCandidate,
+                                entry.spellType, entry.spellName, targetId)
+                            if not ok then
+                                conditionReason = 'intelligence_error:' .. tostring(allowed)
+                            elseif allowed ~= true then
+                                conditionOk = false
+                                conditionReason = tostring(intelReason or 'intelligence_rejected')
+                            else
+                                conditionReason = tostring(intelReason or 'eligible')
+                            end
+                        end
                     end
                 end
             else
@@ -615,35 +592,6 @@ local function debugActorTargets()
             tostring(member.inCombat == true), tostring(member.targetId or 0),
             tostring(member.targetType or ''), tostring(member.targetName or ''))
     end
-end
-
-local function directTestCast()
-    local action, reason = selectSpell()
-    if not action then
-        commandEcho('testcast: no action: %s', tostring(reason))
-        return
-    end
-
-    commandEcho('testcast: slot=%s spell=%s target=%s',
-        tostring(action.slot), tostring(action.spellName), tostring(action.targetId))
-
-    if action.targetId and action.targetId > 0 then
-        mq.cmdf('/target id %d', action.targetId)
-        mq.delay(500, function()
-            local t = mq.TLO.Target
-            return t and t() and t.ID() == action.targetId
-        end)
-        local currentTarget = lib.safeNum(function() return mq.TLO.Target.ID() end, 0)
-        if currentTarget ~= action.targetId then
-            commandEcho('testcast failed: target wanted=%s got=%s', tostring(action.targetId), tostring(currentTarget))
-            return
-        end
-    end
-
-    mq.cmdf('/cast %d', action.slot)
-    mq.delay(250)
-    commandEcho('testcast result: casting=%s spellReady=%s',
-        tostring(lib.isCasting()), tostring(isSpellReady(action.slot, action.spellName)))
 end
 
 -------------------------------------------------------------------------------
@@ -733,6 +681,7 @@ local function sendIntelTelemetry(self, action, reason)
             spellType = tostring(action.spellType or ''),
             slot = tonumber(action.slot) or 0,
             activeSet = tostring(action.activeSet or ''),
+            rotationPriority = tonumber(action.rotationPriority) or 0,
         } or nil,
         observerScope = _intel.damageEvents and _intel.damageEvents.getScope
             and tostring(_intel.damageEvents.getScope() or '') or '',
@@ -745,6 +694,7 @@ local function sendIntelTelemetry(self, action, reason)
         },
         elementResists = {},
         spellResists = {},
+        candidates = _lastCandidateDecisions,
     }
 
     if target then
@@ -849,7 +799,7 @@ local function sendIntelTelemetry(self, action, reason)
             end
             if resistLog.iterZone then
                 for mobName, spellName, record in resistLog.iterZone() do
-                    if tostring(mobName) == targetName then
+                    if tostring(mobName):lower() == targetName:lower() then
                         local skip, skipReason = false, nil
                         if resistLog.shouldSkip then
                             local ok, value, why = pcall(resistLog.shouldSkip, spellName, targetName)
@@ -880,6 +830,12 @@ local function sendIntelTelemetry(self, action, reason)
     end
 
     local spellDamage = _intel.spellDamage
+    if spellDamage and spellDamage.getDiagnostics then
+        local ok, diagnostics = pcall(spellDamage.getDiagnostics)
+        if ok and type(diagnostics) == 'table' then
+            payload.spellDamageDiagnostics = diagnostics
+        end
+    end
     if spellDamage and type(spellDamage.data) == 'table'
         and (now - _lastIntelCatalogAt) >= INTEL_CATALOG_MS then
         _lastIntelCatalogAt = now
@@ -933,6 +889,20 @@ end
 -------------------------------------------------------------------------------
 
 module.onTick = function(self)
+    Cache.setSettings(lib.getSettings())
+    if not self.componentMode then Cache.tick() end
+    if self.componentMode and self.domainKillAuthorized ~= true then
+        _selectionCache = {
+            atMs = lib.getTimeMs(),
+            valid = true,
+            action = nil,
+            reason = self.domainKillGateReason or 'kill_not_authorized',
+        }
+        _lastReason = tostring(
+            self.domainKillGateReason or 'kill_not_authorized')
+        self:setIntent(false, nil, _lastReason)
+        return
+    end
     tickDpsIntelligence(self)
     local action, reason = selectSpell()
     _lastReason = action and ('ready:' .. tostring(action.spellName)) or tostring(reason or 'none')
@@ -942,6 +912,7 @@ end
 
 module.shouldAct = function(self)
     if not self:hasValidState() then return false end
+    if self.componentMode and self.domainKillAuthorized ~= true then return false end
     local action = selectSpell()
     return action ~= nil
 end
@@ -960,6 +931,9 @@ module.getAction = function(self)
         targetName = action.targetName,
         combatAction = true,
         allowBreakInvis = true,
+        rotationGroup = action.rotationGroup,
+        rotationKey = action.rotationKey,
+        rotationPriority = action.rotationPriority,
         -- Targeting plus the configured humanized reaction window happens
         -- before /cast, so this workflow needs an explicit bounded exception.
         castStartTimeoutMs = 4000,
@@ -1067,8 +1041,16 @@ module.executeAction = function(self)
 end
 
 
+-- The legacy callback above is retained only as migration reference and must
+-- never be selected by ModuleBase.
+module.executeAction = nil
 module:enableUnifiedExecutor({
     preflight = function(action)
+        if module.componentMode
+            and (module.domainKillAuthorized ~= true
+                or tonumber(action.targetId) ~= tonumber(module.domainKillTargetId)) then
+            return false, 'kill_authorization_changed'
+        end
         local slot = tonumber(action.gemSlot) or 0
         if slot <= 0 then return false, 'bad_gem_slot' end
         if not isSpellReady(slot, action.spellName or action.name) then
@@ -1082,12 +1064,18 @@ module:enableUnifiedExecutor({
     end,
     onComplete = function(action)
         _lastExecuteReason = 'completed'
+        if action.rotationGroup and action.rotationKey then
+            _lastCompletedRotation[tostring(action.rotationGroup)] = tostring(action.rotationKey)
+        end
+        _selectionCache.valid = false
         commandEcho('execute completed: %s', tostring(action.spellName or action.name))
     end,
     onFailure = function(_, _, _, result)
+        _selectionCache.valid = false
         _lastExecuteReason = tostring(result and result.reason or 'failed')
     end,
     onCancel = function(_, _, _, result)
+        _selectionCache.valid = false
         _lastExecuteReason = tostring(result and result.reason or 'cancelled')
     end,
 })
@@ -1148,10 +1136,8 @@ mq.bind('/sk_dps', function(cmd)
         debugList()
     elseif cmd == 'actors' then
         debugActorTargets()
-    elseif cmd == 'testcast' then
-        directTestCast()
     else
-        commandEcho('Usage: /sk_dps status|list|actors|testcast|reload|stop')
+        commandEcho('Usage: /sk_dps status|list|actors|reload|stop')
     end
 end)
 
@@ -1161,7 +1147,9 @@ end)
 
 initDpsIntelligence()
 module:run(50)
-flushSessionDamage(module, true)
-shutdownDpsIntelligence()
+if not module.componentMode then
+    flushSessionDamage(module, true)
+    shutdownDpsIntelligence()
+end
 
 return module

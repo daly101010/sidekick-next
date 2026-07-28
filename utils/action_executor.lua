@@ -54,6 +54,8 @@ local _job = nil
 local _lastResult = nil
 local _jobCounter = 0
 
+M.USE_DEFAULT_DISPATCH = 'use_default_dispatch'
+
 M.PHASE = {
     QUEUED = 'queued',
     DISPATCHING = 'dispatching',
@@ -358,6 +360,8 @@ local function publicStatus(job)
         finishedAtMs = job.finishedAtMs,
         elapsedMs = math.max(0, (job.finishedAtMs or nowMs()) - (job.submittedAtMs or nowMs())),
         reason = job.reason,
+        monitor = job.monitor,
+        observedCast = job.observedCast == true,
         requestId = action.requestId,
         idempotencyKey = action.idempotencyKey,
     }
@@ -567,6 +571,18 @@ function M.tick(context)
         local dispatched, dispatchReason, monitor
         if job.handlers and type(job.handlers.dispatch) == 'function' then
             dispatched, dispatchReason, monitor = callHandler(job, 'dispatch')
+            if dispatched == nil and dispatchReason == M.USE_DEFAULT_DISPATCH then
+                local dispatchOk, result, reason, resultMonitor =
+                    pcall(defaultDispatch, job)
+                if dispatchOk then
+                    dispatched, dispatchReason, monitor =
+                        result, reason, resultMonitor
+                else
+                    abortSpellEngine()
+                    dispatched, dispatchReason =
+                        false, 'dispatch_error:' .. tostring(result)
+                end
+            end
         else
             local dispatchOk, result, reason, resultMonitor = pcall(defaultDispatch, job)
             if dispatchOk then

@@ -28,7 +28,9 @@ local function commandEcho(fmt, ...)
     else
         msg = tostring(fmt)
     end
-    pcall(function() print(string.format('\ag[SK Resources]\ax %s', msg)) end)
+    pcall(function()
+        print(string.format('%s \ag[SK Resources]\ax %s', lib.timestampPrefix(), msg))
+    end)
 end
 
 local function toBool(v, default)
@@ -374,6 +376,9 @@ module.executeAction = function(self)
 end
 
 
+-- The legacy callback above is retained only as migration reference and must
+-- never be selected by ModuleBase.
+module.executeAction = nil
 module:enableUnifiedExecutor({
     preflight = function(action)
         local settings = getSettings()

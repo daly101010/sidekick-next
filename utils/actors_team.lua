@@ -244,10 +244,15 @@ end
 
 local function normalizeSender(sender)
     sender = sender or {}
+    local senderScript = lib.actorSenderEndpoint(sender)
+    if lib.actorSenderMatches(sender,
+        lib.Scripts.COORDINATOR, lib.Mailbox.TEAM) then
+        senderScript = lib.Scripts.COORDINATOR
+    end
     return {
         character = clean(sender.character or sender.Character),
         server = clean(sender.server or sender.Server),
-        script = clean(sender.script or sender.Script),
+        script = clean(senderScript),
         mailbox = clean(sender.mailbox or sender.Mailbox),
         account = clean(sender.account or sender.Account),
         name = clean(sender.name or sender.Name),
@@ -269,11 +274,8 @@ local function enqueue(message)
         _stats.identityRejected = _stats.identityRejected + 1
         return
     end
-    if normalize(sender.script) ~= normalize(lib.Scripts.COORDINATOR) then
-        _stats.identityRejected = _stats.identityRejected + 1
-        return
-    end
-    if normalize(sender.mailbox):find(normalize(lib.Mailbox.TEAM), 1, true) == nil then
+    if not lib.actorSenderMatches(sender,
+        lib.Scripts.COORDINATOR, lib.Mailbox.TEAM) then
         _stats.identityRejected = _stats.identityRejected + 1
         return
     end

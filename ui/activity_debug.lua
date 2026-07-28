@@ -44,6 +44,11 @@ local LABELS = {
 }
 
 local function labelFor(key)
+    local component, reason = tostring(key or ''):match('^failed:([^:]+):(.+)$')
+    if component and reason then
+        return string.format('%s failures (%s)', component,
+            reason:gsub('_', ' '))
+    end
     return LABELS[key] or key
 end
 
@@ -94,9 +99,16 @@ function M.drawContent()
         if counters then
             local base = _baseline[moduleName] or {}
             local rows = {}
+            local hasFailureDetail = false
+            for key in pairs(counters) do
+                if tostring(key):match('^failed:[^:]+:.+$') then
+                    hasFailureDetail = true
+                    break
+                end
+            end
             for _, key in ipairs(sortedKeys(counters)) do
                 local value = (tonumber(counters[key]) or 0) - (tonumber(base[key]) or 0)
-                if value > 0 then
+                if value > 0 and not (key == 'failed' and hasFailureDetail) then
                     rows[#rows + 1] = string.format('%s: %d', labelFor(key), value)
                 end
             end

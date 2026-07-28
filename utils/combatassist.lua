@@ -7,6 +7,7 @@
 ]]
 
 local mq = require('mq')
+local FeignSafety = require('sidekick-next.utils.feign_safety')
 
 -- ============================================================================
 -- Mez Tracking (MuleAssist pattern)
@@ -238,6 +239,16 @@ local function tick_stuck_recovery()
   end
 end
 
+local function cancel_stuck_recovery()
+  if not _recovery then return end
+  if _recovery.stage == 'back' then
+    mq.cmd('/keypress back')
+  elseif _recovery.stage == 'strafe' then
+    mq.cmdf('/keypress %s', _recovery.strafe)
+  end
+  _recovery = nil
+end
+
 -- ============================================================================
 -- Navigation
 -- ============================================================================
@@ -369,17 +380,17 @@ local function get_main_assist_spawn()
     pcall(function() ma = mq.TLO.Group and mq.TLO.Group.MainAssist end)
     return ma
   elseif mode == 'raid1' then
-    local ma
-    pcall(function() ma = mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(1) end)
-    return ma
+    local member
+    pcall(function() member = mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(1) end)
+    return member and member.Spawn or nil
   elseif mode == 'raid2' then
-    local ma
-    pcall(function() ma = mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(2) end)
-    return ma
+    local member
+    pcall(function() member = mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(2) end)
+    return member and member.Spawn or nil
   elseif mode == 'raid3' then
-    local ma
-    pcall(function() ma = mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(3) end)
-    return ma
+    local member
+    pcall(function() member = mq.TLO.Raid and mq.TLO.Raid.MainAssist and mq.TLO.Raid.MainAssist(3) end)
+    return member and member.Spawn or nil
   elseif mode == 'byname' then
     local name = config.assist_name or ''
     if name == '' then return nil end
@@ -404,7 +415,8 @@ local function get_assist_target()
     local tankState = okA and Actors and Actors.getTankState and Actors.getTankState() or nil
     local updatedAt = type(tankState) == 'table' and tonumber(tankState.updatedAt) or nil
     if updatedAt and (os.clock() - updatedAt) <= 5 then
-      local pid = tonumber(tankState.primaryTargetId) or 0
+      local pid = tankState.killAuthorized == true
+        and (tonumber(tankState.primaryTargetId) or 0) or 0
       if pid > 0 then
         local spawn = mq.TLO.Spawn(pid)
         if spawn and is_attackable(spawn) then
@@ -596,6 +608,13 @@ local function stop()
 end
 
 local function tick()
+  if FeignSafety.isManagedFeign() then
+    cancel_stuck_recovery()
+    clear_engage()
+    stop_nav()
+    return
+  end
+
   -- Always advance any in-flight stuck-recovery release sequence so the
   -- back/strafe hold gets cleared even when assist is disabled mid-recovery.
   tick_stuck_recovery()

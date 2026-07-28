@@ -3,6 +3,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 local M = {}
 
@@ -30,13 +31,12 @@ M.remoteDebuffs = {}  -- { [mobId] = { [debuffType] = { appliedAt, expiresAt, ap
 -- Debuff claims (before casting, claim so others don't try)
 M.localClaims = {}   -- { [mobId] = { [debuffType] = { claimedAt } } }
 M.remoteClaims = {}  -- { [mobId] = { [debuffType] = { claimedAt, claimer } } }
+M.lastPeerBlock = nil
 
 -- Timing
-local _lastBroadcast = 0
 local _lastCleanup = 0
-local BROADCAST_INTERVAL = 2.0   -- Broadcast every 2 seconds
 local CLEANUP_INTERVAL = 1.0     -- Clean expired every 1 second
-local CLAIM_TIMEOUT = 8.0        -- Claims expire after 8 seconds
+local CLAIM_TIMEOUT = CoordinationPolicy.CLAIM_TTL_SECONDS.DEBUFF
 local DEBUFF_DURATION_DEFAULT = 60  -- Default debuff duration
 
 local _selfName = ''
@@ -56,15 +56,9 @@ function M.init()
     M.localClaims = {}
     M.remoteClaims = {}
     _lastClaimBroadcast = {}
+    M.lastPeerBlock = nil
 
     _selfName = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or ''
-
-    -- Check if we're a debuffer class
-    local cls = ''
-    if mq.TLO.Me and mq.TLO.Me.Class and mq.TLO.Me.Class.ShortName then
-        cls = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
-    end
-    _isDebuffer = DEBUFFER_CLASSES[cls] ~= nil
 end
 
 function M.tick()
@@ -74,12 +68,6 @@ function M.tick()
     if (now - _lastCleanup) >= CLEANUP_INTERVAL then
         _lastCleanup = now
         M.cleanupExpired()
-    end
-
-    -- Broadcast our debuffs periodically
-    if _isDebuffer and (now - _lastBroadcast) >= BROADCAST_INTERVAL then
-        _lastBroadcast = now
-        M.broadcastDebuffs()
     end
 end
 
@@ -125,7 +113,9 @@ function M.cleanupExpired()
     -- Clean expired remote claims
     for mobId, claims in pairs(M.remoteClaims) do
         for debuffType, data in pairs(claims) do
-            if (now - data.claimedAt) >= CLAIM_TIMEOUT then
+            local active = CoordinationPolicy.evaluateLocalClaim(
+                getActors(), data, CLAIM_TIMEOUT, now)
+            if not active then
                 claims[debuffType] = nil
             end
         end
@@ -246,12 +236,35 @@ function M.isDebuffClaimed(mobId, debuffType)
     local remoteClaims = M.remoteClaims[id]
     if remoteClaims and remoteClaims[debuffType] then
         local claim = remoteClaims[debuffType]
-        if (now - claim.claimedAt) < CLAIM_TIMEOUT then
+        local active, peer = CoordinationPolicy.evaluateLocalClaim(
+            getActors(), claim, CLAIM_TIMEOUT, now)
+        claim.peerAgeMs = peer.peerAgeMs
+        claim.peerReason = peer.peerReason
+        claim.leaseRemainingMs = peer.leaseRemainingMs
+        if active then
+            M.lastPeerBlock = {
+                at = now,
+                targetId = id,
+                category = debuffType,
+                blockedBy = claim.claimer,
+                peerAgeMs = peer.peerAgeMs,
+                leaseRemainingMs = peer.leaseRemainingMs,
+            }
             return true, claim.claimer
         end
+        remoteClaims[debuffType] = nil
+        if not next(remoteClaims) then M.remoteClaims[id] = nil end
     end
 
     return false, nil
+end
+
+function M.getLastPeerBlockReason(maxAgeSeconds)
+    local block = M.lastPeerBlock
+    if not block or (os.clock() - (block.at or 0)) > (tonumber(maxAgeSeconds) or 1.0) then
+        return nil
+    end
+    return CoordinationPolicy.formatPeerBlock('claimed_by', block.blockedBy, block)
 end
 
 --- Broadcast a claim
@@ -318,6 +331,9 @@ function M.receiveClaim(payload)
     M.remoteClaims[mobId][debuffType] = {
         claimedAt = os.clock(),
         claimer = claimer,
+        zone = tostring(payload.zone or ''),
+        server = tostring(payload.server or payload._skActorSenderServer or ''),
+        senderScript = tostring(payload._skActorSenderScript or ''),
     }
 end
 
@@ -422,40 +438,6 @@ function M.receiveDebuffLanded(payload)
 end
 
 --- Broadcast all our active debuffs
-function M.broadcastDebuffs()
-    local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
-
-    if not next(M.localDebuffs) then return end
-
-    local now = os.clock()
-    local debuffList = {}
-
-    for mobId, debuffs in pairs(M.localDebuffs) do
-        for debuffType, data in pairs(debuffs) do
-            local ttl = (data.expiresAt or 0) - now
-            if ttl > 0 then
-                debuffList[#debuffList + 1] = {
-                    mobId = mobId,
-                    debuffType = debuffType,
-                    ttl = ttl,
-                    spellName = data.spellName or '',
-                }
-            end
-        end
-    end
-
-    if #debuffList > 0 then
-        local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
-        if myZone == '' or myZone == 'NULL' then myZone = nil end
-        Actors.broadcast('debuff:list', {
-            debuffs = debuffList,
-            sender = _selfName,
-            zone = myZone,
-        })
-    end
-end
-
 --------------------------------------------------------------------------------
 -- Query Functions
 --------------------------------------------------------------------------------

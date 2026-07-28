@@ -159,8 +159,9 @@ module.executeAction = function(self)
 end
 
 -- The unified executor fires and monitors the AA without blocking this
--- worker's heartbeat loop. The legacy callback above remains available while
--- the coordinated executor is being rolled out to every worker.
+-- Quarantine the retired direct callback. All execution now goes through the
+-- shared lease-bound executor below.
+module.executeAction = nil
 module:enableUnifiedExecutor()
 
 module.onTick = function(self)

@@ -11,6 +11,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local lib = require('sidekick-next.sk_lib')
 
 local M = {}
 
@@ -26,6 +27,15 @@ local _vitals = {}
 
 -- Members we consider alive (for death edge detection): name -> true
 local _wasAlive = {}
+local _deadCandidates = {} -- name -> first explicit-dead observation time
+local DEATH_CONFIRM_MS = 750
+
+-- Zone transitions invalidate Group/Me health TLOs. A new observation epoch
+-- must positively see members alive again before death edges can be armed.
+local _zoneSuspended = false
+local _lastZoneId = 0
+local _rearmUntil = 0
+local POST_ZONE_REARM_MS = 2000
 
 -- Per-member report cooldown (avoid duplicate reports for one death)
 local _lastReport = {}  -- name -> time
@@ -93,8 +103,8 @@ function M.onCastComplete(castData, result)
     local SpellEvents = getSpellEvents()
     local resultName = (SpellEvents and SpellEvents.getResultName and SpellEvents.getResultName(result))
         or tostring(result)
-    local targetName = ''
-    if castData.targetId and castData.targetId > 0 then
+    local targetName = tostring(castData.targetName or '')
+    if targetName == '' and castData.targetId and castData.targetId > 0 then
         local ok, name = pcall(function()
             local s = mq.TLO.Spawn(castData.targetId)
             return s and s() and s.CleanName() or ''
@@ -115,12 +125,22 @@ local function forEachMember(fn)
     -- Self first
     local me = mq.TLO.Me
     if me and me() then
-        fn(me.CleanName() or 'Me', {
-            hp = tonumber(me.PctHPs()) or 0,
-            mana = tonumber(me.PctMana()) or 0,
-            dead = (me.Hovering and me.Hovering()) == true,
-            class = me.Class and me.Class.ShortName and me.Class.ShortName() or '',
-        })
+        local ok, data = pcall(function()
+            local dead = (me.Hovering and me.Hovering()) == true
+            local hp = tonumber(me.PctHPs and me.PctHPs() or nil)
+            return {
+                name = me.CleanName() or 'Me',
+                hp = hp,
+                mana = tonumber(me.PctMana and me.PctMana() or nil) or 0,
+                dead = dead,
+                class = me.Class and me.Class.ShortName and me.Class.ShortName() or '',
+                observable = dead or (hp ~= nil and hp > 0),
+            }
+        end)
+        if ok and data and data.observable then
+            if data.hp == nil then data.hp = 0 end
+            fn(data.name, data)
+        end
     end
 
     local count = tonumber(mq.TLO.Group.Members()) or 0
@@ -131,19 +151,22 @@ local function forEachMember(fn)
                 local spawn = member
                 if member.Spawn and member.Spawn() then spawn = member.Spawn() end
                 local name = (spawn.CleanName and spawn.CleanName()) or member.Name() or ''
-                local dead = false
-                if member.Dead and member.Dead() then dead = true end
-                local hp = tonumber(member.PctHPs and member.PctHPs() or nil) or 0
-                if hp <= 0 then dead = dead or hp == 0 end
+                local unavailable = (member.Offline and member.Offline() == true)
+                    or (member.OtherZone and member.OtherZone() == true)
+                local dead = not unavailable
+                    and (member.Dead and member.Dead() == true or false)
+                local hp = tonumber(member.PctHPs and member.PctHPs() or nil)
                 return {
                     name = name,
                     hp = hp,
                     mana = tonumber(member.PctMana and member.PctMana() or nil) or 0,
                     dead = dead,
                     class = (member.Class and member.Class.ShortName and member.Class.ShortName()) or '',
+                    observable = not unavailable and (dead or (hp ~= nil and hp > 0)),
                 }
             end)
-            if ok and data and data.name ~= '' then
+            if ok and data and data.name ~= '' and data.observable then
+                if data.hp == nil then data.hp = 0 end
                 fn(data.name, data)
             end
         end
@@ -242,6 +265,10 @@ local function buildReport(deadName, deadInfo)
     add('Engaged mobs:')
     local ma = getMobAssessor()
     local mi = getMobIntel()
+    if mi then
+        if mi.loadDatabase then pcall(mi.loadDatabase) end
+        if mi.loadZone then pcall(mi.loadZone) end
+    end
     local xtCount = tonumber(mq.TLO.Me.XTarget()) or 0
     local mobLines = 0
     for i = 1, xtCount do
@@ -312,12 +339,46 @@ end
 -- Tick / lifecycle
 -------------------------------------------------------------------------------
 
+--- Invalidate all death-edge state for a zone transition. Safe to call on
+--- every suspended UI tick; only the first call resets the rolling window.
+function M.suspendForZone()
+    if _zoneSuspended then return end
+    _zoneSuspended = true
+    _lastZoneId = 0
+    _rearmUntil = 0
+    _wasAlive = {}
+    _deadCandidates = {}
+    _vitals = {}
+    _events = {}
+end
+
 function M.tick()
     if not enabled() then return end
 
     local now = mq.gettime()
+    if not lib.isInGame() then
+        M.suspendForZone()
+        return
+    end
+
+    local zoneId = lib.safeNum(function() return mq.TLO.Zone.ID() end, 0)
+    if zoneId <= 0 then
+        M.suspendForZone()
+        return
+    end
+    if _zoneSuspended or (_lastZoneId > 0 and zoneId ~= _lastZoneId) then
+        _zoneSuspended = false
+        _wasAlive = {}
+        _deadCandidates = {}
+        _vitals = {}
+        _events = {}
+        _rearmUntil = now + POST_ZONE_REARM_MS
+    end
+    _lastZoneId = zoneId
+
     if (now - _lastSample) < SAMPLE_INTERVAL_MS then return end
     _lastSample = now
+    local deathEdgesArmed = now >= _rearmUntil
 
     forEachMember(function(name, data)
         -- Record vitals
@@ -330,11 +391,18 @@ function M.tick()
 
         -- Death edge detection
         if data.dead then
-            if _wasAlive[name] then
-                _wasAlive[name] = nil
-                reportDeath(name, data)
+            if deathEdgesArmed and _wasAlive[name] then
+                local firstSeen = _deadCandidates[name]
+                if not firstSeen then
+                    _deadCandidates[name] = now
+                elseif (now - firstSeen) >= DEATH_CONFIRM_MS then
+                    _deadCandidates[name] = nil
+                    _wasAlive[name] = nil
+                    reportDeath(name, data)
+                end
             end
-        elseif data.hp > 0 then
+        elseif data.hp and data.hp > 0 then
+            _deadCandidates[name] = nil
             _wasAlive[name] = true
         end
     end)
@@ -346,21 +414,50 @@ function M.init()
     if _initialized then return end
     _initialized = true
 
-    -- Incoming damage feed (available once the healing module loads the parser)
-    local dp = getDamageParser()
-    if dp and dp.addListener then
-        dp.addListener(function(targetId, targetName, amount, source, dmgType)
-            M.onIncomingDamage(targetId, targetName, amount, source, dmgType)
-        end)
-    end
+    local coordinated = _G.SIDEKICK_NEXT_CONFIG
+        and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
+    if coordinated then
+        -- The UI owns report assembly, but the authoritative damage parser and
+        -- SpellEngines live in workers. Consume their explicitly routed feeds
+        -- rather than initializing duplicate combat parsers in this process.
+        local ok, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+        if ok and Actors and Actors.registerMessageCallback then
+            Actors.registerMessageCallback('forensics:damage', function(content)
+                for _, event in ipairs(type(content.events) == 'table' and content.events or {}) do
+                    M.onIncomingDamage(event.targetId, event.targetName, event.amount,
+                        event.source, event.dmgType)
+                end
+            end)
+            Actors.registerMessageCallback('forensics:cast', function(content)
+                M.onCastComplete(content.castData, content.result)
+            end)
+        end
+    else
+        -- Monolithic compatibility: initialize and consume local process feeds.
+        local dp = getDamageParser()
+        if dp then
+            if dp.init then
+                local Core = getCore()
+                pcall(dp.init, Core and Core.Settings or nil)
+            end
+            if dp.addListener then
+                dp.addListener(function(targetId, targetName, amount, source, dmgType)
+                    M.onIncomingDamage(targetId, targetName, amount, source, dmgType)
+                end)
+            end
+        end
 
-    -- My cast completions
-    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
-    if ok and SpellEngine then
-        local prev = SpellEngine.onCastComplete
-        SpellEngine.onCastComplete = function(castData, result)
-            if prev then pcall(prev, castData, result) end
-            M.onCastComplete(castData, result)
+        local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
+        if ok and SpellEngine then
+            if SpellEngine.addCastCompleteListener then
+                SpellEngine.addCastCompleteListener(M.onCastComplete)
+            else
+                local prev = SpellEngine.onCastComplete
+                SpellEngine.onCastComplete = function(castData, result)
+                    if prev then pcall(prev, castData, result) end
+                    M.onCastComplete(castData, result)
+                end
+            end
         end
     end
 end

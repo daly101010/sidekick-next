@@ -21,6 +21,7 @@
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
 local SafeLoad = require('sidekick-next.utils.safe_load')
+local MobName = require('sidekick-next.utils.mob_name')
 
 local M = {}
 
@@ -38,6 +39,9 @@ M.dirty = false
 
 -- Pending attempts awaiting land/resist resolution
 local _pending = {}  -- array of {spell, mob, element, expires (ms)}
+local _initialized = false
+local _recentOwnDamage = {} -- damage chat can dispatch just before cast completion
+local RECENT_DAMAGE_TTL_MS = 2500
 
 -- How long after cast completion a resist message can still claim the attempt
 local PENDING_GRACE_MS = 2000
@@ -64,6 +68,53 @@ local function getDbPath()
     return mq.configDir .. '/SideKick/data/resist_tracker.lua'
 end
 
+local function mergeCorpseStats(database)
+    local migrated = 0
+    for _, mobs in pairs(type(database) == 'table' and database or {}) do
+        if type(mobs) == 'table' then
+            local moves = {}
+            for name, elements in pairs(mobs) do
+                local baseName = MobName.corpseBaseName(name)
+                if baseName then
+                    moves[#moves + 1] = {
+                        corpseName = name,
+                        baseName = baseName,
+                        elements = elements,
+                    }
+                end
+            end
+            for _, move in ipairs(moves) do
+                local destination = mobs[move.baseName]
+                if type(destination) ~= 'table' then
+                    destination = {}
+                    mobs[move.baseName] = destination
+                end
+                for element, sourceStats in pairs(
+                    type(move.elements) == 'table' and move.elements or {})
+                do
+                    local targetStats = destination[element]
+                    if type(targetStats) ~= 'table' then
+                        targetStats = {}
+                        destination[element] = targetStats
+                    end
+                    for key, value in pairs(
+                        type(sourceStats) == 'table' and sourceStats or {})
+                    do
+                        if type(value) == 'number' then
+                            targetStats[key] = (tonumber(targetStats[key]) or 0) + value
+                        elseif targetStats[key] == nil then
+                            targetStats[key] = value
+                        end
+                    end
+                end
+                mobs[move.corpseName] = nil
+                migrated = migrated + 1
+            end
+        end
+    end
+    return migrated
+end
+
 -------------------------------------------------------------------------------
 -- Persistence (same shape as immune_database)
 -------------------------------------------------------------------------------
@@ -71,6 +122,7 @@ end
 function M.loadDatabase()
     M.currentZone = ''
     M.zoneStats = {}
+    M.dirty = false
 
     local path = getDbPath()
     local file = io.open(path, 'r')
@@ -86,6 +138,13 @@ function M.loadDatabase()
         local data, err = SafeLoad.tableLiteral(content, path)
         if type(data) == 'table' then
             M.database = data
+            local migrated = mergeCorpseStats(M.database)
+            if migrated > 0 then
+                M.dirty = true
+                print(string.format(
+                    '\ay[ResistTracker]\ax Migrated %d corpse knowledge entr%s to live mob names',
+                    migrated, migrated == 1 and 'y' or 'ies'))
+            end
             return
         end
         print(string.format('\ar[ResistTracker]\ax load failed: %s', tostring(err or 'invalid data')))
@@ -150,7 +209,7 @@ end
 -------------------------------------------------------------------------------
 
 local function getStats(mobName, element, create)
-    if not mobName or mobName == '' then return nil end
+    if not MobName.isKnowledgeName(mobName) then return nil end
     if not element or element == '' then return nil end
     element = element:lower()
 
@@ -291,8 +350,9 @@ function M.onCastComplete(castData, result)
     local element = resolveElement(castData.spellName)
     if element == '' then return end
 
-    local mobName = resolveMobName(castData.targetId)
-    if mobName == '' then return end
+    local mobName = tostring(castData.targetName or '')
+    if mobName == '' then mobName = resolveMobName(castData.targetId) end
+    if not MobName.isKnowledgeName(mobName) then return end
 
     local SpellEvents = getSpellEvents()
     local RESULT = SpellEvents and SpellEvents.RESULT or {}
@@ -308,6 +368,20 @@ function M.onCastComplete(castData, result)
             element = element,
             expires = mq.gettime() + PENDING_GRACE_MS,
         })
+        -- ModuleBase drains MQ events before advancing SpellEngine. If the
+        -- damage line landed in that drain, consume the bounded cached hit now
+        -- that its cast attempt exists.
+        local now = mq.gettime()
+        for i = #_recentOwnDamage, 1, -1 do
+            local hit = _recentOwnDamage[i]
+            if (now - hit.at) > RECENT_DAMAGE_TTL_MS then
+                table.remove(_recentOwnDamage, i)
+            elseif hit.mob == mobName then
+                table.remove(_recentOwnDamage, i)
+                M.onOwnSpellDamage(hit.mob, hit.amount)
+                break
+            end
+        end
     end
     -- IMMUNE and other failures are not resist-rate signal (immune DB owns immunities)
 end
@@ -340,9 +414,6 @@ function M.onOwnSpellDamage(mobName, amount)
 
             local SpellDamage = getSpellDamage()
             if SpellDamage then
-                if SpellDamage.record then
-                    SpellDamage.record(p.spell, amount)
-                end
                 local baseline = SpellDamage.getBaseline and SpellDamage.getBaseline(p.spell)
                 if baseline and baseline > 0 then
                     M.recordEfficiency(p.mob, p.element, amount / baseline)
@@ -351,11 +422,37 @@ function M.onOwnSpellDamage(mobName, amount)
             return
         end
     end
+    -- Cache only damage from the SpellEngine cast that is still awaiting its
+    -- terminal tick. Unrelated proc damage must not be attributed to the next
+    -- nuke cast on the same mob.
+    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
+    local castInfo = ok and SpellEngine and SpellEngine.getCastInfo
+        and SpellEngine.getCastInfo() or nil
+    local castTargetName = castInfo and tostring(castInfo.targetName or '') or ''
+    if castTargetName == '' and castInfo then
+        castTargetName = resolveMobName(castInfo.targetId)
+    end
+    if not castInfo or not DAMAGE_CATEGORIES[tostring(castInfo.category or ''):lower()]
+        or castTargetName ~= mobName then
+        return
+    end
+    table.insert(_recentOwnDamage, {
+        mob = mobName,
+        amount = amount,
+        at = mq.gettime(),
+    })
+    if #_recentOwnDamage > 20 then table.remove(_recentOwnDamage, 1) end
 end
 
 --- Resolve expired pending attempts as landed; throttled periodic save
 function M.tick()
     local now = mq.gettime()
+
+    for i = #_recentOwnDamage, 1, -1 do
+        if (now - (_recentOwnDamage[i].at or 0)) > RECENT_DAMAGE_TTL_MS then
+            table.remove(_recentOwnDamage, i)
+        end
+    end
 
     local i = 1
     while i <= #_pending do
@@ -379,6 +476,7 @@ end
 -------------------------------------------------------------------------------
 
 function M.init()
+    if _initialized then return end
     M.loadDatabase()
     M.loadZone()
 
@@ -390,13 +488,17 @@ function M.init()
         onResistEvent(spell)
     end)
 
-    -- Hook cast completions (chain any existing callback)
+    -- Hook cast completions without replacing other process-local observers.
     local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
     if ok and SpellEngine then
-        local prev = SpellEngine.onCastComplete
-        SpellEngine.onCastComplete = function(castData, result)
-            if prev then pcall(prev, castData, result) end
-            M.onCastComplete(castData, result)
+        if SpellEngine.addCastCompleteListener then
+            SpellEngine.addCastCompleteListener(M.onCastComplete)
+        else
+            local prev = SpellEngine.onCastComplete
+            SpellEngine.onCastComplete = function(castData, result)
+                if prev then pcall(prev, castData, result) end
+                M.onCastComplete(castData, result)
+            end
         end
     end
 
@@ -409,6 +511,7 @@ function M.init()
             end
         end)
     end
+    _initialized = true
 end
 
 function M.shutdown()

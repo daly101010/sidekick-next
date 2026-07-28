@@ -25,7 +25,9 @@ end
 
 module.onTick = function(self)
     local work, reason = plannedWork()
-    self:markDirtyEffects(Memorize.hasDirtyEffects())
+    local dirty = Memorize.hasDirtyEffects()
+    self:markDirtyEffects(dirty,
+        dirty and not self:ownsLease(self.currentRequestId))
     Memorize.publishWorkerStatus(reason, false)
     self:setIntent(work ~= nil, work and 1000 or nil, _lastReason)
 end
@@ -80,7 +82,7 @@ local function finalizeLease(self, _, reason)
         -- A stale lease snapshot may be released, but it cannot authorize a
         -- spellbook mutation. Advertise recovery need and wait for the
         -- coordinator's exact recovery lease.
-        self:markDirtyEffects(true)
+        self:markDirtyEffects(true, true)
         Memorize.abortActive(reason or 'lease_lost', true)
         return true, 'recovery_required'
     end

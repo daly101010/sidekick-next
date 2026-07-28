@@ -153,6 +153,7 @@ M.properties = {
     { key = "IsHealer",   label = "is Healer",  type = "boolean" },
     { key = "IsMelee",    label = "is Melee",   type = "boolean" },
     { key = "IsCaster",   label = "is Caster",  type = "boolean" },
+    { key = "IsPet",      label = "is Pet",     type = "boolean" },
   },
   ["detrimental:Target"] = {
     { key = "PctHPs",   label = "HP",       type = "numeric", isPercent = true, min = 0, max = 100 },
@@ -1370,6 +1371,11 @@ function M.evaluateWithContext(conditionData, ctx)
           if actual == nil and spawn and spawn() then
             local cls = spawn.Class and spawn.Class.ShortName and spawn.Class.ShortName() or ''
             actual = cls == 'WIZ' or cls == 'MAG' or cls == 'ENC' or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM'
+          end
+        elseif cond.property == "IsPet" then
+          actual = ctx.buffTargetIsPet
+          if actual == nil and spawn and spawn() then
+            actual = tostring(spawn.Type() or ''):lower() == 'pet'
           end
         end
       end

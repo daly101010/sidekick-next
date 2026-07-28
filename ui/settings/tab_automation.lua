@@ -93,6 +93,48 @@ function M.draw(settings, themeNames, onChange)
                 tooltip = 'Stand and let inbound mobs come to you beyond this distance.\nOnly chase (via nav pathfinding) when the mob stops closing.',
             })
             if hrChanged and onChange then onChange('TankHoldRadius', newHold) end
+
+            local fleeHandoff = settings.TankFleeHandoff ~= false
+            local fhVal, fhChanged = Components.CheckboxRow.draw(
+                'Hand Off Fleeing Mobs', 'TankFleeHandoff', fleeHandoff, nil, {
+                    tooltip = 'Keep DPS on a fleeing low-HP primary while the tank opens the next add. Named primaries are never handed off.',
+                })
+            if fhChanged and onChange then onChange('TankFleeHandoff', fhVal) end
+
+            if fleeHandoff then
+                local fleeHp = tonumber(settings.TankFleeHpThreshold) or 20
+                local hpChanged, newHp = Components.SliderRow.percent(
+                    'Handoff Below HP', 'TankFleeHpThreshold', fleeHp, nil, {
+                        tooltip = 'Only hand off a fleeing non-named primary at or below this HP percentage.',
+                    })
+                if hpChanged and onChange then onChange('TankFleeHpThreshold', newHp) end
+
+                local recedeRate = tonumber(settings.TankFleeMinRecedeRate) or 2.25
+                local rateChanged, newRate = Components.SliderRow.float(
+                    'Minimum Recede Speed', 'TankFleeMinRecedeRate',
+                    recedeRate, 0.5, 20.0, nil, {
+                        format = '%.1f u/s',
+                        tooltip = 'Minimum outward distance change per second required to identify the primary as fleeing.',
+                    })
+                if rateChanged and onChange then
+                    onChange('TankFleeMinRecedeRate', newRate)
+                end
+
+                local fleeAdds = tonumber(settings.TankFleeMinAdds) or 2
+                local addsChanged, newAdds = Components.SliderRow.int(
+                    'Minimum Haters', 'TankFleeMinAdds', fleeAdds, 2, 8, nil, {
+                        tooltip = 'Minimum eligible haters, including the runner, before an early handoff.',
+                    })
+                if addsChanged and onChange then onChange('TankFleeMinAdds', newAdds) end
+
+                local fleeWindow = tonumber(settings.TankFleeHandoffWindowSec) or 15
+                local windowChanged, newWindow = Components.SliderRow.int(
+                    'Handoff Window (sec)', 'TankFleeHandoffWindowSec',
+                    fleeWindow, 3, 30)
+                if windowChanged and onChange then
+                    onChange('TankFleeHandoffWindowSec', newWindow)
+                end
+            end
         end, { id = 'tank_settings', defaultOpen = true })
     end
 
@@ -157,31 +199,34 @@ function M.draw(settings, themeNames, onChange)
         if mfChanged and onChange then onChange('DpsMinManaPct', newMf) end
     end, { id = 'dps_casting_settings', defaultOpen = false })
 
-        -- Ranged standoff is a WIZARD positioning feature: keep enough
-        -- distance that rain spells never splash the caster. It is not for
-        -- general casting — in a tight camp it relocates every few seconds,
-        -- and movement defers timed casts (fatal for mezzers/healers).
+    -- Independent of Combat Mode: coordinated DPS telemetry supplies the target.
+    -- This movement path never enables Assist, /stick, or /attack.
     Components.SettingGroup.draw('Ranged Standoff (Casters)', function()
-            local standoff = settings.CasterStandoffEnabled == true
+        local standoff = settings.CasterStandoffEnabled == true
         local soVal, soChanged = Components.CheckboxRow.draw(
             'Keep Ranged Distance', 'CasterStandoffEnabled', standoff, nil, {
-                tooltip = 'Maintain a randomized casting distance from the coordinated DPS target.\n'
+                tooltip = 'Immediately establish a casting spot when combat starts, even before a spell is eligible.\n'
+                    .. 'After placement, retreat only when the coordinated DPS target gets too close.\n'
+                    .. 'Distant or out-of-sight targets never pull the caster forward.\n'
                     .. 'This does not enable melee Assist, /stick, or /attack.\n'
                     .. 'Movement defers timed casts, so leave it OFF for healers and mezzers.',
             })
-            if soChanged and onChange then onChange('CasterStandoffEnabled', soVal) end
+        if soChanged and onChange then onChange('CasterStandoffEnabled', soVal) end
 
-            if soVal then
-                local minD = tonumber(settings.CasterStandoffMin) or 35
-                local minChanged, newMin = Components.SliderRow.int('Min Distance', 'CasterStandoffMin', minD, 20, 80, nil, {
-                    tooltip = 'Reposition when the target is closer than this (rain splash radius + margin)',
-                })
-                if minChanged and onChange then onChange('CasterStandoffMin', newMin) end
+        if soVal then
+            local minD = tonumber(settings.CasterStandoffMin) or 35
+            local minChanged, newMin = Components.SliderRow.int('Min Distance', 'CasterStandoffMin', minD, 20, 80, nil, {
+                tooltip = 'Reposition when the DPS target is closer than this.',
+            })
+            if minChanged and onChange then onChange('CasterStandoffMin', newMin) end
 
-                local maxD = tonumber(settings.CasterStandoffMax) or 60
-                local maxChanged, newMax = Components.SliderRow.int('Max Distance', 'CasterStandoffMax', maxD, 25, 120)
-                if maxChanged and onChange then onChange('CasterStandoffMax', newMax) end
-            end
+            local maxD = tonumber(settings.CasterStandoffMax) or 60
+            local maxChanged, newMax = Components.SliderRow.int('Retreat To Distance', 'CasterStandoffMax', maxD, 25, 120, nil, {
+                tooltip = 'One-time retreat destination after the target crosses Min Distance.\n'
+                    .. 'Being farther away than this does not make the caster move toward the mob.',
+            })
+            if maxChanged and onChange then onChange('CasterStandoffMax', newMax) end
+        end
     end, { id = 'standoff_settings', defaultOpen = false })
 
     -- Stick commands apply to any combat mode that moves the character

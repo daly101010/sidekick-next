@@ -11,6 +11,18 @@
 --- @return boolean ok
 --- @return string|nil err Error message on failure
 local function safeWrite(path, content)
+    path = tostring(path or '')
+    local parent = path:match('^(.+)[/\\][^/\\]+$')
+    if parent then
+        local pathsOk, Paths = pcall(require, 'sidekick-next.utils.paths')
+        if pathsOk and Paths and Paths.ensureDir then
+            local dirOk, dirErr = Paths.ensureDir(parent)
+            if dirOk == false then
+                return false, tostring(dirErr or ('directory_unavailable:' .. parent))
+            end
+        end
+    end
+
     local tmpPath = path .. '.tmp'
     local bakPath = path .. '.bak'
 

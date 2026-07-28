@@ -288,7 +288,7 @@ traceLog = function(level, category, key, intervalSec, fmt, ...)
     if _buffDebugEnabled and not Logger.wouldLog('buffs', unifiedLevel) then
         local color = level == 'error' and '\ar' or (level == 'warn' and '\ay' or '\at')
         pcall(function()
-            printf('%s[SK Buffs][%s][%s]\ax %s', color,
+            printf('%s %s[SK Buffs][%s][%s]\ax %s', lib.timestampPrefix(), color,
                 tostring(level or 'info'):upper(), tostring(category or 'trace'), msg)
         end)
     end
@@ -482,7 +482,9 @@ local function commandEcho(fmt, ...)
     else
         msg = tostring(fmt)
     end
-    pcall(function() printf('\ag[SK Buffs]\ax %s', msg) end)
+    pcall(function()
+        printf('%s \ag[SK Buffs]\ax %s', lib.timestampPrefix(), msg)
+    end)
 end
 
 local function dumpBuffDefinitions()
@@ -1023,14 +1025,50 @@ local function getGroupRoleNames()
     return roles
 end
 
-function groupBuffCandidates(myId)
+function groupBuffCandidates(myId, includePets)
     local candidates = {}
+    local seen = {}
     local roleNames = getGroupRoleNames()
     local me = mq.TLO.Me
 
+    local function addCandidate(candidate)
+        local id = tonumber(candidate and candidate.id) or 0
+        if id <= 0 or seen[id] then return end
+        seen[id] = true
+        table.insert(candidates, candidate)
+    end
+
+    local function addPet(owner, ownerName)
+        if includePets ~= true or not owner then return end
+        local petId = lib.safeNum(function() return owner.Pet.ID() end, 0)
+        if petId <= 0 or seen[petId] then return end
+        local live = select(1, isLiveBuffSpawn(petId))
+        if not live then return end
+        local pet = mq.TLO.Spawn(petId)
+        if not (pet and pet()) then return end
+        addCandidate({
+            id = petId,
+            name = lib.safeTLO(function()
+                return pet.CleanName and pet.CleanName() or pet.Name()
+            end, ''),
+            class = lib.safeTLO(function()
+                return pet.Class and pet.Class.ShortName
+                    and pet.Class.ShortName() or ''
+            end, ''),
+            hp = lib.safeNum(function() return pet.PctHPs() end, 100),
+            mana = lib.safeNum(function() return pet.PctMana() end, 100),
+            distance = lib.safeNum(function() return pet.Distance() end, 999),
+            role = 'Pet',
+            isSelf = false,
+            isPet = true,
+            ownerName = tostring(ownerName or ''),
+            tlo = pet,
+        })
+    end
+
     if me and me() and myId > 0 then
         local name = me.CleanName and me.CleanName() or _selfName
-        table.insert(candidates, {
+        addCandidate({
             id = myId,
             name = name,
             class = me.Class and me.Class.ShortName and me.Class.ShortName() or '',
@@ -1038,8 +1076,10 @@ function groupBuffCandidates(myId)
             mana = me.PctMana and me.PctMana() or 100,
             role = roleNames[tostring(name or ''):lower()],
             isSelf = true,
+            isPet = false,
             tlo = me,
         })
+        addPet(me, name)
     end
 
     local memberCount = tonumber(mq.TLO.Group.Members()) or 0
@@ -1053,7 +1093,7 @@ function groupBuffCandidates(myId)
             local liveSpawn = select(1, isLiveBuffSpawn(id))
             if id > 0 and id ~= myId and liveSpawn and not dead and not offline and not otherZone then
                 local name = member.CleanName and member.CleanName() or ''
-                table.insert(candidates, {
+                addCandidate({
                     id = id,
                     name = name,
                     class = member.Class and member.Class.ShortName and member.Class.ShortName() or '',
@@ -1062,8 +1102,10 @@ function groupBuffCandidates(myId)
                     distance = member.Distance and tonumber(member.Distance()) or 999,
                     role = roleNames[tostring(name or ''):lower()],
                     isSelf = false,
+                    isPet = false,
                     tlo = member,
                 })
+                addPet(member, name)
             end
         end
     end
@@ -1071,19 +1113,17 @@ function groupBuffCandidates(myId)
     return candidates
 end
 
-local function targetMatchesBuffTarget(candidate, buffTarget)
+local function targetMatchesBuffTarget(candidate, buffTarget, conditionUsesPet)
     if not candidate then return false end
     local targetType = tostring(buffTarget and buffTarget.type or 'group'):lower()
     local targetValue = tostring(buffTarget and buffTarget.value or ''):lower()
 
     if targetType == '' or targetType == 'group' then
-        return true
+        return candidate.isPet ~= true or conditionUsesPet == true
     elseif targetType == 'self' then
         return candidate.isSelf == true
     elseif targetType == 'pet' then
-        -- Pet candidates are not part of the OOC group rotation yet. Do not
-        -- fall through and cast a pet-only buff on a player.
-        return false
+        return candidate.isPet == true
     elseif targetType == 'role' then
         return tostring(candidate.role or ''):lower() == targetValue
     elseif targetType == 'class' then
@@ -1095,7 +1135,7 @@ local function targetMatchesBuffTarget(candidate, buffTarget)
     return true
 end
 
-local function conditionPassesForTarget(buffDef, candidate)
+local function resolveBuffCondition(buffDef)
     local condition = buffDef and buffDef.condition
     -- Spellset persistence stores conditions as SERIALIZED STRINGS.
     -- Indexing the string for `.conditions` returned nil, so the
@@ -1116,6 +1156,24 @@ local function conditionPassesForTarget(buffDef, candidate)
         if buffDef._parsedCondition == false then return false end
         condition = buffDef._parsedCondition
     end
+    return condition
+end
+
+local function conditionUsesPetTarget(buffDef)
+    local condition = resolveBuffCondition(buffDef)
+    if type(condition) ~= 'table' then return false end
+    for _, entry in ipairs(condition.conditions or {}) do
+        if tostring(entry.subject or '') == 'BuffTarget'
+            and tostring(entry.property or '') == 'IsPet' then
+            return true
+        end
+    end
+    return false
+end
+
+local function conditionPassesForTarget(buffDef, candidate)
+    local condition = resolveBuffCondition(buffDef)
+    if condition == false then return false end
     if not condition or not condition.conditions or #condition.conditions == 0 then return true end
 
     local ConditionBuilder = getConditionBuilder()
@@ -1134,10 +1192,13 @@ local function conditionPassesForTarget(buffDef, candidate)
         buffTargetHp = candidate.hp or 100,
         buffTargetMana = candidate.mana or 100,
         buffTargetIsMe = candidate.isSelf == true,
+        buffTargetIsPet = candidate.isPet == true,
         buffTargetIsTank = (cls == 'WAR' or cls == 'PAL' or cls == 'SHD'),
         buffTargetIsHealer = (cls == 'CLR' or cls == 'DRU' or cls == 'SHM'),
         buffTargetIsMelee = (cls == 'WAR' or cls == 'PAL' or cls == 'SHD' or cls == 'MNK' or cls == 'ROG' or cls == 'BER' or cls == 'RNG' or cls == 'BST'),
-        buffTargetIsCaster = (cls == 'WIZ' or cls == 'MAG' or cls == 'ENC' or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM'),
+        buffTargetIsCaster = (cls == 'WIZ' or cls == 'MAG' or cls == 'ENC'
+            or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM'
+            or cls == 'PAL' or cls == 'SHD' or cls == 'RNG' or cls == 'BST'),
     }
 
     local ok, result = pcall(ConditionBuilder.evaluateWithContext, condition, ctx)
@@ -1164,8 +1225,11 @@ local function candidateHasBuff(candidate, spellName, spellId, category, rebuffW
             aura = (not direct and not triggered) and selfHasBuff(spellName, spellId) or false
         end
     else
-        direct = actorHasBuffBySpell(candidate.tlo, spellName, spellId)
-        triggered = actorHasTriggeredEffect(candidate.tlo, spellName)
+        local actor = candidate.tlo
+        local currentTargetId = lib.safeNum(function() return mq.TLO.Target.ID() end, 0)
+        if currentTargetId == tonumber(candidate.id) then actor = mq.TLO.Target end
+        direct = actorHasBuffBySpell(actor, spellName, spellId)
+        triggered = actorHasTriggeredEffect(actor, spellName)
     end
 
     if buffDebugEnabled() then
@@ -1193,6 +1257,18 @@ local function directBuffPresentOnTarget(targetId, spellName, spellId, isGroup)
         return selfHasBuff(spellName, spellId), 'self'
     end
 
+    -- Once the workflow has selected the recipient, Target is the most
+    -- authoritative source of cached buff data. Group.Member/Spawn cached
+    -- buff lists may not yet be populated and must not turn "unknown" into
+    -- "missing".
+    local currentTargetId = lib.safeNum(function() return mq.TLO.Target.ID() end, 0)
+    if currentTargetId == tonumber(targetId) then
+        local target = mq.TLO.Target
+        local present = actorHasBuffBySpell(target, spellName, spellId)
+            or actorHasTriggeredEffect(target, spellName)
+        return present == true, 'current_target'
+    end
+
     for _, candidate in ipairs(groupBuffCandidates(myId)) do
         if tonumber(candidate.id) == tonumber(targetId) then
             local direct = actorHasBuffBySpell(candidate.tlo, spellName, spellId)
@@ -1204,15 +1280,27 @@ local function directBuffPresentOnTarget(targetId, spellName, spellId, isGroup)
     return false, 'target_not_observable'
 end
 
+local function spellWouldStackOnCurrentTarget(spellName)
+    local spell = spellName and mq.TLO.Spell(spellName) or nil
+    if not (spell and spell() and spell.StacksTarget) then return true end
+    local ok, stacks = pcall(function() return spell.StacksTarget() end)
+    return not ok or stacks ~= false
+end
+
 local function pickBuffTarget(buffDef, spellName, category, rebuffWindow, isGroup, myId)
     local spellId = buffDef and buffDef.spellId or getSpellId(spellName)
-    for _, candidate in ipairs(groupBuffCandidates(myId)) do
+    local usesPetCondition = conditionUsesPetTarget(buffDef)
+    local targetType = tostring(buffDef and buffDef.buffTarget
+        and buffDef.buffTarget.type or ''):lower()
+    local includePets = usesPetCondition or targetType == 'pet'
+    for _, candidate in ipairs(groupBuffCandidates(myId, includePets)) do
         -- NOTE: invis candidates are NOT skipped — buffs land on invis group
         -- members as long as the buffer can see them (see-invis), and
         -- Spawn.Invis only reports their state, not our visibility of them.
         -- A truly unseeable target fails the cast and the normal
         -- buff_not_observed_after_cast backoff handles it.
-        if targetMatchesBuffTarget(candidate, buffDef and buffDef.buffTarget)
+        if targetMatchesBuffTarget(candidate, buffDef and buffDef.buffTarget,
+                usesPetCondition)
             and conditionPassesForTarget(buffDef, candidate) then
             local hasBuff = candidateHasBuff(candidate, spellName, spellId, category, rebuffWindow)
             debugLog('pickBuffTarget: %s candidate=%s id=%d hasBuff=%s isGroup=%s',
@@ -2043,7 +2131,7 @@ module.onTick = function(self)
         _pendingAction = nil
         _pendingReason = nil
         releaseActorBuffClaim('lease_lost')
-        self:markDirtyEffects(dirtyEffects)
+        self:markDirtyEffects(dirtyEffects, dirtyEffects)
         if not dirtyEffects then
             self:cancelUnifiedAction('lease_lost')
             ActionExecutor.consumeResult()
@@ -2358,14 +2446,37 @@ module.executeAction = function(self)
                     lib.getTimeMs() - (_buffGemSwap.lastMemAt or 0))
                 return false, castWaitReason or 'spell_not_ready'
             end
-            -- Ready to cast - ensure correct target first
-            if not action.isGroup then
-                if not ensureTarget(targetId) then
-                    debugLog('executeAction: Failed to target %d for cast', targetId)
+            -- Ready to cast. Even a group spell retains the candidate that
+            -- made it look necessary; target that recipient for one live
+            -- buff/stacking recheck before issuing the group cast.
+            local liveRecipientId = action.isGroup
+                and (tonumber(action.needTargetId) or tonumber(targetId) or 0) or targetId
+            if liveRecipientId > 0 then
+                if not ensureTarget(liveRecipientId) then
+                    debugLog('executeAction: Failed to target %d for cast validation', liveRecipientId)
                     traceLog('warn', 'action', 'target_failed_' .. tostring(category), 5,
                         'Buff cast target failed: spell=%s category=%s target=%d',
-                        tostring(spellName), tostring(category), targetId)
+                        tostring(spellName), tostring(category), liveRecipientId)
                     return false, 'target_failed'
+                end
+
+                -- Selection can only see cached buff data for an untargeted
+                -- group member. Revalidate against the live Target datatype
+                -- after targeting and immediately before the mutation.
+                local spellId = action.spellId or getSpellId(spellName)
+                local alreadyPresent = directBuffPresentOnTarget(
+                    liveRecipientId, spellName, spellId, false)
+                local wouldStack = spellWouldStackOnCurrentTarget(spellName)
+                if alreadyPresent or not wouldStack then
+                    local skipReason = alreadyPresent and 'already_buffed' or 'would_not_stack'
+                    traceLog('info', 'action', 'precast_skip_' .. tostring(category), 0,
+                        'Buff cast skipped after live target recheck: spell=%s category=%s target=%d reason=%s',
+                        tostring(spellName), tostring(category), liveRecipientId, skipReason)
+                    _pendingAction = nil
+                    _pendingReason = nil
+                    maybeRestoreBuffGem()
+                    clearActiveBuff()
+                    return true, skipReason
                 end
             end
             debugLog('executeAction: Spell ready, sending cast command')
@@ -2608,7 +2719,7 @@ module.onLeaseFinalizing = function(self, _, reason)
     -- a recovery lease; that lease will re-enter this finalizer with exact
     -- ownership.
     if not exactLease and (ownedCasting or spellbookOpen or _buffGemSwap.active) then
-        self:markDirtyEffects(true)
+        self:markDirtyEffects(true, true)
         releaseActorBuffClaim(reason or 'lease_lost')
         return true
     end

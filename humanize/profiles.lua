@@ -80,7 +80,7 @@ M.subsystems = {
     targeting  = true,   -- target gate
     buffs      = true,   -- buff refresh jitter
     heals      = true,   -- heal_selector perturbChoice + heal cast gate
-    fidget     = true,   -- idle camera/sit-stand emitter
+    fidget     = false,  -- source retained; execution disabled for now
     engagement = true,   -- stick variant + engage threshold
 }
 
@@ -89,12 +89,17 @@ function M.get(name)
 end
 
 function M.subsystemEnabled(name)
+    if name == 'fidget' then return false end
     local v = M.subsystems[name]
     if v == nil then return true end
     return v == true
 end
 
 function M.setSubsystem(name, enabled)
+    if name == 'fidget' then
+        M.subsystems.fidget = false
+        return
+    end
     if M.subsystems[name] ~= nil then
         M.subsystems[name] = enabled and true or false
     end

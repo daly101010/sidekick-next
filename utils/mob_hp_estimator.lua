@@ -14,6 +14,7 @@
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
 local SafeLoad = require('sidekick-next.utils.safe_load')
+local MobName = require('sidekick-next.utils.mob_name')
 
 local M = {}
 
@@ -127,6 +128,7 @@ end
 
 -- Merge a live estimate into the persistent per-zone database
 local function mergeToDatabase(mobName, live)
+    if not MobName.isKnowledgeName(mobName) then return end
     if not live or (live.weightSum or 0) <= 0 then return end
 
     local zone = M.currentZone
@@ -231,7 +233,7 @@ end
 -- @param mobName string Mob name as printed in the damage message
 -- @param amount number Damage dealt
 function M.observe(mobName, amount)
-    if not mobName or mobName == '' then return end
+    if not MobName.isKnowledgeName(mobName) then return end
     amount = tonumber(amount) or 0
     if amount <= 0 then return end
 

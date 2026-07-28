@@ -15,6 +15,8 @@
 -- pending-release without blocking the caller.
 
 local mq = require('mq')
+local SkLib = require('sidekick-next.sk_lib')
+local FeignSafety = require('sidekick-next.utils.feign_safety')
 
 local Profiles      = require('sidekick-next.humanize.profiles')
 local Selector      = require('sidekick-next.humanize.selector')
@@ -107,6 +109,8 @@ local function blockedByGameState()
     if not isMeValid() then return true, 'no_me' end
     local me = mq.TLO.Me
 
+    if FeignSafety.isManagedFeign() then return true, 'protected_feign' end
+
     -- Never synthesize keypresses while the player is typing. Use only members
     -- present in mq-definitions; pcall is for transient window absence, not for
     -- guessing TLO names.
@@ -122,7 +126,11 @@ local function blockedByGameState()
         return true, 'chat_input'
     end
 
-    -- In combat (self).
+    -- XTarget haters are the reliable caster combat signal; Me.CombatState can
+    -- lag or describe rest eligibility rather than the active encounter.
+    if SkLib.inCombat and SkLib.inCombat() then return true, 'combat' end
+
+    -- Retain CombatState as an additional melee/client-state signal.
     local cs = me.CombatState and me.CombatState() or ''
     if cs == 'COMBAT' then return true, 'combat' end
 
@@ -443,6 +451,13 @@ function M.tick(opts)
     -- after the hold began. Starting a chained leg, toggling a window, or
     -- changing sit state remains blocked while chat owns the keyboard.
     local blocked, blockedReason = blockedByGameState()
+
+    -- Combat/follow/nav can begin in the middle of a multi-second strafe or
+    -- turn hold. Release it immediately instead of waiting for releaseAt.
+    if blocked and pendingHoldsMovement() then
+        M.releaseHeldKeys()
+        return
+    end
 
     -- Process any pending release first.
     if Fidget.pending and now >= Fidget.pending.releaseAt then

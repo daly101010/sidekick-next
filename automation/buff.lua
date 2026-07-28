@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 local M = {}
 
@@ -74,6 +75,7 @@ M.remoteBuffs = {}  -- { [targetId] = { [buffCategory] = { expiresAt, caster } }
 -- Claims (before casting, claim to prevent duplicates)
 M.localClaims = {}   -- { [targetId] = { [buffCategory] = { claimedAt } } }
 M.remoteClaims = {}  -- { [targetId] = { [buffCategory] = { claimedAt, claimer } } }
+M.lastPeerBlock = nil
 
 -- Buff blocks (what buffs targets don't want)
 M.remoteBlocks = {}  -- { [charName] = { [buffCategory] = true } }
@@ -102,7 +104,7 @@ local _lastBuffAudit = 0
 local BUFF_LIST_BROADCAST_INTERVAL = 2.0   -- Broadcast buff list every 2 seconds
 local BLOCKS_BROADCAST_INTERVAL = 5.0      -- Broadcast blocks every 5 seconds
 local CLEANUP_INTERVAL = 1.0               -- Clean expired every 1 second
-local CLAIM_TIMEOUT = 8.0                  -- Claims expire after 8 seconds
+local CLAIM_TIMEOUT = CoordinationPolicy.CLAIM_TTL_SECONDS.BUFF
 local BUFF_CHECK_INTERVAL = 60.0           -- How often to recheck buff status on targets (use cache otherwise)
 local BUFF_INITIAL_CHECK_INTERVAL = 0.0    -- Always check if no state exists (immediate)
 local BUFF_TICK_INTERVAL = 0.5             -- Casting tick interval (500ms)
@@ -532,6 +534,7 @@ function M.init()
     M.remoteBuffs = {}
     M.localClaims = {}
     M.remoteClaims = {}
+    M.lastPeerBlock = nil
     M.remoteBlocks = {}
     M.buffDefinitions = {}
 
@@ -739,7 +742,9 @@ function M.cleanupExpired()
     -- Cleanup remote claims
     for targetId, categories in pairs(M.remoteClaims) do
         for category, data in pairs(categories) do
-            if (now - (data.claimedAt or 0)) >= CLAIM_TIMEOUT then
+            local active = CoordinationPolicy.evaluateLocalClaim(
+                getActors(), data, CLAIM_TIMEOUT, now)
+            if not active then
                 categories[category] = nil
             end
         end
@@ -882,6 +887,7 @@ function M.claimBuff(targetId, buffCategory)
             targetId = id,
             buffType = buffCategory,
             claimer = _selfName,
+            zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
         })
     end
 
@@ -907,6 +913,7 @@ function M.renewClaim(targetId, buffCategory)
             targetId = id,
             buffType = buffCategory,
             claimer = _selfName,
+            zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
         })
     end
     return true
@@ -924,6 +931,9 @@ function M.receiveClaim(payload)
     M.remoteClaims[targetId][buffType] = {
         claimedAt = os.clock(),
         claimer = payload.claimer or 'unknown',
+        zone = tostring(payload.zone or ''),
+        server = tostring(payload.server or payload._skActorSenderServer or ''),
+        senderScript = tostring(payload._skActorSenderScript or ''),
     }
 end
 
@@ -946,11 +956,37 @@ function M.isBuffClaimed(targetId, buffCategory)
     if not id then return false end
 
     local claim = M.remoteClaims[id] and M.remoteClaims[id][buffCategory]
-    if claim and (os.clock() - (claim.claimedAt or 0)) < CLAIM_TIMEOUT then
+    local active, peer = CoordinationPolicy.evaluateLocalClaim(
+        getActors(), claim, CLAIM_TIMEOUT, os.clock())
+    if claim then
+        claim.peerAgeMs = peer.peerAgeMs
+        claim.peerReason = peer.peerReason
+        claim.leaseRemainingMs = peer.leaseRemainingMs
+    end
+    if claim and active then
+        M.lastPeerBlock = {
+            at = os.clock(),
+            targetId = id,
+            category = buffCategory,
+            blockedBy = claim.claimer,
+            peerAgeMs = peer.peerAgeMs,
+            leaseRemainingMs = peer.leaseRemainingMs,
+        }
         return true, claim.claimer
+    elseif claim then
+        M.remoteClaims[id][buffCategory] = nil
+        if not next(M.remoteClaims[id]) then M.remoteClaims[id] = nil end
     end
 
     return false
+end
+
+function M.getLastPeerBlockReason(maxAgeSeconds)
+    local block = M.lastPeerBlock
+    if not block or (os.clock() - (block.at or 0)) > (tonumber(maxAgeSeconds) or 1.0) then
+        return nil
+    end
+    return CoordinationPolicy.formatPeerBlock('claimed_by', block.blockedBy, block)
 end
 
 --- Check if a target has blocked a buff type

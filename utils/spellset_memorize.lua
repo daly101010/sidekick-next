@@ -196,13 +196,17 @@ local function nextTransportId(prefix)
         _transportSession, lib.getTimeMs(), _transportSequence)
 end
 
-local function hasValidV2Envelope(content)
+local function hasValidActorEnvelope(content)
     local envelope = type(content) == 'table'
         and type(content.envelope) == 'table' and content.envelope or nil
+    local ActorsCoordinator = getActorsCoordinator()
+    local expectedVersion = ActorsCoordinator
+        and tonumber(ActorsCoordinator.ENVELOPE_VERSION) or nil
     local sequence = envelope and tonumber(envelope.sequence) or 0
     local ttlMs = envelope and tonumber(envelope.ttlMs) or 0
     return envelope ~= nil
-        and tonumber(envelope.version) == 2
+        and expectedVersion ~= nil
+        and tonumber(envelope.version) == expectedVersion
         and tostring(envelope.session or '') ~= ''
         and sequence > 0
         and sequence == math.floor(sequence)
@@ -212,19 +216,12 @@ end
 
 local function isLocalUiSender(sender, fromMe)
     if fromMe ~= true or type(sender) ~= 'table' then return false end
-    local script = tostring(sender.script or ''):gsub('\\', '/'):lower()
     local scripts = type(lib.Scripts.UI) == 'table'
         and lib.Scripts.UI or { lib.Scripts.UI }
-    local allowed = false
     for _, scriptName in ipairs(scripts) do
-        if script == tostring(scriptName or ''):gsub('\\', '/'):lower() then
-            allowed = true
-            break
-        end
+        if lib.actorSenderMatches(sender, scriptName, 'sidekick') then return true end
     end
-    if not allowed then return false end
-    local mailbox = tostring(sender.mailbox or ''):lower()
-    return (mailbox:match('([^:]+)$') or mailbox) == 'sidekick'
+    return false
 end
 
 local function copyApplyMessage(content, sender)
@@ -269,7 +266,7 @@ function M.initializeWorker()
         -- gameplay, send, or yielding work.
         if type(content) ~= 'table'
             or tostring(content.id or ''):lower() ~= APPLY_TOPIC
-            or not hasValidV2Envelope(content)
+            or not hasValidActorEnvelope(content)
             or not isLocalUiSender(sender, fromMe)
             or #_commandInbox >= MAX_COMMAND_INBOX then
             return true

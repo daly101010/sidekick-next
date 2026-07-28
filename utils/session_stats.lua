@@ -207,6 +207,9 @@ function M.exportCSV()
 
     -- Per-spell damage stats (from the spell damage tracker)
     local SpellDamage = getSpellDamage()
+    if SpellDamage and SpellDamage.load and not next(SpellDamage.data or {}) then
+        pcall(SpellDamage.load)
+    end
     if SpellDamage and SpellDamage.data and next(SpellDamage.data) then
         table.insert(lines, '')
         table.insert(lines, 'spell,typical_hit,max_hit,observations')
@@ -277,19 +280,39 @@ function M.init()
         M.recordKill()
     end)
 
-    -- Per-member damage
-    local de = getDamageEvents()
-    if de and de.addListener then
-        de.addListener(onDamageEvent)
-    end
+    local coordinated = _G.SIDEKICK_NEXT_CONFIG
+        and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
+    if coordinated then
+        local ok, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
+        if ok and Actors and Actors.registerMessageCallback then
+            Actors.registerMessageCallback('session:damage', function(content)
+                for _, event in ipairs(type(content.events) == 'table' and content.events or {}) do
+                    onDamageEvent(event)
+                end
+            end)
+            -- Reuse the worker terminal-cast feed consumed by death forensics.
+            Actors.registerMessageCallback('forensics:cast', function(content)
+                M.onCastComplete(content.castData, content.result)
+            end)
+        end
+    else
+        -- Monolithic compatibility consumes local process feeds.
+        local de = getDamageEvents()
+        if de and de.addListener then
+            de.addListener(onDamageEvent)
+        end
 
-    -- Cast/mana tracking
-    local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
-    if ok and SpellEngine then
-        local prev = SpellEngine.onCastComplete
-        SpellEngine.onCastComplete = function(castData, result)
-            if prev then pcall(prev, castData, result) end
-            M.onCastComplete(castData, result)
+        local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
+        if ok and SpellEngine then
+            if SpellEngine.addCastCompleteListener then
+                SpellEngine.addCastCompleteListener(M.onCastComplete)
+            else
+                local prev = SpellEngine.onCastComplete
+                SpellEngine.onCastComplete = function(castData, result)
+                    if prev then pcall(prev, castData, result) end
+                    M.onCastComplete(castData, result)
+                end
+            end
         end
     end
 end

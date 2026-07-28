@@ -8,7 +8,8 @@ local module = ModuleBase.create('chase', lib.Priority.DPS)
 
 local SLICE_MS = 15000
 local PROGRESS_SAMPLE_MS = 1000
-local REQUEUE_BACKOFF_MS = 500
+local REQUEUE_BACKOFF_MS = 1000
+local MAX_REQUEUE_BACKOFF_MS = 30000
 local MAX_RECOVERY_ATTEMPTS = 2
 local STAND_CONFIRM_MS = 1500
 
@@ -19,6 +20,7 @@ local _lastReason = 'init'
 local _backoffUntilMs = 0
 local _orphanRecoveryComplete = false
 local _lastTelemetryAtMs = 0
+local _failureStreak = 0
 
 local function nowMs()
     return lib.getTimeMs()
@@ -57,7 +59,14 @@ end
 
 local function finishEpisode(reason)
     reason = tostring(reason or 'completed')
-    if needsBackoff(reason) then _backoffUntilMs = nowMs() + REQUEUE_BACKOFF_MS end
+    if needsBackoff(reason) then
+        _failureStreak = _failureStreak + 1
+        local delay = REQUEUE_BACKOFF_MS * (2 ^ math.min(5, _failureStreak - 1))
+        _backoffUntilMs = nowMs() + math.min(MAX_REQUEUE_BACKOFF_MS, delay)
+    elseif reason == 'arrived' then
+        _failureStreak = 0
+        _backoffUntilMs = 0
+    end
     Chase.endEpisode()
     _activeAction = nil
     _lastReason = reason
@@ -115,9 +124,12 @@ local function publishTelemetry(self)
     if (now - _lastTelemetryAtMs) < 500 then return end
     _lastTelemetryAtMs = now
     local movement = Movement.snapshot()
+    self:setIntent(_intent ~= nil or self.currentRequestId ~= nil
+        or Movement.hasOwnedEffects(), nil, _lastReason)
     self:sendToLocalUi('chase:telemetry', {
         reason = _lastReason,
         backoffMs = math.max(0, _backoffUntilMs - now),
+        failureStreak = _failureStreak,
         movement = movement,
         targetId = _activeAction and _activeAction.targetId
             or (_intent and _intent.targetId) or 0,
@@ -130,18 +142,20 @@ module.onTick = function(self)
     refreshSettings()
 
     if not _orphanRecoveryComplete then
-        _intent = {
-            kind = 'chase_orphan_recovery',
-            name = 'Recover chase movement',
-            targetId = 0,
-            skipBoundaryTarget = true,
-            breaksInvis = false,
-            idempotencyKey = 'chase:orphan-recovery',
-            reason = 'orphan_recovery',
-        }
-        _lastReason = 'orphan_recovery_pending'
-        publishTelemetry(self)
-        return
+        local pending, reason = Movement.inspectOrphanRecovery()
+        if pending then
+            -- Dirty recovery is coordinator-owned and intentionally bypasses
+            -- ChaseEnabled/automation pause. A normal lease request would be
+            -- rejected by those user gates and could leave /nav running.
+            self:markDirtyEffects(true, true)
+            _intent = nil
+            _lastReason = tostring(reason or 'orphan_recovery_pending')
+            publishTelemetry(self)
+            return
+        end
+        self:markDirtyEffects(false)
+        _orphanRecoveryComplete = true
+        _lastReason = tostring(reason or 'orphan_clean')
     end
 
     if self.currentRequestId then
@@ -187,6 +201,15 @@ module.onTick = function(self)
     local intent, reason = Chase.selectIntent(_settings, {
         externalMovementReason = externalReason,
     })
+    if intent then
+        local backend, backendReason = Movement.resolveBackend(intent.fingerprint)
+        if not backend then
+            intent = nil
+            reason = backendReason or 'no_movement_backend'
+        else
+            intent.plannedBackend = backend
+        end
+    end
     if intent then
         intent.kind = 'chase'
         intent.workflow = 'chase_slice'
@@ -408,6 +431,42 @@ module.onSchedulerResume = function(self, elapsedMs)
     end
     Movement.rebaseTimers(elapsedMs)
 end
+
+local function echo(fmt, ...)
+    mq.cmdf('/echo \\ag[SK Chase]\\ax ' .. fmt, ...)
+end
+
+mq.bind('/sk_chase', function(command)
+    command = tostring(command or 'status'):lower()
+    if command == 'stop' then
+        module:stop()
+        echo('Stop requested')
+        return
+    end
+
+    local fingerprint = Chase.fingerprint(_settings)
+    local backend = Movement.backendSnapshot(fingerprint)
+    local movement = Movement.snapshot()
+    local lease = module.state and module.state.lease
+    local distance = fingerprint and Chase.distanceTo(mq.TLO.Spawn(fingerprint.id)) or nil
+    echo('running=%s enabled=%s ownsLease=%s pending=%s holder=%s reason=%s',
+        tostring(module.running), tostring(_settings.ChaseEnabled == true),
+        tostring(module:ownsLease()), tostring(module.requestPending),
+        tostring(lease and lease.holderModule or '-'), tostring(_lastReason))
+    echo('target=%s(%d) distance=%s backend=%s navMesh=%s navPath=%s moveto=%s stick=%s',
+        tostring(fingerprint and fingerprint.cleanName or '-'),
+        tonumber(fingerprint and fingerprint.id) or 0,
+        distance and string.format('%.1f', distance) or '-',
+        tostring(backend.selected or '-'), tostring(backend.navMeshLoaded),
+        tostring(backend.navPathExists), tostring(backend.moveToAvailable),
+        tostring(backend.stickAvailable))
+    echo('movementOwned=%s active=%s phase=%s backoffMs=%d failures=%d lastResult=%s:%s',
+        tostring(movement.owned == true), tostring(movement.active == true),
+        tostring(movement.phase or '-'),
+        math.max(0, _backoffUntilMs - nowMs()), _failureStreak,
+        tostring(module.lastActionResult and module.lastActionResult.phase or '-'),
+        tostring(module.lastActionResult and module.lastActionResult.reason or '-'))
+end)
 
 module:run(50)
 

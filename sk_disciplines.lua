@@ -6,9 +6,8 @@
 --
 -- Self-gates: the script exits without entering its run loop if the
 -- player's class config doesn't define any discLines/aaLines or any
--- defaultConditions. That means casters with no disciplines (no class
--- config disc surface) silently no-op; tank/melee classes get auto-
--- discipline rotation.
+-- defaultConditions. Spell-gem casts are never owned by this worker;
+-- casters without a discipline surface silently no-op.
 --
 -- Coordination with sk_dps: both modules sit at DPS priority. In
 -- practice they serve different classes — a CLR has nuke spells and no
@@ -119,16 +118,16 @@ local _pendingAction = nil
 local _pendingComputedAt = 0
 local PENDING_TTL_MS = 250  -- accept a freshly-picked action for this long
 
--- Default: restrict picks to disciplines and AAs so we never steal
--- heal/nuke ownership from the heal-intelligence module or sk_dps. A
--- class config can override by setting `M.allowKindsInRotation` —
--- e.g., ENC wants {'aa','disc','spell'} since its rotation is
--- predominantly spells (mez/tash/slow/nukes) and there is no
--- competing ENC nuke module.
-local DEFAULT_ALLOW_KINDS = { aa = true, disc = true, skill = true }
+-- Hard ownership boundary: this worker may use disciplines, AAs, and trained
+-- skills only. Class configuration cannot widen this set to spell-gem casts;
+-- those belong to the dedicated DPS, CC, healing, buff, and support workers.
+local ALLOWED_ACTION_KINDS = { aa = true, disc = true, skill = true }
 
--- Mez spell ownership belongs exclusively to sk_cc. ENC's discipline engine
--- still handles stun/debuff/DPS conditions, but can never select these casts.
+local function isAllowedActionKind(kind)
+    return ALLOWED_ACTION_KINDS[tostring(kind or ''):lower()] == true
+end
+
+-- Defense in depth for legacy condition names that belong to sk_cc.
 local COORDINATOR_OWNED_CONDITIONS = {
     doSingleMez = true,
     doFastMez = true,
@@ -151,14 +150,6 @@ local function ownedTankConditions(cfg)
         end
     end
     return excluded
-end
-
-local function classAllowKinds(cfg)
-    if not (cfg and cfg.allowKindsInRotation) then return DEFAULT_ALLOW_KINDS end
-    local set = {}
-    for _, k in ipairs(cfg.allowKindsInRotation) do set[k] = true end
-    if not next(set) then return DEFAULT_ALLOW_KINDS end
-    return set
 end
 
 function loadDynamicAbilities()
@@ -265,10 +256,22 @@ local function pickPendingAction()
     if dynamic then return dynamic end
 
     if not _classConfig then return nil end
-    return Engine.pickReadyAbility(_classConfig, ctx, {
-        allowKinds = classAllowKinds(_classConfig),
-        excludeConditions = ownedTankConditions(_classConfig),
+    local excluded = ownedTankConditions(_classConfig)
+    -- The engine also serves sk_tank, where spell kinds are valid. Keep this
+    -- worker's boundary explicit and reject anything outside it even if a
+    -- class config or future engine change attempts to return one.
+    local action = Engine.pickReadyAbility(_classConfig, ctx, {
+        allowKinds = ALLOWED_ACTION_KINDS,
+        excludeConditions = excluded,
     })
+    if not action then return nil end
+    if not isAllowedActionKind(action.kind) then
+        lib.log('error', module.name,
+            'rejected non-discipline action from picker: %s (%s)',
+            tostring(action.name or '?'), tostring(action.kind or '?'))
+        return nil
+    end
+    return action
 end
 
 local function refreshPending(self)
@@ -289,7 +292,14 @@ module.onTick = function(self)
     -- Per-process runtime cache: the 'mez_target' selector resolves through
     -- CC.getBestMezTarget, which reads Cache.xtarget.haters in THIS process
     -- — empty forever unless someone ticks it.
-    Cache.tick()
+    if not self.componentMode then Cache.tick() end
+    if self.componentMode and self.domainKillAuthorized ~= true then
+        _pendingAction = nil
+        _pendingComputedAt = 0
+        self:setIntent(false, nil,
+            self.domainKillGateReason or 'kill_not_authorized')
+        return
+    end
     if not disciplinesEnabled() then
         self:setIntent(false, nil, 'disabled')
         return
@@ -304,6 +314,7 @@ end
 
 module.shouldAct = function(self)
     if not self:hasValidState() then return false end
+    if self.componentMode and self.domainKillAuthorized ~= true then return false end
     if not disciplinesEnabled() then return false end
     return refreshPending(self) ~= nil
 end
@@ -326,34 +337,50 @@ end
 --- failure paths. nil targetId means "skip this action — no valid target".
 local function acquireTargetFor(action)
     if action and action.targetId and action.targetId > 0 then
-        return action.targetId, false
+        return action.targetId, false, 'explicit'
     end
     local sel = selectorFor(action.condKey)
     if sel == 'mez_target' then
         local CC = getCC()
-        if not (CC and CC.getBestMezTarget) then return nil, false end
+        if not (CC and CC.getBestMezTarget) then return nil, false, 'control' end
         local id, name = CC.getBestMezTarget()
-        if not id or id <= 0 then return nil, false end
+        if not id or id <= 0 then return nil, false, 'control' end
         if CC.claimTarget then CC.claimTarget(id, name) end
         if CC.broadcastClaim then pcall(CC.broadcastClaim, id, name) end
-        return id, true
+        return id, true, 'control'
+    end
+    -- In the consolidated Combat host, Tank authorization names the exact
+    -- kill target. Never let a temporary peel/manual/heal target leak into a
+    -- discipline just because some positive primary exists elsewhere.
+    if module.componentMode and module.domainKillAuthorized == true then
+        local id = tonumber(module.domainKillTargetId) or 0
+        if id > 0 then return id, false, 'kill' end
+        return nil, false, 'kill'
     end
     -- Default: use current target.
     local target = mq.TLO.Target
     if target and target() then
         local id = lib.safeNum(function() return target.ID() end, 0)
-        if id > 0 then return id, false end
+        if id > 0 then return id, false, 'legacy_current' end
     end
     -- Fall back to self for self-targeted abilities (runes, self-buffs).
     local me = mq.TLO.Me
-    return lib.safeNum(function() return me.ID() end, 0), false
+    return lib.safeNum(function() return me.ID() end, 0), false, 'self'
 end
 
 module.getAction = function(self)
     local action = refreshPending(self)
     if not action then return nil end
+    if not isAllowedActionKind(action.kind) then
+        lib.log('error', module.name,
+            'rejected non-discipline action before claim: %s (%s)',
+            tostring(action.name or '?'), tostring(action.kind or '?'))
+        _pendingAction = nil
+        _pendingComputedAt = 0
+        return nil
+    end
 
-    local targetId, claimedTarget = acquireTargetFor(action)
+    local targetId, claimedTarget, targetRole = acquireTargetFor(action)
     if not targetId or targetId <= 0 then
         -- Couldn't get a valid target (e.g., mez selector found no haters).
         -- Drop the pending pick so onTick re-evaluates next cycle.
@@ -364,17 +391,17 @@ module.getAction = function(self)
     local kindMap = {
         aa    = lib.ActionKind.USE_AA,
         disc  = 'use_disc',
-        spell = lib.ActionKind.CAST_SPELL,
         skill = lib.ActionKind.USE_SKILL,
     }
 
     return {
-        kind           = kindMap[action.kind] or 'use_disc',
+        kind           = kindMap[action.kind],
         name           = action.name,
         setName        = action.setName,
         condKey        = action.condKey,
         targetId       = targetId,
         claimedTarget  = claimedTarget,
+        requiresKillTarget = targetRole == 'kill',
         idempotencyKey = string.format('disc:%s:%d:%d', action.setName, targetId, lib.getTimeMs()),
         reason         = string.format('%s %s', action.kind, action.setName),
         -- Echo the engine's classification so executeAction can fire the
@@ -395,7 +422,7 @@ local function awaitNotCasting(self, maxMs)
     return true
 end
 
---- Ensure /target id <id> locks in the requested target before we cast.
+--- Ensure /target id <id> locks in the requested target before the action.
 --- Returns true if locked, false if the spawn no longer exists.
 local function ensureTarget(targetId)
     if not targetId or targetId <= 0 then return false end
@@ -422,9 +449,20 @@ module.executeAction = function(self)
     _pendingAction = nil
     _pendingComputedAt = 0
 
-    -- Lock the chosen target before casting. For mez/cc selectors this
-    -- is critical — the engine's predicate may have evaluated against a
-    -- different live target than the one we should cast on.
+    if not isAllowedActionKind(action.engineKind) then
+        lib.log('error', module.name,
+            'rejected non-discipline action before execution: %s (%s)',
+            tostring(action.name or '?'), tostring(action.engineKind or '?'))
+        if action.claimedTarget then
+            local CC = getCC()
+            if CC and CC.releaseClaim then CC.releaseClaim(action.targetId) end
+        end
+        return true, 'invalid_action_kind'
+    end
+
+    -- Lock the chosen target before firing the discipline/AA/skill. For
+    -- selectors this is critical — the predicate may have evaluated against a
+    -- different live target than the one the action should affect.
     if not ensureTarget(action.targetId) then
         if action.claimedTarget then
             local CC = getCC()
@@ -443,31 +481,42 @@ module.executeAction = function(self)
         return true, 'fire_refused'
     end
 
-    -- AAs and spells start a cast bar; disciplines are instant. Wait for
+    -- Some AAs start a cast bar; disciplines are instant. Wait for
     -- the cast bar where applicable so we don't immediately try to fire
     -- another ability on top of an in-progress one.
     if action.engineKind == 'aa' or action.engineKind == 'spell' then
         if not awaitNotCasting(self, 8000) then return true, 'lease_lost' end
     else
-        -- Disciplines fire instantly; tiny settle delay so ActiveDisc
-        -- updates before the next tick's predicate evaluation.
+        -- Disciplines and trained skills fire instantly; tiny settle delay so
+        -- ActiveDisc/readiness updates before the next predicate evaluation.
         mq.delay(100)
     end
 
-    -- For successful mez casts, automation/cc.lua's mq.event handler
-    -- ('sidekick_cc_mezzed') fires asynchronously and releases the claim
-    -- itself. We don't release here unconditionally — that would create
-    -- a window where another mezzer could double-cast on the same mob
-    -- while our mez is still resolving.
+    -- Claimed target cleanup is handled by failure/cancel callbacks below.
 
     return true, 'completed'
 end
 
 
+-- The legacy callback above is retained only as migration reference and must
+-- never be selected by ModuleBase.
+module.executeAction = nil
 module:enableUnifiedExecutor({
     preflight = function(action)
         _pendingAction = nil
         _pendingComputedAt = 0
+        if not isAllowedActionKind(action and action.engineKind) then
+            lib.log('error', module.name,
+                'rejected non-discipline action in preflight: %s (%s)',
+                tostring(action and action.name or '?'),
+                tostring(action and action.engineKind or '?'))
+            return false, 'invalid_action_kind'
+        end
+        if action.requiresKillTarget == true
+            and (module.domainKillAuthorized ~= true
+                or tonumber(action.targetId) ~= tonumber(module.domainKillTargetId)) then
+            return false, 'kill_authorization_changed'
+        end
         if ensureTarget(tonumber(action.targetId) or 0) then return true end
         if action.claimedTarget then
             local CC = getCC()
@@ -476,9 +525,15 @@ module:enableUnifiedExecutor({
         return false, 'target_lost'
     end,
     dispatch = function(action)
+        if not isAllowedActionKind(action and action.engineKind) then
+            lib.log('error', module.name,
+                'rejected non-discipline action at dispatch: %s (%s)',
+                tostring(action and action.name or '?'),
+                tostring(action and action.engineKind or '?'))
+            return false, 'invalid_action_kind'
+        end
         local fired = Engine.fireAbility({ kind = action.engineKind, name = action.name })
         if not fired then return false, 'fire_refused' end
-        if action.engineKind == 'spell' then return true, nil, 'cast' end
         if action.engineKind == 'aa' then return true, nil, 'cast_or_settle' end
         return true, nil, 'settle'
     end,
@@ -535,6 +590,7 @@ if not shouldRunForClass(_classConfig, myClassShort()) then
     -- bind anyway so the user can flip BurnActive on any character — it's
     -- consumed by clickies and other features beyond just disciplines.
     registerBurnBind()
+    module.componentDisabled = true
     return module
 end
 
@@ -542,6 +598,7 @@ if not configHasDisciplines(_classConfig) and not hasDynamicDisciplines() then
     -- Class is opted in but the class config has no disciplines/AAs/
     -- conditions defined yet. Bind /sk_burn for consistency, exit run.
     registerBurnBind()
+    module.componentDisabled = true
     return module
 end
 

@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local FeignSafety = require('sidekick-next.utils.feign_safety')
 
 local M = {}
 
@@ -46,6 +47,11 @@ local SELF_TARGET_TYPES = {
     ['Self'] = true,
     ['PB AE'] = true,
     ['Self Only'] = true,
+}
+
+local CASTER_STANDOFF_CLASSES = {
+    ENC = true, WIZ = true, MAG = true, NEC = true,
+    CLR = true, DRU = true, SHM = true, RNG = true,
 }
 
 -- Current cast state (use setState() to update — tracks entry time for watchdog)
@@ -190,6 +196,42 @@ local function preCastChecks(spellName, targetId, opts)
         if okCA and CasterAssist and CasterAssist.isRepositioning and CasterAssist.isRepositioning() then
             return false, 'repositioning'
         end
+        -- Coordinated movement runs in the SideKick UI process, so the DPS
+        -- worker cannot observe CasterAssist's process-local state. The live
+        -- movement TLOs are the cross-process source of truth.
+        local class = me.Class and me.Class.ShortName and me.Class.ShortName() or ''
+        local classUpper = tostring(class):upper()
+        if classUpper ~= 'BRD' then
+            local function movementState()
+                local moving = me.Moving and me.Moving() == true
+                local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
+                    and mq.TLO.Navigation.Active() == true
+                return moving, navActive
+            end
+            local moving, navActive = movementState()
+            if moving or navActive then
+                -- A ranged-standoff route wins until it reaches its selected
+                -- location. There is a small race where sk_dps can acquire its
+                -- claim in the frame before the UI host starts Nav; cancelling
+                -- that Nav here made a cast interrupt every reposition. The
+                -- failed dispatch is bounded and will be retried after arrival.
+                local standoffNav = navActive
+                    and getSetting('CasterStandoffEnabled', false) == true
+                    and CASTER_STANDOFF_CLASSES[classUpper] == true
+                    and (tostring(opts.sourceLayer or '') == 'dps'
+                        or tostring(opts.spellCategory or '') == 'damage')
+                if standoffNav then return false, 'repositioning' end
+
+                -- Non-standoff optional movement still yields to an owned cast.
+                if navActive then mq.cmd('/squelch /nav stop') end
+                mq.delay(750, function()
+                    local stillMoving, stillNavigating = movementState()
+                    return not stillMoving and not stillNavigating
+                end)
+                moving, navActive = movementState()
+                if moving or navActive then return false, 'moving' end
+            end
+        end
     end
 
     -- Check window not open
@@ -209,6 +251,12 @@ local function preCastChecks(spellName, targetId, opts)
     end
     if me.Feared and me.Feared() then
         return false, 'feared'
+    end
+
+    -- Casting implicitly stands a feigned character on some clients. Only
+    -- the UI-host feign controller may release managed MNK/NEC feign.
+    if FeignSafety.isManagedFeign(getSettings()) then
+        return false, 'protected_feign'
     end
 
     -- Check standing (stand up if sitting)
@@ -427,6 +475,11 @@ function M.cast(spellName, targetId, opts)
     if me.Silenced and me.Silenced() then return false, 'silenced' end
     if me.Feared and me.Feared() then return false, 'feared' end
 
+    -- Preserve the live target identity before issuing the cast. A lethal
+    -- spell can leave the same spawn ID pointing at "<mob>'s corpse" by the
+    -- time terminal listeners run.
+    local castTargetName = resolveTargetName(targetId)
+
     -- Issue cast command
     mq.cmdf('/cast "%s"', spellName)
     local resistTracked, resistTargetName = recordResistCast(spellName, targetId, opts)
@@ -436,6 +489,7 @@ function M.cast(spellName, targetId, opts)
         spellName = spellName,
         spellId = spell and tonumber(spell.ID()) or 0,
         targetId = targetId or 0,
+        targetName = castTargetName,
         startTime = os.clock(),
         castTime = castTime / 1000,  -- Convert to seconds
         range = range,
@@ -572,8 +626,13 @@ local function handleResult(result)
             buffLog.info('spell_engine', 'Cast completed: spell=%s result=%s',
                 tostring(_castData.spellName), SpellEvents.getResultName(result))
         end
-        if M.onCastComplete and _castData then
-            pcall(M.onCastComplete, _castData, result)
+        if _castData then
+            if M.onCastComplete then
+                pcall(M.onCastComplete, _castData, result)
+            end
+            for _, listener in ipairs(M._castCompleteListeners) do
+                pcall(listener, _castData, result)
+            end
         end
         setState(M.STATE.IDLE)
         _castData = nil
@@ -727,6 +786,7 @@ function M.getCastInfo()
             spellName = _castData.spellName,
             spellId = _castData.spellId,
             targetId = _castData.targetId,
+            targetName = _castData.targetName,
             startTime = _castData.startTime,
             castTime = _castData.castTime,
             retriesLeft = _castData.retries,
@@ -757,6 +817,18 @@ end
 
 -- Optional listener invoked when a cast completes (terminal result, no retry pending).
 -- Signature: fn(castData, result) where castData = {spellName, targetId, spellCategory, ...}
+-- Kept for compatibility; new consumers should use addCastCompleteListener so
+-- independent worker features cannot overwrite one another's callback.
 M.onCastComplete = nil
+M._castCompleteListeners = {}
+
+--- Register an independent terminal cast-result listener.
+-- @param fn function Signature: fn(castData, result)
+-- @return boolean True when registered
+function M.addCastCompleteListener(fn)
+    if type(fn) ~= 'function' then return false end
+    table.insert(M._castCompleteListeners, fn)
+    return true
+end
 
 return M

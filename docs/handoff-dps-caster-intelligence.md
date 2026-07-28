@@ -37,7 +37,9 @@ The core fix for "% HP is the wrong currency for DPS decisions."
   delta-weighted, per mob name, persisted per zone
   (`SideKick/data/mob_hp_estimates.lua`). `getMaxHP` / `getRemainingHP`.
 - **`utils/spell_damage_tracker.lua`** (new): learns each spell's typical/max
-  hit per character (`spell_damage_<server>_<char>.lua`).
+  hit per character (`spell_damage_<server>_<char>.lua`). The tracker directly
+  correlates own-nuke chat with `SpellEngine` completion in either arrival
+  order; resist tracking consumes its baseline but no longer gates learning.
 - **Overkill check:** `overkillOk(mobId, spellName)` — skip a nuke whose
   expected damage > remaining HP × `DpsOverkillFactor` (falls through to
   smaller nukes in rotation order).
@@ -62,12 +64,14 @@ The core fix for "% HP is the wrong currency for DPS decisions."
 
 ### `db16fa3` — Caster/ranger standoff positioning
 - `automation/caster_assist.lua`: when closer than `CasterStandoffMin` (35) in
-  combat, nav to a randomized spot in [min, max=60] on the character's own side
-  of the mob. Desync = name-hash base angle (±45°) + per-move seeded RNG
-  jitter; candidates validated for nav-mesh reachability + LoS; never
+  combat, nav once to a randomized spot at the configured retreat radius
+  (`CasterStandoffMax`, default 60) on the character's own side of the mob.
+  Being farther away never pulls the caster toward the mob. Desync =
+  name-hash base angle (±45°) + per-move seeded RNG jitter; candidates
+  validated for nav-mesh reachability + LoS; never
   interrupts a cast; `spell_engine` defers timed casts (reason
   `repositioning`) while moving. Rangers route here when
-  `CasterStandoffEnabled`. Standoff overrides `CasterUseStick`.
+  `CasterStandoffEnabled`. Pure casters never use melee stick movement.
 
 ### `ccbb010` + `6959ae5` — Rain spell-set conditions + mez safety
 - `isRainSpell()`: EQ `Rain` subcategory, fallback Targeted AE + AEDuration>0.
@@ -91,7 +95,7 @@ The core fix for "% HP is the wrong currency for DPS decisions."
 3. **Tank auto-peel** (`utils/aggro.lua findPriorityPeelTarget`): reactive
    taunt ranks loose mobs by victim fragility CLR=6 DRU/SHM=5 ENC/WIZ/MAG/NEC=4
    RNG/BST/BRD=3 PAL/SHD=2 melee=1.
-4. **Tank flee-handoff** (`automation/tank.lua checkFleeHandoff`): target ≤
+4. **Tank flee-handoff** (`sk_tank.lua updateFleeHandoff`): target ≤
    `TankFleeHpThreshold` and gaining distance + another add available → runner
    excluded from tank targeting (`selectBestTarget` gained `excludeId`) for
    `TankFleeHandoffWindowSec`; sticky-mode assisters finish it.

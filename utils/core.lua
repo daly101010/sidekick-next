@@ -15,6 +15,7 @@ local _moduleData = {}
 local _dirtyModules = {}
 local _combinedBaseline = {}
 local _owner = 'unknown'
+local _primaryWriter = false
 local _dirty = false
 local _lastSaveAt = 0
 local _revision = 0
@@ -47,8 +48,7 @@ local function callerLabel(startLevel)
 end
 
 local function isPrimaryWriter()
-    local owner = tostring(_owner or ''):gsub('\\', '/'):lower()
-    return owner:find('sidekick%-next/sidekick%.lua') ~= nil
+    return _primaryWriter == true
 end
 
 local function nowMs()
@@ -201,8 +201,17 @@ local function overlayModuleFiles()
     end
 end
 
-function Core.load()
-    _owner = callerLabel(3)
+function Core.load(opts)
+    opts = type(opts) == 'table' and opts or {}
+    -- Writer ownership is explicit rather than inferred from debug stack
+    -- frames. Worker refreshes call Core.load through pcall, which used to
+    -- replace the UI owner's source with "[C]::pcall" and make the actual
+    -- settings host fail its own single-writer check. Once the UI declares
+    -- this Lua state primary, ordinary reloads cannot revoke that role.
+    if opts.primaryWriter == true then
+        _primaryWriter = true
+    end
+    _owner = callerLabel(2)
     _dirtyModules = {}
     _dirty = false
     _unregisteredSettings = {}

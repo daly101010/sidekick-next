@@ -120,6 +120,92 @@ do
     assert(scheduler.lease.status == 'active')
 end
 
+-- Queue timing is measured on the coordinator clock. Refresh packets extend
+-- request TTL without erasing the first receipt or original blocker.
+do
+    local scheduler = newScheduler('queue-timing')
+    request(scheduler, 'dps', 'dps-holding', 10)
+    scheduler:tick(20)
+    request(scheduler, 'healing', 'heal-waiting', 100)
+    request(scheduler, 'healing', 'heal-waiting', 600)
+    assert(scheduler.requests.healing.firstReceivedAtMs == 100)
+    assert(scheduler.requests.healing.lastReceivedAtMs == 600)
+    assert(scheduler.requests.healing.refreshCount == 1)
+    assert(releaseCurrent(scheduler, 900))
+    scheduler:tick(1000)
+    local timing = assert(scheduler.lease.queueTiming)
+    assert(timing.schedulerWaitMs == 900)
+    assert(timing.blockedByModule == 'dps')
+    assert(timing.blockedByStatus == 'active')
+    assert(timing.requestRefreshes == 1)
+end
+
+-- When requests arrive in one coordinator drain, the selected holder is
+-- attributed to lower-ranked work that was already queued without a holder.
+do
+    local scheduler = newScheduler('queue-batch-blocker')
+    request(scheduler, 'dps', 'dps-waiting', 10)
+    request(scheduler, 'healing', 'heal-first', 11)
+    scheduler:tick(20)
+    assert(scheduler.lease.holderModule == 'healing')
+    assert(scheduler.requests.dps.blockedByModule == 'healing')
+    assert(scheduler.requests.dps.blockedByStatus == 'active')
+end
+
+-- Request TTL expiry is observable and cannot disappear as a silent drop.
+do
+    local scheduler = newScheduler('request-expiry')
+    request(scheduler, 'dps', 'dps-expiring', 1, { requestTtlMs = 100 })
+    scheduler:tick(252)
+    local snapshot = scheduler:getSnapshot()
+    assert(snapshot.requestCount == 0)
+    assert(snapshot.metrics.requestExpiries == 1)
+end
+
+-- Mandatory dirty-effect recovery is fencing, not ordinary preemption. It
+-- revokes safely even when urgent-worker preemption is disabled and even when
+-- the recovering worker is not on the urgent whitelist.
+do
+    local scheduler = newScheduler('mandatory-recovery')
+    scheduler:setPreemptionEnabled(false, 0)
+    request(scheduler, 'dps', 'dps-1', 1)
+    scheduler:tick(2)
+    local ok, reason = scheduler:requestRecovery(
+        'assist', 'assist-session', 'sk_assist', 3)
+    assert(ok, reason)
+    assert(scheduler.lease.holderModule == 'dps')
+    assert(scheduler.lease.status == 'revoking')
+    assert(scheduler.lease.revokeReason == 'recovery_pending:assist')
+    assert(releaseCurrent(scheduler, 4))
+    scheduler:tick(5)
+    assert(scheduler.lease.holderModule == 'assist')
+    assert(scheduler.lease.status == 'recovering')
+end
+
+-- Active side effects owned by the exact live lease are not orphans. A worker
+-- that explicitly reports lost authority, or whose request identity no longer
+-- matches the lease, still requires fenced recovery.
+do
+    local scheduler = newScheduler('dirty-effects')
+    request(scheduler, 'dps', 'dps-1', 1)
+    scheduler:tick(2)
+    assert(scheduler:heartbeatNeedsRecovery({
+        requestId = 'dps-1',
+        dirtyEffects = true,
+        needsRecovery = false,
+    }, 'dps', 'dps-session') == false)
+    assert(scheduler:heartbeatNeedsRecovery({
+        requestId = 'dps-1',
+        dirtyEffects = true,
+        needsRecovery = true,
+    }, 'dps', 'dps-session') == true)
+    assert(scheduler:heartbeatNeedsRecovery({
+        requestId = 'stale-request',
+        dirtyEffects = true,
+        needsRecovery = false,
+    }, 'dps', 'dps-session') == true)
+end
+
 -- Exact boot/session/request/token validation fences stale holders.
 do
     local scheduler = newScheduler('fencing')

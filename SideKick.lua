@@ -64,13 +64,13 @@ LZ.getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
 LZ.getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
 LZ.getActorsDebug = lazy('sidekick-next.ui.actors_debug')
 LZ.getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
+LZ.getIntelligenceDebug = lazy.init('sidekick-next.ui.intelligence_debug')
 
 -- Runtime cache, action executor, and spell engine (lazy-loaded)
 LZ.getRuntimeCache = lazy.init('sidekick-next.utils.runtime_cache')
 LZ.getActionExecutor = lazy.init('sidekick-next.utils.action_executor')
 LZ.getSpellEngine = lazy.init('sidekick-next.utils.spell_engine')
 LZ.getImmuneDB = lazy.init('sidekick-next.utils.immune_database')
-LZ.getRezAccept = lazy.init('sidekick-next.utils.rez_accept')
 LZ.getResistTracker = lazy.init('sidekick-next.utils.resist_tracker')
 LZ.getDamageEvents = lazy.init('sidekick-next.utils.damage_events')
 LZ.getMobHpEstimator = lazy.init('sidekick-next.utils.mob_hp_estimator')
@@ -195,6 +195,52 @@ local function enqueue(fn)
 end
 
 local _itemManualRequestCounter = 0
+local _abilityManualRequestCounter = 0
+
+local function queueAbilityActivation(def)
+    def = type(def) == 'table' and def or {}
+    local sourceKind = tostring(def.kind or 'aa'):lower()
+    local kindBySource = {
+        aa = SkLib.ActionKind.USE_AA,
+        disc = SkLib.ActionKind.USE_DISC,
+        spell = SkLib.ActionKind.CAST_SPELL,
+        skill = SkLib.ActionKind.USE_SKILL,
+    }
+    local kind = kindBySource[sourceKind]
+    if not kind then return end
+
+    local name = ''
+    if sourceKind == 'aa' then
+        name = tostring(def.altName or def.name or def.altID or '')
+    elseif sourceKind == 'disc' then
+        name = tostring(def.discName or def.altName or def.name or '')
+    elseif sourceKind == 'spell' then
+        name = tostring(def.spellName or def.altName or def.name or '')
+    else
+        name = tostring(def.skillName or def.name or def.altName or '')
+    end
+    if name == '' then return end
+
+    _abilityManualRequestCounter = _abilityManualRequestCounter + 1
+    local requestId = string.format('ui-action:%d:%d', mq.gettime(), _abilityManualRequestCounter)
+    local aaId = tonumber(def.altID or def.aaId)
+    local targetId = tonumber(def.targetId)
+
+    enqueue(function()
+        local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_items', 'action:manual', {
+            requestId = requestId,
+            requestedAtMs = mq.gettime(),
+            kind = kind,
+            name = name,
+            aaId = aaId,
+            targetId = targetId,
+        })
+        if not sent then
+            print(string.format('\ar[SideKick Actions]\ax Could not queue %s: action worker transport unavailable', name))
+        end
+    end)
+end
+
 local function queueItemActivation(entry)
     local itemName = tostring(entry and entry.itemName or '')
     if itemName == '' then return end
@@ -1242,7 +1288,7 @@ local function draw()
                                 modeLabels = Abilities.MODE_LABELS,
                                 onToggle = function(key, value) Core.set(key, value) end,
                                 onMode = function(key, value) Core.set(key, value) end,
-                                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                                onActivate = queueAbilityActivation,
                                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                                 helpers = Helpers,
                             }) end
@@ -1261,7 +1307,7 @@ local function draw()
                                 modeLabels = Abilities.MODE_LABELS,
                                 onToggle = function(key, value) Core.set(key, value) end,
                                 onMode = function(key, value) Core.set(key, value) end,
-                                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                                onActivate = queueAbilityActivation,
                                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                                 helpers = Helpers,
                             }) end
@@ -1381,6 +1427,15 @@ local function draw()
                                 end
                                 Core.set(key, value)
                                 local settingKey = tostring(key)
+                                if settingKey == 'AssistMode'
+                                    or settingKey == 'AssistName' then
+                                    -- A manual assist edit becomes an ordinary
+                                    -- persistent assist configuration, not a
+                                    -- raid-scoped command-bar override.
+                                    Core.set('RaidAssistOverrideActive', false, {
+                                        source = 'manual_assist_edit',
+                                    })
+                                end
                                 if settingKey:match('^Meditation') or settingKey:match('^Chase')
                                     or settingKey:match('^Rez') or settingKey:match('^AutoRez')
                                     or settingKey == 'AutoAcceptRez' or settingKey == 'CombatMode' then
@@ -1646,6 +1701,32 @@ local function syncModulesFromSettings()
         Chase.setEnabled(Core.Settings.ChaseEnabled == true, { auto = true })
     end
 
+    -- The command-bar override exists only for the current raid. Require a
+    -- short continuous no-raid window so zoning/roster refresh does not clear
+    -- it during a transient Raid.Members()==0 observation.
+    if Core.Settings.RaidAssistOverrideActive == true then
+        local raidMembers = tonumber(mq.TLO.Raid and mq.TLO.Raid.Members
+            and mq.TLO.Raid.Members() or 0) or 0
+        if raidMembers > 0 then
+            State.raidOverrideNoRaidSince = nil
+        else
+            State.raidOverrideNoRaidSince =
+                State.raidOverrideNoRaidSince or now
+            if (now - State.raidOverrideNoRaidSince) >= 3 then
+                Core.setMany({
+                    AssistMode = 'group',
+                    RaidAssistOverrideActive = false,
+                }, {
+                    source = 'raid_assist_override_expired',
+                    save = true,
+                })
+                State.raidOverrideNoRaidSince = nil
+            end
+        end
+    else
+        State.raidOverrideNoRaidSince = nil
+    end
+
     local assistEnabled = (Core.Settings.CombatMode or 'off') == 'assist'
     CombatAssist.apply_config({
         enabled = assistEnabled,
@@ -1778,7 +1859,16 @@ local function drawAutostartPrompt()
 end
 
 local function main()
-    Core.load()
+    Core.load({ primaryWriter = true })
+
+    -- Global pause is session-scoped. It is persisted so a coordinated
+    -- shutdown can drain safely, but a new SideKick launch always begins
+    -- resumed; users can pause the new session again explicitly if desired.
+    if Core.Settings.AutomationPaused == true then
+        Core.set('AutomationPaused', false, { source = 'startup_auto_resume' })
+        Core.forceSave()
+    end
+
     Logger.configure(Core.Settings)
 
     if _G.SIDEKICK_NEXT_CONFIG then
@@ -1813,7 +1903,19 @@ local function main()
             CoordinatorDebug.init()
         end
     end
-    LZ.getRezAccept()
+    do
+        local IntelligenceDebug = LZ.getIntelligenceDebug()
+        if IntelligenceDebug and IntelligenceDebug.init then
+            IntelligenceDebug.init()
+        end
+    end
+    if SettingsUI.initialize then
+        local ok, initialized = pcall(SettingsUI.initialize)
+        if not ok or initialized ~= true then
+            log.error('Settings UI preload failed: %s',
+                ok and 'redesign unavailable' or tostring(initialized))
+        end
+    end
     do
         local monitor = LZ.getHealingMonitor()
         if monitor and ActorsCoordinator.registerMessageCallback then
@@ -1840,6 +1942,13 @@ local function main()
                 ownsLease = content.ownsLease == true,
                 receivedAt = mq.gettime(),
             }
+            return true
+        end)
+        ActorsCoordinator.registerMessageCallback('action:trace', function(content)
+            local debugUi = LZ.getCoordinatorDebug()
+            if debugUi and debugUi.setActionTrace then
+                debugUi.setActionTrace(content)
+            end
             return true
         end)
     end
@@ -2022,13 +2131,15 @@ local function main()
         elseif a1 == 'spell' then
             -- Debug command disabled (no in-game output)
         elseif a1 == 'testcast' then
-            -- Debug command: test cast a spell (silent)
             local spellName = args[2]
             if spellName then
                 local target = mq.TLO.Target
                 local targetId = target and target() and target.ID() or 0
-                local SE = LZ.getSpellEngine()
-                if SE then SE.cast(spellName, targetId) end
+                queueAbilityActivation({
+                    kind = 'spell',
+                    spellName = spellName,
+                    targetId = targetId,
+                })
             end
         elseif a1 == 'healmonitor' then
             do local M = LZ.getHealingMonitor() if M then M.toggle() end end
@@ -2239,6 +2350,22 @@ local function main()
     _bindCmd('/skassistme', function()
         enqueue(function()
             ActorsCoordinator.broadcastAssistMe()
+        end)
+    end)
+    _bindCmd('/sk_next_set_raid_assist', function(rawName)
+        local name = tostring(rawName or ''):match('^%s*([%a]+)%s*$')
+        if not name or name == '' then return end
+        enqueue(function()
+            Core.setMany({
+                AssistMode = 'byname',
+                AssistName = name,
+                RaidAssistOverrideActive = true,
+            }, { source = 'raid_assist_broadcast' })
+            local saved, err = Core.forceSave()
+            if saved == false then
+                log.error('Failed to save raid assist authority %s: %s',
+                    name, tostring(err))
+            end
         end)
     end)
     _bindCmd('/skpause', function()
@@ -2564,7 +2691,7 @@ local function main()
                 animSpellIcons = animSpellIcons,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
-                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                onActivate = queueAbilityActivation,
                 modeLabels = Abilities.MODE_LABELS,
                 onMode = function(key, value) Core.set(key, value) end,
                 onOpenSettings = function() State.settingsOpen = true end,
@@ -2578,7 +2705,7 @@ local function main()
                 animSpellIcons = animSpellIcons,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
-                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                onActivate = queueAbilityActivation,
                 onSettingChange = function(key, value) Core.set(key, value) end,
             }) end
         end
@@ -2591,7 +2718,7 @@ local function main()
                 animSpellIcons = animSpellIcons,
                 cooldownProbe = function(row) return Cooldowns.probe(row) end,
                 helpers = Helpers,
-                onActivate = function(def) enqueue(function() Abilities.activate(def) end) end,
+                onActivate = queueAbilityActivation,
             }) end
         end
 
@@ -2614,9 +2741,7 @@ local function main()
                 if SkillBar then SkillBar.draw({
                     settings = Core.Settings,
                     onActivate = function(sk)
-                        enqueue(function()
-                            Abilities.activate({ kind = 'skill', skillName = sk.name })
-                        end)
+                        queueAbilityActivation({ kind = 'skill', skillName = sk.name })
                     end,
                 }) end
             end
@@ -2676,8 +2801,9 @@ local function main()
         else
         refreshClassAbilitiesIfNeeded()
         drainQueue()
+        do local M = LZ.getRemoteAbilities() if M and M.tick then M.tick() end end
         syncModulesFromSettings()
-        do local M = LZ.getRezAccept() if M and M.tick then M.tick() end end
+        do local M = LZ.getIntelligenceDebug() if M and M.tick then M.tick() end end
         tickAutomation()
 
         -- Forward spell-set intent and drain async worker status from the main

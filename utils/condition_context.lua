@@ -19,7 +19,8 @@ end
 --- Build a context object for condition evaluation
 --- Caches expensive TLO calls for the duration of the tick
 ---@return table ctx Context object with me, target, group, spawn, combat, burn, mode
-function M.build()
+function M.build(snapshot)
+    local cache = snapshot or RuntimeCache
     local me = mq.TLO.Me
     local target = mq.TLO.Target
     local group = mq.TLO.Group
@@ -53,8 +54,8 @@ function M.build()
             invis = safe(function() return me.Invis() end, false),
             hovering = safe(function() return me.Hovering() end, false),
             feigning = safe(function() return me.Feigning() end, false),
-            moving = RuntimeCache.me and RuntimeCache.me.moving or false,
-            casting = RuntimeCache.me and RuntimeCache.me.casting or false,
+            moving = cache.me and cache.me.moving or false,
+            casting = cache.me and cache.me.casting or false,
             activeDisc = safe(function() return me.ActiveDisc.Name() end, nil),
             activeDiscId = safeNum(function() return me.ActiveDisc.ID() end, 0),
             level = safeNum(function() return me.Level() end, 1),
@@ -242,9 +243,9 @@ function M.build()
                 return safeNum(function() return group.Injured(pct)() end, 0)
             end,
             -- Get lowest HP in group from RuntimeCache
-            lowestHP = (RuntimeCache.group and RuntimeCache.group.lowestHPPercent) or 100,
+            lowestHP = (cache.group and cache.group.lowestHPPercent) or 100,
             -- Get tank HP from RuntimeCache
-            tankHP = (RuntimeCache.group and RuntimeCache.group.tankHP) or 100,
+            tankHP = (cache.group and cache.group.tankHP) or 100,
         },
 
         raid = {
@@ -269,10 +270,11 @@ function M.build()
         },
 
         -- Combat state from RuntimeCache
-        combat = RuntimeCache.inCombat and RuntimeCache.inCombat() or false,
+        combat = type(cache.inCombat) == 'function' and cache.inCombat()
+            or cache.inCombat == true,
 
         -- Burn phase active
-        burn = RuntimeCache.burnActive or false,
+        burn = cache.burnActive or false,
 
         -- Current combat mode from settings
         mode = Core.Settings and Core.Settings.CombatMode or 'DPS',

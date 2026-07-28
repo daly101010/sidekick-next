@@ -31,19 +31,12 @@ end
 
 local function isLocalUiSender(sender, fromMe)
     if fromMe ~= true or type(sender) ~= 'table' then return false end
-    local script = tostring(sender.script or ''):gsub('\\', '/'):lower()
     local scripts = type(lib.Scripts.UI) == 'table'
         and lib.Scripts.UI or { lib.Scripts.UI }
-    local allowed = false
     for _, scriptName in ipairs(scripts) do
-        if script == tostring(scriptName or ''):gsub('\\', '/'):lower() then
-            allowed = true
-            break
-        end
+        if lib.actorSenderMatches(sender, scriptName, 'sidekick') then return true end
     end
-    if not allowed then return false end
-    local mailbox = tostring(sender.mailbox or ''):lower()
-    return (mailbox:match('([^:]+)$') or mailbox) == 'sidekick'
+    return false
 end
 
 local function receiveManualRequest(content, sender, fromMe)
@@ -88,7 +81,8 @@ local function drainManualRequests()
             Pull.setCamp()
         elseif request.command == 'status' then
             local state = Pull.getState()
-            print(string.format('\ag[SK Pull]\ax state=%s reason=%s target=%s owns=%s',
+            print(string.format('%s \ag[SK Pull]\ax state=%s reason=%s target=%s owns=%s',
+                lib.timestampPrefix(),
                 tostring(state.state), tostring(state.reason), tostring(state.pullId),
                 tostring(module:ownsLease())))
         end

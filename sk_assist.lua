@@ -8,11 +8,12 @@ local CombatAssist = require('sidekick-next.utils.combatassist')
 local Assist = require('sidekick-next.automation.assist')
 local CasterAssist = require('sidekick-next.automation.caster_assist')
 local Actors = require('sidekick-next.utils.actors_coordinator')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 local module = ModuleBase.create('assist', lib.Priority.DPS)
 module:enablePeerActors()
 
-local ACTOR_TARGET_TTL_SECONDS = 5
+local ACTOR_TARGET_TTL_SECONDS = CoordinationPolicy.STATE_TTL_SECONDS.ACTOR_TARGET
 local _settings = nil
 local _selectedTarget = nil
 local _stickyActorTargetId = nil
@@ -27,15 +28,25 @@ local _cleanupOwnNavigation = false
 
 local function commandEcho(fmt, ...)
     local ok, message = pcall(string.format, fmt, ...)
-    print(string.format('\ag[SK Assist]\ax %s', ok and message or tostring(fmt)))
+    print(string.format('%s \ag[SK Assist]\ax %s',
+        lib.timestampPrefix(), ok and message or tostring(fmt)))
 end
 
 local function applySettings()
     _settings = lib.getSettings() or _settings or {}
-    local enabled = tostring(_settings.CombatMode or 'off'):lower() == 'assist'
+    local assistEnabled =
+        tostring(_settings.CombatMode or 'off'):lower() == 'assist'
+    local standoffEnabled = _settings.CasterStandoffEnabled == true
+        and (CasterAssist.isPureCaster()
+            or (CasterAssist.shouldRouteStandoff
+                and CasterAssist.shouldRouteStandoff(_settings)))
+    -- Ranged Standoff is intentionally independent of melee Assist mode.
+    -- This only wakes the caster targeting/movement path; CombatAssist itself
+    -- remains disabled so it cannot arm /attack or /stick.
+    local enabled = assistEnabled or standoffEnabled
     local engageCondition = tostring(_settings.AssistEngageCondition or 'hp'):lower()
     CombatAssist.apply_config({
-        enabled = enabled,
+        enabled = assistEnabled,
         assist_at = engageCondition == 'tank_aggro' and 100 or _settings.AssistAt,
         assist_rng = _settings.AssistRange,
         assist_mode = _settings.AssistMode,
@@ -50,7 +61,7 @@ local function applySettings()
     return _settings, enabled
 end
 
-local function validateTarget(targetId, source, settings)
+local function validateTarget(targetId, source, settings, skipEngageGate)
     targetId = tonumber(targetId) or 0
     if targetId <= 0 then return nil, 'no_target' end
 
@@ -75,9 +86,9 @@ local function validateTarget(targetId, source, settings)
     local hp = lib.safeNum(function() return spawn.PctHPs() end, 100)
     local engageAt = tonumber(settings.AssistAt) or 97
     local engageCondition = tostring(settings.AssistEngageCondition or 'hp'):lower()
-    if engageCondition == 'hp' and hp > engageAt then
+    if skipEngageGate ~= true and engageCondition == 'hp' and hp > engageAt then
         return nil, string.format('above_assist_at:%d>%d', hp, engageAt)
-    elseif engageCondition == 'tank_aggro' then
+    elseif skipEngageGate ~= true and engageCondition == 'tank_aggro' then
         local tankId = 0
         if tostring(source or ''):find('actor_', 1, true) == 1 then
             tankId = tonumber(Assist.tankId) or 0
@@ -98,7 +109,7 @@ local function validateTarget(targetId, source, settings)
     }, nil
 end
 
-local function actorTarget(settings)
+local function actorTarget(settings, skipEngageGate)
     local state = Actors.getTankState and Actors.getTankState() or nil
     if type(state) ~= 'table' or tonumber(state.updatedAt) == nil
         or (os.clock() - tonumber(state.updatedAt)) > ACTOR_TARGET_TTL_SECONDS then
@@ -117,18 +128,26 @@ local function actorTarget(settings)
         _stickyActorTargetId = nil
         return nil, 'actor_primary_cleared', true
     end
+    if state.killAuthorized ~= true then
+        _stickyActorTargetId = nil
+        return nil, 'actor_primary_not_engaged', true
+    end
     _stickyActorTargetId = primaryId
-    local target, reason = validateTarget(primaryId, 'actor_primary', settings)
+    local target, reason = validateTarget(primaryId, 'actor_primary', settings,
+        skipEngageGate)
     return target, reason, true
 end
 
-local function selectTarget(settings)
-    local target, actorReason, authoritative = actorTarget(settings)
+local function selectTarget(settings, skipEngageGate)
+    local target, actorReason, authoritative =
+        actorTarget(settings, skipEngageGate)
     if target then return target, nil end
     if authoritative then return nil, actorReason end
 
     local id = CombatAssist.get_assist_target()
-    local fallback, fallbackReason = validateTarget(id, 'assist_' .. tostring(settings.AssistMode or 'group'), settings)
+    local fallback, fallbackReason = validateTarget(id,
+        'assist_' .. tostring(settings.AssistMode or 'group'), settings,
+        skipEngageGate)
     if fallback then return fallback, nil end
     return nil, fallbackReason or actorReason or 'no_target'
 end
@@ -141,6 +160,17 @@ module.onTick = function(self)
         self:setIntent(_needsStop, nil, _lastReason)
         return
     end
+    if self.componentMode and self.domainKillAuthorized ~= true then
+        _selectedTarget = nil
+        _stickyActorTargetId = nil
+        -- Cleanup of an assist episode that this component previously armed
+        -- remains lease-controlled even though new offense is gated.
+        if _stableTargetId > 0 then _needsStop = true end
+        _lastReason = tostring(
+            self.domainKillGateReason or 'kill_not_authorized')
+        self:setIntent(_needsStop, nil, _lastReason)
+        return
+    end
     local pureCaster = CasterAssist.isPureCaster()
     local standoffRoute = CasterAssist.shouldRouteStandoff
         and CasterAssist.shouldRouteStandoff(settings)
@@ -148,7 +178,10 @@ module.onTick = function(self)
         and settings.CasterStandoffEnabled ~= true
     _casterRouting = (pureCaster or standoffRoute) and not casterUsesStick
     if _casterRouting then
-        local target, reason = selectTarget(settings)
+        -- The explicit Tank primary is enough to establish a casting spot.
+        -- Do not wait for AssistAt or target-of-target aggro, which would put
+        -- the first DPS cast ahead of the initial standoff movement.
+        local target, reason = selectTarget(settings, true)
         _selectedTarget = target
         _standoffNeeded = false
         if target then
@@ -156,7 +189,9 @@ module.onTick = function(self)
             if currentId == target.id then
                 _stableTargetId = target.id
                 _standoffNeeded = select(1,
-                    CasterAssist.getStandoffNeed(settings, target.id)) == true
+                    CasterAssist.getStandoffNeed(settings, target.id,
+                        self.componentMode
+                            and self.domainKillAuthorized == true)) == true
             else
                 _stableTargetId = 0
             end
@@ -193,7 +228,8 @@ end
 
 module.shouldAct = function()
     return _needsStop or (_wasEnabled and _selectedTarget ~= nil
-        and _stableTargetId ~= _selectedTarget.id)
+        and (_stableTargetId ~= _selectedTarget.id
+            or (_casterRouting and _standoffNeeded)))
 end
 
 module.getAction = function()
@@ -277,7 +313,9 @@ module.executeAction = function(self)
         return true, 'mode_off'
     end
     local claimedId = tonumber(leasedAction.targetId) or 0
-    local target, reason = selectTarget(settings)
+    local casterAction = leasedAction.assistMode == 'caster_target'
+        or leasedAction.assistMode == 'caster_standoff'
+    local target, reason = selectTarget(settings, casterAction)
     if not target then
         CombatAssist.stop()
         return true, reason or 'target_lost'
@@ -315,7 +353,9 @@ module.executeAction = function(self)
                 return false, standoffReason
             end
             local started, standoffReason =
-                CasterAssist.startStandoff(settings, claimedId)
+                CasterAssist.startStandoff(settings, claimedId,
+                    self.componentMode
+                        and self.domainKillAuthorized == true)
             if not started then
                 return true, standoffReason or 'standoff_no_longer_needed'
             end
@@ -389,14 +429,17 @@ mq.bind('/sk_assist', function(cmd)
         commandEcho('Stop requested')
     elseif cmd == 'status' or cmd == '' then
         local settings, enabled = applySettings()
-        local target, reason = selectTarget(settings)
+        local target, reason = selectTarget(settings, _casterRouting)
         commandEcho(
-            'enabled=%s tier=%s ownsLease=%s request=%s target=%s source=%s hp=%s reason=%s last=%s',
+            'enabled=%s tier=%s ownsLease=%s request=%s target=%s source=%s hp=%s reason=%s last=%s casterRoute=%s standoffNeeded=%s standoffPhase=%s positionedTarget=%d',
             tostring(enabled), tostring(module.priority),
             tostring(module:ownsLease()), tostring(module.currentRequestId or 'none'),
             tostring(target and target.id or 'none'),
             tostring(target and target.source or 'none'), tostring(target and target.hp or 'none'),
-            tostring(reason or 'ready'), tostring(_lastReason))
+            tostring(reason or 'ready'), tostring(_lastReason),
+            tostring(_casterRouting), tostring(_standoffNeeded),
+            tostring(CasterAssist.standoffState.phase or 'idle'),
+            tonumber(CasterAssist.standoffState.positionedTargetId) or 0)
     else
         commandEcho('Usage: /sk_assist status|stop')
     end
@@ -404,6 +447,6 @@ end)
 
 Assist.init({ CombatAssist = CombatAssist })
 module:run(50)
-CombatAssist.stop()
+if not module.componentMode then CombatAssist.stop() end
 
 return module

@@ -12,13 +12,14 @@ local lazy = require('sidekick-next.utils.lazy_require')
 local RezData = require('sidekick-next.utils.rez_data')
 local Logger = require('sidekick-next.utils.logger')
 local ActionExecutor = require('sidekick-next.utils.action_executor')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 local getCore = lazy('sidekick-next.utils.core')
 local getSpellEvents = lazy('sidekick-next.utils.spell_events')
 local module = ModuleBase.create('resurrection', lib.Priority.RESURRECTION)
 
 local LAST_ATTEMPT_SUPPRESS_MS = 10000
-local INTENT_TTL_SECONDS = 3
+local INTENT_TTL_SECONDS = CoordinationPolicy.CLAIM_TTL_SECONDS.REZ
 local INTENT_SETTLE_MS = 450
 local INTENT_REFRESH_MS = 1000
 local LEASE_REFRESH_MS = 1000
@@ -58,6 +59,8 @@ local Runtime = {
     stopAfterCleanup = false,
     lastDebug = {},
     actorScan = nil,
+    candidateCount = 0,
+    rangeRejectedCount = 0,
     consentInbox = {},
     pendingConsent = nil,
 }
@@ -97,7 +100,7 @@ local function debugEnabled()
 end
 
 local function echo(fmt, ...)
-    print(string.format('\aw[SK-Rez]\ax ' .. fmt, ...))
+    print(string.format('%s \aw[SK-Rez]\ax ' .. fmt, lib.timestampPrefix(), ...))
 end
 
 local function debugEcho(key, fmt, ...)
@@ -126,6 +129,42 @@ end
 
 local function zoneShort()
     return lib.safeTLO(function() return mq.TLO.Zone.ShortName() end, '') or ''
+end
+
+local function rezDialogOpen()
+    local window = mq.TLO.Window('ConfirmationDialogBox')
+    if not (window and window() and window.Open and window.Open()) then
+        return false
+    end
+    local text = ''
+    local child = window.Child and window.Child('CD_TextOutput') or nil
+    if child and child() and child.Text then
+        text = tostring(child.Text() or '')
+    end
+    if text == '' then
+        local fallback = window.Child and window.Child('Text') or nil
+        if fallback and fallback() and fallback.Text then
+            text = tostring(fallback.Text() or '')
+        end
+    end
+    return text:lower():find('resurrect', 1, true) ~= nil
+end
+
+local function rezAcceptAction()
+    if not settingBool('AutoAcceptRez', true) or not rezDialogOpen() then
+        return nil
+    end
+    return {
+        kind = 'rez_accept',
+        name = 'Accept resurrection',
+        skipBoundaryTarget = true,
+        breaksInvis = false,
+        expectsCastStart = false,
+        settleMs = 250,
+        timeoutMs = 1500,
+        idempotencyKey = 'rez:accept-dialog',
+        reason = 'rez_offer_open',
+    }
 end
 
 local function normalizedSpawnName(value)
@@ -368,12 +407,14 @@ local function corpseDistance(corpseId)
     return lib.safeNum(function() return spawn.Distance() end, 99999)
 end
 
-local function findRezTarget(inCombat)
+local function findRezTargets(inCombat)
     local now = nowMs()
     local forced = trim(Runtime.forcedTargetName):lower()
     local groupCount = lib.getGroupCount()
     local sawDead, sawFiltered, sawSuppressed = false, false, false
     local seenNames = {}
+    local seenCorpseIds = {}
+    local candidates = {}
     local team = module.state and module.state.team or nil
     local currentZone = zoneShort():lower()
     Runtime.actorScan = {
@@ -423,7 +464,7 @@ local function findRezTarget(inCombat)
                     end
                     local lastAt = Runtime.lastAttempt[corpseId] or 0
                     if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
-                        return {
+                        candidates[#candidates + 1] = {
                             corpseId = corpseId,
                             corpseName = corpseName,
                             corpseType = corpseType,
@@ -431,7 +472,9 @@ local function findRezTarget(inCombat)
                             classShort = classShort,
                             distance = lib.safeNum(function() return spawn.Distance() end, 99999),
                             source = 'group',
-                        }, nil
+                        }
+                        seenCorpseIds[corpseId] = true
+                        goto continue
                     end
                     sawSuppressed = true
                     goto continue
@@ -494,8 +537,10 @@ local function findRezTarget(inCombat)
                         goto continue_actor
                     end
                     local lastAt = Runtime.lastAttempt[scan.corpseId] or 0
-                    if (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
-                        return {
+                    if seenCorpseIds[scan.corpseId] then
+                        scan.result = 'already_group_candidate'
+                    elseif (now - lastAt) >= LAST_ATTEMPT_SUPPRESS_MS then
+                        candidates[#candidates + 1] = {
                             corpseId = scan.corpseId,
                             corpseName = scan.corpseName,
                             corpseType = scan.corpseType,
@@ -504,10 +549,13 @@ local function findRezTarget(inCombat)
                             distance = lib.safeNum(function() return spawn.Distance() end, 99999),
                             source = 'actor_team',
                             targetServer = tostring(member.server or ''),
-                        }, nil
+                        }
+                        seenCorpseIds[scan.corpseId] = true
+                        scan.result = 'candidate'
+                    else
+                        scan.result = 'attempt_suppressed'
+                        sawSuppressed = true
                     end
-                    scan.result = 'attempt_suppressed'
-                    sawSuppressed = true
                 end
                 if not spawn then scan.result = 'corpse_not_found' end
             elseif scan.self then
@@ -525,17 +573,30 @@ local function findRezTarget(inCombat)
         end
     end
 
-    if sawSuppressed then return nil, 'corpse_attempt_suppressed' end
-    if sawFiltered then return nil, 'combat_target_class_filtered' end
-    if sawDead then return nil, 'dead_member_corpse_not_found' end
-    return nil, forced ~= '' and 'requested_member_not_dead_or_present' or 'no_dead_group_or_actor_member'
+    if #candidates > 0 then return candidates, nil end
+    if sawSuppressed then return candidates, 'corpse_attempt_suppressed' end
+    if sawFiltered then return candidates, 'combat_target_class_filtered' end
+    if sawDead then return candidates, 'dead_member_corpse_not_found' end
+    return candidates,
+        forced ~= '' and 'requested_member_not_dead_or_present'
+            or 'no_dead_group_or_actor_member'
 end
 
 local function prunePeerIntents()
     local nowEpoch = os.time()
     for corpseId, perRezzer in pairs(Runtime.peerIntents) do
         for rezzer, intent in pairs(perRezzer) do
-            if (tonumber(intent.expiresAt) or 0) < nowEpoch then
+            local fresh, peer = true, nil
+            if module.peerActors and module.peerActors.isPeerLeaseFresh then
+                fresh, peer = module.peerActors.isPeerLeaseFresh(
+                    intent.from or rezzer, intent.zone, intent.server)
+            end
+            intent.peerAgeMs = peer and peer.ageMs or nil
+            intent.peerReason = peer and peer.reason or 'unknown'
+            intent.leaseRemainingMs = CoordinationPolicy.epochLeaseRemainingMs(
+                intent.expiresAt, nowEpoch)
+            if (tonumber(intent.expiresAt) or 0) < nowEpoch
+                or (peer and peer.known and not fresh) then
                 perRezzer[rezzer] = nil
             end
         end
@@ -573,6 +634,9 @@ local function receivePeerIntent(content, sender, fromMe)
             math.min(tonumber(content.expiresAt)
                 or (nowEpoch + INTENT_TTL_SECONDS),
                 nowEpoch + (INTENT_TTL_SECONDS * 2))),
+        zone = tostring(content.zone or ''),
+        server = tostring(content.server or (sender and sender.server) or ''),
+        senderScript = tostring(content._skActorSenderScript or ''),
     }
     local workflow = Runtime.workflow
     if workflow and not workflow.terminalReason
@@ -775,7 +839,10 @@ local function localWinsIntent(target, resource)
     local winner = candidates[1]
     Runtime.winner = winner and winner.from or myName()
     if not winner or winner.localCandidate ~= true then
-        return false, 'peer_rez_claim:' .. tostring(Runtime.winner or 'unknown')
+        return false, string.format('peer_rez_claim:%s:peerAge=%sms:lease=%sms',
+            tostring(Runtime.winner or 'unknown'),
+            tostring(winner and winner.peerAgeMs or '?'),
+            tostring(winner and winner.leaseRemainingMs or '?'))
     end
     if (now - intent.firstAtMs) < INTENT_SETTLE_MS then
         return false, 'actor_claim_settling'
@@ -853,12 +920,12 @@ local function navActive()
     end, false) == true
 end
 
-local function updateDirtyEffects(workflow)
+local function updateDirtyEffects(workflow, recoveryRequired)
     module:markDirtyEffects(workflow ~= nil and (
         workflow.navStarted == true
         or workflow.navStopPending == true
         or workflow.castMayBeActive == true
-        or workflow.tempGem == true))
+        or workflow.tempGem == true), recoveryRequired)
 end
 
 local function requestWorkflowNavStop(workflow, resumePhase, includeActive)
@@ -940,6 +1007,42 @@ local function targetRangeReason(target, resource, inCombat)
         return string.format('corpse_beyond_nav_limit:%.1f', distance)
     end
     return nil
+end
+
+local function selectRangeEligibleTarget(candidates, resource, inCombat)
+    local navigable = nil
+    local nearestRejected = nil
+    local rejected = {}
+    local resourceRange = math.max(1, tonumber(resource and resource.range) or 100)
+
+    for _, candidate in ipairs(candidates or {}) do
+        local reason = targetRangeReason(candidate, resource, inCombat)
+        if not reason then
+            -- Prefer a corpse that can be rezzed immediately over an earlier
+            -- roster corpse that would require navigation.
+            if (tonumber(candidate.distance) or 99999) <= resourceRange then
+                return candidate, nil, rejected
+            end
+            if not navigable then navigable = candidate end
+        else
+            rejected[#rejected + 1] = {
+                target = candidate,
+                corpseId = candidate.corpseId,
+                memberName = candidate.memberName,
+                distance = candidate.distance,
+                reason = reason,
+            }
+            if not nearestRejected
+                or (tonumber(candidate.distance) or 99999)
+                    < (tonumber(nearestRejected.distance) or 99999) then
+                nearestRejected = rejected[#rejected]
+            end
+        end
+    end
+
+    if navigable then return navigable, nil, rejected end
+    return nil, nearestRejected and nearestRejected.reason
+        or 'no_range_eligible_corpse', rejected, nearestRejected
 end
 
 local function actionFor(target, resource)
@@ -1117,7 +1220,7 @@ local function loadRecoveryWorkflow()
         terminalReason = 'recovered_temporary_gem',
     }
     Runtime.workflow.action = cleanupAction(Runtime.workflow)
-    updateDirtyEffects(Runtime.workflow)
+    updateDirtyEffects(Runtime.workflow, true)
     echo('Recovered an interrupted rez gem swap; restoring gem %d', slot)
 end
 
@@ -1148,7 +1251,9 @@ local function startWorkflow(action)
     if Runtime.workflow.targetSource == 'actor_team'
         and module.peerActors and module.peerActors.sendToCharacter then
         local team = module.state and module.state.team or {}
-        module.peerActors.sendToCharacter('sidekick-next/sk_resurrection',
+        local rezScript = lib.WorkerProfile == 'consolidated'
+            and 'sidekick-next/sk_support' or 'sidekick-next/sk_resurrection'
+        module.peerActors.sendToCharacter(rezScript,
             Runtime.workflow.targetName, tostring(action.targetServer or ''),
             'rez:consent_request', {
                 targetName = Runtime.workflow.targetName,
@@ -1266,7 +1371,12 @@ local function stepWorkflow()
 
     if workflow.phase == 'target_wait' then
         if targetIs(workflow.targetId) then
-            workflow.phase = 'drag_send'
+            local distance = corpseDistance(workflow.targetId) or 99999
+            if distance <= (workflow.resource.range or 100) then
+                workflow.phase = 'prepare_resource'
+            else
+                workflow.phase = 'drag_send'
+            end
         elseif now >= workflow.deadlineMs then
             return beginRestore(false, 'target_failed')
         end
@@ -1488,6 +1598,8 @@ local function sendTelemetry(self, force)
         winner = Runtime.winner or '',
         lastResult = Runtime.lastResult,
         itemName = settingString('RezItemName', ''),
+        candidateCount = Runtime.candidateCount,
+        rangeRejectedCount = Runtime.rangeRejectedCount,
         updatedAt = os.time(),
     })
 end
@@ -1535,6 +1647,17 @@ module.onTick = function(self)
     Runtime.target = nil
     Runtime.resource = nil
     Runtime.pendingAction = nil
+    Runtime.candidateCount = 0
+    Runtime.rangeRejectedCount = 0
+
+    Runtime.pendingAction = rezAcceptAction()
+    if Runtime.pendingAction then
+        clearLocalIntent('accepting_local_rez')
+        setReason('ready:accept_rez')
+        self:setIntent(true, nil, Runtime.reason)
+        sendTelemetry(self)
+        return
+    end
 
     if Runtime.pendingConsent then
         Runtime.pendingAction = consentAction(Runtime.pendingConsent)
@@ -1579,15 +1702,15 @@ module.onTick = function(self)
     end
 
 
-    local target, targetReason = findRezTarget(inCombat)
-    if not target then
+    local candidates, targetReason = findRezTargets(inCombat)
+    Runtime.candidateCount = #(candidates or {})
+    if Runtime.candidateCount == 0 then
         clearLocalIntent(targetReason)
         setReason(targetReason)
         self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
-    Runtime.target = target
 
     local resource, resourceReason = selectResource(inCombat)
     if not resource then
@@ -1606,14 +1729,18 @@ module.onTick = function(self)
     end
     Runtime.resource = resource
 
-    local rangeReason = targetRangeReason(target, resource, inCombat)
-    if rangeReason then
+    local target, rangeReason, rangeRejected, nearestRejected =
+        selectRangeEligibleTarget(candidates, resource, inCombat)
+    Runtime.rangeRejectedCount = #(rangeRejected or {})
+    if not target then
+        Runtime.target = nearestRejected and nearestRejected.target or candidates[1]
         clearLocalIntent(rangeReason)
         setReason(rangeReason)
         self:setIntent(false, nil, Runtime.reason)
         sendTelemetry(self)
         return
     end
+    Runtime.target = target
 
     -- Selection is read-only. Coordinated navigation can finish while this
     -- request waits; any stale nav still present after grant is stopped inside
@@ -1668,6 +1795,19 @@ module.executeAction = function(self)
     if not self:ownsLease(self.currentRequestId) then return false, 'no_lease' end
     local action = self:getLeaseAction()
     if not action then return true, 'missing_leased_rez_action' end
+
+    if action.kind == 'rez_accept' then
+        local current = rezAcceptAction()
+        if not current
+            or tostring(current.idempotencyKey) ~= tostring(action.idempotencyKey) then
+            Runtime.pendingAction = nil
+            return true, 'rez_offer_closed'
+        end
+        mq.cmd('/notify ConfirmationDialogBox Yes_Button leftmouseup')
+        Runtime.pendingAction = nil
+        Runtime.lastResult = 'rez_offer_accepted'
+        return true, Runtime.lastResult
+    end
 
     if action.kind == 'rez_consent' then
         local pending = Runtime.pendingConsent

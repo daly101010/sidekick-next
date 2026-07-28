@@ -119,6 +119,7 @@ function M.draw(settings, themeNames, onChange)
 
     -- Fidget tuning -------------------------------------------------------
     if imgui.CollapsingHeader('Fidget tuning') then
+        imgui.TextDisabled('Fidget execution is disabled in this build.')
         local F = getFidget()
         if not F then
             imgui.TextDisabled('fidget module not loaded')

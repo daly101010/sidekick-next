@@ -10,12 +10,14 @@ local SAFE_RECOVERY_AGE_SECONDS = 5
 local START_CONFIRM_MS = 1000
 local STOP_RETRY_MS = 250
 local MARKER_REFRESH_MS = 500
+local BACKEND_PROBE_MS = 1000
 
 local State = {
     owner = nil,
     orphanChecked = false,
     orphan = nil,
     lastMarkerWriteAt = 0,
+    backendProbe = nil,
 }
 
 local function nowMs()
@@ -240,6 +242,55 @@ local function chooseBackend(fingerprint)
     return nil
 end
 
+--- Resolve a usable movement backend without issuing any movement command.
+--- Chase calls this during its sensor pass so an unavailable backend never
+--- becomes a lease request that can only fail and requeue.
+---@param fingerprint table
+---@return string|nil backend
+---@return string|nil reason
+function M.resolveBackend(fingerprint, force)
+    if type(fingerprint) ~= 'table'
+        or (tonumber(fingerprint.id) or 0) <= 0 then
+        return nil, 'target_missing_id'
+    end
+    local targetId = tonumber(fingerprint.id)
+    local now = nowMs()
+    local probe = State.backendProbe
+    if force ~= true and probe and probe.targetId == targetId
+        and (now - probe.atMs) < BACKEND_PROBE_MS then
+        return probe.backend, probe.reason
+    end
+    local backend = chooseBackend(fingerprint)
+    local reason
+    if not backend then reason = 'no_movement_backend' end
+    State.backendProbe = {
+        targetId = targetId,
+        atMs = now,
+        backend = backend,
+        reason = reason,
+    }
+    return backend, reason
+end
+
+--- Read-only backend diagnostics for the Chase worker status command.
+function M.backendSnapshot(fingerprint)
+    local navMesh = navMeshLoaded()
+    local navPath = false
+    if navMesh and type(fingerprint) == 'table'
+        and (tonumber(fingerprint.id) or 0) > 0 then
+        navPath = navPathExists(fingerprint.id)
+    end
+    local backend, reason = M.resolveBackend(fingerprint)
+    return {
+        selected = backend,
+        reason = reason,
+        navMeshLoaded = navMesh,
+        navPathExists = navPath,
+        moveToAvailable = moveToAvailable(),
+        stickAvailable = stickAvailable(),
+    }
+end
+
 local function issueStart(owner)
     local id = tonumber(owner.fingerprint and owner.fingerprint.id) or 0
     if id <= 0 then return false, 'target_missing_id' end
@@ -368,7 +419,7 @@ function M.begin(fingerprint, arrivalDistance, actionId, ownership)
         coordinatorBootId = tostring(ownership.coordinatorBootId or ''),
         fingerprint = fingerprint,
         arrivalDistance = tonumber(arrivalDistance) or 20,
-        backend = chooseBackend(fingerprint),
+        backend = M.resolveBackend(fingerprint, true),
         phase = 'preparing',
         held = {},
         startedAtMs = nowMs(),
@@ -664,33 +715,52 @@ local function orphanHasConflictingMovement(marker)
     return false
 end
 
-function M.tickOrphanRecovery()
+--- Inspect and stage an orphan marker without issuing movement commands.
+--- This is safe from the worker sensor pass; cleanup itself remains leased.
+---@return boolean pending
+---@return string reason
+function M.inspectOrphanRecovery()
     if not State.orphanChecked then
         State.orphanChecked = true
         local marker = loadMarker()
-        if not marker then return true, 'no_dirty_marker', false end
+        if not marker then return false, 'no_dirty_marker' end
         local valid, reason = validOrphanMarker(marker)
         if not valid then
-            -- Stale, wrong-zone, and wrong-instance markers are never allowed
-            -- to stop movement that may now be manual.
-            clearMarker()
-            return true, reason, true
+            State.orphan = {
+                marker = marker,
+                terminalReason = reason,
+            }
+            return true, reason
         end
-        if orphanHasConflictingMovement(marker) then
-            clearMarker()
-            return true, 'orphan_conflicting_movement', true
-        end
+        local conflict = orphanHasConflictingMovement(marker)
         State.orphan = {
             marker = marker,
             inactiveSamples = 0,
             lastStopAtMs = 0,
             keysReleased = false,
+            terminalReason = conflict and 'orphan_conflicting_movement' or nil,
         }
     end
+    if not State.orphan then return false, 'orphan_clean' end
+    return true, State.orphan.terminalReason or 'orphan_recovery_pending'
+end
+
+function M.tickOrphanRecovery()
+    local pending, inspectReason = M.inspectOrphanRecovery()
+    if not pending then return true, inspectReason, false end
 
     local orphan = State.orphan
     if not orphan then return true, 'orphan_clean', false end
     local marker = orphan.marker
+    if orphan.terminalReason then
+        -- Stale, wrong-zone, wrong-instance, and conflicting markers may be
+        -- deleted, but never used to stop movement. Marker deletion happens
+        -- under the recovery lease along with every other recovery effect.
+        clearMarker()
+        local reason = orphan.terminalReason
+        State.orphan = nil
+        return true, reason, true
+    end
     if not orphan.keysReleased then
         if tonumber(marker.heldBack) == 1 then mq.cmd('/keypress back') end
         if marker.heldStrafe == 'strafe_left' or marker.heldStrafe == 'strafe_right' then

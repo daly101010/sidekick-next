@@ -45,6 +45,114 @@ local _filePath = nil         -- Current log file path
 local _fileDate = nil         -- Date for log rotation
 local _tracerEnabled = true   -- Caller tracing on by default
 local _scriptLabel = 'SK'     -- Short script prefix for console output
+local _moduleLevels = {}      -- canonical module name -> 0(off), 1..5
+
+local function monotonicMs()
+    local ok, value = pcall(mq.gettime)
+    if ok and tonumber(value) then return math.floor(tonumber(value)) end
+    return math.floor(os.clock() * 1000)
+end
+
+--- Timestamp shared by console and file diagnostics.
+--- Wall time is human-readable; mq time is monotonic and lets logs from
+--- separate SideKick worker processes be ordered to millisecond precision.
+function M.timestamp()
+    return string.format('%s|mq:%d', os.date('%H:%M:%S'), monotonicMs())
+end
+
+--- MQ-colored timestamp prefix for direct console diagnostics that cannot use
+--- the leveled logger (for example explicit /status command responses).
+function M.consoleTimestamp()
+    return string.format('\aw[%s]\ax', M.timestamp())
+end
+
+local KNOWN_MODULES = {
+    { key = 'coordinator', label = 'Coordinator' },
+    { key = 'emergency', label = 'Emergency' },
+    { key = 'support', label = 'Support' },
+    { key = 'healing', label = 'Healing' },
+    { key = 'cures', label = 'Cures' },
+    { key = 'resurrection', label = 'Resurrection' },
+    { key = 'cc', label = 'Crowd Control' },
+    { key = 'tank', label = 'Tank' },
+    { key = 'combat', label = 'Combat' },
+    { key = 'pull', label = 'Pull' },
+    { key = 'assist', label = 'Assist' },
+    { key = 'dps', label = 'DPS' },
+    { key = 'items', label = 'Items' },
+    { key = 'resources', label = 'Resources' },
+    { key = 'maintenance', label = 'Maintenance' },
+    { key = 'buffs', label = 'Buffs' },
+    { key = 'disciplines', label = 'Disciplines' },
+    { key = 'feign', label = 'Feign Safety' },
+    { key = 'next_meditation', label = 'Meditation' },
+    { key = 'fidget', label = 'Fidget' },
+}
+
+local MODULE_ALIASES = {
+    rez = 'resurrection',
+    resurrection = 'resurrection',
+    buff = 'buffs',
+    buffs = 'buffs',
+    heal = 'healing',
+    healing = 'healing',
+    med = 'next_meditation',
+    meditation = 'next_meditation',
+    nextmeditation = 'next_meditation',
+    sk_meditation = 'next_meditation',
+    skmeditation = 'next_meditation',
+    sk_coordinator = 'coordinator',
+    skcoordinator = 'coordinator',
+}
+
+local LEVEL_NAMES = {
+    off = 0,
+    error = 1,
+    warn = 2,
+    warning = 2,
+    info = 3,
+    debug = 4,
+    verbose = 5,
+    trace = 5,
+}
+
+local function canonicalModuleName(value)
+    local name = tostring(value or ''):lower():match('^%s*(.-)%s*$') or ''
+    name = name:gsub('[^%w_]', '')
+    return MODULE_ALIASES[name] or name
+end
+
+local function parseLevel(value)
+    if type(value) == 'number' then
+        return math.max(0, math.min(5, math.floor(value)))
+    end
+    local text = tostring(value or ''):lower():match('^%s*(.-)%s*$') or ''
+    if LEVEL_NAMES[text] ~= nil then return LEVEL_NAMES[text] end
+    local numeric = tonumber(text)
+    if numeric then return math.max(0, math.min(5, math.floor(numeric))) end
+    return nil
+end
+
+local function decodeModuleLevels(serialized)
+    local levels = {}
+    for entry in tostring(serialized or ''):gmatch('[^,;]+') do
+        local moduleName, rawLevel = entry:match('^%s*([^=:]+)%s*[=:]%s*([^=:]+)%s*$')
+        local canonical = canonicalModuleName(moduleName)
+        local level = parseLevel(rawLevel)
+        if canonical ~= '' and level ~= nil then levels[canonical] = level end
+    end
+    return levels
+end
+
+local function moduleOverride(moduleName)
+    return _moduleLevels[canonicalModuleName(moduleName)]
+end
+
+local function effectiveLevel(moduleName, fallback)
+    local override = moduleOverride(moduleName)
+    if override ~= nil then return override end
+    return fallback
+end
 
 -- ============================================================
 -- GLOBAL CONTROL API
@@ -58,6 +166,69 @@ end
 --- Get the current global log level
 function M.getLevel()
     return _globalLevel
+end
+
+function M.getKnownModules()
+    local result = {}
+    for i, entry in ipairs(KNOWN_MODULES) do
+        result[i] = { key = entry.key, label = entry.label }
+    end
+    return result
+end
+
+function M.decodeModuleLevels(serialized)
+    return decodeModuleLevels(serialized)
+end
+
+function M.encodeModuleLevels(levels)
+    levels = levels or _moduleLevels
+    local normalized = {}
+    for moduleName, level in pairs(levels) do
+        local canonical = canonicalModuleName(moduleName)
+        local parsed = parseLevel(level)
+        if canonical ~= '' and parsed ~= nil then normalized[canonical] = parsed end
+    end
+    local keys = {}
+    for moduleName in pairs(normalized) do keys[#keys + 1] = moduleName end
+    table.sort(keys)
+    local encoded = {}
+    for _, moduleName in ipairs(keys) do
+        encoded[#encoded + 1] = string.format('%s=%d', moduleName, normalized[moduleName])
+    end
+    return table.concat(encoded, ',')
+end
+
+function M.setModuleLevel(moduleName, level)
+    local canonical = canonicalModuleName(moduleName)
+    if canonical == '' then return false, 'invalid_module' end
+    if level == nil or tostring(level):lower() == 'inherit' then
+        _moduleLevels[canonical] = nil
+        return true
+    end
+    local parsed = parseLevel(level)
+    if parsed == nil then return false, 'invalid_level' end
+    _moduleLevels[canonical] = parsed
+    return true
+end
+
+function M.getModuleLevel(moduleName)
+    return moduleOverride(moduleName)
+end
+
+function M.getModuleLevels()
+    local result = {}
+    for moduleName, level in pairs(_moduleLevels) do result[moduleName] = level end
+    return result
+end
+
+--- True when a message would reach at least one configured sink.
+function M.wouldLog(moduleName, level)
+    local levelDef = LEVELS[tostring(level or ''):lower()]
+    if not levelDef then return false end
+    local consoleMin = effectiveLevel(moduleName, _consoleLevel or _globalLevel)
+    local fileMin = effectiveLevel(moduleName, _fileLevel or _globalLevel)
+    return levelDef.num <= consoleMin
+        or (_fileLogging and levelDef.num <= fileMin)
 end
 
 --- Set minimum level for console output (nil = use global level)
@@ -105,6 +276,7 @@ function M.configure(settings)
     M.setFileLogging(settings.SideKickLogFile == true)
     local filter = tostring(settings.SideKickLogFilter or '')
     M.setFilter(filter ~= '' and filter or nil)
+    _moduleLevels = decodeModuleLevels(settings.SideKickModuleLogLevels)
 end
 
 function M.getConfiguration()
@@ -112,6 +284,8 @@ function M.getConfiguration()
         level = _globalLevel,
         fileLogging = _fileLogging,
         filter = _filter or '',
+        moduleLevels = M.getModuleLevels(),
+        moduleLevelsEncoded = M.encodeModuleLevels(),
     }
 end
 
@@ -219,50 +393,53 @@ end
 --- @param ... any Format arguments
 local function writeLog(levelName, moduleName, depthOffset, fmt, ...)
     local levelDef = LEVELS[levelName]
-    if not levelDef then return end
+    if not levelDef then return false end
 
     local levelNum = levelDef.num
 
     -- Cheap suppression check BEFORE formatting: suppressed debug/verbose
     -- calls sit on hot paths (per drained actor message in the coordinator)
     -- and must cost next to nothing when no sink would accept the line.
-    local suppressConsoleMin = _consoleLevel or _globalLevel
-    local suppressFileMin = _fileLevel or _globalLevel
+    local suppressConsoleMin = effectiveLevel(moduleName, _consoleLevel or _globalLevel)
+    local suppressFileMin = effectiveLevel(moduleName, _fileLevel or _globalLevel)
     if levelNum > suppressConsoleMin
         and (not _fileLogging or levelNum > suppressFileMin) then
-        return
+        return false
     end
 
     local message = formatMessage(fmt, ...)
 
     -- Check filter
-    if not passesFilter(moduleName, message) then return end
+    if not passesFilter(moduleName, message) then return false end
+    local emitted = false
 
     -- Console output
-    local consoleMin = _consoleLevel or _globalLevel
+    local consoleMin = effectiveLevel(moduleName, _consoleLevel or _globalLevel)
     if levelNum <= consoleMin then
         -- Stack: getCallerInfo → writeLog → log.X → caller = depth 4 + depthOffset
         local callerInfo = getCallerInfo(4 + (depthOffset or 0))
-        local consoleLine = string.format('%s[%s]\ax \aw[\at%s\aw]%s %s%s\ax',
-            levelDef.color, _scriptLabel,
+        local consoleLine = string.format('\aw[%s]\ax %s[%s]\ax \aw[\at%s\aw]%s %s%s\ax',
+            M.timestamp(), levelDef.color, _scriptLabel,
             moduleName or '?',
             callerInfo,
             levelDef.color, message)
         printf(consoleLine)
+        emitted = true
     end
 
     -- File output
-    local fileMin = _fileLevel or _globalLevel
+    local fileMin = effectiveLevel(moduleName, _fileLevel or _globalLevel)
     if levelNum <= fileMin then
         local fh = getFileHandle()
         if fh then
-            local timestamp = os.date('%H:%M:%S')
             local fileLine = string.format('[%s][%s][%s] %s\n',
-                timestamp, levelDef.tag, moduleName or '?', stripColors(message))
+                M.timestamp(), levelDef.tag, moduleName or '?', stripColors(message))
             fh:write(fileLine)
             fh:flush()
+            emitted = true
         end
     end
+    return emitted
 end
 
 -- ============================================================
@@ -277,16 +454,15 @@ function M.new(moduleName, depthOffset)
     depthOffset = depthOffset or 0
     local logger = {}
 
-    function logger.error(fmt, ...) writeLog('error', moduleName, depthOffset, fmt, ...) end
-    function logger.warn(fmt, ...)  writeLog('warn',  moduleName, depthOffset, fmt, ...) end
-    function logger.info(fmt, ...)  writeLog('info',  moduleName, depthOffset, fmt, ...) end
-    function logger.debug(fmt, ...) writeLog('debug', moduleName, depthOffset, fmt, ...) end
-    function logger.verbose(fmt, ...) writeLog('verbose', moduleName, depthOffset, fmt, ...) end
+    function logger.error(fmt, ...) return writeLog('error', moduleName, depthOffset, fmt, ...) end
+    function logger.warn(fmt, ...)  return writeLog('warn',  moduleName, depthOffset, fmt, ...) end
+    function logger.info(fmt, ...)  return writeLog('info',  moduleName, depthOffset, fmt, ...) end
+    function logger.debug(fmt, ...) return writeLog('debug', moduleName, depthOffset, fmt, ...) end
+    function logger.verbose(fmt, ...) return writeLog('verbose', moduleName, depthOffset, fmt, ...) end
 
     --- Check if a level would produce output (for expensive message construction)
     function logger.isLevel(level)
-        local maxLevel = math.max(_consoleLevel or _globalLevel, _fileLevel or _globalLevel)
-        return (LEVELS[level] and LEVELS[level].num or 99) <= maxLevel
+        return M.wouldLog(moduleName, level)
     end
 
     return logger

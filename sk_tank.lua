@@ -6,6 +6,7 @@
 -- after a coordinator ACTION claim.
 
 local mq = require('mq')
+local lazy = require('sidekick-next.utils.lazy_require')
 local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local Cache = require('sidekick-next.utils.runtime_cache')
@@ -15,6 +16,7 @@ local Engine = require('sidekick-next.utils.discipline_engine')
 local Actors = require('sidekick-next.utils.actors_coordinator')
 local Counters = require('sidekick-next.utils.action_counters')
 local Roles = require('sidekick-next.utils.class_roles')
+local NamedDetector = require('sidekick-next.utils.named_detector')
 
 local module = ModuleBase.create('tank', lib.Priority.TANK)
 module:enablePeerActors()
@@ -23,12 +25,14 @@ local TANK_CLASSES = Roles.TANK_CLASSES
 local PRIMARY_BROADCAST_MS = 1000
 local TARGET_SETTLE_MS = 150
 local TAUNT_TIMEOUT_MS = 3500
+local ENGAGE_VERIFY_MS = 1500
 
 local _settings = {}
 local _classConfig = nil
 local _classShort = ''
 local _primaryId = 0
 local _primaryName = ''
+local _killAuthorized = false
 local _pending = nil
 local _lastReason = 'init'
 local _lastBroadcastAt = 0
@@ -51,6 +55,7 @@ local PEEL_BLOCK_MS = 30000
 -- DPS casts for a taunt that cannot fire yet.
 local _tauntNotReadyUntil = 0
 local MEZ_PREP_TTL_MS = 120000
+local _lastProtectedPetId = 0
 
 -- Camp anchor: where the tank idles between fights. Mobs pinned on walls
 -- block backstabs; repositioning drags the primary toward this point.
@@ -64,6 +69,33 @@ local DRAG_BLOCK_TTL_MS = 30000
 local REPO_STEP_SIZE = 15        -- units per drag step toward camp
 local REPO_CAMP_RADIUS = 25      -- mob within this of camp = good enough
 
+-- Pull-state publication is owned by the coordinated tank worker. Healers
+-- consume this over a script-addressed Actor route.
+local getPullMonitor = lazy('sidekick-next.healing.pull_monitor')
+local _pullBroadcast = { lastSent = 0, lastPhase = 'idle' }
+
+-- Low-HP runners handed to DPS are temporarily excluded from tank primary
+-- selection so the tank can open on the next add.
+local _flee = {
+    watchId = 0,
+    lastDist = 0,
+    lastCheck = 0,
+    runnerId = 0,
+    workingId = 0,
+    workingMezzed = false,
+    runnerUntil = 0,
+}
+-- A runner handoff owns movement beyond its initial target/attack mutation.
+-- Keep the Tank lease until that movement ends, and remember the exact Stick
+-- target so cleanup never tears down a later owner that replaced our command.
+local _handoffEffects = {
+    active = false,
+    targetId = 0,
+    stickIssued = false,
+    cleanupIssued = false,
+    lastStopAt = 0,
+}
+
 local function safe(fn, fallback)
     local ok, value = pcall(fn)
     if not ok or value == nil then return fallback end
@@ -72,7 +104,54 @@ end
 
 local function echo(fmt, ...)
     local ok, text = pcall(string.format, fmt, ...)
-    print(string.format('\ag[SK Tank]\ax %s', ok and text or tostring(fmt)))
+    print(string.format('%s \ag[SK Tank]\ax %s',
+        lib.timestampPrefix(), ok and text or tostring(fmt)))
+end
+
+local function tickPullBroadcast(enabled, hostileActivity)
+    local allow = enabled and _settings.PrePullHotEnabled ~= false
+    local monitor = allow and getPullMonitor() or nil
+    if not monitor then
+        if _pullBroadcast.lastPhase == 'inbound' then
+            _pullBroadcast.lastPhase = 'idle'
+            Actors.broadcastPullState({
+                phase = 'idle', mobId = 0, mobName = '', eta = 0,
+                mult = 1.0, dist = 0,
+            })
+        end
+        return
+    end
+
+    -- XTarget[1] is already sampled by the Tank activity gate. Do not run
+    -- the pull monitor's additional XTarget reads while both it and the
+    -- sentinel are idle; a previously-active monitor still gets one tick to
+    -- observe the hater disappearing and publish its idle transition.
+    local monitorActive = monitor.state
+        and tostring(monitor.state.phase or 'idle') ~= 'idle'
+    if hostileActivity or monitorActive then monitor.tick() end
+    local now = lib.getTimeMs()
+    local inbound = monitor.getInbound()
+    if inbound then
+        if (now - _pullBroadcast.lastSent) >= 1000 then
+            _pullBroadcast.lastSent = now
+            _pullBroadcast.lastPhase = 'inbound'
+            Actors.broadcastPullState({
+                phase = 'inbound',
+                mobId = inbound.mobId,
+                mobName = inbound.mobName,
+                eta = inbound.eta,
+                mult = inbound.mult,
+                dist = inbound.dist,
+            })
+        end
+    elseif _pullBroadcast.lastPhase == 'inbound' then
+        _pullBroadcast.lastSent = now
+        _pullBroadcast.lastPhase = 'idle'
+        Actors.broadcastPullState({
+            phase = 'idle', mobId = 0, mobName = '', eta = 0,
+            mult = 1.0, dist = 0,
+        })
+    end
 end
 
 -- In-game announcements for target choices and taunt peels. Change-gated by
@@ -89,6 +168,22 @@ end
 local function navStop()
     if safe(function() return mq.TLO.Navigation.Active() end, false) == true then
         mq.cmd('/nav stop')
+    end
+end
+
+-- Immediately clear offensive state when a protected charm pet leaks into the
+-- tank target. /attack is the part that blocks meditation; /stick and /nav
+-- would otherwise keep the tank staring at or following the pet.
+local function stopOffensiveEngagement(targetId, clearTarget)
+    navStop()
+    mq.cmd('/squelch /stick off')
+    -- Do not rely on Me.Combat here: while auto-attack is armed against a
+    -- non-hostile charm pet, that TLO can still read false even though the
+    -- attack toggle remains on and blocks meditation.
+    mq.cmd('/attack off')
+    local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+    if clearTarget == true and currentId == (tonumber(targetId) or 0) then
+        mq.cmd('/squelch /target clear')
     end
 end
 
@@ -117,12 +212,13 @@ local function spawnById(id)
     return spawn
 end
 
-local function validNpc(id, allowMezzed)
+local function validNpc(id, allowMezzed, allowCharmPet)
     local spawn = spawnById(id)
     if not spawn then return nil end
     if tostring(safe(function() return spawn.Type() end, '') or ''):lower() ~= 'npc' then return nil end
     if safe(function() return spawn.Dead() end, false) == true then return nil end
     if (tonumber(safe(function() return spawn.PctHPs() end, 0)) or 0) <= 0 then return nil end
+    if allowCharmPet ~= true and Actors.isCharmPet(id) then return nil end
     if not allowMezzed and Targeting.isMezzed(spawn) then return nil end
     return spawn
 end
@@ -150,6 +246,20 @@ local function choosePrimary()
 
     local engageRange = tonumber(_settings.TankEngageRange) or 125
 
+    -- During a runner handoff the published primary is intentionally allowed
+    -- to leave the tank's normal engagement radius. The tank is working the
+    -- next add privately; changing primary here would make DPS follow that
+    -- temporary tank target and defeat the split-target contract.
+    if _flee.runnerId > 0 and _primaryId == _flee.runnerId
+        and lib.getTimeMs() < (_flee.runnerUntil or 0) then
+        local runner = validNpc(_flee.runnerId, false)
+        if runner and not Cache.isMobMezzed(_flee.runnerId) then
+            return runner
+        end
+        _flee.runnerId, _flee.workingId, _flee.runnerUntil = 0, 0, 0
+        _flee.workingMezzed = false
+    end
+
     -- RG-style target stability: keep the kill target while it remains a live,
     -- unmezzed hater. Aggro recovery uses a separate target and never replaces
     -- it. Grace of 1.5x engage range so a mob drifting at the boundary doesn't
@@ -169,8 +279,11 @@ local function choosePrimary()
     local forced = tostring(_settings.TargetingForcedTargetName or '')
     if forced ~= '' then
         local forcedSpawn = mq.TLO.Spawn('npc =' .. forced)
-        if forcedSpawn and forcedSpawn() and not Targeting.isMezzed(forcedSpawn) then
-            return forcedSpawn
+        local forcedId = forcedSpawn and forcedSpawn()
+            and tonumber(safe(function() return forcedSpawn.ID() end, 0)) or 0
+        local validForced = validNpc(forcedId, false)
+        if validForced then
+            return validForced
         end
     end
 
@@ -196,6 +309,7 @@ local function choosePrimary()
         if not row.mezzed and not Cache.isMobMezzed(row.id)
             and not Cache.isMobMezClaimed(row.id)
             and not Actors.isCharmPet(row.id)
+            and tonumber(row.id) ~= _flee.runnerId
             and (tonumber(row.distance) or 999) <= engageRange then
             local spawn = validNpc(row.id, false)
             if spawn then
@@ -224,6 +338,7 @@ local function choosePrimary()
             if not row.mezzed and not Cache.isMobMezzed(row.id)
                 and not Cache.isMobMezClaimed(row.id)
                 and not Actors.isCharmPet(row.id)
+                and tonumber(row.id) ~= _flee.runnerId
                 and (tonumber(row.distance) or 999) <= declareRange then
                 local spawn = validNpc(row.id, false)
                 if spawn then
@@ -246,7 +361,8 @@ local function choosePrimary()
     -- Recovery taunts still never touch mezzed mobs.
     if not best and _settings.TankBreakMez ~= false then
         for _, row in ipairs(Cache.xtarget.haters or {}) do
-            local spawn = not Actors.isCharmPet(row.id) and validNpc(row.id, true) or nil
+            local spawn = tonumber(row.id) ~= _flee.runnerId
+                and not Actors.isCharmPet(row.id) and validNpc(row.id, true) or nil
             if spawn and (tonumber(row.distance) or 999) <= engageRange then
                 local score = (100 - (tonumber(row.hp) or 100)) - (tonumber(row.distance) or 0)
                 if not best or score > bestScore then
@@ -261,22 +377,161 @@ end
 local function setPrimary(spawn)
     local id = spawn and tonumber(safe(function() return spawn.ID() end, 0)) or 0
     local name = spawn and tostring(safe(function() return spawn.CleanName() end, '') or '') or ''
+    if id > 0 and Actors.isCharmPet(id) then
+        id, name = 0, ''
+    end
     if id == _primaryId then return false end
     _primaryId, _primaryName = id, name
+    _killAuthorized = false
     _lastBroadcastAt = 0
     return true
 end
 
+local function updateFleeHandoff()
+    local now = lib.getTimeMs()
+    if _settings.TankFleeHandoff == false
+        or tostring(_settings.TankTargetMode or 'auto'):lower() ~= 'auto'
+        or tostring(_settings.TargetingForcedTargetName or '') ~= '' then
+        _flee.watchId, _flee.runnerId, _flee.workingId, _flee.runnerUntil = 0, 0, 0, 0
+        _flee.workingMezzed = false
+        return
+    end
+
+    if _flee.runnerId > 0 then
+        local runner = spawnById(_flee.runnerId)
+        if now >= _flee.runnerUntil or not runner then
+            _flee.runnerId, _flee.workingId, _flee.runnerUntil = 0, 0, 0
+            _flee.workingMezzed = false
+        else
+            return
+        end
+    end
+
+    local target = validNpc(_primaryId, false)
+    if not target or _primaryId == _flee.runnerId then
+        _flee.watchId = 0
+        return
+    end
+
+    local distance = tonumber(safe(function() return target.Distance3D() end,
+        safe(function() return target.Distance() end, 0))) or 0
+    if _flee.watchId ~= _primaryId then
+        _flee.watchId = _primaryId
+        _flee.lastDist = distance
+        _flee.lastCheck = now
+        return
+    end
+    local sampleMs = now - _flee.lastCheck
+    if sampleMs < 900 then return end
+
+    local recedeRate = (distance - _flee.lastDist)
+        / math.max(0.001, sampleMs / 1000)
+    _flee.lastDist = distance
+    _flee.lastCheck = now
+
+    local hpThreshold = tonumber(_settings.TankFleeHpThreshold) or 20
+    local minRecedeRate = math.max(0,
+        tonumber(_settings.TankFleeMinRecedeRate) or 2.25)
+    local hp = tonumber(safe(function() return target.PctHPs() end, 100)) or 100
+    local minAdds = math.max(2, tonumber(_settings.TankFleeMinAdds) or 2)
+    local activeAdds = 0
+    for _, row in ipairs(Cache.xtarget.haters or {}) do
+        if not Actors.isCharmPet(row.id) then
+            activeAdds = activeAdds + 1
+        end
+    end
+    -- Never leave a named primary for trash cleanup. Use the shared named
+    -- detector so custom/plugin-backed named definitions count too.
+    if NamedDetector.isNamed(target, _settings) then return end
+    if hp > hpThreshold or recedeRate < minRecedeRate
+        or activeAdds < minAdds then
+        return
+    end
+
+    local engageRange = tonumber(_settings.TankEngageRange) or 125
+    local function pickWorkingTarget(wantMezzed)
+        local bestId, bestScore = 0, -math.huge
+        for _, row in ipairs(Cache.xtarget.haters or {}) do
+            local mezzed = row.mezzed == true or Cache.isMobMezzed(row.id)
+            if tonumber(row.id) ~= _primaryId
+                and mezzed == wantMezzed
+                and not Actors.isCharmPet(row.id)
+                and (tonumber(row.distance) or 999) <= engageRange then
+                local candidate = validNpc(row.id, wantMezzed)
+                if candidate then
+                    local score = (tonumber(row.level) or 0) * 10
+                        + (100 - (tonumber(row.hp) or 100))
+                        - (tonumber(row.distance) or 0)
+                    if score > bestScore then
+                        bestScore = score
+                        bestId = tonumber(row.id) or 0
+                    end
+                end
+            end
+        end
+        return bestId
+    end
+
+    -- Work a loose add first. If every alternative is mezzed, the existing
+    -- Break Mez setting permits consuming one early while DPS finishes the
+    -- runner.
+    local workingId = pickWorkingTarget(false)
+    local workingMezzed = false
+    if workingId <= 0 and _settings.TankBreakMez ~= false then
+        workingId = pickWorkingTarget(true)
+        workingMezzed = workingId > 0
+    end
+    if workingId <= 0 then return end
+
+    local runnerId = _primaryId
+    local runnerName = _primaryName
+    _flee.runnerId = runnerId
+    _flee.workingId = workingId
+    _flee.workingMezzed = workingMezzed
+    _flee.runnerUntil = now
+        + math.max(1, tonumber(_settings.TankFleeHandoffWindowSec) or 15) * 1000
+    _flee.watchId = 0
+    _forceEngage = true
+    announce('Runner handoff: DPS stays on \aw%s\ax (%d) at %d%%; tank opens %d%s',
+        runnerName, runnerId, hp, workingId,
+        workingMezzed and ' (breaking mez)' or '')
+end
+
 local function broadcastPrimary(force)
     local now = lib.getTimeMs()
+    -- A declared primary and kill authorization are separate states. CC needs
+    -- the declaration before the pull arrives, while offense must wait until
+    -- Tank has verified target + attack (+ Stick in auto mode).
+    if _primaryId <= 0 and force ~= true then return end
     if not force and (now - _lastBroadcastAt) < PRIMARY_BROADCAST_MS then return end
     _lastBroadcastAt = now
-    Actors.broadcastTargetPrimary(_primaryId, _primaryName)
+    Actors.broadcastTargetPrimary(_primaryId, _primaryName, _killAuthorized)
+end
+
+local function groupVictimPriorities()
+    local priorities = {}
+    local count = tonumber(safe(function() return mq.TLO.Group.Members() end, 0)) or 0
+    for i = 1, count do
+        local member = mq.TLO.Group.Member(i)
+        if member and member() then
+            local id = tonumber(safe(function() return member.ID() end, 0)) or 0
+            local classShort = tostring(safe(function()
+                return member.Class.ShortName()
+            end, '') or ''):upper()
+            if id > 0 then
+                priorities[id] = tonumber(Aggro.PEEL_PRIORITY[classShort]) or 1
+            end
+        end
+    end
+    return priorities
 end
 
 local function chooseLooseMob()
     local best, bestScore = nil, -math.huge
     local maxRange = tonumber(_settings.TankTauntChaseRange) or Aggro.TAUNT_CHASE_RANGE
+    local autoPeel = _settings.TankAutoPeel ~= false
+    local minPriority = math.max(1, tonumber(_settings.TankPeelMinPriority) or 1)
+    local victimPriorities = autoPeel and groupVictimPriorities() or {}
     for _, row in ipairs(Cache.xtarget.haters or {}) do
         -- Loose = NOT targeting me. A mob already on me with a sub-100 aggro
         -- reading is not loose: taunting a mob that's targeting you does
@@ -291,15 +546,22 @@ local function chooseLooseMob()
         end
         if not row.mezzed and not row.targetingMe
             and not Cache.isMobMezzed(row.id) then
-            local spawn = validNpc(row.id, false)
+            -- A protected charm pet is eligible here only for the damageless
+            -- loose-mob Taunt recovery path.
+            local spawn = validNpc(row.id, false, Actors.isCharmPet(row.id))
             local distance = spawn and tonumber(safe(function() return spawn.Distance3D() end,
                 safe(function() return spawn.Distance() end, 999))) or 999
             if spawn and distance <= maxRange then
                 local attackingOther = tonumber(row.targetId) > 0 and not row.targetingMe
-                local score = (attackingOther and 1000 or 0)
-                    + (100 - (tonumber(row.aggro) or 100)) * 5
-                    - distance
-                if score > bestScore then best, bestScore = spawn, score end
+                local victimPriority = victimPriorities[tonumber(row.targetId) or 0] or 1
+                local eligible = not autoPeel or minPriority <= 1 or victimPriority >= minPriority
+                if eligible then
+                    local score = (attackingOther and 1000 or 0)
+                        + (autoPeel and victimPriority * 2000 or 0)
+                        + (100 - (tonumber(row.aggro) or 100)) * 5
+                        - distance
+                    if score > bestScore then best, bestScore = spawn, score end
+                end
             end
         end
     end
@@ -475,6 +737,40 @@ local function computePending()
         }, lib.Priority.TANK_RECOVERY, 'taunt:' .. tostring(id)
     end
 
+    -- A low-HP runner remains the authoritative group kill target while the
+    -- tank privately opens the next add. This is intentionally separate from
+    -- primary selection: assisters must not follow the temporary tank target.
+    if _flee.runnerId > 0 and _flee.runnerId == _primaryId
+        and lib.getTimeMs() < (_flee.runnerUntil or 0) then
+        local runner = validNpc(_flee.runnerId, false)
+        local working = validNpc(_flee.workingId, _flee.workingMezzed)
+        if runner and working then
+            local remainingMs = math.max(500,
+                (_flee.runnerUntil or lib.getTimeMs()) - lib.getTimeMs())
+            return {
+                kind = 'tank_runner_handoff',
+                tankAction = 'runner_handoff',
+                name = 'Tank runner handoff',
+                targetId = _flee.workingId,
+                runnerId = _flee.runnerId,
+                workingMezzed = _flee.workingMezzed == true,
+                handoffUntil = _flee.runnerUntil,
+                restorePrimaryId = _primaryId,
+                expectsCastStart = false,
+                settleMs = 75,
+                -- The custom monitor ends at handoffUntil. Leave headroom so
+                -- its explicit window-expired edge wins over executor timeout.
+                timeoutMs = remainingMs + 2000,
+                idempotencyKey = string.format('tank:runner-handoff:%d:%d',
+                    _flee.workingId, _flee.runnerUntil),
+                reason = 'runner_handoff_working',
+            }, lib.Priority.TANK_ENGAGE,
+                'runner_handoff:' .. tostring(_flee.workingId)
+        end
+        _flee.runnerId, _flee.workingId, _flee.runnerUntil = 0, 0, 0
+        _flee.workingMezzed = false
+    end
+
     if _primaryId <= 0 then return nil, lib.Priority.DPS, 'no_target' end
 
     -- Primary taunt: we're fighting our target but no longer top hate
@@ -618,7 +914,8 @@ local function computePending()
     -- Re-engage only when target or attack state drifted (or a taunt
     -- excursion forced a re-stick). Repositioning is its own claim-based
     -- drag action now; no periodic stick refresh needed.
-    local needEngage = currentId ~= _primaryId or not attacking or _forceEngage
+    local needEngage = currentId ~= _primaryId or not attacking
+        or not _killAuthorized or _forceEngage
     if needEngage then
         return {
             kind = 'tank_engage',
@@ -639,8 +936,8 @@ local function computePending()
     return nil, lib.Priority.DPS, 'holding_primary'
 end
 
-local function ensureTarget(id, allowMezzed)
-    local spawn = validNpc(id, allowMezzed == true)
+local function ensureTarget(id, allowMezzed, allowCharmPet)
+    local spawn = validNpc(id, allowMezzed == true, allowCharmPet == true)
     if not spawn then return false end
     local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
     if currentId == tonumber(id) then return true end
@@ -649,6 +946,12 @@ local function ensureTarget(id, allowMezzed)
         return (tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0) == tonumber(id)
     end)
     return (tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0) == tonumber(id)
+end
+
+local function actionAllowsCharmPet(action)
+    return action and action.tankAction == 'taunt'
+        and action.reason == 'loose_mob_taunt'
+        and not Actors.isActiveCharmPet(action.targetId)
 end
 
 local function ensureSelfTarget()
@@ -668,21 +971,222 @@ local function restorePrimary(action)
     if id > 0 and validNpc(id, false) then mq.cmdf('/target id %d', id) end
 end
 
+local function stickState()
+    local active = safe(function()
+        return mq.TLO.Stick and mq.TLO.Stick.Active
+            and mq.TLO.Stick.Active()
+    end, false) == true
+    local targetId = tonumber(safe(function()
+        return mq.TLO.Stick and mq.TLO.Stick.StickTarget
+            and mq.TLO.Stick.StickTarget()
+    end, 0)) or 0
+    return active, targetId
+end
+
+local function meleeRange()
+    local value = tonumber(safe(function()
+        return mq.TLO.Target.MaxRangeTo()
+    end, 14)) or 14
+    return value > 0 and value or 14
+end
+
+local function beginEngageVerification(action, job)
+    navStop()
+    if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+        mq.cmdf('/stick 10 id %d uw', action.targetId)
+    end
+    mq.cmd('/attack on')
+    local now = lib.getTimeMs()
+    job.tank = {
+        phase = 'engage_verify',
+        deadline = now + ENGAGE_VERIFY_MS,
+        lastIssueAt = now,
+    }
+end
+
+local function engagementObserved(action)
+    local targetId = tonumber(action and action.targetId) or 0
+    local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+    local attacking = safe(function() return mq.TLO.Me.Combat() end, false) == true
+    if targetId <= 0 or currentId ~= targetId or not attacking then
+        return false, currentId ~= targetId and 'target_not_confirmed'
+            or 'attack_not_confirmed'
+    end
+
+    local spawn = validNpc(targetId, true)
+    local distance = spawn and tonumber(safe(function()
+        return spawn.Distance3D()
+    end, 999)) or 999
+    local melee = meleeRange()
+    local los = spawn and safe(function() return spawn.LineOfSight() end, false) == true
+    if distance > melee or not los then return false, 'melee_not_confirmed' end
+
+    if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+        local stickActive, stickTargetId = stickState()
+        if not stickActive or (stickTargetId > 0 and stickTargetId ~= targetId) then
+            return false, 'stick_not_confirmed'
+        end
+    end
+    return true, 'engagement_confirmed'
+end
+
+local function ownRunnerHandoff(action)
+    _handoffEffects.active = true
+    _handoffEffects.targetId = tonumber(action and action.targetId) or 0
+    _handoffEffects.stickIssued = false
+    _handoffEffects.cleanupIssued = false
+    _handoffEffects.lastStopAt = 0
+end
+
+local function issueRunnerHandoffStick(action)
+    local targetId = tonumber(action and action.targetId) or 0
+    if targetId <= 0
+        or tostring(_settings.AutomationLevel or 'auto'):lower() ~= 'auto' then
+        return
+    end
+    module:markDirtyEffects(true)
+    mq.cmdf('/stick 10 id %d uw', targetId)
+    _handoffEffects.stickIssued = true
+end
+
+local function beginRunnerHandoffHold(action, job)
+    navStop()
+    module:markDirtyEffects(true)
+    issueRunnerHandoffStick(action)
+    mq.cmd('/attack on')
+    job.tank = job.tank or {}
+    job.tank.phase = 'runner_handoff_hold'
+    job.tank.lastStickAt = lib.getTimeMs()
+end
+
+-- Stop only effects still pointing at this action's private working target.
+-- If another system has replaced Stick or the EQ target, that newer state is
+-- not ours to tear down.
+local function stopOwnedRunnerHandoff(action)
+    local targetId = tonumber(action and action.targetId) or 0
+    if action == nil or action.tankAction ~= 'runner_handoff'
+        or not _handoffEffects.active
+        or targetId <= 0
+        or targetId ~= _handoffEffects.targetId then
+        return
+    end
+
+    navStop()
+    local stickActive, stickTargetId = stickState()
+    if _handoffEffects.stickIssued and stickActive
+        and stickTargetId == targetId then
+        local now = lib.getTimeMs()
+        if not _handoffEffects.cleanupIssued
+            or (now - (_handoffEffects.lastStopAt or 0)) >= 250 then
+            mq.cmd('/squelch /stick off')
+            _handoffEffects.lastStopAt = now
+        end
+    end
+
+    local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+    local attacking = safe(function() return mq.TLO.Me.Combat() end, false) == true
+    if currentId == targetId and attacking then mq.cmd('/attack off') end
+
+    if not _handoffEffects.cleanupIssued then
+        _handoffEffects.cleanupIssued = true
+        _forceEngage = true
+        restorePrimary(action)
+    end
+end
+
 module.onTick = function(self)
-    Cache.tick()
     local enabled = refreshSettings()
+    local hostileActivity = Cache.hasAutoHaterActivity()
+    Cache.setHeavyScanEnabled(hostileActivity)
+    if hostileActivity then Cache.tick() end
+    tickPullBroadcast(enabled, hostileActivity)
+
+    -- Actor charm state can arrive after an NPC was already selected. If Tank
+    -- already owns a lease, it drains the offensive state under that lease and
+    -- terminates it immediately. Otherwise cleanup is represented as a normal
+    -- leased action. This runs before the enabled check so tank mode being off
+    -- cannot preserve an offensive toggle that this worker armed.
+    local currentTargetId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+    local currentIsPet = currentTargetId > 0 and Actors.isCharmPet(currentTargetId)
+    local protectedPetAction = nil
+    if currentIsPet then
+        local leaseAction = self:getLeaseAction()
+        if self.currentRequestId and not actionAllowsCharmPet(leaseAction) then
+            -- Charm can land after Engage/Taunt dispatch. Do not wait for
+            -- executor cancellation or a second cleanup lease before
+            -- disarming the client attack toggle and movement plugins.
+            stopOffensiveEngagement(currentTargetId, true)
+            if currentTargetId == _primaryId then
+                setPrimary(nil)
+                broadcastPrimary(true)
+            end
+            self:cancelUnifiedAction('charm_pet_protected')
+            self:finishAction({
+                phase = 'cancelled',
+                reason = 'charm_pet_protected',
+            })
+            return
+        end
+        -- Merely targeting your own charm pet is normal for an Enchanter.
+        -- A disabled/non-tank Tank worker did not arm that target, attack, or
+        -- movement state and must not request a high-priority cleanup lease.
+        -- An already-running Tank action was handled above; only an enabled
+        -- Tank may request a new protection action.
+        if enabled then
+            protectedPetAction = {
+                kind = 'tank_cleanup',
+                tankAction = 'protect_charm_pet',
+                name = 'Protect charm pet',
+                targetId = currentTargetId,
+                skipBoundaryTarget = true,
+                breaksInvis = false,
+                timeoutMs = 1500,
+                idempotencyKey = 'tank:protect-charm:' .. tostring(currentTargetId),
+                reason = 'charm_pet_protected',
+            }
+            if currentTargetId ~= _lastProtectedPetId then
+                announce('Protected charm pet rejected as attack target: %d', currentTargetId)
+                _lastProtectedPetId = currentTargetId
+            end
+        else
+            _lastProtectedPetId = 0
+        end
+    else
+        _lastProtectedPetId = 0
+    end
+    if _primaryId > 0 and Actors.isCharmPet(_primaryId) then
+        setPrimary(nil)
+        _pending = nil
+        _forceEngage = false
+    end
+
     if not enabled then
         if _primaryId > 0 then
             setPrimary(nil)
             broadcastPrimary(true)
         end
-        _pending = nil
-        _lastReason = TANK_CLASSES[_classShort] and 'mode_off' or 'not_tank_class'
-        self:setIntent(false, nil, _lastReason)
+        _pending = protectedPetAction
+        _lastReason = protectedPetAction and protectedPetAction.reason
+            or (TANK_CLASSES[_classShort] and 'mode_off' or 'not_tank_class')
+        self:setIntent(_pending ~= nil, nil, _lastReason)
         return
     end
 
+    if not hostileActivity and _primaryId > 0 then
+        setPrimary(nil)
+        broadcastPrimary(true)
+    end
+
     if self.currentRequestId then
+        local leaseAction = self:getLeaseAction()
+        if not hostileActivity and not actionAllowsCharmPet(leaseAction) then
+            self:cancelUnifiedAction('no_auto_hater')
+            self:finishAction({
+                phase = 'cancelled',
+                reason = 'no_auto_hater',
+            })
+            return
+        end
         -- Keep the primary broadcast warm while a lease executes (engage
         -- approaches can run 10s+): the mezzer's exclusion has a freshness
         -- window and must not expire mid-fight.
@@ -691,7 +1195,11 @@ module.onTick = function(self)
         return
     end
 
-    local campReturnAction = nil
+    -- Flee handoff changes only the tank's private working target. The
+    -- published primary remains the low-HP runner so DPS never follows the
+    -- tank onto the next add.
+    updateFleeHandoff()
+
     -- Camp anchor maintenance while idle (no haters, standing still).
     -- Deadband keeps the anchor stable against combat drift (rgmercs solves
     -- this with an explicit /camp; we infer it):
@@ -700,7 +1208,7 @@ module.onTick = function(self)
     --   > 100 (or unset): deliberate relocation — re-anchor here
     do
         local nowMs = lib.getTimeMs()
-        if (Cache.xtarget.count or 0) == 0 and (nowMs - _lastAnchorSampleAt) >= 5000 then
+        if not hostileActivity and (nowMs - _lastAnchorSampleAt) >= 5000 then
             _lastAnchorSampleAt = nowMs
             local moving = safe(function() return mq.TLO.Me.Moving() end, false) == true
             local navActive = safe(function() return mq.TLO.Navigation.Active() end, false) == true
@@ -720,31 +1228,23 @@ module.onTick = function(self)
                         if Actors.broadcastTankCampAnchor then
                             Actors.broadcastTankCampAnchor(x, y, z)
                         end
-                    elseif _settings.TankRepositionEnabled == true
-                        and tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
-                        campReturnAction = {
-                            kind = 'movement',
-                            tankAction = 'return_camp',
-                            name = 'Return to camp',
-                            campX = _anchor.x,
-                            campY = _anchor.y,
-                            campZ = _anchor.z,
-                            skipBoundaryTarget = true,
-                            breaksInvis = false,
-                            timeoutMs = 15000,
-                            idempotencyKey = string.format(
-                                'tank:return-camp:%d:%d',
-                                math.floor(_anchor.x), math.floor(_anchor.y)),
-                            reason = 'return_to_camp',
-                        }
                     end
                 end
             end
         end
     end
 
-    local primary = choosePrimary()
+    local primary = hostileActivity and choosePrimary() or nil
     local primaryChanged = setPrimary(primary)
+    local authorizationChanged = false
+    if _killAuthorized and _primaryId > 0 and not self.currentRequestId then
+        local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+        local attacking = safe(function() return mq.TLO.Me.Combat() end, false) == true
+        if currentId ~= _primaryId or not attacking then
+            _killAuthorized = false
+            authorizationChanged = true
+        end
+    end
     if primaryChanged and _primaryId > 0 then
         local row = haterRow(_primaryId)
         local dist = row and tonumber(row.distance) or nil
@@ -757,17 +1257,23 @@ module.onTick = function(self)
     elseif primaryChanged and _primaryId <= 0 then
         announce('Target cleared')
     end
-    -- A fresh zero is authoritative "do not acquire", not an absent target.
-    -- Keep broadcasting it while this worker owns target authority so DPS
-    -- cannot fall back to the tank's temporary peel/aggro target.
-    broadcastPrimary(primaryChanged)
+    -- A zero transition is authoritative "do not acquire", not an absent
+    -- target. Positive targets alone need periodic refresh.
+    broadcastPrimary(primaryChanged or authorizationChanged)
 
-    local action, priority, reason = computePending()
-    if not action and campReturnAction then
-        action = campReturnAction
-        reason = campReturnAction.reason
+    local action, reason
+    if hostileActivity then
+        action, _, reason = computePending()
+    else
+        reason = 'no_auto_hater'
     end
-    if not action and _primaryId <= 0 then reason = 'no_unmezzed_hater' end
+    if protectedPetAction then
+        action = protectedPetAction
+        reason = protectedPetAction.reason
+    end
+    if hostileActivity and not action and _primaryId <= 0 then
+        reason = 'no_unmezzed_hater'
+    end
     _pending = action
     _lastReason = reason
 
@@ -809,7 +1315,9 @@ local function endDragStep(action)
         _backHeld = false
     end
     if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto'
-        and action and tonumber(action.targetId) then
+        and action and tonumber(action.targetId)
+        and not Actors.isCharmPet(action.targetId)
+        and validNpc(action.targetId, false) then
         mq.cmdf('/squelch /stick 10 id %d uw', action.targetId)
     end
     Actors.broadcastTankSettled()
@@ -818,7 +1326,12 @@ end
 module:enableUnifiedExecutor({
     preflight = function(action)
         _pending = nil
-        if action.tankAction == 'return_camp' then
+        if action.tankAction == 'protect_charm_pet' then
+            local currentId = tonumber(safe(function() return mq.TLO.Target.ID() end, 0)) or 0
+            return currentId == tonumber(action.targetId)
+                and Actors.isCharmPet(action.targetId),
+                'protected_pet_no_longer_targeted'
+        elseif action.tankAction == 'return_camp' then
             if Cache.inCombat() or (Cache.xtarget.count or 0) > 0 then
                 return false, 'combat_resumed'
             end
@@ -826,6 +1339,26 @@ module:enableUnifiedExecutor({
                 and tonumber(action.campY) ~= nil
                 and tonumber(action.campZ) ~= nil,
                 'camp_anchor_missing'
+        elseif action.tankAction == 'runner_handoff' then
+            local now = lib.getTimeMs()
+            if tonumber(action.runnerId) ~= _flee.runnerId
+                or tonumber(action.targetId) ~= _flee.workingId
+                or now >= (tonumber(action.handoffUntil) or 0) then
+                return false, 'runner_handoff_changed'
+            end
+            if not validNpc(action.runnerId, false) then
+                return false, 'runner_lost'
+            end
+            if not validNpc(action.targetId, action.workingMezzed == true) then
+                return false, 'working_target_lost'
+            end
+            ownRunnerHandoff(action)
+        elseif tonumber(action.targetId) and Actors.isCharmPet(action.targetId)
+            and not actionAllowsCharmPet(action)
+        then
+            stopOffensiveEngagement(action.targetId, true)
+            if tonumber(action.targetId) == _primaryId then setPrimary(nil) end
+            return false, 'charm_pet_protected'
         end
         if action.tankAction == 'ability' then
             if action.requiresSelfTarget then return ensureSelfTarget(), 'self_target_lost' end
@@ -836,11 +1369,18 @@ module:enableUnifiedExecutor({
         end
         -- Engage may deliberately target a mezzed primary (break-mez), and a
         -- mez pre-taunt targets a mezzed add by design.
-        local allowMezzed = action.tankAction == 'engage' or action.reason == 'mez_pretaunt'
-        return ensureTarget(action.targetId, allowMezzed), 'target_lost'
+        local allowMezzed = action.tankAction == 'engage'
+            or action.tankAction == 'runner_handoff'
+            or action.reason == 'mez_pretaunt'
+        return ensureTarget(action.targetId, allowMezzed, actionAllowsCharmPet(action)), 'target_lost'
     end,
     dispatch = function(action, _, job)
-        if action.tankAction == 'return_camp' then
+        if action.tankAction == 'protect_charm_pet' then
+            stopOffensiveEngagement(action.targetId, true)
+            if tonumber(action.targetId) == _primaryId then setPrimary(nil) end
+            _lastAction = 'protect_charm_pet:' .. tostring(action.targetId)
+            return true, 'charm_pet_protected', 'none'
+        elseif action.tankAction == 'return_camp' then
             module:markDirtyEffects(true)
             mq.cmdf('/nav locyxz %.1f %.1f %.1f',
                 tonumber(action.campY), tonumber(action.campX), tonumber(action.campZ))
@@ -850,20 +1390,52 @@ module:enableUnifiedExecutor({
             }
             _lastAction = 'return_camp'
             return true, 'returning_to_camp', 'custom'
+        elseif action.tankAction == 'runner_handoff' then
+            if Actors.isCharmPet(action.targetId) then
+                stopOffensiveEngagement(action.targetId, true)
+                return false, 'charm_pet_protected'
+            end
+            _lastEngageAt = lib.getTimeMs()
+            _forceEngage = false
+            broadcastPrimary(true)
+            _lastAction = 'runner_handoff:' .. tostring(action.targetId)
+            local now = lib.getTimeMs()
+            local spawn = validNpc(action.targetId, action.workingMezzed == true)
+            local dist = spawn and tonumber(safe(function()
+                return spawn.Distance3D()
+            end, 999)) or 999
+            local melee = meleeRange()
+            local los = spawn and safe(function()
+                return spawn.LineOfSight()
+            end, false) == true
+            if dist <= melee and los then
+                beginRunnerHandoffHold(action, job)
+                return true, 'runner_handoff_holding', 'custom'
+            end
+            job.tank = {
+                phase = 'runner_handoff_approach',
+                deadline = math.min(now + 12000,
+                    tonumber(action.handoffUntil) or (now + 12000)),
+                lastDist = dist,
+                progressAt = now,
+            }
+            return true, 'runner_handoff_approach', 'custom'
         elseif action.tankAction == 'engage' then
+            if Actors.isCharmPet(action.targetId) then
+                stopOffensiveEngagement(action.targetId, true)
+                if tonumber(action.targetId) == _primaryId then setPrimary(nil) end
+                return false, 'charm_pet_protected'
+            end
             _lastEngageAt = lib.getTimeMs()
             _forceEngage = false
             broadcastPrimary(true)
             _lastAction = 'engage:' .. tostring(action.targetId)
             local dist = tonumber(safe(function() return mq.TLO.Target.Distance3D() end, 999)) or 999
-            local melee = tonumber(safe(function() return mq.TLO.Target.MaxRangeTo() end, 14)) or 14
+            local melee = meleeRange()
             local los = safe(function() return mq.TLO.Target.LineOfSight() end, false) == true
             if dist <= melee and los then
-                if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
-                    mq.cmdf('/stick 10 id %d uw', action.targetId)
-                end
-                mq.cmd('/attack on')
-                return true, 'engaged', 'none'
+                beginEngageVerification(action, job)
+                return true, 'engage_verifying', 'custom'
             end
             -- Not in melee yet: the approach phase decides between waiting
             -- for an inbound mob, pathfinding via nav (LOS-safe), and the
@@ -932,6 +1504,11 @@ module:enableUnifiedExecutor({
             Counters.bump('reposition_step')
             return true, 'drag_step', 'custom'
         elseif action.tankAction == 'taunt' then
+            if Actors.isCharmPet(action.targetId) then
+                -- Charm-pet recovery is intentionally damageless.
+                mq.cmd('/attack off')
+                mq.cmd('/squelch /stick off')
+            end
             -- Readiness was checked at decision time, but the claim grant can
             -- lag — and when this taunt preempted a cast (selection treats
             -- our own mid-cast as "usable"), the ability lockout takes a
@@ -980,7 +1557,8 @@ module:enableUnifiedExecutor({
             end
             Actors.broadcastTauntRun()
             job.tank = { phase = 'approach', deadline = lib.getTimeMs() + TAUNT_TIMEOUT_MS }
-            local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt')
+            local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt',
+                actionAllowsCharmPet(action))
             local distance = spawn and tonumber(safe(function() return spawn.Distance3D() end,
                 safe(function() return spawn.Distance() end, 999))) or 999
             if distance > Aggro.TAUNT_RANGE then
@@ -1050,9 +1628,98 @@ module:enableUnifiedExecutor({
             end
             return true, 'dragging'
         end
-        if action.tankAction == 'engage' then
+        if action.tankAction == 'runner_handoff' then
+            if Actors.isCharmPet(action.targetId) then
+                return true, 'charm_pet_protected', 'failed'
+            end
             local runtime = job.tank or {}
-            if runtime.phase ~= 'engage_approach' then return true end
+            local now = lib.getTimeMs()
+            if _settings.TankFleeHandoff == false
+                or tostring(_settings.TankTargetMode or 'auto'):lower() ~= 'auto'
+                or tostring(_settings.TargetingForcedTargetName or '') ~= '' then
+                return true, 'runner_handoff_disabled', 'cancelled'
+            end
+            if tonumber(action.runnerId) ~= _flee.runnerId
+                or tonumber(action.targetId) ~= _flee.workingId then
+                return true, 'runner_handoff_changed', 'cancelled'
+            end
+            if now >= (tonumber(action.handoffUntil) or 0) then
+                return true, 'runner_handoff_window_expired', 'completed'
+            end
+            local runner = validNpc(action.runnerId, false)
+            if not runner or Cache.isMobMezzed(action.runnerId) then
+                return true, 'runner_resolved', 'completed'
+            end
+            local spawn = validNpc(action.targetId, action.workingMezzed == true)
+            if not spawn then
+                return true, 'working_target_lost', 'completed'
+            end
+
+            local dist = tonumber(safe(function()
+                return spawn.Distance3D()
+            end, 999)) or 999
+            local melee = meleeRange()
+            local los = safe(function() return spawn.LineOfSight() end, false) == true
+
+            if runtime.phase == 'runner_handoff_approach' then
+                if dist <= melee and los then
+                    beginRunnerHandoffHold(action, job)
+                    return true, 'runner_handoff_holding'
+                end
+                if now >= (runtime.deadline or 0) then
+                    return true, 'runner_handoff_approach_timeout', 'failed'
+                end
+                if dist < (runtime.lastDist or math.huge) - 1 then
+                    runtime.progressAt = now
+                end
+                runtime.lastDist = dist
+                local holdRadius = tonumber(_settings.TankHoldRadius) or 50
+                if dist > holdRadius
+                    and (now - (runtime.progressAt or 0)) < 2500 then
+                    return true, 'runner_handoff_waiting_inbound'
+                end
+                if (now - (runtime.navIssuedAt or 0)) >= 2000 then
+                    runtime.navIssuedAt = now
+                    module:markDirtyEffects(true)
+                    mq.cmdf('/nav id %d', action.targetId)
+                end
+                return true, 'runner_handoff_approaching'
+            end
+
+            local currentId = tonumber(safe(function()
+                return mq.TLO.Target.ID()
+            end, 0)) or 0
+            if currentId ~= tonumber(action.targetId)
+                and not ensureTarget(action.targetId, action.workingMezzed == true) then
+                return true, 'working_target_lost', 'failed'
+            end
+
+            if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+                local stickActive, stickTargetId = stickState()
+                if (not stickActive or stickTargetId ~= tonumber(action.targetId))
+                    and (now - (runtime.lastStickAt or 0)) >= 500 then
+                    issueRunnerHandoffStick(action)
+                    runtime.lastStickAt = now
+                end
+            end
+            if safe(function() return mq.TLO.Me.Combat() end, false) ~= true then
+                module:markDirtyEffects(true)
+                mq.cmd('/attack on')
+            end
+            return true, 'runner_handoff_holding'
+        end
+        if action.tankAction == 'engage' then
+            if Actors.isCharmPet(action.targetId) then
+                navStop()
+                stopOffensiveEngagement(action.targetId, true)
+                if tonumber(action.targetId) == _primaryId then setPrimary(nil) end
+                return true, 'charm_pet_protected', 'failed'
+            end
+            local runtime = job.tank or {}
+            if runtime.phase ~= 'engage_approach'
+                and runtime.phase ~= 'engage_verify' then
+                return true, 'engage_runtime_missing', 'failed'
+            end
             local now = lib.getTimeMs()
             -- allowMezzed: a break-mez engage approaches a still-mezzed mob.
             local spawn = validNpc(action.targetId, true)
@@ -1061,25 +1728,57 @@ module:enableUnifiedExecutor({
                 return true, 'target_lost', 'failed'
             end
             local dist = tonumber(safe(function() return spawn.Distance3D() end, 999)) or 999
-            local melee = tonumber(safe(function() return mq.TLO.Target.MaxRangeTo() end, 14)) or 14
+            local melee = meleeRange()
             local los = safe(function() return spawn.LineOfSight() end, false) == true
+
+            if runtime.phase == 'engage_verify' then
+                local observed, verifyReason = engagementObserved(action)
+                if observed then
+                    _killAuthorized = true
+                    broadcastPrimary(true)
+                    Counters.bump('engage_confirmed')
+                    return true, 'engagement_confirmed', 'completed'
+                end
+                if now >= (runtime.deadline or 0) then
+                    _killAuthorized = false
+                    _forceEngage = true
+                    broadcastPrimary(true)
+                    Counters.bump('engage_not_confirmed')
+                    return true, verifyReason or 'engage_not_confirmed', 'failed'
+                end
+                if dist > melee or not los then
+                    job.tank = {
+                        phase = 'engage_approach',
+                        deadline = now + 12000,
+                        lastDist = dist,
+                        progressAt = now,
+                    }
+                    return true, 'engage_target_moved'
+                end
+                if (now - (runtime.lastIssueAt or 0)) >= 300 then
+                    runtime.lastIssueAt = now
+                    if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
+                        mq.cmdf('/stick 10 id %d uw', action.targetId)
+                    end
+                    mq.cmd('/attack on')
+                end
+                return true, verifyReason or 'engage_verifying'
+            end
 
             -- Arrived: hand off from nav to stick and start swinging.
             if dist <= melee and los then
-                navStop()
-                if tostring(_settings.AutomationLevel or 'auto'):lower() == 'auto' then
-                    mq.cmdf('/stick 10 id %d uw', action.targetId)
-                end
-                mq.cmd('/attack on')
-                return true, 'engaged', 'completed'
+                beginEngageVerification(action, job)
+                return true, 'engage_verifying'
             end
 
             if now >= (runtime.deadline or 0) then
-                -- Couldn't close (pathing, evasive mob). Flip attack so an
-                -- arriving mob is met swinging, and let drift detection retry.
+                -- Failure to close is not engagement and must never authorize
+                -- the combat domain.
                 navStop()
-                mq.cmd('/attack on')
-                return true, 'engage_approach_timeout', 'completed'
+                _killAuthorized = false
+                _forceEngage = true
+                broadcastPrimary(true)
+                return true, 'engage_approach_timeout', 'failed'
             end
 
             -- Track whether the gap is closing (mob inbound to us).
@@ -1108,7 +1807,8 @@ module:enableUnifiedExecutor({
         end
         if action.tankAction ~= 'taunt' then return true end
         local runtime = job.tank or {}
-        local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt')
+        local spawn = validNpc(action.targetId, action.reason == 'mez_pretaunt',
+            actionAllowsCharmPet(action))
         if not spawn then return true, 'target_lost', 'failed' end
         if lib.getTimeMs() >= (runtime.deadline or 0) then
             navStop()
@@ -1119,7 +1819,8 @@ module:enableUnifiedExecutor({
         if runtime.phase == 'approach' then
             if distance > Aggro.TAUNT_RANGE then return true, 'approaching' end
             navStop()
-            if not ensureTarget(action.targetId, action.reason == 'mez_pretaunt') then
+            if not ensureTarget(action.targetId, action.reason == 'mez_pretaunt',
+                actionAllowsCharmPet(action)) then
                 return true, 'target_lost', 'failed'
             end
             if not Aggro.isTauntReady() then return true, 'taunt_not_ready', 'failed' end
@@ -1145,7 +1846,9 @@ module:enableUnifiedExecutor({
         return true, 'taunt_wait'
     end,
     onComplete = function(action)
-        if action.tankAction == 'return_camp' then
+        if action.tankAction == 'runner_handoff' then
+            stopOwnedRunnerHandoff(action)
+        elseif action.tankAction == 'return_camp' then
             navStop()
         elseif action.tankAction == 'reposition' then
             endDragStep(action)
@@ -1164,26 +1867,40 @@ module:enableUnifiedExecutor({
         end
     end,
     onFailure = function(action)
-        if action and action.tankAction == 'taunt' then
+        if action and action.tankAction == 'runner_handoff' then
+            stopOwnedRunnerHandoff(action)
+        elseif action and action.tankAction == 'taunt' then
             navStop()
             Actors.broadcastTauntDone()
             _forceEngage = true
         elseif action and (action.tankAction == 'engage'
             or action.tankAction == 'return_camp') then
             navStop()
+            if action.tankAction == 'engage' then
+                _killAuthorized = false
+                _forceEngage = true
+                broadcastPrimary(true)
+            end
         elseif action and action.tankAction == 'reposition' then
             endDragStep(action)
         end
         restorePrimary(action)
     end,
     onCancel = function(action)
-        if action and action.tankAction == 'taunt' then
+        if action and action.tankAction == 'runner_handoff' then
+            stopOwnedRunnerHandoff(action)
+        elseif action and action.tankAction == 'taunt' then
             navStop()
             Actors.broadcastTauntDone()
             _forceEngage = true
         elseif action and (action.tankAction == 'engage'
             or action.tankAction == 'return_camp') then
             navStop()
+            if action.tankAction == 'engage' then
+                _killAuthorized = false
+                _forceEngage = true
+                broadcastPrimary(true)
+            end
         elseif action and action.tankAction == 'reposition' then
             endDragStep(action)
         end
@@ -1194,6 +1911,28 @@ module:enableUnifiedExecutor({
 module.onLeaseFinalizing = function(self, action, reason)
     if _backHeld then
         endDragStep(action)
+    end
+
+    if action and action.tankAction == 'runner_handoff'
+        and _handoffEffects.active then
+        stopOwnedRunnerHandoff(action)
+        local stickActive, stickTargetId = stickState()
+        if _handoffEffects.stickIssued and stickActive
+            and stickTargetId == _handoffEffects.targetId then
+            return false, 'stopping_runner_handoff_stick'
+        end
+        local currentId = tonumber(safe(function()
+            return mq.TLO.Target.ID()
+        end, 0)) or 0
+        if currentId == _handoffEffects.targetId
+            and safe(function() return mq.TLO.Me.Combat() end, false) == true then
+            return false, 'stopping_runner_handoff_attack'
+        end
+        _handoffEffects.active = false
+        _handoffEffects.targetId = 0
+        _handoffEffects.stickIssued = false
+        _handoffEffects.cleanupIssued = false
+        _handoffEffects.lastStopAt = 0
     end
 
     local navActive = safe(function() return mq.TLO.Navigation.Active() end, false) == true
@@ -1228,8 +1967,9 @@ mq.bind('/sk_tank', function(command)
         tostring(module.running), tostring(_classShort), tostring(_settings.CombatMode or 'off'),
         tostring(module.priority), tostring(module:ownsLease()),
         tostring(_pending and _pending.name or '-'), tostring(_lastReason))
-    echo('primary=%s(%d) coordinatorLeaseHolder=%s last=%s haters=%d deficits=%d',
+    echo('primary=%s(%d) killAuthorized=%s coordinatorLeaseHolder=%s last=%s haters=%d deficits=%d',
         _primaryName ~= '' and _primaryName or '-', _primaryId,
+        tostring(_killAuthorized),
         tostring(owner and owner.holderModule or '-'), tostring(_lastAction),
         tonumber(Cache.xtarget.count) or 0, tonumber(Cache.xtarget.aggroDeficitCount) or 0)
     local stateAge = (module.stateReceivedAt and module.stateReceivedAt > 0)
@@ -1241,6 +1981,16 @@ mq.bind('/sk_tank', function(command)
         tostring(module.lastRequestSendOk),
         tostring(module.lastRequestSendError or '-'),
         tostring(result.phase or '-'), tostring(result.reason or '-'))
+    local actorDebug = Actors.getDebugState and Actors.getDebugState() or {}
+    local primaryDiag = actorDebug.primaryTarget or {}
+    local lastSend = primaryDiag.lastSend or {}
+    echo('primaryActor stage=%s reason=%s sendAttempts=%d sendFailures=%d sendSeq=%d sendErr=%s',
+        tostring(primaryDiag.stage or 'waiting'),
+        tostring(primaryDiag.reason or 'no_target_primary_packet'),
+        tonumber(lastSend.attempts) or 0,
+        tonumber(lastSend.failures) or 0,
+        tonumber(lastSend.sequence) or 0,
+        tostring(lastSend.lastError ~= '' and lastSend.lastError or '-'))
 end)
 
 Cache.init()

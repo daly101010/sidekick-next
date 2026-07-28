@@ -1236,7 +1236,8 @@ function M.tick(settings)
 
     -- Priority 1.5: pre-pull HoT - a pull is inbound, get a HoT ticking on the
     -- tank BEFORE the mob arrives so the first hits land on top of healing.
-    -- Detection is XTarget-based only (works with a non-sidekick puller).
+    -- The tank worker normally owns XTarget detection and broadcasts the result;
+    -- a healer scans locally only when no active SideKick tank is available.
     -- Settings (registry): PrePullHotEnabled / PrePullHotEtaSec / PrePullHotBigMult
     local okCore, CoreSettings = pcall(function()
         return require('sidekick-next.utils.core').Settings
@@ -1430,8 +1431,13 @@ function M.checkDucking(opts)
     return monitorDuck(opts)
 end
 
-function M.tickSensors()
+function M.tickSensors(opts)
     if not _initialized then return end
+    opts = type(opts) == 'table' and opts or {}
+    -- Sensor ticks are read-only by default. Targeting and /consider are
+    -- gameplay mutations and must be represented by a separately leased
+    -- action if coordinated healing ever needs to refresh that intelligence.
+    if opts.readOnly == nil then opts.readOnly = true end
     if _configReloadPending then
         _configReloadPending = false
         Config.load()
@@ -1443,7 +1449,7 @@ function M.tickSensors()
     end
     TargetMonitor.tick()
     IncomingHeals.tick()
-    CombatAssessor.tick()
+    CombatAssessor.tick(opts)
     SpellEvents.tick()
     HealTracker.tick()
 
@@ -1460,7 +1466,7 @@ function M.tickSensors()
         if da and da.tick then da.tick() end
 
         local ma = getMobAssessor()
-        if ma and ma.tick then ma.tick() end
+        if ma and ma.tick then ma.tick(opts) end
     end
 end
 
@@ -1709,5 +1715,16 @@ M.Logger = nil
 function M.getMonitor() return getMonitor() end
 function M.getSettings() return getSettings() end
 function M.getMobAssessor() return getMobAssessor() end
+
+--- Subscribe to the authoritative healing worker's incoming-damage parser.
+-- Used by coordinated diagnostics so the UI does not initialize a duplicate
+-- combat-log parser.
+function M.addIncomingDamageListener(fn)
+    if type(fn) ~= 'function' then return false end
+    local dp = getDamageParser()
+    if not dp or not dp.addListener then return false end
+    dp.addListener(fn)
+    return true
+end
 
 return M

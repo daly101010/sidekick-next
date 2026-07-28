@@ -13,7 +13,7 @@
 --
 -- Wire-up:
 --   - spell_events forwards results via M.recordResult(spellName, targetName, success)
---   - rotation_engine queries M.shouldSkip(spellName, targetName) before casting
+--   - combat_spell_executor and rotation_engine query M.shouldSkip before casting
 --
 -- Storage path:
 --   <configDir>/SideKick/resist_log_<server>_<char>.lua
@@ -55,6 +55,45 @@ local _lastSaveAt = 0
 local _dirty = false
 local _disabled = false
 local _loaded = false
+
+local function normalizeMobName(name)
+    return tostring(name or ''):match('^%s*(.-)%s*$'):lower()
+end
+
+-- Older event paths did not agree on spawn-name casing: cast attempts commonly
+-- recorded "a mob" while resist chat recorded "A mob". Consolidate those rows
+-- so casts and resists contribute to the same decision.
+local function normalizeLoadedMobKeys(data)
+    local changed = false
+    for _, zoneRec in pairs(data.zones or {}) do
+        local normalized = {}
+        for mobName, spellRows in pairs(zoneRec) do
+            local mobKey = normalizeMobName(mobName)
+            if mobKey ~= tostring(mobName) then changed = true end
+            normalized[mobKey] = normalized[mobKey] or {}
+            for spellName, record in pairs(spellRows or {}) do
+                local existing = normalized[mobKey][spellName]
+                if existing then
+                    existing.casts = (tonumber(existing.casts) or 0)
+                        + (tonumber(record.casts) or 0)
+                    existing.resists = (tonumber(existing.resists) or 0)
+                        + (tonumber(record.resists) or 0)
+                    existing.lastResistAt = math.max(
+                        tonumber(existing.lastResistAt) or 0,
+                        tonumber(record.lastResistAt) or 0)
+                    changed = true
+                else
+                    normalized[mobKey][spellName] = record
+                end
+            end
+        end
+        if changed then
+            for key in pairs(zoneRec) do zoneRec[key] = nil end
+            for key, value in pairs(normalized) do zoneRec[key] = value end
+        end
+    end
+    return changed
+end
 
 -- ---------------------------------------------------------------------------
 -- Storage
@@ -103,6 +142,7 @@ function M.load()
     local data, err = SafeLoad.tableLiteral(content, path)
     if type(data) == 'table' and type(data.zones) == 'table' then
         M.data = data
+        if normalizeLoadedMobKeys(M.data) then _dirty = true end
         return true
     end
     print(string.format('\ar[ResistLog]\ax load failed: %s', tostring(err or 'invalid data')))
@@ -131,6 +171,15 @@ end
 
 function M.setDisabled(v) _disabled = v and true or false end
 function M.isDisabled() return _disabled end
+function M.getStoragePath() return getPath() end
+function M.getPolicy()
+    return {
+        minCasts = MIN_CASTS_TO_JUDGE,
+        skipRatePct = SKIP_RATE_THRESHOLD * 100,
+        consecutiveLimit = CONSECUTIVE_RESIST_LIMIT,
+        sessionTtlSec = SESSION_TTL,
+    }
+end
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -191,7 +240,7 @@ end
 function M.recordCast(spellName, targetName)
     if _disabled then return end
     spellName = tostring(spellName or '')
-    targetName = tostring(targetName or '')
+    targetName = normalizeMobName(targetName)
     if spellName == '' or targetName == '' then return end
 
     local zone = currentZone()
@@ -205,7 +254,7 @@ end
 function M.recordSuccess(spellName, targetName)
     if _disabled then return end
     spellName = tostring(spellName or '')
-    targetName = tostring(targetName or '')
+    targetName = normalizeMobName(targetName)
     if spellName == '' or targetName == '' then return end
     bumpConsecutive(currentZone(), targetName, spellName, false)
 end
@@ -217,7 +266,7 @@ end
 function M.recordResist(spellName, targetName)
     if _disabled then return end
     spellName = tostring(spellName or '')
-    targetName = tostring(targetName or '')
+    targetName = normalizeMobName(targetName)
     if spellName == '' or targetName == '' then return end
 
     local zone = currentZone()
@@ -240,7 +289,7 @@ end
 function M.shouldSkip(spellName, targetName)
     if _disabled then return false end
     spellName = tostring(spellName or '')
-    targetName = tostring(targetName or '')
+    targetName = normalizeMobName(targetName)
     if spellName == '' or targetName == '' then return false end
 
     local zone = currentZone()
@@ -272,9 +321,17 @@ function M.getRecord(zone, mob, spell)
     zone = zone or currentZone()
     local zr = M.data.zones[zone]
     if not zr then return nil end
-    local mr = zr[mob]
+    local mr = zr[normalizeMobName(mob)]
     if not mr then return nil end
     return mr[spell]
+end
+
+--- Inspect the current-fight consecutive resist count for UI/debug.
+--- @return number count
+--- @return number lastAt Epoch seconds of the last streak update
+function M.getConsecutiveResists(zone, mob, spell)
+    zone = zone or currentZone()
+    return getConsecutive(zone, normalizeMobName(mob), tostring(spell or ''))
 end
 
 --- Walk all records for the given zone (defaults to current). For UI listing.
@@ -301,6 +358,7 @@ function M.resetSessionCounters() _consecutive = {} end
 function M.forget(zone, mob, spell)
     local zr = M.data.zones[zone or currentZone()]
     if not zr then return end
+    mob = mob and normalizeMobName(mob) or nil
     if mob and spell and zr[mob] then zr[mob][spell] = nil
     elseif mob then zr[mob] = nil
     end

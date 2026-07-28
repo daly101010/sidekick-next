@@ -123,8 +123,10 @@ local function getAuthoritativePrimary(worker, actorTtlSeconds)
 
     local tankState = Actors.getTankState and Actors.getTankState() or nil
     local tankUpdatedAt = type(tankState) == 'table' and tonumber(tankState.updatedAt) or nil
-    if tankUpdatedAt and (os.clock() - tankUpdatedAt) <= actorTtlSeconds then
-        local primaryId = tonumber(tankState.primaryTargetId) or 0
+    if tankUpdatedAt and tankUpdatedAt > 0
+        and (os.clock() - tankUpdatedAt) <= actorTtlSeconds then
+        local primaryId = tankState.killAuthorized == true
+            and (tonumber(tankState.primaryTargetId) or 0) or 0
         if primaryId <= 0 then return true, nil end
         return true, validateNpcTarget(
             worker, primaryId, 'actor_primary', true, true)

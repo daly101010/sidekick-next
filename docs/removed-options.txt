@@ -1,5 +1,6 @@
 Removed options (sidekick-next)
 Date: 2026-01-22
+Updated: 2026-07-26
 
 These settings were removed either because they had no functional implementation or because their behavior was consolidated into the canonical setting noted in the implementation history. Do not restore them as independent controls.
 
@@ -33,6 +34,9 @@ Removed setting keys:
 - CCPrioritizeSelfHeal
 - CCSelfHealHpThreshold
 - CureCoordinateActors
+- CasterUseStick
+- CasterEscapeRange
+- CasterSafeZoneRadius
 - DebuffAutoCripple
 - DebuffAutoMalo
 - DebuffAutoSlow

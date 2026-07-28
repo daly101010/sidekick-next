@@ -47,6 +47,9 @@ M.removed = {
     BuffPetsEnabled = true,
     CureCoordinateActors = true,
     DoCharm = true,
+    CasterUseStick = true,
+    CasterEscapeRange = true,
+    CasterSafeZoneRadius = true,
 }
 
 M.defaults = {
@@ -181,6 +184,7 @@ M.defaults = {
 
     AssistMode = { type = 'text', Default = 'group', Category = 'Automation', DisplayName = 'Assist Mode (group/raid1/raid2/raid3/byname)', Options = { 'group', 'raid1', 'raid2', 'raid3', 'byname' } },
     AssistName = { type = 'text', Default = '', Category = 'Automation', DisplayName = 'Assist Name (if byname)' },
+    RaidAssistOverrideActive = { type = 'bool', Default = false, Category = 'Automation', DisplayName = 'Raid Command-Bar Assist Override' },
     AssistAt = { type = 'number', Default = 97, Category = 'Automation', DisplayName = 'Assist At %' },
     AssistRange = { type = 'number', Default = 100, Category = 'Automation', DisplayName = 'Assist Range' },
 
@@ -232,12 +236,9 @@ M.defaults = {
     DebuffAllTask = { type = 'bool', Default = false, Category = 'Debuff', DisplayName = 'Debuff All Task Mobs' },
 
     -- Caster Assist Settings
-    CasterUseStick = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Use Stick' },
-    CasterEscapeRange = { type = 'number', Default = 30, Category = 'Combat', DisplayName = 'Caster Escape Range' },
-    CasterSafeZoneRadius = { type = 'number', Default = 30, Category = 'Combat', DisplayName = 'Safe Zone Radius' },
     CasterStandoffEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Standoff (Ranged Casting)' },
     CasterStandoffMin = { type = 'number', Default = 35, Category = 'Combat', DisplayName = 'Standoff Min Distance' },
-    CasterStandoffMax = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Standoff Max Distance' },
+    CasterStandoffMax = { type = 'number', Default = 60, Category = 'Combat', DisplayName = 'Standoff Retreat Distance' },
     PreferredResistType = { type = 'text', Default = 'Any', Category = 'Combat', DisplayName = 'Preferred Resist Type' },
 
     -- Spell execution and rotation retry settings
@@ -273,6 +274,7 @@ M.defaults = {
     TankPeelMinPriority = { type = 'number', Default = 1, Category = 'Combat', DisplayName = 'Peel Min Victim Priority (1=any, 4=casters+, 5=healers)' },
     TankFleeHandoff = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Hand Off Fleeing Mobs to DPS' },
     TankFleeHpThreshold = { type = 'number', Default = 20, Category = 'Combat', DisplayName = 'Flee Handoff HP %' },
+    TankFleeMinRecedeRate = { type = 'number', Default = 2.25, Category = 'Combat', DisplayName = 'Flee Handoff Min Recede Speed' },
     TankFleeHandoffWindowSec = { type = 'number', Default = 15, Category = 'Combat', DisplayName = 'Flee Handoff Window (sec)' },
     TankFleeMinAdds = { type = 'number', Default = 2, Category = 'Combat', DisplayName = 'Flee Handoff Min Haters (incl. runner)' },
 
@@ -566,7 +568,7 @@ local MODULE_KEYS = {
         ResourceConversionEnabled ResourceMinSecondsBetweenCasts
     ]],
     assist = [[
-        AssistMode AssistName AssistAt AssistRange AssistTargetMode AssistEngageCondition
+        AssistMode AssistName RaidAssistOverrideActive AssistAt AssistRange AssistTargetMode AssistEngageCondition
         AssistOutsideGroup AssistOutsideRaid AssistOutsidePeers
     ]],
     dps = [[
@@ -581,14 +583,14 @@ local MODULE_KEYS = {
         TankRepositionEnabled TankRepositionCooldown TankTauntChaseRange TankEngageRange
         TankBreakMez TankAnnounce TankHoldRadius BandolierEnabled StickCommand SoftPauseStick DragonPositioning
         DragonPositionAngle IgnorePCPets EmergencyHpThreshold DefenseHpThreshold
-        TankDefenseHpThreshold UseSpells UseAAs UseDiscs CasterUseStick CasterEscapeRange
-        CasterSafeZoneRadius PreferredResistType SafeTargetingEnabled SafeTargetingCheckRaid
+        TankDefenseHpThreshold UseSpells UseAAs UseDiscs
+        PreferredResistType SafeTargetingEnabled SafeTargetingCheckRaid
         SafeTargetingCheckPeers TargetingForcedTargetName TargetingIgnoredTargetNames
         NamedDetectionUseSpawnMaster NamedDetectionUseAlertMaster NamedDetectionMinLevel
         NamedDetectionCustomNames NamedDetectionForceNamed
         CasterStandoffEnabled CasterStandoffMin CasterStandoffMax
         TankAutoPeel TankPeelMinPriority TankFleeHandoff TankFleeHpThreshold
-        TankFleeHandoffWindowSec TankFleeMinAdds
+        TankFleeMinRecedeRate TankFleeHandoffWindowSec TankFleeMinAdds
         DamageObserver DeathForensicsEnabled
         ReadinessEnabled ReadinessAnnounce ReadyHpPct ReadyManaPct ReadyEndPct
     ]],

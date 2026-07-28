@@ -133,7 +133,7 @@ local function loadTabs()
         end
     end
 
-    -- Diagnostic tabs: Performance Monitor, Coordinator Debug, Rotation Debug
+    -- Diagnostic tabs: performance, coordinator, activity, and combat intelligence.
     -- These embed the content from standalone debug windows into settings tabs.
     local diagDefs = {
         {
@@ -153,6 +153,11 @@ local function loadTabs()
             -- action counters instead (heals cast/ducked, taunts, swaps...).
             name = 'Activity',
             module = 'sidekick-next.ui.activity_debug',
+            drawFn = 'drawContent',
+        },
+        {
+            name = 'Intelligence',
+            module = 'sidekick-next.ui.intelligence_debug',
             drawFn = 'drawContent',
         },
     }
@@ -560,7 +565,48 @@ end
 -- MAIN DRAW FUNCTION
 -- ============================================================
 
+-- Lazy handle to the redesigned shell (ui/settings2). Loaded on first draw
+-- so tab modules that require this file at load time don't recurse into it.
+local _redesignShell = nil
+local function getRedesignShell()
+    if _redesignShell ~= nil then return _redesignShell or nil end
+    local ok, shell = pcall(require, 'sidekick-next.ui.settings2.init')
+    _redesignShell = (ok and shell) or false
+    return _redesignShell or nil
+end
+
+--- Preload settings modules from the normal Lua coroutine before MQ invokes
+--- the non-yieldable ImGui callback.
+function M.initialize()
+    loadTabs()
+    local cfg = _G.SIDEKICK_NEXT_CONFIG or {}
+    if cfg.SETTINGS_REDESIGN == true then
+        local shell = getRedesignShell()
+        if shell and shell.preload then
+            local ok, result = pcall(shell.preload, M)
+            return ok and result == true
+        end
+        return false
+    end
+    return true
+end
+
 function M.draw(settings, themeNames, onChange, opts)
+    -- Route to the redesigned shell when the feature flag is on. The old tab
+    -- modules stay reachable (settings2 mounts them inside its chapters) so
+    -- helpers like `M.labeledInputText` continue to work.
+    local cfg = _G.SIDEKICK_NEXT_CONFIG or {}
+    if cfg.SETTINGS_REDESIGN == true then
+        local shell = getRedesignShell()
+        if shell and shell.draw then
+            M._currentSettings = settings
+            M._currentThemeNames = themeNames
+            M._currentOnChange = onChange
+            return shell.draw(settings, themeNames, onChange, opts)
+        end
+        -- Fall through to legacy shell if the redesign failed to load.
+    end
+
     loadTabs()
 
     opts = opts or {}

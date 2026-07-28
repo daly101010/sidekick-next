@@ -16,47 +16,85 @@ local sessionId = nil
 local lastGameState = ''
 local latestState = {}
 local pendingMessages = {}
+local pendingMessageHead = 1
+local pendingMessageCount = 0
+local pendingMessageOverflows = 0
+local pendingMessageDrops = 0
+local pendingMessageDropReasons = {}
 local MAX_PENDING_MESSAGES = 16
 local shutdownDrained = false
 local lastCoordinatorBootId = nil
 
+local function countDrop(reason)
+    reason = tostring(reason or 'unknown')
+    pendingMessageDrops = pendingMessageDrops + 1
+    pendingMessageDropReasons[reason] =
+        (pendingMessageDropReasons[reason] or 0) + 1
+end
+
 local function enqueueSupervisorMessage(message)
     -- Actor callbacks are non-yieldable. Copy the small scalar acknowledgement
     -- and validate/apply it from tick()/stop().
-    local content = message()
-    if type(content) ~= 'table' then return end
+    local ok, content = pcall(function() return message() end)
+    if not ok or type(content) ~= 'table' then
+        countDrop(ok and 'malformed_supervisor_message'
+            or 'supervisor_message_read_failed')
+        return
+    end
     local sender = message.sender or {}
-    if #pendingMessages >= MAX_PENDING_MESSAGES then table.remove(pendingMessages, 1) end
-    pendingMessages[#pendingMessages + 1] = {
+    local senderScript = lib.actorSenderEndpoint(sender)
+    if pendingMessageCount >= MAX_PENDING_MESSAGES then
+        pendingMessages[pendingMessageHead] = nil
+        pendingMessageHead = (pendingMessageHead % MAX_PENDING_MESSAGES) + 1
+        pendingMessageCount = pendingMessageCount - 1
+        pendingMessageOverflows = pendingMessageOverflows + 1
+        countDrop('supervisor_queue_overflow')
+    end
+    local tail = ((pendingMessageHead + pendingMessageCount - 1)
+        % MAX_PENDING_MESSAGES) + 1
+    pendingMessages[tail] = {
         msgType = tostring(content.msgType or ''),
+        version = tonumber(content.version),
         ownerName = tostring(content.ownerName or ''),
         ownerServer = tostring(content.ownerServer or ''),
         sessionId = tostring(content.sessionId or ''),
         coordinatorBootId = tostring(content.coordinatorBootId or ''),
         senderCharacter = tostring(sender.character or ''),
         senderServer = tostring(sender.server or ''),
-        senderScript = tostring(sender.script or ''),
+        senderScript = tostring(senderScript or ''),
         senderMailbox = tostring(sender.mailbox or ''),
     }
+    pendingMessageCount = pendingMessageCount + 1
 end
 
 local function drainSupervisorMessages()
-    if #pendingMessages == 0 then return end
-    local pending = pendingMessages
+    if pendingMessageCount == 0 then return end
+    local pending = {}
+    for offset = 0, pendingMessageCount - 1 do
+        local index = ((pendingMessageHead + offset - 1)
+            % MAX_PENDING_MESSAGES) + 1
+        pending[#pending + 1] = pendingMessages[index]
+    end
     pendingMessages = {}
+    pendingMessageHead = 1
+    pendingMessageCount = 0
     local myName, myServer = lib.getMyName(), lib.getMyServer()
     for _, content in ipairs(pending) do
-        local logicalMailbox = content.senderMailbox:lower():match('([^:]+)$')
         if content.msgType == 'supervisor_shutdown_drained'
+            and tonumber(content.version) == tonumber(lib.LEASE_PROTOCOL_VERSION)
             and content.sessionId == tostring(sessionId or '')
             and content.ownerName == tostring(myName or '')
             and content.ownerServer == tostring(myServer or '')
             and content.senderCharacter == tostring(myName or '')
             and content.senderServer == tostring(myServer or '')
-            and content.senderScript == tostring(lib.Scripts.COORDINATOR or '')
-            and logicalMailbox == 'coordinator' then
+            and lib.actorSenderMatches({
+                script = content.senderScript,
+                mailbox = content.senderMailbox,
+            }, lib.Scripts.COORDINATOR, 'coordinator') then
             shutdownDrained = true
             lastCoordinatorBootId = content.coordinatorBootId
+        else
+            countDrop('supervisor_ack_rejected')
         end
     end
 end
@@ -119,6 +157,7 @@ local function send(msgType)
     end
     local payload = {
         msgType = msgType,
+        version = lib.LEASE_PROTOCOL_VERSION,
         module = 'supervisor',
         ownerName = ownerName,
         ownerServer = ownerServer,
@@ -128,6 +167,9 @@ local function send(msgType)
         settingsRevision = revision,
         humanizeOverride = humanizeOverride(),
         leasePreemptionEnabled = preemptionEnabled ~= false,
+        inboxOverflows = pendingMessageOverflows,
+        inboxDrops = pendingMessageDrops,
+        inboxDropReasons = pendingMessageDropReasons,
     }
     local ok, result = pcall(function()
         dropbox:send({ mailbox = lib.Mailbox.SUPERVISOR, script = lib.Scripts.COORDINATOR,
@@ -142,6 +184,11 @@ function M.start()
     lastGameState = lib.getGameState()
     sessionId = string.format('%s:%s:%d', lib.getMyServer(), lib.getMyName(), lib.getTimeMs())
     pendingMessages = {}
+    pendingMessageHead = 1
+    pendingMessageCount = 0
+    pendingMessageOverflows = 0
+    pendingMessageDrops = 0
+    pendingMessageDropReasons = {}
     shutdownDrained = false
     lastCoordinatorBootId = nil
     dropbox = actors.register('supervisor', enqueueSupervisorMessage)
@@ -149,7 +196,7 @@ function M.start()
     -- A previous UI can be force-stopped without running Lua cleanup. Clear
     -- managed scripts before starting a new coordinated session, but wait for
     -- MQ2Lua to actually retire each process before issuing a matching run.
-    for _, script in ipairs(lib.Scripts.WORKERS) do
+    for _, script in ipairs(lib.Scripts.ALL_WORKERS or lib.Scripts.WORKERS) do
         stopScript(script, 3000)
     end
     stopScript(lib.Scripts.COORDINATOR, 3000)
@@ -170,12 +217,17 @@ function M.tick(state)
     if type(state) == 'table' then latestState = state end
     drainSupervisorMessages()
     local now = lib.getTimeMs()
+    local inGame = lib.isInGame()
 
     -- The parent owns coordinator lifetime. MQ2Lua stop/run commands complete
     -- asynchronously, so a manual reload can otherwise race and leave every
     -- worker alive but permanently state-stale. Detect that condition before
     -- the workers' longer coordinator-absence watchdog expires.
-    if (now - lastCoordinatorCheckAt) >= lib.Timing.SUPERVISOR_HEARTBEAT_MS then
+    if not inGame then
+        -- MQ2Lua process-status queries may be temporarily unavailable while
+        -- zoning. Absence during this window is expected, not restart evidence.
+        lastCoordinatorCheckAt = now
+    elseif (now - lastCoordinatorCheckAt) >= lib.Timing.SUPERVISOR_HEARTBEAT_MS then
         lastCoordinatorCheckAt = now
         local coordinatorRunning = isRunning(lib.Scripts.COORDINATOR)
         if coordinatorRunning then
@@ -193,19 +245,21 @@ function M.tick(state)
                 or (now - coordinatorRecoveryAt) >= lib.Timing.RESTART_COOLDOWN_MS) then
             coordinatorRecoveryAt = now
             coordinatorRecoveryAttempts = coordinatorRecoveryAttempts + 1
-            printf('\ay[SK Supervisor]\ax Coordinator exited; restarting it')
+            printf('%s \ay[SK Supervisor]\ax Coordinator exited; restarting it',
+                lib.timestampPrefix())
             if startScript(lib.Scripts.COORDINATOR, 3000) then
                 send('supervisor_heartbeat')
                 lastHeartbeatAt = lib.getTimeMs()
             else
-                printf('\ar[SK Supervisor]\ax Coordinator restart failed')
+                printf('%s \ar[SK Supervisor]\ax Coordinator restart failed',
+                    lib.timestampPrefix())
             end
         elseif not coordinatorRunning
             and coordinatorRecoveryAttempts >= lib.MAX_MODULE_RESTARTS
             and not coordinatorRecoveryExhaustedLogged then
             coordinatorRecoveryExhaustedLogged = true
-            printf('\ar[SK Supervisor]\ax Coordinator restart limit reached (%d)',
-                lib.MAX_MODULE_RESTARTS)
+            printf('%s \ar[SK Supervisor]\ax Coordinator restart limit reached (%d)',
+                lib.timestampPrefix(), lib.MAX_MODULE_RESTARTS)
         end
     end
 
@@ -242,7 +296,7 @@ function M.stop()
     if not shutdownDrained and isRunning(lib.Scripts.COORDINATOR) then
         printf('\ar[SK Supervisor]\ax Lease drain acknowledgement timed out; stopping fleet in safety-fault state')
     end
-    for _, script in ipairs(lib.Scripts.WORKERS) do
+    for _, script in ipairs(lib.Scripts.ALL_WORKERS or lib.Scripts.WORKERS) do
         stopScript(script, 3000)
     end
     stopScript(lib.Scripts.COORDINATOR, 3000)
@@ -259,12 +313,22 @@ function M.stop()
     coordinatorRecoveryExhaustedLogged = false
     latestState = {}
     pendingMessages = {}
+    pendingMessageHead = 1
+    pendingMessageCount = 0
+    pendingMessageOverflows = 0
     shutdownDrained = false
     lastCoordinatorBootId = nil
 end
 
 function M.sessionId()
     return sessionId
+end
+
+function M.diagnostics()
+    return {
+        inboxDepth = pendingMessageCount,
+        inboxOverflows = pendingMessageOverflows,
+    }
 end
 
 return M

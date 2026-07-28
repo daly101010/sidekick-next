@@ -1,9 +1,11 @@
--- F:/lua/SideKick/automation/caster_assist.lua
--- Caster-specific assist logic: stay-put casting with rooted-mob escape
+-- F:/lua/sidekick-next/automation/caster_assist.lua
+-- Caster-specific assist logic: stay-put casting with optional ranged standoff
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
 local Roles = require('sidekick-next.utils.class_roles')
+local log = require('sidekick-next.utils.logger').new('assist')
+local SkLib = require('sidekick-next.sk_lib')
 
 local M = {}
 
@@ -16,182 +18,58 @@ M.PURE_MELEE = Roles.PURE_MELEE
 
 -- State
 M.enabled = false
-M.escapeState = {
-    phase = 'idle',  -- idle, finding_safe, navigating, kiting
-    targetGroupmateId = nil,
-    kiteDirection = nil,
-    rootedMobId = nil,
-    startTime = 0,
-}
 
 -- Standoff state (keep ranged distance from the target so rains/AEs on the mob
 -- don't clip the caster)
 M.standoffState = {
     phase = 'idle',  -- idle, moving
     startTime = 0,
+    startX = 0,
+    startY = 0,
+    outwardX = 0,
+    outwardY = 0,
+    startDistance = 0,
     targetId = 0,
+    moveKind = '',
+    destinationX = 0,
+    destinationY = 0,
+    positionedTargetId = 0,
+    holdUntilMs = 0,
+    retryAfterMs = 0,
 }
-M.standoffCooldownMs = 4000
+-- MuleAssist's StayAwayMoveTimer prevents its range controller from firing
+-- again immediately after movement. Use a slightly longer plant window here
+-- because SideKick evaluates positioning and spell readiness in separate Lua
+-- processes.
+M.standoffCooldownMs = 6000
 M.lastStandoffMove = 0
 M.coordinatedTarget = {
     id = 0,
     name = '',
     combatActive = false,
+    lastCombatActiveAtMs = 0,
+    actionReady = false,
+    reason = '',
     receivedAtMs = 0,
 }
-local COORDINATED_TARGET_TTL_MS = 2500
-
--- Lazy-load dependencies
-local getCore = lazy('sidekick-next.utils.core')
-local getCombatAssist = lazy('sidekick-next.utils.combatassist')
-
---- Check if a spawn is targeting me
--- @param spawn userdata Spawn to check
--- @return boolean
-local function isTargetingMe(spawn)
-    if not spawn or not spawn() then return false end
-    local myId = mq.TLO.Me.ID()
-    local targetId = spawn.TargetOfTarget and spawn.TargetOfTarget.ID and spawn.TargetOfTarget.ID()
-    return targetId == myId
-end
-
---- Check if a spawn is rooted
--- @param spawn userdata Spawn to check
--- @return boolean
-local function isRooted(spawn)
-    if not spawn or not spawn() then return false end
-    local rooted = spawn.Rooted and spawn.Rooted()
-    return rooted and rooted ~= ''
-end
-
---- Check if I'm on a mob's hate list (via XTarget)
--- @param spawnId number Spawn ID to check
--- @return boolean
-local function isOnHateList(spawnId)
-    if not spawnId or spawnId <= 0 then return false end
-    local xtCount = mq.TLO.Me.XTarget() or 0
-    for i = 1, xtCount do
-        local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt() and xt.ID() == spawnId then
-            return true
-        end
-    end
-    return false
-end
-
---- Find a rooted mob that's hitting me
--- @return userdata|nil Rooted mob spawn, or nil
-local function findRootedMobHittingMe()
-    local xtCount = mq.TLO.Me.XTarget() or 0
-    for i = 1, xtCount do
-        local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt() and xt.ID() and xt.ID() > 0 then
-            -- Targeting me, rooted, AND actually within melee reach. A
-            -- rooted mob glaring from 100 units away can't hit us — escaping
-            -- from it (with its /stopcast) chain-interrupted every cast
-            -- while the escape state machine spun.
-            if isTargetingMe(xt) and isRooted(xt) then
-                local dist = tonumber(xt.Distance and xt.Distance()) or 999
-                if dist <= 20 then
-                    return xt
-                end
-            end
-        end
-    end
-    return nil
-end
-
---- Count hostile mobs near a location
--- @param x number X coordinate
--- @param y number Y coordinate
--- @param radius number Search radius
--- @return number Count of hostile NPCs
-local function countHostilesNear(x, y, radius)
-    local count = 0
-    local xtCount = mq.TLO.Me.XTarget() or 0
-    for i = 1, xtCount do
-        local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt() and xt.ID() and xt.ID() > 0 then
-            local mobX = xt.X() or 0
-            local mobY = xt.Y() or 0
-            local dist = math.sqrt((x - mobX)^2 + (y - mobY)^2)
-            if dist <= radius then
-                count = count + 1
-            end
-        end
-    end
-    return count
-end
-
---- Find the nearest safe groupmate (no hostiles nearby)
--- @param safeRadius number Radius to check for hostiles
--- @return number|nil Spawn ID of safe groupmate, or nil
-local function findSafeGroupmate(safeRadius)
-    local myId = mq.TLO.Me.ID()
-    local myX = mq.TLO.Me.X() or 0
-    local myY = mq.TLO.Me.Y() or 0
-
-    local bestId = nil
-    local bestDist = math.huge
-
-    local groupCount = mq.TLO.Group.Members() or 0
-    for i = 1, groupCount do
-        local member = mq.TLO.Group.Member(i)
-        if member and member() and member.ID() ~= myId then
-            local memberId = member.ID()
-            local memberX = member.X() or 0
-            local memberY = member.Y() or 0
-
-            -- Check if this groupmate has no hostiles near them
-            local hostileCount = countHostilesNear(memberX, memberY, safeRadius)
-            if hostileCount == 0 then
-                -- Calculate distance to me
-                local dist = math.sqrt((myX - memberX)^2 + (myY - memberY)^2)
-                if dist < bestDist then
-                    bestDist = dist
-                    bestId = memberId
-                end
-            end
-        end
-    end
-
-    return bestId
-end
-
---- Calculate a position X units away from a mob
--- @param mobId number Mob spawn ID
--- @param distance number Distance to move away
--- @return number, number New X, Y coordinates
-local function calculateKitePosition(mobId, distance)
-    local mob = mq.TLO.Spawn(mobId)
-    if not mob or not mob() then
-        return mq.TLO.Me.X(), mq.TLO.Me.Y()
-    end
-
-    local myX = mq.TLO.Me.X() or 0
-    local myY = mq.TLO.Me.Y() or 0
-    local mobX = mob.X() or 0
-    local mobY = mob.Y() or 0
-
-    -- Calculate direction away from mob
-    local dx = myX - mobX
-    local dy = myY - mobY
-    local len = math.sqrt(dx^2 + dy^2)
-
-    if len < 1 then
-        -- Too close, pick a random direction
-        local angle = math.random() * 2 * math.pi
-        dx = math.cos(angle)
-        dy = math.sin(angle)
-        len = 1
-    end
-
-    -- Normalize and extend
-    local newX = myX + (dx / len) * distance
-    local newY = myY + (dy / len) * distance
-
-    return newX, newY
-end
+-- Worker telemetry normally arrives every second, but coordinator/debug load
+-- and foreground scheduling can create multi-second gaps. Keep a live,
+-- locally-resolvable NPC authoritative long enough that Chase cannot steal
+-- movement between standoff updates.
+local COORDINATED_TARGET_TTL_MS = 12000
+-- Briefly retain ownership through a missed/contradictory worker sample. A
+-- dead or despawned target still releases immediately.
+local COORDINATED_COMBAT_GRACE_MS = 2500
+-- Once encounter evidence is observed, keep caster movement fenced for a few
+-- seconds so the end of a cast cannot hand control back to Chase between
+-- worker telemetry samples. This lease controls movement only; it never makes
+-- a target eligible for DPS.
+local STANDOFF_MOVEMENT_LEASE_MS = 5000
+M.combatMovementLease = {
+    untilMs = 0,
+    targetId = 0,
+    reason = '',
+}
 
 -------------------------------------------------------------------------------
 -- Standoff positioning (ranged casting distance with desynced random spots)
@@ -253,8 +131,8 @@ local function pickStandoffSpot(target, minD, maxD)
     local myY = mq.TLO.Me.Y() or 0
     local myZ = mq.TLO.Me.Z() or mobZ
 
-    -- Base direction: from the mob toward me (stay on my own side, don't cross
-    -- the camp), then rotate by this character's personal offset
+    -- Base direction: from the mob toward me (stay on my own side and never
+    -- choose a retreat destination across the mob).
     local dx, dy = myX - mobX, myY - mobY
     local base
     if (dx * dx + dy * dy) < 1 then
@@ -262,12 +140,14 @@ local function pickStandoffSpot(target, minD, maxD)
     else
         base = math.atan2(dx, dy)
     end
-    base = base + math.rad(_nameAngleOffset)
-
-    for attempt = 1, 8 do
-        -- Jitter widens with each failed attempt to find valid ground
-        local spreadDeg = 20 + attempt * 10
-        local angle = base + math.rad(math.random(-spreadDeg, spreadDeg))
+    for _ = 1, 8 do
+        -- Keep every candidate inside a 50-degree outward cone. The previous
+        -- widening search could reach the far side of the target after several
+        -- failed candidates, making a "retreat" visibly run at the mob.
+        local personalOffset = math.max(-25, math.min(25, _nameAngleOffset))
+        local jitter = math.random(-25, 25)
+        local offset = math.max(-50, math.min(50, personalOffset + jitter))
+        local angle = base + math.rad(offset)
         local dist = minD + (maxD - minD) * math.random()
         local x = mobX + math.sin(angle) * dist
         local y = mobY + math.cos(angle) * dist
@@ -288,29 +168,192 @@ function M.isRepositioning()
     return M.standoffState.phase == 'moving'
 end
 
+--- Stop movement backends that can continue steering toward the MA or target
+--- while MQ2Nav is trying to execute a standoff retreat.
+---@return string stopped Comma-separated movement backends stopped
+local function stopCompetingNonNavMovement()
+    local stopped = {}
+    local stickActive = mq.TLO.Stick and mq.TLO.Stick.Active
+        and mq.TLO.Stick.Active()
+    if stickActive then
+        mq.cmd('/squelch /stick off')
+        stopped[#stopped + 1] = 'stick'
+    end
+
+    local moveToActive = mq.TLO.MoveTo and mq.TLO.MoveTo.Moving
+        and mq.TLO.MoveTo.Moving()
+    if moveToActive then
+        mq.cmd('/squelch /moveto off')
+        stopped[#stopped + 1] = 'moveto'
+    end
+
+    local advFollowing = mq.TLO.AdvPath and mq.TLO.AdvPath.Following
+        and mq.TLO.AdvPath.Following()
+    if advFollowing then
+        mq.cmd('/squelch /afollow off')
+        stopped[#stopped + 1] = 'afollow'
+    end
+
+    local followingId = mq.TLO.Me.Following and mq.TLO.Me.Following.ID
+        and tonumber(mq.TLO.Me.Following.ID()) or 0
+    if followingId > 0 then
+        mq.cmd('/squelch /follow off')
+        stopped[#stopped + 1] = 'follow'
+    end
+    return table.concat(stopped, ',')
+end
+
+local function stopAllPluginMovement()
+    local stopped = stopCompetingNonNavMovement()
+    local navActive = (mq.TLO.Nav and mq.TLO.Nav.Active and mq.TLO.Nav.Active())
+        or (mq.TLO.Navigation and mq.TLO.Navigation.Active
+            and mq.TLO.Navigation.Active())
+    if navActive then
+        mq.cmd('/squelch /nav stop')
+        stopped = stopped ~= '' and (stopped .. ',nav') or 'nav'
+    end
+    return stopped
+end
+
+local function isPureCasterClass()
+    local class = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
+    return M.PURE_CASTERS[class] == true
+end
+
+--- Pure casters always own their combat movement fence. Rangers participate
+--- only when ranged standoff is explicitly enabled.
+local function isCasterMovementClass(settings)
+    if isPureCasterClass() then return true end
+    local class = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
+    return settings and settings.CasterStandoffEnabled == true and class == 'RNG'
+end
+
+local function isStandoffClass(settings)
+    return isCasterMovementClass(settings)
+        and settings and settings.CasterStandoffEnabled == true
+end
+
+--- Return locally observable encounter evidence. CombatState is deliberately
+--- excluded: it describes OOC-rest eligibility, not whether a hostile is
+--- presently engaged.
+---@param settings table
+---@param spawn userdata|nil
+---@return boolean active
+---@return string reason
+---@return number targetId
+local function getLocalCombatEvidence(settings, spawn)
+    -- Any hater means combat for a caster, regardless of its current range.
+    -- Restricting this to AssistRange let Chase wake when the tank moved a mob
+    -- outside the local standoff vicinity.
+    local aggressive, hostileId = SkLib.hasNearbyAggressiveXTarget()
+    if aggressive then
+        return true, 'local_xtarget', tonumber(hostileId) or 0
+    end
+
+    -- The cast itself bridges the exact handoff that used to let Chase wake:
+    -- sk_dps has targeted an NPC and begun a detrimental spell, but its next
+    -- telemetry sample (or the damage event) may not have arrived yet.
+    local casting = mq.TLO.Me.Casting
+    local castingName = casting and tostring(casting() or '') or ''
+    if castingName ~= '' and castingName ~= 'NULL' then
+        local detrimental = false
+        pcall(function()
+            local spellId = tonumber(casting.ID and casting.ID()) or 0
+            local spell = spellId > 0 and mq.TLO.Spell(spellId)
+                or mq.TLO.Spell(castingName)
+            detrimental = spell and spell()
+                and tostring(spell.SpellType and spell.SpellType() or ''):lower()
+                    == 'detrimental'
+        end)
+        if detrimental then
+            local current = mq.TLO.Target
+            if current and current() and tostring(current.Type() or '') == 'NPC'
+                and not (current.Dead and current.Dead())
+            then
+                return true, 'detrimental_cast', tonumber(current.ID()) or 0
+            end
+        end
+    end
+
+    if spawn and spawn() and tostring(spawn.Type() or '') == 'NPC'
+        and not (spawn.Dead and spawn.Dead())
+    then
+        local spawnId = tonumber(spawn.ID()) or 0
+        local hp = tonumber(spawn.PctHPs and spawn.PctHPs()) or 100
+        if hp > 0 and hp < 100 then
+            return true, 'damaged_target', spawnId
+        end
+
+        local targetType = tostring(
+            spawn.Target and spawn.Target.Type and spawn.Target.Type() or ''):lower()
+        if targetType == 'pc' or targetType == 'pet' or targetType == 'mercenary' then
+            return true, 'engaged_target', spawnId
+        end
+    end
+
+    return false, '', 0
+end
+
+local function rememberCombatMovementLease(reason, targetId)
+    M.combatMovementLease.untilMs = mq.gettime() + STANDOFF_MOVEMENT_LEASE_MS
+    M.combatMovementLease.targetId = tonumber(targetId) or 0
+    M.combatMovementLease.reason = tostring(reason or 'combat')
+end
+
+local function clearCombatMovementLease()
+    M.combatMovementLease.untilMs = 0
+    M.combatMovementLease.targetId = 0
+    M.combatMovementLease.reason = ''
+end
+
 --- Accept the local sk_dps intelligence snapshot. Actor callbacks only store
 --- data; all navigation remains in the yieldable SideKick main loop.
 ---@param content table
 function M.setCoordinatedTarget(content)
     local target = type(content) == 'table' and content.target or nil
+    local action = type(content) == 'table' and content.action or nil
+    local now = mq.gettime()
+    local targetId = tonumber(target and target.id) or 0
+    local combatActive = target and target.combatActive == true or false
+    local lastCombatActiveAtMs = 0
+    if combatActive then
+        lastCombatActiveAtMs = now
+    elseif targetId > 0 and targetId == (tonumber(M.coordinatedTarget.id) or 0) then
+        lastCombatActiveAtMs = tonumber(M.coordinatedTarget.lastCombatActiveAtMs) or 0
+    end
     M.coordinatedTarget = {
-        id = tonumber(target and target.id) or 0,
+        id = targetId,
         name = tostring(target and target.name or ''),
-        combatActive = target and target.combatActive == true or false,
-        receivedAtMs = mq.gettime(),
+        combatActive = combatActive,
+        lastCombatActiveAtMs = lastCombatActiveAtMs,
+        actionReady = type(action) == 'table'
+            and tostring(action.spellName or '') ~= '',
+        reason = tostring(type(content) == 'table' and content.reason or ''),
+        receivedAtMs = now,
     }
 end
 
 --- Stop only navigation started by the standoff controller.
 function M.stopStandoff()
     if M.standoffState.phase == 'moving' then
-        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
-            and mq.TLO.Navigation.Active()
-        if navActive then mq.cmd('/squelch /nav stop') end
+        stopAllPluginMovement()
+        log.debug('standoff stopped externally target=%d',
+            tonumber(M.standoffState.targetId) or 0)
     end
     M.standoffState.phase = 'idle'
     M.standoffState.startTime = 0
+    M.standoffState.startX = 0
+    M.standoffState.startY = 0
+    M.standoffState.outwardX = 0
+    M.standoffState.outwardY = 0
+    M.standoffState.startDistance = 0
     M.standoffState.targetId = 0
+    M.standoffState.moveKind = ''
+    M.standoffState.destinationX = 0
+    M.standoffState.destinationY = 0
+    M.standoffState.positionedTargetId = 0
+    M.standoffState.holdUntilMs = 0
+    M.standoffState.retryAfterMs = 0
 end
 
 --- Should assist routing send this (non-pure-caster) class through CasterAssist?
@@ -324,7 +367,10 @@ function M.shouldRouteStandoff(settings)
 end
 
 --- Side-effect-free standoff eligibility for the leased assist worker.
-function M.getStandoffNeed(settings, targetId)
+--- `combatAuthorized` is the consolidated Combat host's fresh Tank-primary
+--- authorization. It permits initial positioning before this client's
+--- CombatState changes after its first detrimental cast.
+function M.getStandoffNeed(settings, targetId, combatAuthorized)
     if not settings or settings.CasterStandoffEnabled ~= true then
         return false, 'standoff_disabled'
     end
@@ -342,31 +388,45 @@ function M.getStandoffNeed(settings, targetId)
         return M.standoffState.targetId == targetId,
             M.standoffState.targetId == targetId and 'moving' or 'different_target'
     end
-    if tostring(mq.TLO.Me.CombatState() or '') ~= 'COMBAT' then
+    if combatAuthorized ~= true
+        and tostring(mq.TLO.Me.CombatState() or '') ~= 'COMBAT' then
         return false, 'not_in_combat'
     end
     local casting = tostring(mq.TLO.Me.Casting() or '')
     if casting ~= '' and casting ~= 'NULL' then return false, 'casting' end
     local minD = tonumber(settings.CasterStandoffMin) or 35
-    local maxD = tonumber(settings.CasterStandoffMax) or 60
-    if maxD < minD + 5 then maxD = minD + 5 end
     local distance = tonumber(target.Distance()) or 999
-    if distance >= minD and distance <= maxD then return false, 'in_band' end
+
+    -- A new coordinated target gets one leased positioning turn. The mutation
+    -- path either retreats to the configured radius or, if already farther
+    -- away, records the target as planted without moving inward.
+    if tonumber(M.standoffState.positionedTargetId) ~= targetId then
+        return true, 'initial_position'
+    end
+
+    -- StayAway semantics have only an inner trigger. Once safely outside it,
+    -- never run toward a distant mob merely to satisfy a maximum distance.
+    if distance >= minD then return false, 'outside_minimum' end
     if (mq.gettime() - M.lastStandoffMove) < M.standoffCooldownMs then
         return false, 'cooldown'
     end
     local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
         and mq.TLO.Navigation.Active() == true
-    if navActive then return false, 'external_navigation_active' end
-    return true, string.format('outside_band:%.1f', distance)
+    if navActive and combatAuthorized ~= true then
+        return false, 'external_navigation_active'
+    end
+    return true, string.format('inside_minimum:%.1f', distance)
 end
 
-function M.startStandoff(settings, targetId)
-    local needed, reason = M.getStandoffNeed(settings, targetId)
+function M.startStandoff(settings, targetId, combatAuthorized)
+    local needed, reason =
+        M.getStandoffNeed(settings, targetId, combatAuthorized)
     if not needed then return false, reason end
-    M.tickStandoff(settings, targetId)
+    M.tickStandoff(settings, targetId, reason == 'initial_position')
     return M.isRepositioning(),
-        M.isRepositioning() and 'standoff_started' or 'standoff_not_started'
+        M.isRepositioning() and 'standoff_started'
+            or (M.standoffState.positionedTargetId == targetId
+                and 'standoff_planted' or 'standoff_not_started')
 end
 
 function M.advanceStandoff(settings, targetId)
@@ -375,10 +435,11 @@ function M.advanceStandoff(settings, targetId)
         M.isRepositioning() and 'standoff_moving' or 'standoff_complete'
 end
 
---- Standoff tick: move to a randomized ranged spot when outside the configured band.
+--- Standoff tick: establish the initial casting spot or retreat when too close.
 -- @param settings table Settings
 -- @param targetId number|nil Coordinated DPS target; current target is the legacy fallback
-function M.tickStandoff(settings, targetId)
+-- @param forceInitial boolean|nil Establish the retreat-radius spot for a new combat target
+function M.tickStandoff(settings, targetId, forceInitial)
     if not settings or settings.CasterStandoffEnabled ~= true then return end
     local state = M.standoffState
 
@@ -386,82 +447,359 @@ function M.tickStandoff(settings, targetId)
     local target = targetId > 0 and mq.TLO.Spawn(targetId) or mq.TLO.Target
     local haveTarget = target and target() and (target.Type and target.Type() or '') == 'NPC'
         and not (target.Dead and target.Dead())
+    local minD = tonumber(settings.CasterStandoffMin) or 35
+    local retreatD = tonumber(settings.CasterStandoffMax) or 60
+    -- Keep a real hysteresis band between the retreat trigger and destination.
+    -- Nav may finish several feet short of the requested point; a five-foot
+    -- gap could therefore leave the caster back inside the trigger and make
+    -- the next spell cooldown look like a request to move again. MuleAssist
+    -- similarly retreats to 40 from a 30-foot trigger.
+    if retreatD < minD + 10 then retreatD = minD + 10 end
+    local dist = haveTarget and (tonumber(target.Distance()) or 999) or 999
 
     if state.phase == 'moving' then
+        -- `/stick` and `/moveto` can remain active independently of Nav. Chase
+        -- used to leave those fallbacks behind when yielding, which pulled the
+        -- caster toward the MA while this retreat Nav stayed active.
+        local stopped = stopCompetingNonNavMovement()
+        if stopped ~= '' then
+            log.warn('standoff suppressed competing movement target=%d backends=%s',
+                tonumber(state.targetId) or 0, stopped)
+        end
+
         local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
-        if not haveTarget or (targetId > 0 and state.targetId ~= targetId)
-            or not navActive or (os.clock() - state.startTime) > 8
-        then
-            if navActive then mq.cmd('/squelch /nav stop') end
+        local elapsed = os.clock() - state.startTime
+        local myX = tonumber(mq.TLO.Me.X()) or state.startX
+        local myY = tonumber(mq.TLO.Me.Y()) or state.startY
+        local outwardProgress = (myX - state.startX) * state.outwardX
+            + (myY - state.startY) * state.outwardY
+        -- A valid retreat route can begin sideways around geometry, but it
+        -- must never carry the caster materially toward the mob. Abort quickly
+        -- instead of allowing the old eight-second timeout to run inward.
+        local wrongWay = navActive and elapsed >= 0.5 and outwardProgress < -2
+        if wrongWay then
+            mq.cmd('/squelch /nav stop')
+            local completedTargetId = tonumber(state.targetId) or 0
+            log.warn('standoff movement aborted target=%d reason=wrong_direction startDistance=%.1f distance=%.1f outwardProgress=%.1f destination=%.1f,%.1f',
+                completedTargetId, tonumber(state.startDistance) or 0, dist,
+                outwardProgress, tonumber(state.destinationX) or 0,
+                tonumber(state.destinationY) or 0)
             state.phase = 'idle'
+            state.startTime = 0
             state.targetId = 0
+            state.moveKind = ''
+            state.retryAfterMs = mq.gettime() + 2000
+            M.lastStandoffMove = mq.gettime()
+            return
+        end
+
+        -- A retreat is one bounded movement, not a continuously recomputed
+        -- orbit. MuleAssist's StayAwayToCast follows the same pattern: finish
+        -- the selected retreat location, then plant and cast.
+        if not haveTarget or (targetId > 0 and state.targetId ~= targetId)
+            or not navActive or elapsed > 8
+        then
+            local completedTargetId = tonumber(state.targetId) or 0
+            local completedKind = tostring(state.moveKind or '')
+            local stopReason = not haveTarget and 'target_invalid'
+                or ((targetId > 0 and state.targetId ~= targetId) and 'target_changed')
+                or (not navActive and 'destination_reached')
+                or 'timeout'
+            if navActive then mq.cmd('/squelch /nav stop') end
+            log.info('standoff %s ended target=%d reason=%s distance=%.1f',
+                completedKind ~= '' and completedKind or 'movement',
+                tonumber(state.targetId) or 0, stopReason, dist)
+            state.phase = 'idle'
+            state.startTime = 0
+            state.startX = 0
+            state.startY = 0
+            state.outwardX = 0
+            state.outwardY = 0
+            state.startDistance = 0
+            state.targetId = 0
+            state.moveKind = ''
+            state.destinationX = 0
+            state.destinationY = 0
+            local completedAtMs = mq.gettime()
+            if completedKind == 'initial'
+                and stopReason ~= 'target_invalid' and stopReason ~= 'target_changed'
+            then
+                state.positionedTargetId = completedTargetId
+            end
+            -- MuleAssist starts StayAwayMoveTimer after its blocking Nav
+            -- finishes. Mirror that timing so a long route cannot consume the
+            -- entire cooldown and immediately trigger another retreat.
+            M.lastStandoffMove = completedAtMs
+            if stopReason == 'destination_reached' then
+                state.holdUntilMs = completedAtMs + M.standoffCooldownMs
+                state.retryAfterMs = 0
+                log.info('standoff planted target=%d hold=%dms distance=%.1f',
+                    completedTargetId, M.standoffCooldownMs, dist)
+            else
+                state.holdUntilMs = 0
+                state.retryAfterMs = completedAtMs + 2000
+            end
         end
         return
     end
 
     if not haveTarget then return end
 
-    -- Only reposition during combat
-    local combatState = tostring(mq.TLO.Me.CombatState() or '')
-    if combatState ~= 'COMBAT' then return end
+    -- Once Nav reaches the selected casting spot, remain planted for a full
+    -- hold window. Casts are allowed during this phase; only another movement
+    -- decision is suppressed. A target change bypasses the old target's hold
+    -- so initial positioning for the new fight still happens immediately.
+    local nowMs = mq.gettime()
+    if (tonumber(state.retryAfterMs) or 0) > nowMs then return end
+    state.retryAfterMs = 0
+    if (tonumber(state.holdUntilMs) or 0) > nowMs then
+        local heldTargetId = tonumber(state.positionedTargetId) or 0
+        local currentTargetId = targetId > 0 and targetId
+            or (tonumber(target.ID()) or 0)
+        if heldTargetId == 0 or heldTargetId == currentTargetId then
+            return
+        end
+        state.holdUntilMs = 0
+    elseif (tonumber(state.holdUntilMs) or 0) > 0 then
+        state.holdUntilMs = 0
+    end
 
-    local minD = tonumber(settings.CasterStandoffMin) or 35
-    local maxD = tonumber(settings.CasterStandoffMax) or 60
-    if maxD < minD + 5 then maxD = minD + 5 end
+    -- Coordinated callers already provide a target marked combatActive by
+    -- sk_dps, which can establish the casting spot before this client gains
+    -- aggro. The legacy/current-target path accepts either a damaged NPC or a
+    -- nearby hater XTarget; CombatState is only an OOC-rest state and is too
+    -- late for initial positioning.
+    if targetId <= 0 then
+        local hp = tonumber(target.PctHPs and target.PctHPs()) or 100
+        local damaged = hp > 0 and hp < 100
+        local assistRange = tonumber(settings.AssistRange) or 100
+        local retreatRange = tonumber(settings.CasterStandoffMax) or 60
+        local vicinity = math.max(assistRange, retreatRange + 20)
+        local aggressive = SkLib.hasNearbyAggressiveXTarget(vicinity)
+        if not damaged and not aggressive then return end
+    end
 
-    local dist = tonumber(target.Distance()) or 999
-    if dist >= minD and dist <= maxD then
-        -- If Chase started navigation before standoff acquired this combat
-        -- target, stop that competing route once we are already in the band.
-        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active
-            and mq.TLO.Navigation.Active()
-        if navActive then mq.cmd('/squelch /nav stop') end
+    -- StayAwayToCast semantics: the minimum is the retreat trigger, not the
+    -- inner edge of a min/max orbit. Once safely outside it, remain planted no
+    -- matter how far the mob moves away. This prevents repeated inward/outward
+    -- repositioning while the tank and target move during combat. In
+    -- particular, loss of line of sight is never permission to run toward an
+    -- incoming or distant mob; DPS simply waits for a castable target.
+    if forceInitial == true and dist >= retreatD then
+        stopAllPluginMovement()
+        state.positionedTargetId = targetId > 0
+            and targetId or (tonumber(target.ID()) or 0)
         return
     end
 
-    -- Never interrupt an in-progress cast; we'll move as soon as it finishes
-    if mq.TLO.Me.Casting() then return end
+    if forceInitial ~= true and dist >= minD then
+        -- Stop a Chase route that began immediately before standoff acquired
+        -- the coordinated combat target.
+        stopAllPluginMovement()
+        return
+    end
+
+    -- Never interrupt an in-progress cast; we'll move as soon as it finishes.
+    -- Some MQ builds return the literal "NULL" while idle.
+    local casting = tostring(mq.TLO.Me.Casting() or '')
+    if casting ~= '' and casting ~= 'NULL' then return end
 
     -- Cooldown prevents dancing when mobs chase
-    if (mq.gettime() - M.lastStandoffMove) < M.standoffCooldownMs then return end
-    M.lastStandoffMove = mq.gettime()
+    if forceInitial ~= true
+        and (nowMs - M.lastStandoffMove) < M.standoffCooldownMs
+    then
+        return
+    end
+    M.lastStandoffMove = nowMs
 
-    local x, y, z = pickStandoffSpot(target, minD, maxD)
+    -- Retreat to one configured destination radius. The cooldown plus the
+    -- min/retreat gap provides hysteresis if the mob follows.
+    local x, y, z = pickStandoffSpot(target, retreatD, retreatD)
+    local myX = tonumber(mq.TLO.Me.X()) or 0
+    local myY = tonumber(mq.TLO.Me.Y()) or 0
+    local mobX = tonumber(target.X()) or myX
+    local mobY = tonumber(target.Y()) or myY
+    local outwardDX = myX - mobX
+    local outwardDY = myY - mobY
+    local outwardLen = math.sqrt(outwardDX * outwardDX + outwardDY * outwardDY)
+    if outwardLen < 0.001 then
+        local destinationDX = x - mobX
+        local destinationDY = y - mobY
+        outwardLen = math.max(math.sqrt(destinationDX * destinationDX
+            + destinationDY * destinationDY), 0.001)
+        outwardDX, outwardDY = destinationDX, destinationDY
+    end
+    local moveKind = forceInitial == true and 'initial' or 'retreat'
+    local moveReason = forceInitial == true and 'combat_target_acquired' or 'too_close'
+    local stopped = stopAllPluginMovement()
+    log.info('standoff %s starting target=%d reason=%s distance=%.1f trigger=%.1f destinationRadius=%.1f destination=%.1f,%.1f cleared=%s',
+        moveKind, tonumber(targetId) or 0, moveReason, dist, minD, retreatD,
+        x, y, stopped ~= '' and stopped or 'none')
     state.phase = 'moving'
     state.startTime = os.clock()
+    state.startX = myX
+    state.startY = myY
+    state.outwardX = outwardDX / outwardLen
+    state.outwardY = outwardDY / outwardLen
+    state.startDistance = dist
     state.targetId = targetId > 0 and targetId or (tonumber(target.ID()) or 0)
+    state.moveKind = moveKind
+    state.destinationX = x
+    state.destinationY = y
     mq.cmdf('/squelch /nav locxyz %.2f %.2f %.2f', x, y, z)
 end
 
---- Independent coordinated-mode movement tick. Returns true while a fresh,
---- active DPS target owns follower movement so Chase does not fight the
---- standoff navigation. This path never targets, sticks, or enables attack.
+--- Resolve a fresh coordinated target backed by worker or local encounter
+--- evidence. Movement ownership itself may outlive this snapshot briefly so
+--- Chase cannot resume on the cast-completion boundary.
 ---@param settings table
 ---@return boolean ownsMovement
-function M.tickCoordinated(settings)
-    local enabled = settings and settings.CasterStandoffEnabled == true
-    local class = tostring(mq.TLO.Me.Class.ShortName() or ''):upper()
-    local supported = M.PURE_CASTERS[class] == true or class == 'RNG'
-    if not enabled or not supported then
-        M.stopStandoff()
-        return false
-    end
+local function resolveCoordinatedMovementTarget(settings)
+    if not isCasterMovementClass(settings) then return nil, nil end
 
     local target = M.coordinatedTarget
-    local ageMs = mq.gettime() - (tonumber(target.receivedAtMs) or 0)
+    local now = mq.gettime()
+    local ageMs = now - (tonumber(target.receivedAtMs) or 0)
     if ageMs < 0 or ageMs > COORDINATED_TARGET_TTL_MS
-        or target.combatActive ~= true or (tonumber(target.id) or 0) <= 0
+        or (tonumber(target.id) or 0) <= 0
     then
-        M.stopStandoff()
-        return false
+        return nil, nil
     end
 
     local spawn = mq.TLO.Spawn(target.id)
     if not (spawn and spawn()) or tostring(spawn.Type() or '') ~= 'NPC'
         or (spawn.Dead and spawn.Dead())
     then
+        return nil, nil
+    end
+
+    local lastActiveAt = tonumber(target.lastCombatActiveAtMs) or 0
+    local combatActive = target.combatActive == true
+        or (lastActiveAt > 0 and (now - lastActiveAt) <= COORDINATED_COMBAT_GRACE_MS)
+    local localActive = getLocalCombatEvidence(settings, spawn)
+    if not combatActive and not localActive then
+        return nil, nil
+    end
+    return target, spawn
+end
+
+--- Return whether a caster has exclusive local combat-movement ownership.
+--- Ownership survives cast completion and brief telemetry gaps while the
+--- encounter is still locally observable; a dead/despawned leased target
+--- releases at once. Standoff may move during this lease when enabled;
+--- otherwise the caster remains planted.
+---@param settings table
+---@return boolean
+function M.wantsCoordinatedMovement(settings)
+    if not isCasterMovementClass(settings) then
+        clearCombatMovementLease()
+        return false
+    end
+
+    local target = resolveCoordinatedMovementTarget(settings)
+    if target then
+        local reason = target.combatActive == true
+            and 'coordinated_target' or 'coordinated_target_local'
+        rememberCombatMovementLease(reason, target.id)
+        return true
+    end
+
+    -- Current-target evidence covers monolithic/telemetry-gap combat. Merely
+    -- selecting an undamaged idle NPC is not enough; the helper requires a
+    -- hater, detrimental cast, damage, or an NPC actively targeting a player.
+    local active, reason, targetId = getLocalCombatEvidence(settings, mq.TLO.Target)
+    if active then
+        rememberCombatMovementLease(reason, targetId)
+        return true
+    end
+
+    if M.standoffState.phase == 'moving' then
+        rememberCombatMovementLease('standoff_moving', M.standoffState.targetId)
+        return true
+    end
+
+    local now = mq.gettime()
+    local leaseTargetId = tonumber(M.combatMovementLease.targetId) or 0
+    if leaseTargetId > 0 then
+        local leasedSpawn = mq.TLO.Spawn(leaseTargetId)
+        if not (leasedSpawn and leasedSpawn())
+            or tostring(leasedSpawn.Type() or '') ~= 'NPC'
+            or (leasedSpawn.Dead and leasedSpawn.Dead())
+        then
+            clearCombatMovementLease()
+            return false
+        end
+    end
+    if now < (tonumber(M.combatMovementLease.untilMs) or 0) then
+        return true
+    end
+
+    clearCombatMovementLease()
+    return false
+end
+
+function M.tickCoordinated(settings)
+    local ownsMovement = M.wantsCoordinatedMovement(settings)
+    local target, spawn = resolveCoordinatedMovementTarget(settings)
+    if ownsMovement and M.standoffState.phase ~= 'moving' then
+        -- Enforce the fence before evaluating cooldown/hold branches. Those
+        -- branches intentionally do not start standoff Nav, but another worker
+        -- could otherwise keep steering the caster during their early return.
+        local stopped = stopAllPluginMovement()
+        if stopped ~= '' then
+            log.warn('caster combat fence suppressed movement reason=%s backends=%s',
+                tostring(M.combatMovementLease.reason or 'combat'), stopped)
+        end
+    end
+
+    -- Pure casters are always planted during combat. Disabling standoff turns
+    -- positioning off; it does not hand combat movement back to Chase/follow.
+    if not isStandoffClass(settings) then
+        if M.standoffState.phase == 'moving' then M.stopStandoff() end
+        return ownsMovement
+    end
+
+    if not target then
+        -- A standoff route already in flight remains the one permitted combat
+        -- movement even if its worker snapshot briefly disappears.
+        if ownsMovement and M.standoffState.phase == 'moving'
+            and (tonumber(M.standoffState.targetId) or 0) > 0
+        then
+            M.tickStandoff(settings, M.standoffState.targetId)
+            return true
+        end
+
+        if ownsMovement then
+            -- The combat fence above planted the caster. Without a selected
+            -- coordinated target there is no standoff route to start.
+            return true
+        end
+
         M.stopStandoff()
         return false
+    end
+
+    -- Establish the casting spot as soon as an engaged target is known. This
+    -- is driven by combat-target telemetry (including a 99%-HP engage), not by
+    -- whether a spell currently satisfies its condition.
+    if M.standoffState.positionedTargetId ~= target.id then
+        M.tickStandoff(settings, target.id, true)
+        return true
+    end
+
+    -- Spell selection and movement run in separate Lua processes. When the
+    -- worker advertises a ready spell, keep this frame planted so standoff
+    -- cannot start Nav before the cast claim arrives. Only an immediately
+    -- dangerous mob (roughly half the configured minimum, capped at 15) may
+    -- override a ready cast and force a retreat.
+    if target.actionReady == true and M.standoffState.phase ~= 'moving' then
+        local minD = tonumber(settings.CasterStandoffMin) or 35
+        local emergencyD = math.min(15, math.max(5, minD * 0.5))
+        local dist = tonumber(spawn.Distance()) or 999
+        if dist > emergencyD then
+            stopAllPluginMovement()
+            return true
+        end
     end
 
     M.tickStandoff(settings, target.id)
@@ -491,10 +829,8 @@ end
 
 --- Initialize caster assist
 -- @param opts table Options
-function M.init(opts)
-    opts = opts or {}
+function M.init(_opts)
     M.enabled = false
-    M.escapeState.phase = 'idle'
 end
 
 --- Enable/disable caster assist
@@ -512,147 +848,9 @@ function M.tick(settings)
     local isCaster = M.isPureCaster()
     if not isCaster and not (standoffEnabled and M.shouldRouteStandoff(settings)) then return end
 
-    -- Check if user wants stick mode (behave like melee).
-    -- Standoff takes precedence - sticking to the mob defeats ranged casting.
-    local useStick = isCaster and settings and settings.CasterUseStick and not standoffEnabled
-    if useStick then
-        -- Delegate to CombatAssist for melee-like behavior
-        local ca = getCombatAssist()
-        if ca and ca.tick then
-            ca.tick()
-        end
-        return
-    end
-
-    -- Escape-from-rooted-mob logic deliberately removed: being targeted by
-    -- a mob is not an emergency (the tank's recovery taunt handles peels),
-    -- and the escape sequence stopcast whatever the caster was doing —
-    -- chain-interrupting mezzes. The state machine below is retained but
-    -- never entered. Clear any leftover state from an older session.
-    if M.escapeState.phase ~= 'idle' then
-        M.escapeState.phase = 'idle'
-        mq.cmd('/squelch /nav stop')
-    end
-
     -- Standoff positioning: keep ranged distance from the target
     if standoffEnabled then
         M.tickStandoff(settings)
-    end
-end
-
---- Check if we need to escape from a rooted mob
--- @param settings table Settings
-function M.checkEscapeCondition(settings)
-    -- Already escaping? Don't re-check
-    if M.escapeState.phase ~= 'idle' then return end
-
-    -- Never interrupt CC or beneficial casts. Detection is SPA-based, not
-    -- name-based: classic mez names ("Glamour of Kintaz", "Enthrall",
-    -- "Rapture") contain no 'mez' substring, so the old name match let the
-    -- escape stopcast every mez on emu.
-    local casting = mq.TLO.Me.Casting
-    if casting and casting() then
-        local protect = false
-        pcall(function()
-            local sp = mq.TLO.Spell(casting.ID())
-            if sp and sp() then
-                if sp.Beneficial() == true then protect = true end     -- heals/runes
-                if sp.HasSPA(31)() == true then protect = true end     -- mez
-                if sp.HasSPA(22)() == true then protect = true end     -- charm
-            end
-        end)
-        if protect then
-            -- Let the cast complete
-            return
-        end
-    end
-
-    -- Find a rooted mob hitting me
-    local rootedMob = findRootedMobHittingMe()
-    if not rootedMob then return end
-
-    -- Start escape sequence
-    M.escapeState = {
-        phase = 'finding_safe',
-        targetGroupmateId = nil,
-        kiteDirection = nil,
-        rootedMobId = rootedMob.ID(),
-        startTime = os.clock(),
-    }
-
-    -- Interrupt current cast (if any, and not mez/heal - already checked above)
-    if mq.TLO.Me.Casting() then
-        mq.cmd('/stopcast')
-    end
-end
-
---- Tick the escape state machine
--- @param settings table Settings
-function M.tickEscape(settings)
-    local state = M.escapeState
-    local safeRadius = settings and settings.CasterSafeZoneRadius or 30
-    local escapeRange = settings and settings.CasterEscapeRange or 30
-
-    -- Timeout after 10 seconds
-    if (os.clock() - state.startTime) > 10 then
-        M.escapeState.phase = 'idle'
-        mq.cmd('/squelch /nav stop')
-        return
-    end
-
-    -- Check if rooted mob is dead or no longer a threat
-    if state.rootedMobId then
-        local mob = mq.TLO.Spawn(state.rootedMobId)
-        if not mob or not mob() or (mob.Dead and mob.Dead()) then
-            -- Threat gone, stop escaping
-            M.escapeState.phase = 'idle'
-            mq.cmd('/squelch /nav stop')
-            return
-        end
-
-        -- Check if we're now out of range
-        local dist = mob.Distance() or 0
-        if dist > escapeRange then
-            -- Safe now
-            M.escapeState.phase = 'idle'
-            mq.cmd('/squelch /nav stop')
-            return
-        end
-    end
-
-    -- State machine
-    if state.phase == 'finding_safe' then
-        -- Try to find a safe groupmate
-        local safeId = findSafeGroupmate(safeRadius)
-        if safeId then
-            state.targetGroupmateId = safeId
-            state.phase = 'navigating'
-            mq.cmdf('/nav id %d', safeId)
-        else
-            -- No safe groupmate, kite away from mob
-            local kiteX, kiteY = calculateKitePosition(state.rootedMobId, escapeRange)
-            state.kiteDirection = { x = kiteX, y = kiteY }
-            state.phase = 'kiting'
-            mq.cmdf('/nav loc %f %f', kiteX, kiteY)
-        end
-
-    elseif state.phase == 'navigating' then
-        -- Check if nav is complete
-        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
-        if not navActive then
-            -- Arrived at safe groupmate
-            mq.cmd('/squelch /nav stop')
-            M.escapeState.phase = 'idle'
-        end
-
-    elseif state.phase == 'kiting' then
-        -- Check if nav is complete
-        local navActive = mq.TLO.Navigation and mq.TLO.Navigation.Active and mq.TLO.Navigation.Active()
-        if not navActive then
-            -- Arrived at kite position
-            mq.cmd('/squelch /nav stop')
-            M.escapeState.phase = 'idle'
-        end
     end
 end
 

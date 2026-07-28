@@ -17,6 +17,7 @@
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
 local SafeLoad = require('sidekick-next.utils.safe_load')
+local MobName = require('sidekick-next.utils.mob_name')
 
 local M = {}
 
@@ -29,6 +30,7 @@ M.dirty = false
 -- Pending CC attempts awaiting land/resist resolution (same model as resist_tracker)
 local _pending = {}
 local PENDING_GRACE_MS = 2000
+local _initialized = false
 
 local _lastSave = 0
 local SAVE_INTERVAL_MS = 30000
@@ -150,7 +152,7 @@ end
 -------------------------------------------------------------------------------
 
 local function getMobRecord(mobName)
-    if not mobName or mobName == '' then return nil end
+    if not MobName.isKnowledgeName(mobName) then return nil end
     local zone = M.currentZone
     if zone == '' then return nil end
 
@@ -275,8 +277,10 @@ function M.onCastComplete(castData, result)
     local ccType = CC_CATEGORIES[tostring(castData.spellCategory or ''):lower()]
     if not ccType then return end
 
-    local mobName, mobId = resolveTargetInfo(castData.targetId)
-    if mobName == '' then return end
+    local mobId = tonumber(castData.targetId) or 0
+    local mobName = tostring(castData.targetName or '')
+    if mobName == '' then mobName, mobId = resolveTargetInfo(mobId) end
+    if not MobName.isKnowledgeName(mobName) then return end
 
     local SpellEvents = getSpellEvents()
     local RESULT = SpellEvents and SpellEvents.RESULT or {}
@@ -386,32 +390,44 @@ function M.buildConsolidated()
     -- Own store: level, classes, cc, casts
     for zone, mobs in pairs(M.database) do
         for name, rec in pairs(mobs) do
-            local e = mobEntry(zone, name)
-            e.level = rec.level
-            e.classes = rec.classes
-            e.cc = rec.cc
-            e.casts = rec.casts
+            if MobName.isKnowledgeName(name) then
+                local e = mobEntry(zone, name)
+                e.level = rec.level
+                e.classes = rec.classes
+                e.cc = rec.cc
+                e.casts = rec.casts
+            end
         end
     end
 
     -- Resist tracker: per-element rates + efficiency
     local RT = getResistTracker()
+    if RT and RT.loadDatabase and not next(RT.database or {}) then
+        pcall(RT.loadDatabase)
+    end
     if RT and RT.database then
         for zone, mobs in pairs(RT.database) do
             for name, elements in pairs(mobs) do
-                mobEntry(zone, name).resists = elements
+                if MobName.isKnowledgeName(name) then
+                    mobEntry(zone, name).resists = elements
+                end
             end
         end
     end
 
     -- HP estimator: absolute max HP
     local HP = getHpEstimator()
+    if HP and HP.loadDatabase and not next(HP.database or {}) then
+        pcall(HP.loadDatabase)
+    end
     if HP and HP.database then
         for zone, mobs in pairs(HP.database) do
             for name, d in pairs(mobs) do
-                local e = mobEntry(zone, name)
-                e.maxHP = d.maxHP
-                e.hpWeight = d.weight
+                if MobName.isKnowledgeName(name) then
+                    local e = mobEntry(zone, name)
+                    e.maxHP = d.maxHP
+                    e.hpWeight = d.weight
+                end
             end
         end
     end
@@ -625,6 +641,7 @@ end
 -------------------------------------------------------------------------------
 
 function M.init()
+    if _initialized then return end
     M.loadDatabase()
     M.loadZone()
 
@@ -667,15 +684,21 @@ function M.init()
         end
     end)
 
-    -- Chain onto cast completions for CC results
+    -- Observe cast completions for CC results without replacing other
+    -- process-local consumers.
     local ok, SpellEngine = pcall(require, 'sidekick-next.utils.spell_engine')
     if ok and SpellEngine then
-        local prev = SpellEngine.onCastComplete
-        SpellEngine.onCastComplete = function(castData, result)
-            if prev then pcall(prev, castData, result) end
-            M.onCastComplete(castData, result)
+        if SpellEngine.addCastCompleteListener then
+            SpellEngine.addCastCompleteListener(M.onCastComplete)
+        else
+            local prev = SpellEngine.onCastComplete
+            SpellEngine.onCastComplete = function(castData, result)
+                if prev then pcall(prev, castData, result) end
+                M.onCastComplete(castData, result)
+            end
         end
     end
+    _initialized = true
 end
 
 function M.shutdown()

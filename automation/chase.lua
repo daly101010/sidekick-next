@@ -162,8 +162,9 @@ function M.resolveSpawn(settings)
         spawn = mq.TLO.Group and mq.TLO.Group.Leader
     elseif role == 'raid1' or role == 'raid2' or role == 'raid3' then
         local index = tonumber(role:sub(-1))
-        spawn = mq.TLO.Raid and mq.TLO.Raid.MainAssist
+        local member = mq.TLO.Raid and mq.TLO.Raid.MainAssist
             and mq.TLO.Raid.MainAssist(index) or nil
+        spawn = member and member.Spawn or nil
     elseif role == 'byname' then
         local name = trim(settings.ChaseTarget or settings.target)
         if name == '' then return nil, 'empty_target_name' end
@@ -296,7 +297,9 @@ local function preflight(settings)
     settings = settings or {}
     if settings.ChaseEnabled ~= true then return nil, 'disabled' end
     if M.state.userPaused then return nil, 'user_paused' end
-    if settings.AutomationPaused == true then return nil, 'automation_paused' end
+    -- Coordinated workers take global pause exclusively from the coordinator
+    -- state enforced by ModuleBase. The persisted settings copy can be stale
+    -- across process startup/revision reload and must not veto a resumed fleet.
     if tostring(settings.AutomationLevel or 'auto'):lower() ~= 'auto' then
         return nil, 'movement_not_auto'
     end

@@ -2,7 +2,8 @@
 -- Throttled logging utility to prevent console spam
 -- Each log key can only fire once per interval
 
-local mq = require('mq')
+local Logger = require('sidekick-next.utils.logger')
+local log = Logger.new('throttled_log', 1)
 
 local M = {}
 
@@ -27,10 +28,9 @@ function M.log(key, interval, format, ...)
         return false
     end
 
-    M._lastLogTime[key] = now
-
-    -- In-game echo disabled
-    return true
+    local emitted = log.info(format, ...) == true
+    if emitted then M._lastLogTime[key] = now end
+    return emitted
 end
 
 --- Log with default interval
@@ -46,7 +46,7 @@ end
 -- @param format string Format string for message
 -- @param ... Additional arguments for format
 function M.logImmediate(format, ...)
-    -- In-game echo disabled
+    return log.info(format, ...) == true
 end
 
 --- Check if a key is currently throttled
@@ -87,7 +87,14 @@ M.debugEnabled = false
 -- @return boolean True if message was logged
 function M.debug(key, format, ...)
     if not M.debugEnabled then return false end
-    return M.log(key, M.defaultInterval, "[DEBUG] " .. format, ...)
+    local now = os.clock()
+    local lastTime = M._lastLogTime[key] or 0
+    if now - lastTime < M.defaultInterval then
+        return false
+    end
+    local emitted = log.debug(format, ...) == true
+    if emitted then M._lastLogTime[key] = now end
+    return emitted
 end
 
 --- Enable or disable debug logging

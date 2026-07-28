@@ -2,9 +2,8 @@
 -- ui/skill_bar_animated.lua
 -- Skill bar — square cells with wrapped text labels and a cooldown
 -- countdown overlay, mirroring the AA/Disc bar visual style.
--- Discovery via utils/skills.lua. Activations come through
--- utils.abilities.activate which calls M.notifyFired so we can countdown
--- a per-skill reuse timer locally.
+-- Discovery via utils/skills.lua. The host sends activations to the
+-- lease-bound manual action queue; cooldowns are read from live TLO state.
 -- =========================================================================
 
 local mq = require('mq')

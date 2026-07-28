@@ -9,6 +9,7 @@ local lib = require('sidekick-next.sk_lib')
 local ModuleBase = require('sidekick-next.sk_module_base')
 local OffensiveTarget = require('sidekick-next.utils.offensive_target')
 local Debuff = require('sidekick-next.automation.debuff')
+local Cache = require('sidekick-next.utils.runtime_cache')
 
 local module = ModuleBase.create('debuff', lib.Priority.DEBUFF)
 
@@ -326,7 +327,17 @@ local function reserveCandidate(candidate)
 end
 
 module.onTick = function(self)
+    Cache.setSettings(lib.getSettings())
+    if not self.componentMode then Cache.tick() end
     Debuff.tick()
+    if self.componentMode and self.domainKillAuthorized ~= true then
+        releaseReservation(self.domainKillGateReason or 'kill_not_authorized')
+        module._candidate = nil
+        _lastReason = tostring(
+            self.domainKillGateReason or 'kill_not_authorized')
+        self:setIntent(false, nil, _lastReason)
+        return
+    end
     local action, reason = selectSpell()
     if _reservation and self.currentRequestId then
         if not Debuff.renewClaim(_reservation.targetId, _reservation.debuffType) then
@@ -405,6 +416,11 @@ end
 
 module:enableUnifiedExecutor({
     preflight = function(action)
+        if module.componentMode
+            and (module.domainKillAuthorized ~= true
+                or tonumber(action.targetId) ~= tonumber(module.domainKillTargetId)) then
+            return false, 'kill_authorization_changed'
+        end
         if not Debuff.ownsClaim(action.targetId, action.debuffType) then
             return false, 'peer_reservation_lost'
         end
@@ -477,6 +493,6 @@ end)
 
 Debuff.init()
 module:run(50)
-releaseReservation('worker_exit')
+if not module.componentMode then releaseReservation('worker_exit') end
 
 return module

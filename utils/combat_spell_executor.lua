@@ -29,7 +29,7 @@ local TYPE_PRIORITY_MULTIPLIER = 10
 -- Lazy-loaded Dependencies
 --------------------------------------------------------------------------------
 
-local getCore = lazy('sidekick-next.core')
+local getCore = lazy('sidekick-next.utils.core')
 local getSpellsetPersistence = lazy('sidekick-next.utils.spellset_persistence')
 local getSpellbookScanner = lazy('sidekick-next.utils.spellbook_scanner')
 local getConditionDefaults = lazy('sidekick-next.utils.condition_defaults')
@@ -37,6 +37,7 @@ local getConditionBuilder = lazy('sidekick-next.ui.condition_builder')
 local getConditionContext = lazy('sidekick-next.utils.condition_context')
 local getDpsIntel = lazy('sidekick-next.utils.dps_intelligence')
 local getResistTracker = lazy('sidekick-next.utils.resist_tracker')
+local getResistLog = lazy('sidekick-next.utils.resist_log')
 
 --------------------------------------------------------------------------------
 -- Sorted Cast List
@@ -490,21 +491,51 @@ local function isEffectOnTarget(spellName, spellId, targetId)
     return false
 end
 
---- DPS intelligence gates for damage spells: skip when the target won't live
---- long enough for the cast to pay off, or when this mob resists the element
+--- Evaluate every learned DPS/resist gate for one damage spell.
+--- This is the shared decision point used by both the legacy monolithic rotation
+--- and the coordinated sk_dps worker. It fails open whenever evidence is missing.
 ---@param spellType string 'dot' or 'direct_damage'
 ---@param spellName string|nil The spell name
 ---@param targetId number The target spawn ID
----@return boolean True if this cast should be skipped
-local function shouldSkipDamageCast(spellType, spellName, targetId)
-    if not targetId or targetId <= 0 then return false end
+---@return boolean allowed
+---@return string reason
+---@return table details
+function M.evaluateDamageCandidate(spellType, spellName, targetId)
+    spellType = tostring(spellType or ''):lower()
+    local details = {
+        spellType = spellType,
+        spellName = tostring(spellName or ''),
+        targetId = tonumber(targetId) or 0,
+    }
+    if spellType ~= 'dot' and spellType ~= 'direct_damage' then
+        return true, 'not_damage', details
+    end
+    if details.targetId <= 0 then
+        return true, 'no_target_data', details
+    end
 
     local spell = spellName and mq.TLO.Spell(spellName) or nil
     local spellOk = spell and spell() ~= nil
+    local spawn = mq.TLO.Spawn(details.targetId)
+    details.targetName = (spawn and spawn() and spawn.CleanName and spawn.CleanName()) or ''
 
     -- Time-to-die viability (fails open inside dps_intelligence when no data)
     local DpsIntel = getDpsIntel()
     if DpsIntel then
+        if DpsIntel.getTTD then
+            local ok, ttd, source = pcall(DpsIntel.getTTD, details.targetId)
+            if ok then
+                details.ttd = tonumber(ttd)
+                details.ttdSource = tostring(source or 'unknown')
+            end
+        end
+        if DpsIntel.getRemainingHP then
+            local ok, remaining, weight = pcall(DpsIntel.getRemainingHP, details.targetId)
+            if ok then
+                details.remainingHp = tonumber(remaining)
+                details.hpWeight = tonumber(weight) or 0
+            end
+        end
         if spellType == 'dot' then
             local ticks = 0
             local mySpell = spellName and mq.TLO.Me.Spell(spellName) or nil
@@ -515,8 +546,9 @@ local function shouldSkipDamageCast(spellType, spellName, targetId)
                 ticks = tonumber(spell.Duration()) or 0
             end
             local durationSec = ticks > 0 and (ticks * 6) or nil
-            if not DpsIntel.dotViable(targetId, durationSec) then
-                return true
+            details.durationSec = durationSec
+            if not DpsIntel.dotViable(details.targetId, durationSec) then
+                return false, 'ttd_dot', details
             end
         elseif spellType == 'direct_damage' then
             local castSec = nil
@@ -524,41 +556,77 @@ local function shouldSkipDamageCast(spellType, spellName, targetId)
                 local ms = tonumber(spell.MyCastTime())
                 castSec = ms and (ms / 1000) or nil
             end
-            if DpsIntel.isRainSpell and DpsIntel.isRainSpell(spell) then
+            details.castSec = castSec
+            details.isRain = DpsIntel.isRainSpell
+                and DpsIntel.isRainSpell(spellOk and spell or spellName) == true
+                or false
+            if details.isRain then
                 -- Rains need the longer wave-payoff horizon; no single-target
                 -- overkill check (damage spreads over waves and targets).
                 -- rainSafe blocks rains that would splash mezzed mobs.
-                if not DpsIntel.rainViable(targetId, castSec) then
-                    return true
+                if not DpsIntel.rainViable(details.targetId, castSec) then
+                    return false, 'ttd_rain', details
                 end
-                if DpsIntel.rainSafe and not DpsIntel.rainSafe(targetId, spellOk and spell or nil) then
-                    return true
+                if DpsIntel.rainSafe
+                    and not DpsIntel.rainSafe(details.targetId, spellOk and spell or nil)
+                then
+                    return false, 'rain_unsafe', details
                 end
-            -- Includes the overkill check via spellName (learned damage vs est HP)
-            elseif not DpsIntel.nukeViable(targetId, castSec, spellName) then
-                return true
+            else
+                local overkillOk = not DpsIntel.overkillOk
+                    or DpsIntel.overkillOk(details.targetId, spellName)
+                details.overkillOk = overkillOk == true
+                if not overkillOk then
+                    return false, 'overkill', details
+                end
+                if not DpsIntel.nukeViable(details.targetId, castSec, nil) then
+                    return false, 'ttd_nuke', details
+                end
             end
         end
     end
 
-    -- Learned soft-resist steering
+    -- Learned exact spell/mob resist history.
     local Core = getCore()
     local settings = Core and Core.Settings or nil
+    if (not settings or settings.AdaptiveResistSkip ~= false)
+        and details.targetName ~= '' and details.spellName ~= ''
+    then
+        local ResistLog = getResistLog()
+        if ResistLog and ResistLog.shouldSkip then
+            if ResistLog.load then pcall(ResistLog.load) end
+            local ok, skip, why = pcall(
+                ResistLog.shouldSkip, details.spellName, details.targetName)
+            if ok and skip == true then
+                details.adaptiveResistReason = tostring(why or '')
+                return false, 'adaptive_resist:' .. tostring(why or 'learned'), details
+            end
+        end
+    end
+
+    -- Learned soft-resist steering by element.
     if (not settings or settings.UseResistTracker ~= false) and spellOk then
         local RT = getResistTracker()
         if RT and RT.shouldAvoid then
             local resistType = spell.ResistType and spell.ResistType() or ''
+            details.resistType = tostring(resistType):lower()
             if resistType ~= '' then
-                local spawn = mq.TLO.Spawn(targetId)
-                local mobName = (spawn and spawn() and spawn.CleanName()) or ''
-                if mobName ~= '' and RT.shouldAvoid(mobName, resistType:lower(), settings or {}) then
-                    return true
+                if details.targetName ~= ''
+                    and RT.shouldAvoid(details.targetName, details.resistType, settings or {})
+                then
+                    return false, 'element_resist:' .. details.resistType, details
                 end
             end
         end
     end
 
-    return false
+    return true, 'eligible', details
+end
+
+---@return boolean True if this cast should be skipped
+local function shouldSkipDamageCast(spellType, spellName, targetId)
+    local allowed = M.evaluateDamageCandidate(spellType, spellName, targetId)
+    return allowed ~= true
 end
 
 --- Get the next spell to cast based on priority and conditions

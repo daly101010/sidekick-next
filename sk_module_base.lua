@@ -10,6 +10,7 @@ local lib = require('sidekick-next.sk_lib')
 local ActionExecutor = require('sidekick-next.utils.action_executor')
 local ActionCounters = require('sidekick-next.utils.action_counters')
 local ActionBoundary = require('sidekick-next.utils.action_boundary')
+local FeignSafety = require('sidekick-next.utils.feign_safety')
 
 local M = {}
 
@@ -20,9 +21,39 @@ local REQUEST_REFRESH_MS = 500
 local LEASE_RENEW_MS = 500
 local REQUEST_TTL_MS = 2000
 local MAX_STATE_INBOX = 32
+local MAX_RETIRED_COORDINATOR_BOOTS = 16
 
 local function nowMs()
     return lib.getTimeMs()
+end
+
+local function buildPeerHeartbeat(moduleName)
+    local inGame = lib.isInGame()
+    local currentHP = inGame and lib.safeNum(function()
+        return mq.TLO.Me.CurrentHPs()
+    end, 0) or 0
+    local maxHP = inGame and lib.safeNum(function()
+        return mq.TLO.Me.MaxHPs()
+    end, 0) or 0
+    return {
+        id = 'status:update',
+        script = tostring(moduleName or ''),
+        zone = inGame and lib.safeTLO(function()
+            return mq.TLO.Zone.ShortName()
+        end, '') or '',
+        currentHP = currentHP,
+        maxHP = maxHP,
+        characterId = inGame and lib.safeNum(function()
+            return mq.TLO.Me.ID()
+        end, 0) or 0,
+        dead = inGame and (lib.safeTLO(function()
+            return mq.TLO.Me.Dead()
+        end, false) == true or currentHP <= 0) or false,
+        hovering = inGame and lib.safeTLO(function()
+            return mq.TLO.Me.Hovering()
+        end, false) == true or false,
+        inGame = inGame,
+    }
 end
 
 local function actorSafeCopy(value, seen)
@@ -55,6 +86,37 @@ local function actionKey(action)
             tostring(action.kind or ''),
             tostring(action.name or action.spellName or action.itemName or ''),
             tostring(action.targetId or '')))
+end
+
+local function logLeaseTransition(worker, transition, reason)
+    local action = worker.currentAction or {}
+    local component = tostring(action.component or worker.name or 'unknown')
+    local kind = tostring(action.kind or 'action')
+    local name = tostring(action.name or action.spellName
+        or action.itemName or action.discName or '')
+    local targetName = tostring(action.targetName or '')
+    local targetId = tonumber(action.targetId) or 0
+    local target = targetName
+    if targetId > 0 then
+        target = target ~= '' and string.format('%s(%d)', target, targetId)
+            or tostring(targetId)
+    end
+    if target == '' then target = '-' end
+    local now = nowMs()
+    if transition == 'granted' then
+        local queueMs = worker.requestRequestedAt > 0
+            and math.max(0, now - worker.requestRequestedAt) or 0
+        lib.log('info', worker.name,
+            'Lease granted: component=%s action=%s%s target=%s queued=%dms',
+            component, kind, name ~= '' and (':' .. name) or '', target, queueMs)
+    else
+        local holdMs = worker.actionTraceGrantedAtMs > 0
+            and math.max(0, now - worker.actionTraceGrantedAtMs) or 0
+        lib.log('info', worker.name,
+            'Lease released: component=%s action=%s%s target=%s reason=%s held=%dms',
+            component, kind, name ~= '' and (':' .. name) or '', target,
+            tostring(reason or 'completed'), holdMs)
+    end
 end
 
 local function currentScriptFor(moduleName)
@@ -106,10 +168,16 @@ function M.create(moduleName, legacyPriority)
         state = nil,
         coordinatorBootId = nil,
         retiredCoordinatorBootIds = {},
+        retiredCoordinatorBootOrder = {},
         candidateBootId = nil,
         candidateBootSeenAt = 0,
         stateReceivedAt = 0,
         stateInbox = {},
+        stateInboxHead = 1,
+        stateInboxCount = 0,
+        stateInboxOverflows = 0,
+        stateDropReasons = {},
+        stateDrops = 0,
         lastStateTick = nil,
         awaitingResumeState = false,
         resumeStateTick = nil,
@@ -138,6 +206,7 @@ function M.create(moduleName, legacyPriority)
         finalizing = nil,
         lastFinishedRequestId = nil,
         lastFinishedAtMs = 0,
+        lastRecoveryReportAtMs = 0,
         lastActionResult = nil,
         intent = { active = false, reason = 'init', updatedAtMs = 0 },
         dirtyEffects = false,
@@ -154,6 +223,10 @@ function M.create(moduleName, legacyPriority)
         settingsRevision = nil,
         unifiedExecutorEnabled = false,
         actionHandlers = nil,
+        actionTraceSequence = 0,
+        actionTraceLastKey = '',
+        actionTraceGrantedAtMs = 0,
+        actionTraceGrantedSentFor = '',
 
         onTick = nil,
         shouldAct = nil,
@@ -215,7 +288,14 @@ function M.create(moduleName, legacyPriority)
             return false
         end
         if tostring(lease.token or '') == '' then return false end
+        local firstObservation = not self.activeLeaseSnapshot
+            or tostring(self.activeLeaseSnapshot.requestId or '')
+                ~= tostring(lease.requestId or '')
         self.activeLeaseSnapshot = actorSafeCopy(lease)
+        if firstObservation then
+            self.actionTraceGrantedAtMs = nowMs()
+            logLeaseTransition(self, 'granted')
+        end
         return true
     end
 
@@ -229,6 +309,63 @@ function M.create(moduleName, legacyPriority)
         self.intent.active = active == true
         self.intent.reason = tostring(reason or (active and 'ready' or 'idle'))
         self.intent.updatedAtMs = nowMs()
+    end
+
+    function self:_countStateDrop(reason)
+        reason = tostring(reason or 'unknown')
+        self.stateDrops = self.stateDrops + 1
+        self.stateDropReasons[reason] =
+            (self.stateDropReasons[reason] or 0) + 1
+    end
+
+    function self:traceAction(phase, action, reason, extra)
+        phase = tostring(phase or '')
+        action = action or self.currentAction or {}
+        local key = table.concat({
+            phase, tostring(self.currentRequestId or ''), tostring(reason or ''),
+            tostring(action.component or ''),
+        }, '|')
+        if key == self.actionTraceLastKey then return false end
+        self.actionTraceLastKey = key
+        self.actionTraceSequence = self.actionTraceSequence + 1
+        local now = nowMs()
+        local queueMs = self.requestRequestedAt > 0
+            and math.max(0, (self.actionTraceGrantedAtMs > 0
+                and self.actionTraceGrantedAtMs or now)
+                - self.requestRequestedAt) or 0
+        local leaseTiming = self.activeLeaseSnapshot
+            and self.activeLeaseSnapshot.queueTiming or {}
+        local schedulerWaitMs = math.max(0,
+            tonumber(leaseTiming.schedulerWaitMs) or 0)
+        local transportObserveMs = math.max(0, queueMs - schedulerWaitMs)
+        local payload = {
+            version = 1,
+            worker = self.name,
+            workerSessionId = self.workerSessionId,
+            sequence = self.actionTraceSequence,
+            phase = phase,
+            component = tostring(action.component or self.name),
+            kind = tostring(action.kind or ''),
+            name = tostring(action.name or action.spellName
+                or action.itemName or action.discName or ''),
+            targetId = tonumber(action.targetId) or 0,
+            targetName = tostring(action.targetName or ''),
+            reason = tostring(reason or action.reason or ''),
+            requestId = tostring(self.currentRequestId or ''),
+            queueMs = queueMs,
+            schedulerWaitMs = schedulerWaitMs,
+            transportObserveMs = transportObserveMs,
+            blockedByModule = tostring(leaseTiming.blockedByModule or ''),
+            blockedByStatus = tostring(leaseTiming.blockedByStatus or ''),
+            requestRefreshes = tonumber(leaseTiming.requestRefreshes) or 0,
+            holdMs = self.actionTraceGrantedAtMs > 0
+                and math.max(0, now - self.actionTraceGrantedAtMs) or 0,
+            elapsedMs = self.requestRequestedAt > 0
+                and math.max(0, now - self.requestRequestedAt) or 0,
+            sentAtMs = now,
+        }
+        for field, value in pairs(extra or {}) do payload[field] = value end
+        return self:sendToLocalUi(mailbox('ACTION_TRACE', 'action:trace'), payload)
     end
 
     function self:_sendLeaseMessage(mailboxName, payload)
@@ -256,9 +393,13 @@ function M.create(moduleName, legacyPriority)
         return true
     end
 
-    function self:markDirtyEffects(value)
+    function self:markDirtyEffects(value, recoveryRequired)
         self.dirtyEffects = value == true
-        self.needsRecovery = self.dirtyEffects
+        if not self.dirtyEffects then
+            self.needsRecovery = false
+        elseif recoveryRequired == true then
+            self.needsRecovery = true
+        end
     end
 
     function self:_sendRequest()
@@ -288,7 +429,9 @@ function M.create(moduleName, legacyPriority)
         self.currentActionKey = actionKey(action)
         self.requestPending = true
         self.requestRequestedAt = nowMs()
+        self.actionTraceGrantedAtMs = 0
         self.finalizing = nil
+        self:traceAction('selected', action, action.reason or 'selected')
         local ok = self:_sendRequest()
         if not ok then
             if type(self.onRequestWithdrawn) == 'function' then
@@ -300,6 +443,7 @@ function M.create(moduleName, legacyPriority)
         end
         lib.log('debug', self.name, 'Lease requested: %s (%s)',
             tostring(self.currentRequestId), tostring(self.currentActionKey))
+        self:traceAction('requested', action, 'lease_requested')
         return true
     end
 
@@ -320,6 +464,18 @@ function M.create(moduleName, legacyPriority)
         if self:ownsLease(self.currentRequestId) then
             return self:finishAction(reason or 'withdrawn')
         end
+        if self.unifiedExecutorEnabled and ActionExecutor.hasJob() then
+            if ActionExecutor.hasActiveJob() then
+                -- An active job proves this request crossed the mutation
+                -- boundary previously. Without exact ownership, preserve it
+                -- for fenced recovery instead of clearing its identity.
+                self:markDirtyEffects(true, true)
+                self.intent.reason = 'recovery_required:executor_withdraw'
+                return false
+            end
+            local executorResult = ActionExecutor.consumeResult()
+            if executorResult then self.lastActionResult = executorResult end
+        end
         local requestId = self.currentRequestId
         local withdrawnAction = self.currentAction
         self:_sendLeaseMessage(mailbox('LEASE_WITHDRAW', 'sk:lease:withdraw'), {
@@ -332,6 +488,8 @@ function M.create(moduleName, legacyPriority)
         end
         self.lastFinishedRequestId = requestId
         self.lastFinishedAtMs = nowMs()
+        self:traceAction('cancelled', withdrawnAction,
+            tostring(reason or 'withdrawn'))
         self:_clearLocalRequest()
         return true
     end
@@ -389,14 +547,33 @@ function M.create(moduleName, legacyPriority)
             phase = pending.reason == 'preempted' and 'preempted' or 'resolved',
             reason = pending.reason,
         }
-        lib.log('debug', self.name, 'Lease released: %s (%s)',
-            tostring(requestId), tostring(pending.reason))
+        logLeaseTransition(self, 'released', pending.reason)
+        local tracePhase = tostring(self.lastActionResult.phase or '')
+        if tracePhase == 'resolved' then tracePhase = 'completed' end
+        if tracePhase == 'preempted' then tracePhase = 'cancelled' end
+        self:traceAction(tracePhase ~= '' and tracePhase or 'completed',
+            self.currentAction, pending.reason)
         self:_clearLocalRequest()
         return true
     end
 
     function self:finishAction(result)
         if not self.currentRequestId then return false end
+        if self.unifiedExecutorEnabled and ActionExecutor.hasJob() then
+            if ActionExecutor.hasActiveJob() then
+                if not self:ownsLease(self.currentRequestId) then
+                    -- Never abort an executor after authority was lost. Keep
+                    -- the effects dirty so the coordinator grants the fenced
+                    -- recovery lease that is allowed to perform cleanup.
+                    self:markDirtyEffects(true, true)
+                    self.intent.reason = 'recovery_required:executor_active'
+                    return false
+                end
+                ActionExecutor.cancel('lease_finishing')
+            end
+            local executorResult = ActionExecutor.consumeResult()
+            if executorResult then self.lastActionResult = executorResult end
+        end
         local normalized
         if type(result) == 'table' then
             normalized = result
@@ -427,7 +604,7 @@ function M.create(moduleName, legacyPriority)
             -- A cached lease is diagnostic evidence, never authority. Preserve
             -- dirty state and wait for the coordinator's fenced recovery lease
             -- before issuing stop-cast/nav/key-release cleanup mutations.
-            self:markDirtyEffects(true)
+            self:markDirtyEffects(true, true)
             self.intent.reason = 'recovery_required:' .. tostring(reason)
         end
     end
@@ -439,9 +616,14 @@ function M.create(moduleName, legacyPriority)
 
     function self:cancelUnifiedAction(reason)
         if not self:ownsLease(self.currentRequestId) then return false end
-        if self.unifiedExecutorEnabled and ActionExecutor.hasActiveJob() then
-            ActionExecutor.cancel(reason or 'cancelled')
-            return true
+        if self.unifiedExecutorEnabled and ActionExecutor.hasJob() then
+            local cancelled = false
+            if ActionExecutor.hasActiveJob() then
+                cancelled = ActionExecutor.cancel(reason or 'cancelled') == true
+            end
+            local result = ActionExecutor.consumeResult()
+            if result then self.lastActionResult = result end
+            return cancelled or result ~= nil
         end
         return false
     end
@@ -471,6 +653,12 @@ function M.create(moduleName, legacyPriority)
         ActionExecutor.tick({
             ownsAction = function() return self:ownsLease() end,
         })
+        local status = ActionExecutor.getStatus()
+        if status and status.phase then
+            self:traceAction(status.phase, self.currentAction, status.reason, {
+                elapsedMs = status.elapsedMs,
+            })
+        end
         local result = ActionExecutor.consumeResult()
         if result then
             local phaseMap = {
@@ -484,6 +672,13 @@ function M.create(moduleName, legacyPriority)
                 ActionCounters.bump('done:' .. tostring(result.kind or 'action'))
             elseif result.phase == 'failed' then
                 ActionCounters.bump('failed')
+                local component = tostring(self.currentAction
+                    and self.currentAction.component or self.name or 'unknown')
+                    :gsub('[^%w_%-%.]', '_'):sub(1, 40)
+                local failureReason = tostring(result.reason or 'unknown')
+                    :gsub('[^%w_%-%.]', '_'):sub(1, 80)
+                ActionCounters.bump(string.format('failed:%s:%s',
+                    component, failureReason))
             end
             self:finishAction(result)
         end
@@ -501,6 +696,11 @@ function M.create(moduleName, legacyPriority)
             requestPending = self.requestPending == true,
             dirtyEffects = self.dirtyEffects == true,
             needsRecovery = self.needsRecovery == true,
+            intentActive = self.intent and self.intent.active == true,
+            intentReason = tostring(self.intent and self.intent.reason or 'unknown'),
+            stateInboxOverflows = tonumber(self.stateInboxOverflows) or 0,
+            stateDrops = tonumber(self.stateDrops) or 0,
+            stateDropReasons = actorSafeCopy(self.stateDropReasons),
             counters = ActionCounters.snapshot(),
         })
     end
@@ -517,6 +717,26 @@ function M.create(moduleName, legacyPriority)
         local token = tostring(lease.token or '')
         if requestId == '' or token == '' then return false end
 
+        -- Coordinator state is asynchronous. After reporting a completed
+        -- recovery, the same recovering snapshot can remain visible for one
+        -- or more worker ticks. Do not re-run cleanup or emit another
+        -- grant/release pair for that stale snapshot. Retry the report at the
+        -- heartbeat cadence so a lost Actor message cannot strand recovery.
+        if tostring(self.lastFinishedRequestId or '') == requestId then
+            local now = nowMs()
+            if (now - (tonumber(self.lastRecoveryReportAtMs) or 0))
+                >= lib.Timing.MODULE_HEARTBEAT_MS then
+                local sent = self:_sendLeaseMessage(
+                    mailbox('LEASE_RECOVERED', 'sk:lease:recovered'), {
+                        msgType = 'lease:recovered',
+                        requestId = requestId,
+                        token = token,
+                    })
+                if sent then self.lastRecoveryReportAtMs = now end
+            end
+            return true
+        end
+
         self.currentRequestId = requestId
         self.currentAction = self.currentAction or {
             kind = 'recovery_cleanup',
@@ -526,7 +746,13 @@ function M.create(moduleName, legacyPriority)
         }
         self.currentActionKey = actionKey(self.currentAction)
         self.requestPending = false
+        local firstObservation = not self.activeLeaseSnapshot
+            or tostring(self.activeLeaseSnapshot.requestId or '') ~= requestId
         self.activeLeaseSnapshot = actorSafeCopy(lease)
+        if firstObservation then
+            self.actionTraceGrantedAtMs = nowMs()
+            logLeaseTransition(self, 'granted')
+        end
 
         if self.unifiedExecutorEnabled and ActionExecutor.hasActiveJob() then
             ActionExecutor.cancel('orphan_recovery')
@@ -547,68 +773,118 @@ function M.create(moduleName, legacyPriority)
             end
         end
 
-        self:_sendLeaseMessage(mailbox('LEASE_RECOVERED', 'sk:lease:recovered'), {
-            msgType = 'lease:recovered',
-            requestId = requestId,
-            token = token,
-        })
+        local sent, sendError = self:_sendLeaseMessage(
+            mailbox('LEASE_RECOVERED', 'sk:lease:recovered'), {
+                msgType = 'lease:recovered',
+                requestId = requestId,
+                token = token,
+            })
+        if not sent then
+            self.intent.reason = 'recovery_report_failed:' .. tostring(sendError)
+            return true
+        end
         self.dirtyEffects = false
         self.needsRecovery = false
+        logLeaseTransition(self, 'released', 'orphan_recovered')
+        self:traceAction('recovery', self.currentAction, 'orphan_recovered')
         self.lastFinishedRequestId = requestId
         self.lastFinishedAtMs = nowMs()
+        self.lastRecoveryReportAtMs = self.lastFinishedAtMs
         self:_clearLocalRequest()
         return true
     end
 
     function self:_enqueueState(message)
         local ok, content = pcall(function() return message() end)
-        if not ok or type(content) ~= 'table' then return end
+        if not ok or type(content) ~= 'table' then
+            self:_countStateDrop(ok and 'malformed_state'
+                or 'state_message_read_failed')
+            return
+        end
         local copied = actorSafeCopy(content)
-        if not copied then return end
+        if not copied then
+            self:_countStateDrop('state_copy_failed')
+            return
+        end
         local sender = message.sender or {}
+        local senderScript = lib.actorSenderEndpoint(sender)
         local entry = {
             content = copied,
             sender = {
                 character = tostring(sender.character or ''),
                 server = tostring(sender.server or ''),
-                script = tostring(sender.script or ''),
+                script = tostring(senderScript or ''),
                 mailbox = tostring(sender.mailbox or ''),
             },
         }
-        if #self.stateInbox >= MAX_STATE_INBOX then table.remove(self.stateInbox, 1) end
-        self.stateInbox[#self.stateInbox + 1] = entry
+        if self.stateInboxCount >= MAX_STATE_INBOX then
+            self.stateInbox[self.stateInboxHead] = nil
+            self.stateInboxHead = (self.stateInboxHead % MAX_STATE_INBOX) + 1
+            self.stateInboxCount = self.stateInboxCount - 1
+            self.stateInboxOverflows = self.stateInboxOverflows + 1
+            self:_countStateDrop('state_queue_overflow')
+        end
+        local tail = ((self.stateInboxHead + self.stateInboxCount - 1)
+            % MAX_STATE_INBOX) + 1
+        self.stateInbox[tail] = entry
+        self.stateInboxCount = self.stateInboxCount + 1
     end
 
     function self:onStateReceived(entry)
         local content = type(entry) == 'table' and entry.content or nil
         local sender = type(entry) == 'table' and entry.sender or nil
-        if type(content) ~= 'table' then return end
+        if type(content) ~= 'table' then
+            self:_countStateDrop('malformed_queued_state')
+            return
+        end
         if type(sender) ~= 'table'
             or tostring(sender.character or '') ~= tostring(lib.getMyName() or '')
             or tostring(sender.server or '') ~= tostring(lib.getMyServer() or '')
-            or tostring(sender.script or '') ~= tostring(lib.Scripts.COORDINATOR or '') then
+            or not lib.actorSenderMatches(sender,
+                lib.Scripts.COORDINATOR, 'coordinator') then
+            self:_countStateDrop('state_wrong_owner_or_script')
             return
         end
-        local logicalMailbox = tostring(sender.mailbox or ''):lower():match('([^:]+)$')
-        if logicalMailbox ~= 'coordinator' then
+        if tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then
+            self:_countStateDrop('state_protocol_version')
             return
         end
-        if tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then return end
-        if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '') then return end
-        if tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then return end
+        if tostring(content.ownerName or '') ~= tostring(lib.getMyName() or '')
+            or tostring(content.ownerServer or '') ~= tostring(lib.getMyServer() or '') then
+            self:_countStateDrop('state_owner_mismatch')
+            return
+        end
 
         local incomingBootId = tostring(content.coordinatorBootId or '')
-        if incomingBootId == '' or self.retiredCoordinatorBootIds[incomingBootId] then return end
+        if incomingBootId == '' then
+            self:_countStateDrop('state_missing_boot_id')
+            return
+        end
+        if self.retiredCoordinatorBootIds[incomingBootId] then
+            self:_countStateDrop('state_retired_boot_id')
+            return
+        end
         if self.coordinatorBootId and incomingBootId ~= self.coordinatorBootId then
             if self.candidateBootId ~= incomingBootId
                 or (nowMs() - self.candidateBootSeenAt) > 2000 then
                 self.candidateBootId = incomingBootId
                 self.candidateBootSeenAt = nowMs()
+                self:_countStateDrop('state_boot_id_unconfirmed')
                 return
             end
-            self.retiredCoordinatorBootIds[self.coordinatorBootId] = true
+            local retired = tostring(self.coordinatorBootId or '')
+            if retired ~= '' and not self.retiredCoordinatorBootIds[retired] then
+                self.retiredCoordinatorBootIds[retired] = true
+                self.retiredCoordinatorBootOrder[#self.retiredCoordinatorBootOrder + 1] =
+                    retired
+                if #self.retiredCoordinatorBootOrder
+                    > MAX_RETIRED_COORDINATOR_BOOTS then
+                    local oldest = table.remove(self.retiredCoordinatorBootOrder, 1)
+                    self.retiredCoordinatorBootIds[oldest] = nil
+                end
+            end
             if self.currentRequestId or self.activeLeaseSnapshot then
-                self:markDirtyEffects(true)
+                self:markDirtyEffects(true, true)
             end
             self.state = nil
             self.lastStateTick = nil
@@ -617,8 +893,14 @@ function M.create(moduleName, legacyPriority)
         self.candidateBootId = nil
 
         local incomingTick = tonumber(content.tickId)
-        if not incomingTick or incomingTick <= 0 then return end
-        if self.lastStateTick and incomingTick <= self.lastStateTick then return end
+        if not incomingTick or incomingTick <= 0 then
+            self:_countStateDrop('state_invalid_tick')
+            return
+        end
+        if self.lastStateTick and incomingTick <= self.lastStateTick then
+            self:_countStateDrop('state_stale_tick')
+            return
+        end
         self.lastStateTick = incomingTick
         self.state = content
         self.stateReceivedAt = nowMs()
@@ -647,9 +929,16 @@ function M.create(moduleName, legacyPriority)
     end
 
     function self:drainStateInbox()
-        if #self.stateInbox == 0 then return end
-        local inbox = self.stateInbox
+        if self.stateInboxCount == 0 then return end
+        local inbox = {}
+        for offset = 0, self.stateInboxCount - 1 do
+            local index = ((self.stateInboxHead + offset - 1)
+                % MAX_STATE_INBOX) + 1
+            inbox[#inbox + 1] = self.stateInbox[index]
+        end
         self.stateInbox = {}
+        self.stateInboxHead = 1
+        self.stateInboxCount = 0
         for _, entry in ipairs(inbox) do self:onStateReceived(entry) end
     end
 
@@ -658,22 +947,28 @@ function M.create(moduleName, legacyPriority)
     end
 
     function self:sendToLocalUi(msgId, payload)
-        if not self.dropbox or not msgId or msgId == '' then return false end
+        if not msgId or msgId == '' then return false end
         local safePayload = actorSafeCopy(payload or {}) or {}
-        safePayload.id = msgId
-        safePayload.from = safePayload.from or lib.getMyName()
-        safePayload.server = safePayload.server or lib.getMyServer()
+        local gateway = self.peerActors
+        if not gateway then
+            local ok, coordinator = pcall(require, 'sidekick-next.utils.actors_coordinator')
+            if ok and coordinator then
+                coordinator.init()
+                if coordinator.setTeamContext then
+                    pcall(coordinator.setTeamContext,
+                        self.state and self.state.team or nil)
+                end
+                gateway = coordinator
+            end
+        end
+        if not (gateway and gateway.sendToLocalScript) then return false end
         local scripts = type(lib.Scripts.UI) == 'table'
             and lib.Scripts.UI or { lib.Scripts.UI }
         local sent = false
         for _, scriptName in ipairs(scripts) do
-            local ok = pcall(self.dropbox.send, self.dropbox, {
-                mailbox = 'sidekick',
-                script = scriptName,
-                server = lib.getMyServer(),
-                character = lib.localCharacter(),
-            }, safePayload)
-            sent = sent or ok
+            local ok, result = pcall(gateway.sendToLocalScript,
+                scriptName, msgId, safePayload)
+            sent = sent or (ok and result == true)
         end
         return sent
     end
@@ -760,6 +1055,16 @@ function M.create(moduleName, legacyPriority)
             return
         end
 
+        -- In the consolidated profile Combat owns the dedicated feign
+        -- component. No other domain may implicitly stand the character.
+        local feignOwner = self.name == 'feign'
+            or (self.name == 'combat' and lib.WorkerProfile == 'consolidated')
+        if not feignOwner and FeignSafety.isManagedFeign(lib.getSettings()) then
+            self:_cancelAndFinalize('protected_feign', 'cancelled')
+            self:setIntent(false, nil, 'protected_feign')
+            return
+        end
+
         if lib.isSelfDeadOrHovering and lib.isSelfDeadOrHovering()
             and not self.canActDead then
             self:_cancelAndFinalize('self_dead', 'cancelled')
@@ -785,6 +1090,12 @@ function M.create(moduleName, legacyPriority)
         end
 
         if self:ownsLease(self.currentRequestId) then
+            if self.actionTraceGrantedSentFor
+                ~= tostring(self.currentRequestId or '') then
+                self.actionTraceGrantedSentFor =
+                    tostring(self.currentRequestId or '')
+                self:traceAction('granted', self.currentAction, 'lease_granted')
+            end
             local lease = self:getLease()
             if tostring(lease.status or 'active') == 'revoking' then
                 self:cancelUnifiedAction(tostring(lease.revokeReason or 'preempted'))
@@ -805,6 +1116,8 @@ function M.create(moduleName, legacyPriority)
                         and self.currentAction.skipBoundaryTarget == true,
                 })
             if not admitted then
+                self:cancelUnifiedAction(
+                    boundaryReason or 'boundary_rejected')
                 self:finishAction({
                     phase = 'cancelled',
                     reason = boundaryReason or 'boundary_rejected',
@@ -904,6 +1217,20 @@ function M.create(moduleName, legacyPriority)
     end
 
     function self:run(tickDelayMs)
+        -- Consolidated domain workers require the existing scripts as
+        -- components. In that mode their top-level setup runs, but they must
+        -- not register an actor mailbox or enter an independent worker loop.
+        if _G.SK_COMPONENT_MODE == true then
+            self.componentMode = true
+            return self
+        end
+        if lib.isActiveWorker and not lib.isActiveWorker(self.name) then
+            lib.log('info', self.name,
+                'Worker is inactive in the %s profile',
+                tostring(lib.WorkerProfile or 'current'))
+            self.running = false
+            return self
+        end
         tickDelayMs = tickDelayMs or 50
         self:initialize()
         local lastHeartbeat = 0
@@ -926,7 +1253,14 @@ function M.create(moduleName, legacyPriority)
                 end
             end
 
-            if self.peerActors and self.peerActors.tick then self.peerActors.tick() end
+            if self.peerActors and self.peerActors.tick then
+                self.peerActors.tick({
+                    status = buildPeerHeartbeat(self.name),
+                    peerOnly = true,
+                    healthResponsive = self.name == 'healing'
+                        or self.name == 'support',
+                })
+            end
             if mq.doevents then pcall(mq.doevents) end
 
             if not lib.isInGame() then

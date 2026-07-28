@@ -4,6 +4,7 @@
 
 local mq = require('mq')
 local lazy = require('sidekick-next.utils.lazy_require')
+local CoordinationPolicy = require('sidekick-next.utils.coordination_policy')
 
 local M = {}
 
@@ -25,6 +26,69 @@ local getCache = lazy('sidekick-next.utils.runtime_cache')
 -- table for the user toggle.
 local getImmuneDB = lazy('sidekick-next.utils.immune_database')
 local getCore = lazy('sidekick-next.utils.core')
+local getSpellsetPersistence =
+    lazy('sidekick-next.utils.spellset_persistence')
+
+local _mezCapability = {
+    checkedAt = -math.huge,
+    available = false,
+    spellName = '',
+    gemSlot = 0,
+    activeSet = '',
+}
+
+--- Return whether the active spell set contains a configured mez spell
+--- (SPA 31). This is a capability gate, not a readiness check: selection
+--- later verifies that the resolved spell is memorized and castable.
+function M.hasLoadedMezSpell(force)
+    local now = os.clock()
+    if force ~= true and (now - _mezCapability.checkedAt) < 1.0 then
+        return _mezCapability.available, _mezCapability.spellName,
+            _mezCapability.gemSlot, _mezCapability.activeSet
+    end
+
+    _mezCapability.checkedAt = now
+    _mezCapability.available = false
+    _mezCapability.spellName = ''
+    _mezCapability.gemSlot = 0
+    _mezCapability.activeSet = ''
+
+    local Persistence = getSpellsetPersistence()
+    if not Persistence then return false, '', 0, '' end
+    if not Persistence.loaded and Persistence.load then
+        pcall(Persistence.load)
+    end
+    local spellSet = Persistence.getActiveSet
+        and Persistence.getActiveSet() or nil
+    _mezCapability.activeSet = tostring(Persistence.activeSetName
+        or (spellSet and spellSet.name) or '')
+    if not (spellSet and type(spellSet.gems) == 'table') then
+        return false, '', 0, _mezCapability.activeSet
+    end
+
+    for slot, config in pairs(spellSet.gems) do
+        local spellId = tonumber(config and config.spellId) or 0
+        if spellId > 0 then
+            local spell = mq.TLO.Spell(spellId)
+            local isMez = false
+            pcall(function()
+                isMez = spell and spell() and spell.HasSPA
+                    and spell.HasSPA(31)() == true
+            end)
+            if isMez then
+                _mezCapability.available = true
+                _mezCapability.gemSlot = tonumber(slot) or 0
+                pcall(function()
+                    _mezCapability.spellName =
+                        tostring(spell.Name and spell.Name() or '')
+                end)
+                return true, _mezCapability.spellName,
+                    _mezCapability.gemSlot, _mezCapability.activeSet
+            end
+        end
+    end
+    return false, '', 0, _mezCapability.activeSet
+end
 
 local function immunePersistEnabled()
     local Core = getCore()
@@ -70,6 +134,7 @@ M.allMezzes = {}  -- merged view, updated each tick
 -- Mez target claims (before casting, claim target so others don't try)
 M.localClaims = {}   -- { [mobId] = { claimedAt = os.clock(), name = 'mob name' } }
 M.remoteClaims = {}  -- { [mobId] = { claimedAt = os.clock(), name = 'mob name', claimer = 'name' } }
+M.lastPeerBlock = nil
 
 -- Timing
 local _lastBroadcast = 0
@@ -77,7 +142,7 @@ local _lastCleanup = 0
 local _lastClaimBroadcast = 0
 local BROADCAST_INTERVAL = 1.0  -- Broadcast every 1 second
 local CLEANUP_INTERVAL = 0.5    -- Clean expired every 500ms
-local CLAIM_TIMEOUT = 5.0       -- Claims expire after 5 seconds if mez not landed
+local CLAIM_TIMEOUT = CoordinationPolicy.CLAIM_TTL_SECONDS.CC
 local MEZ_DURATION_DEFAULT = 18 -- Default mez duration if unknown
 local _eventsRegistered = false
 local _selfName = ''
@@ -132,6 +197,7 @@ function M.init()
     M.allMezzes = {}
     M.localClaims = {}
     M.remoteClaims = {}
+    M.lastPeerBlock = nil
 
     _selfName = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or ''
     _refreshShardOffset()
@@ -238,6 +304,10 @@ function M.cleanupExpired()
     for mobId, data in pairs(M.remoteClaims) do
         if (now - data.claimedAt) >= CLAIM_TIMEOUT then
             M.remoteClaims[mobId] = nil
+        else
+            local active = CoordinationPolicy.evaluateLocalClaim(
+                getActors(), data, CLAIM_TIMEOUT, now)
+            if not active then M.remoteClaims[mobId] = nil end
         end
     end
 end
@@ -511,12 +581,35 @@ function M.isTargetClaimed(mobId)
     -- late copy gets stored as "remote" and would lock us out of our own
     -- target (e.g. recharming the mob we just mezzed) for CLAIM_TIMEOUT.
     local remoteClaim = M.remoteClaims[id]
-    if remoteClaim and (now - remoteClaim.claimedAt) < CLAIM_TIMEOUT
-        and remoteClaim.claimer ~= _selfName then
+    local active, peer = CoordinationPolicy.evaluateLocalClaim(
+        getActors(), remoteClaim, CLAIM_TIMEOUT, now)
+    if remoteClaim then
+        remoteClaim.peerAgeMs = peer.peerAgeMs
+        remoteClaim.peerReason = peer.peerReason
+        remoteClaim.leaseRemainingMs = peer.leaseRemainingMs
+    end
+    if remoteClaim and active and remoteClaim.claimer ~= _selfName then
+        M.lastPeerBlock = {
+            at = now,
+            targetId = id,
+            blockedBy = remoteClaim.claimer,
+            peerAgeMs = peer.peerAgeMs,
+            leaseRemainingMs = peer.leaseRemainingMs,
+        }
         return true, remoteClaim.claimer
+    elseif remoteClaim and not active then
+        M.remoteClaims[id] = nil
     end
 
     return false, nil
+end
+
+function M.getLastPeerBlockReason(maxAgeSeconds)
+    local block = M.lastPeerBlock
+    if not block or (os.clock() - (block.at or 0)) > (tonumber(maxAgeSeconds) or 1.0) then
+        return nil
+    end
+    return CoordinationPolicy.formatPeerBlock('claimed_by', block.blockedBy, block)
 end
 
 --- Check if we have claimed a target
@@ -574,6 +667,9 @@ function M.receiveClaim(payload)
         claimedAt = os.clock(),
         name = payload.mobName or '',
         claimer = claimer,
+        zone = tostring(payload.zone or ''),
+        server = tostring(payload.server or payload._skActorSenderServer or ''),
+        senderScript = tostring(payload._skActorSenderScript or ''),
     }
 end
 
@@ -581,18 +677,120 @@ end
 -- @param maxTargets number|nil Max targets to check (default all)
 -- @return number|nil Mob ID to mez, or nil if none available
 -- @return string|nil Mob name
--- The tank's broadcast kill target must never be mezzed: mezzing the mob the
--- tank is actively fighting stalls the kill and the tank's next swing breaks
--- it anyway. Local Cache.target only covers this mezzer's own target, so
--- consult the tank-state broadcast too.
+-- The active kill target must never be mezzed: mezzing the mob the group is
+-- fighting stalls the kill and the next swing breaks it anyway. Resolve the
+-- tank broadcast, EQ group roles, configured assist, and actor telemetry.
+local function addProtectedTarget(targets, id, source)
+    id = tonumber(id) or 0
+    if id > 0 and targets[id] == nil then
+        targets[id] = tostring(source or 'kill_target')
+    end
+end
+
+local function addSpawnTarget(targets, spawn, source)
+    if not (spawn and spawn()) then return end
+    local id = 0
+    pcall(function() id = tonumber(spawn.Target.ID()) or 0 end)
+    addProtectedTarget(targets, id, source)
+end
+
+--- Resolve every fresh source that can identify the active kill target. The CC
+--- worker changes its own EQ target while mezzing, so Cache.target stops being
+--- authoritative after the first add is selected.
+local function protectedKillTargets()
+    local targets = {}
+    local Actors = getActors()
+    if Actors and Actors.getTankState then
+        local state = Actors.getTankState() or {}
+        -- The tank rebroadcasts every second; do not preserve a dead worker's
+        -- target forever.
+        if (os.clock() - (tonumber(state.updatedAt) or 0)) <= 10 then
+            addProtectedTarget(targets, state.primaryTargetId, 'tank_primary')
+        end
+    end
+
+    local assistNames = {}
+    local function rememberAssistName(name)
+        name = trim(name)
+        if name ~= '' then assistNames[name:lower()] = true end
+    end
+
+    local group = mq.TLO.Group
+    local groupMA = group and group.MainAssist or nil
+    if groupMA and groupMA() then
+        addSpawnTarget(targets, groupMA, 'group_mainassist')
+        pcall(function() rememberAssistName(groupMA.CleanName()) end)
+    end
+    local Core = getCore()
+    local assistName = Core and Core.Settings and Core.Settings.AssistName or ''
+    rememberAssistName(assistName)
+    if trim(assistName) ~= '' then
+        addSpawnTarget(targets, mq.TLO.Spawn('pc =' .. trim(assistName)),
+            'configured_mainassist')
+    end
+
+    -- Actor status carries the MA target for out-of-group teams.
+    if Actors and Actors.getRemoteCharacters and next(assistNames) then
+        local now = os.clock()
+        local myZone = ''
+        pcall(function() myZone = tostring(mq.TLO.Zone.ShortName() or ''):lower() end)
+        for name, data in pairs(Actors.getRemoteCharacters() or {}) do
+            local targetAge = now - (tonumber(data.targetUpdatedAt) or 0)
+            local peerZone = tostring(data.zone or ''):lower()
+            if assistNames[tostring(name):lower()]
+                and targetAge >= 0
+                and targetAge <= CoordinationPolicy.STATE_TTL_SECONDS.ACTOR_TARGET
+                and (myZone == '' or peerZone == '' or peerZone == myZone)
+            then
+                addProtectedTarget(targets, data.targetId,
+                    'actor_mainassist:' .. tostring(name))
+            end
+        end
+    end
+
+    -- Main-tank target is only a fallback: tanks deliberately cycle adds for
+    -- aggro, and those temporary targets still need mez.
+    local groupMT = group and group.MainTank or nil
+    if not next(targets) and groupMT and groupMT() then
+        addSpawnTarget(targets, groupMT, 'group_maintank')
+    end
+
+    -- Compatibility fallback for groups without an MA designation or actor
+    -- telemetry. Do not use it once an authoritative target exists, because
+    -- the enchanter's current target is normally the add it just mezzed.
+    if not next(targets) then
+        local Cache = getCache()
+        addProtectedTarget(targets,
+            Cache and Cache.target and Cache.target.id or 0,
+            'local_target_fallback')
+    end
+    return targets
+end
+
+function M.isProtectedKillTarget(mobId, targets)
+    targets = targets or protectedKillTargets()
+    local source = targets[tonumber(mobId) or 0]
+    return source ~= nil, source
+end
+
+-- Charm acquisition/pet upkeep still need one preferred kill target. Preserve
+-- the tank-primary preference, then fall back deterministically to the same
+-- protected target set used by mez safety.
 local function tankPrimaryId()
     local Actors = getActors()
-    if not (Actors and Actors.getTankState) then return 0 end
-    local state = Actors.getTankState()
-    -- The tank rebroadcasts every second; a silent entry is a dead tank
-    -- worker or a finished fight — don't let it block mezzing forever.
-    if (os.clock() - (tonumber(state.updatedAt) or 0)) > 10 then return 0 end
-    return tonumber(state.primaryTargetId) or 0
+    if Actors and Actors.getTankState then
+        local state = Actors.getTankState() or {}
+        if (os.clock() - (tonumber(state.updatedAt) or 0)) <= 10 then
+            local id = tonumber(state.primaryTargetId) or 0
+            if id > 0 then return id end
+        end
+    end
+    local best = 0
+    for id in pairs(protectedKillTargets()) do
+        id = tonumber(id) or 0
+        if id > 0 and (best == 0 or id < best) then best = id end
+    end
+    return best
 end
 
 function M.getBestMezTarget(maxTargets)
@@ -600,15 +798,23 @@ function M.getBestMezTarget(maxTargets)
     local haters = Cache and Cache.xtarget and Cache.xtarget.haters or nil
     if not haters then return nil, nil end
 
+    -- A single hostile is the group's kill target, not crowd control work.
+    -- Holding here also fails safe during the brief window before a remote
+    -- Tank primary reaches this process. Charm acquisition is evaluated before
+    -- mez and retains its deliberate solo-hater behavior.
+    local liveHaterCount = 0
+    for _, hater in pairs(haters) do
+        local id = tonumber(hater and hater.id) or 0
+        local hp = tonumber(hater and hater.hp) or 100
+        if id > 0 and hp > 0 then liveHaterCount = liveHaterCount + 1 end
+    end
+    if liveHaterCount <= 1 then
+        return nil, nil, 'sole_hater_hold'
+    end
+
     -- Build list of valid targets
     local candidates = {}
-    local primaryTarget = nil
-
-    -- Get primary target to exclude it
-    if Cache and Cache.target then
-        primaryTarget = Cache.target.id
-    end
-    local tankPrimary = tankPrimaryId()
+    local protectedTargets = protectedKillTargets()
     -- Exclude our charm pet from mez only while the charm is actually
     -- holding (belt-and-suspenders: a held pet isn't a hater anyway). A
     -- BROKEN pet is deliberately mezzable — mez is the control tool while
@@ -622,8 +828,8 @@ function M.getBestMezTarget(maxTargets)
 
     for _, hater in pairs(haters) do
         local id = tonumber(hater.id)
-        if id and id > 0 and id ~= primaryTarget
-            and id ~= tankPrimary and id ~= ourCharmPet then
+        if id and id > 0 and not protectedTargets[id]
+            and id ~= ourCharmPet then
             -- Skip if already mezzed
             if not M.isMobMezzed(id) then
                 -- Skip if claimed by another
@@ -641,6 +847,9 @@ function M.getBestMezTarget(maxTargets)
                     end
                 end
             end
+        elseif id and protectedTargets[id] then
+            dlog('mez candidate protected: %s(%d) source=%s',
+                tostring(hater.name or '?'), id, protectedTargets[id])
         end
     end
 
@@ -675,12 +884,7 @@ function M.getAvailableMezTargets()
     if not haters then return {} end
 
     local candidates = {}
-    local primaryTarget = nil
-
-    if Cache and Cache.target then
-        primaryTarget = Cache.target.id
-    end
-    local tankPrimary = tankPrimaryId()
+    local protectedTargets = protectedKillTargets()
     -- Exclude our charm pet from mez only while the charm is actually
     -- holding (belt-and-suspenders: a held pet isn't a hater anyway). A
     -- BROKEN pet is deliberately mezzable — mez is the control tool while
@@ -694,8 +898,8 @@ function M.getAvailableMezTargets()
 
     for _, hater in pairs(haters) do
         local id = tonumber(hater.id)
-        if id and id > 0 and id ~= primaryTarget
-            and id ~= tankPrimary and id ~= ourCharmPet then
+        if id and id > 0 and not protectedTargets[id]
+            and id ~= ourCharmPet then
             if not M.isMobMezzed(id) then
                 local claimed, _ = M.isTargetClaimed(id)
                 if not claimed then
@@ -786,7 +990,7 @@ end
 
 -- Helper: load class config for class
 local function loadClassConfig(classShort)
-    local ok, config = pcall(require, string.format('data.class_configs.%s', classShort))
+    local ok, config = pcall(require, string.format('sidekick-next.data.class_configs.%s', classShort))
     if ok then return config end
     return nil
 end
@@ -854,6 +1058,13 @@ end
 local function isValidMezTarget(mobId, settings)
     if not mobId or mobId == 0 then return false end
 
+    local protected, source = M.isProtectedKillTarget(mobId)
+    if protected then
+        dlog('mez target rejected: id=%d source=%s',
+            tonumber(mobId) or 0, tostring(source or 'kill_target'))
+        return false
+    end
+
     local spawn = mq.TLO.Spawn(mobId)
     if not spawn or not spawn() then return false end
     if spawn.Dead() then return false end
@@ -877,7 +1088,8 @@ local function isValidMezTarget(mobId, settings)
     return true
 end
 
--- Helper: get number of targets in AE range
+-- Helper: get number of mezzable targets in AE range and report whether the
+-- footprint would also hit the protected main-assist/tank target.
 local function getAETargetCount(centerMobId)
     local Cache = getCache()
     local haters = Cache and Cache.xtarget and Cache.xtarget.haters or nil
@@ -889,24 +1101,32 @@ local function getAETargetCount(centerMobId)
     local centerX = tonumber(centerSpawn.X()) or 0
     local centerY = tonumber(centerSpawn.Y()) or 0
     local aeRange = 30 -- Typical AE mez range
+    local protectedTargets = protectedKillTargets()
 
     local count = 0
+    local protectedId = 0
+    local protectedSource = nil
     for _, hater in pairs(haters) do
         local id = tonumber(hater.id)
-        if id and id > 0 and not M.isMobMezzed(id) then
+        if id and id > 0 then
             local spawn = mq.TLO.Spawn(id)
             if spawn and spawn() then
                 local x = tonumber(spawn.X()) or 0
                 local y = tonumber(spawn.Y()) or 0
                 local dist = math.sqrt((x - centerX)^2 + (y - centerY)^2)
                 if dist <= aeRange then
-                    count = count + 1
+                    if protectedTargets[id] then
+                        protectedId = id
+                        protectedSource = protectedTargets[id]
+                    elseif not M.isMobMezzed(id) then
+                        count = count + 1
+                    end
                 end
             end
         end
     end
 
-    return count
+    return count, protectedId, protectedSource
 end
 
 --- Check if current character is a mez-capable class
@@ -963,6 +1183,21 @@ function M.castMez(mobId, mobName, spellName, opts)
     if not mobId or mobId == 0 then
         return false, 'invalid_target'
     end
+    local protected, protectedSource = M.isProtectedKillTarget(mobId)
+    if not protected and opts.isAE == true then
+        local _, protectedId, aeSource = getAETargetCount(mobId)
+        if protectedId and protectedId > 0 then
+            protected = true
+            protectedSource = string.format('ae_footprint:%s:%d',
+                tostring(aeSource or 'kill_target'), protectedId)
+        end
+    end
+    if protected then
+        dlog('mez cast blocked before claim: %s(%d) source=%s',
+            tostring(mobName or '?'), tonumber(mobId) or 0,
+            tostring(protectedSource or 'kill_target'))
+        return false, 'protected_kill_target'
+    end
 
     if not spellName or spellName == '' then
         return false, 'no_spell'
@@ -998,6 +1233,22 @@ function M.castMez(mobId, mobName, spellName, opts)
     -- the tie-break BOTH mezzers would see each other's claim and BOTH
     -- abort, leaving the mob un-mezzed.
     mq.delay(50)
+    protected, protectedSource = M.isProtectedKillTarget(mobId)
+    if not protected and opts.isAE == true then
+        local _, protectedId, aeSource = getAETargetCount(mobId)
+        if protectedId and protectedId > 0 then
+            protected = true
+            protectedSource = string.format('ae_footprint:%s:%d',
+                tostring(aeSource or 'kill_target'), protectedId)
+        end
+    end
+    if protected then
+        M.releaseClaim(mobId)
+        dlog('mez cast blocked after claim: %s(%d) source=%s',
+            tostring(mobName or '?'), tonumber(mobId) or 0,
+            tostring(protectedSource or 'kill_target'))
+        return false, 'protected_kill_target'
+    end
     local conflicted, otherClaimer = M.isTargetClaimed(mobId)
     if conflicted and otherClaimer then
         if _selfName == '' or otherClaimer < _selfName then
@@ -1049,6 +1300,10 @@ function M.selectMezAction(settings)
     -- Check if mezzing is enabled
     if settings.MezzingEnabled ~= true then
         return nil, 'disabled'
+    end
+
+    if not M.hasLoadedMezSpell() then
+        return nil, 'no_loaded_mez_spell'
     end
 
     -- Only mez classes should mez
@@ -1130,9 +1385,9 @@ function M.selectMezAction(settings)
     end
 
     -- Get best mez target
-    local targetId, targetName = M.getBestMezTarget(maxTargets)
+    local targetId, targetName, targetReason = M.getBestMezTarget(maxTargets)
     if not targetId then
-        return nil, 'no_target'
+        return nil, targetReason or M.getLastPeerBlockReason() or 'no_target'
     end
 
     -- Validate target
@@ -1144,6 +1399,7 @@ function M.selectMezAction(settings)
     local useAEMez = settings.UseAEMez == true
     local aeMinTargets = tonumber(settings.AEMezMinTargets) or 3
     local spellName = nil
+    local isAE = false
 
     -- Deferred charm break (camp_control_hold) forces AE preference: >2
     -- unmezzed plus the loose ex-pet are in camp, and one AE mez both locks
@@ -1152,13 +1408,18 @@ function M.selectMezAction(settings)
     -- targets so a lone straggler still gets the cheaper single mez.
     local campHold = (now - (M.charm.campHoldAt or 0)) < 3.0
     if profile.ae and (useAEMez or campHold) then
-        local aeCount = getAETargetCount(targetId)
-        if aeCount >= (campHold and 2 or aeMinTargets) then
+        local aeCount, protectedId, protectedSource = getAETargetCount(targetId)
+        if protectedId and protectedId > 0 then
+            dlog('AE mez rejected: center=%d protected=%d source=%s',
+                tonumber(targetId) or 0, protectedId,
+                tostring(protectedSource or 'kill_target'))
+        elseif aeCount >= (campHold and 2 or aeMinTargets) then
             -- Use AE mez
             spellName = chooseSpellForLines(classConfig, profile.aeFast or profile.ae)
             if not spellName then
                 spellName = chooseSpellForLines(classConfig, profile.ae)
             end
+            isAE = spellName ~= nil
         end
     end
 
@@ -1181,7 +1442,19 @@ function M.selectMezAction(settings)
         targetName = targetName,
         spellName = spellName,
         reason = 'mez',
+        isAE = isAE,
     }, 'mez'
+end
+
+--- Backward-compatible monolithic entry point.
+-- The coordinated runtime calls selectMezAction() from sk_cc.lua and does not
+-- reach this function.
+function M.mezTick(settings)
+    local action = M.selectMezAction(settings)
+    if not action then return false end
+    return M.castMez(action.targetId, action.targetName, action.spellName, {
+        isAE = action.isAE == true,
+    })
 end
 
 --------------------------------------------------------------------------------
@@ -1306,6 +1579,11 @@ function M.broadcastCharmState(force)
     (Actors.broadcastFleet or Actors.broadcast)('cc:charmpet', {
         petId = tonumber(M.charm.petId) or 0,
         petName = tostring(M.charm.petName or ''),
+        -- Protection remains published during charm-break recovery, but Tank
+        -- may only Taunt in that broken window. Once the pet slot owns this
+        -- exact spawn again, every offensive Tank action must terminate.
+        active = (tonumber(M.charm.petId) or 0) > 0
+            and myPetId() == (tonumber(M.charm.petId) or 0),
         owner = _selfName,
         zone = myZone,
     })

@@ -11,8 +11,8 @@ local M = {}
 --------------------------------------------------------------------------------
 
 ---@class BuffTarget
----@field type string Target type: "self", "group", "raid", "pet", "named", "custom"
----@field value string|nil Custom target value (for "named" or "custom" types)
+---@field type string Target type: "self", "group", "pet", "role", "class", "name"
+---@field value string|nil Target value for role, class, or name types
 
 ---@class GemConfig
 ---@field spellId number The spell ID to memorize in this gem slot

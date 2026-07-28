@@ -21,19 +21,6 @@ local SafeLoad = require('sidekick-next.utils.safe_load')
 
 local M = {}
 
-local _dirReady = false
-local function ensureDirOnce()
-    if _dirReady then return end
-    local Paths = getPaths()
-    local dir = (mq.configDir or 'config') .. '/SideKick'
-    if Paths and Paths.ensureDir then
-        Paths.ensureDir(dir)
-    else
-        os.execute('mkdir "' .. dir .. '" 2>nul')
-    end
-    _dirReady = true
-end
-
 local CATEGORIES = {
     'cc_claim',
     'debuff_claim', 'debuff_landed',
@@ -71,10 +58,21 @@ M.session = {
 M.history = {}                     -- list of { startedAt, endedAt, counts }
 
 local function getPath()
-    local server = (mq.TLO.EverQuest and mq.TLO.EverQuest.Server and mq.TLO.EverQuest.Server()) or 'unknown'
-    local char = (mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName()) or 'unknown'
-    local dir = (mq.configDir or 'config') .. '/SideKick'
-    ensureDirOnce()
+    local Paths = getPaths()
+    if Paths and Paths.getClaimLedgerPath then
+        return Paths.getClaimLedgerPath()
+    end
+    -- Defensive fallback for a partial install. Normal SideKick-Next runtime
+    -- always uses the canonical Paths helper above.
+    local server = (mq.TLO.EverQuest and mq.TLO.EverQuest.Server
+        and mq.TLO.EverQuest.Server()) or 'unknown'
+    local char = (mq.TLO.Me and mq.TLO.Me.CleanName
+        and mq.TLO.Me.CleanName()) or 'unknown'
+    local root = tostring(mq.configDir or 'config'):gsub('\\', '/'):gsub('/+$', '')
+    local dir = root .. '/SideKick-Next/data'
+    os.execute('mkdir "' .. dir .. '" 2>nul')
+    server = tostring(server):gsub('[^%w_%-]', '_')
+    char = tostring(char):gsub('[^%w_%-]', '_')
     return string.format('%s/claim_ledger_%s_%s.lua', dir, server, char)
 end
 

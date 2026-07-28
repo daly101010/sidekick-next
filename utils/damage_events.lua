@@ -37,6 +37,13 @@ local _scope = nil            -- 'full' | 'lean' | nil (not registered)
 
 local getCore = lazy('sidekick-next.utils.core')
 
+local function parseAmount(value)
+    if type(value) == 'string' then
+        value = value:gsub(',', '')
+    end
+    return tonumber(value) or 0
+end
+
 --- Add a damage listener
 -- @param fn function Listener callback
 function M.addListener(fn)
@@ -46,7 +53,7 @@ function M.addListener(fn)
 end
 
 local function dispatch(target, amount, mine, kind, spell, attacker)
-    amount = tonumber(amount) or 0
+    amount = parseAmount(amount)
     if amount <= 0 then return end
     if not target or target == '' then return end
 

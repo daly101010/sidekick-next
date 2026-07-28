@@ -24,6 +24,8 @@ local State = {
     open = false,
     selectedAbilities = {},  -- { [charName] = { [abilityName] = true } }
     abilityOrder = {},       -- { [charName] = { "ability1", "ability2", ... } } - ordered list
+    pendingActions = {},
+    requestCounter = 0,
 }
 
 -- Module-level drag state for ImGui drag-drop
@@ -99,18 +101,35 @@ local function swapAbilities(charName, idx1, idx2)
     saveSelections()
 end
 
--- Execute an ability on a remote character via /dex
-local function executeRemoteAbility(charName, ability)
-    local kind = ability.kind or 'aa'
-    if kind == 'aa' and ability.altID then
-        mq.cmdf('/dex %s /alt activate %d', charName, ability.altID)
-    elseif kind == 'disc' and ability.discName then
-        mq.cmdf('/dex %s /disc %s', charName, ability.discName)
-    elseif kind == 'ability' and ability.altName then
-        mq.cmdf('/dex %s /doability "%s"', charName, ability.altName)
-    elseif kind == 'item' and ability.itemName then
-        mq.cmdf('/dex %s /useitem "%s"', charName, ability.itemName)
-    end
+-- ImGui only records scalar intent. M.tick sends it from the main coroutine.
+local function queueRemoteAbility(charName, server, ability)
+    local sourceKind = tostring(ability.kind or 'aa'):lower()
+    local kindMap = {
+        aa = 'use_aa',
+        disc = 'use_disc',
+        ability = 'use_skill',
+        skill = 'use_skill',
+        spell = 'cast_spell',
+    }
+    local name = tostring(ability.altName or ability.discName
+        or ability.spellName or ability.itemName or '')
+    if name == '' then return end
+    State.requestCounter = State.requestCounter + 1
+    if #State.pendingActions >= 20 then table.remove(State.pendingActions, 1) end
+    State.pendingActions[#State.pendingActions + 1] = {
+        character = tostring(charName or ''),
+        server = tostring(server or ''),
+        messageId = sourceKind == 'item' and 'item:manual' or 'action:manual',
+        payload = {
+            requestId = string.format('remote-ui:%d:%d', mq.gettime(), State.requestCounter),
+            requestedAtMs = mq.gettime(),
+            kind = kindMap[sourceKind],
+            name = name,
+            itemName = sourceKind == 'item' and name or nil,
+            aaId = tonumber(ability.altID or ability.aaId),
+            targetId = tonumber(ability.targetId),
+        },
+    }
 end
 
 -- Use shared fmtCooldown from Helpers
@@ -460,7 +479,7 @@ function M.draw()
                 local clicked, dropTarget = renderAbilityButton(charName, item.name, item.data, cell, idx, item.orderIndex)
 
                 if clicked and not _dragKey then
-                    executeRemoteAbility(charName, item.data)
+                    queueRemoteAbility(charName, data.server, item.data)
                 end
 
                 -- Handle drop - swap abilities
@@ -481,6 +500,20 @@ function M.draw()
     imgui.End()
     imgui.PopStyleVar(2)
     if pushedTheme > 0 then imgui.PopStyleColor(pushedTheme) end
+end
+
+function M.tick()
+    if #State.pendingActions == 0 then return end
+    local pending = State.pendingActions
+    State.pendingActions = {}
+    for _, request in ipairs(pending) do
+        ActorsCoordinator.sendToCharacter(
+            'sidekick-next/sk_items',
+            request.character,
+            request.server,
+            request.messageId,
+            request.payload)
+    end
 end
 
 -- Note: drawSettings() has been moved to ui/settings.lua (Remote tab)

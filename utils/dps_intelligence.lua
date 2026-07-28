@@ -17,16 +17,50 @@ local lazy = require('sidekick-next.utils.lazy_require')
 
 local M = {}
 
-local getCombatAssessor = lazy('sidekick-next.healing.combat_assessor')
 local getMobAssessor = lazy('sidekick-next.healing.mob_assessor')
 local getCore = lazy('sidekick-next.utils.core')
 local getHpEstimator = lazy('sidekick-next.utils.mob_hp_estimator')
 local getSpellDamage = lazy('sidekick-next.utils.spell_damage_tracker')
+local getTargeting = lazy('sidekick-next.utils.targeting')
 
 -- Fallback kill rate when no measured data exists yet (fight start): assume a
 -- normal group mob dies at ~2% HP/sec, scaled down by the mob difficulty
 -- multiplier (raid/named mobs have far bigger pools, so they die slower).
 local FALLBACK_PCT_PER_SEC = 2.0
+local _ttdSnapshots = {} -- mobId -> { name, samples = {{pct, atMs}, ...} }
+local TTD_WINDOW_MS = 30000
+local TTD_SAMPLE_MS = 250
+
+local function measuredTTD(mobId, mobName, pctHP)
+    local now = mq.gettime()
+    local history = _ttdSnapshots[mobId]
+    if not history or history.name ~= mobName then
+        history = { name = mobName, samples = {} }
+        _ttdSnapshots[mobId] = history
+    end
+    local samples = history.samples
+    local last = samples[#samples]
+    -- A large heal/reset or reused spawn ID starts a new decline window.
+    if last and pctHP > (last.pct + 10) then
+        samples = {}
+        history.samples = samples
+        last = nil
+    end
+    if not last or (now - last.atMs) >= TTD_SAMPLE_MS then
+        samples[#samples + 1] = { pct = pctHP, atMs = now }
+    end
+    while #samples > 1 and (now - samples[1].atMs) > TTD_WINDOW_MS do
+        table.remove(samples, 1)
+    end
+    if #samples < 2 then return nil end
+    local first = samples[1]
+    local elapsedSec = (now - first.atMs) / 1000
+    local decline = first.pct - pctHP
+    if elapsedSec < 1 or decline < 0.5 then return nil end
+    local pctPerSec = decline / elapsedSec
+    if pctPerSec <= 0 then return nil end
+    return pctHP / pctPerSec
+end
 
 local function getSetting(key, default)
     local Core = getCore()
@@ -47,23 +81,27 @@ function M.getTTD(mobId)
     mobId = tonumber(mobId) or 0
     if mobId <= 0 then return nil, 'unknown' end
 
-    -- Measured: HP%-decline tracking from combat_assessor (XTarget mobs)
-    local ca = getCombatAssessor()
-    if ca and ca.getMobTTKById then
-        local ok, ttk = pcall(ca.getMobTTKById, mobId)
-        if ok and ttk and ttk > 0 then
-            return ttk, 'measured'
-        end
+    local spawn = mq.TLO.Spawn(mobId)
+    if not spawn or not spawn() then
+        _ttdSnapshots[mobId] = nil
+        return nil, 'unknown'
     end
 
-    -- Fallback: estimate from remaining HP% and mob difficulty tier
-    local spawn = mq.TLO.Spawn(mobId)
-    if not spawn or not spawn() then return nil, 'unknown' end
-
-    local okHp, pctHP = pcall(function() return spawn.PctHPs() end)
+    local okHp, pctHP, mobName = pcall(function()
+        return spawn.PctHPs(), spawn.CleanName()
+    end)
     pctHP = okHp and tonumber(pctHP) or nil
     if not pctHP then return nil, 'unknown' end
+    if pctHP <= 0 then
+        _ttdSnapshots[mobId] = nil
+        return 0, 'measured'
+    end
+    mobName = tostring(mobName or '')
 
+    local measured = measuredTTD(mobId, mobName, pctHP)
+    if measured and measured > 0 then return measured, 'measured' end
+
+    -- Fallback: estimate from remaining HP% and mob difficulty tier
     local mult = 1.0
     local ma = getMobAssessor()
     if ma and ma.getMobMultiplier then
@@ -227,12 +265,12 @@ function M.rainSafe(mobId, spellOrRadius)
 
     -- 'mezzed' mode: any mezzed XTarget mob inside the footprint blocks the rain
     local okX, unsafe = pcall(function()
+        local Targeting = getTargeting()
         local xtCount = tonumber(mq.TLO.Me.XTarget()) or 0
         for i = 1, xtCount do
             local xt = mq.TLO.Me.XTarget(i)
             if xt and xt() and xt.ID() and xt.ID() > 0 and xt.ID() ~= mobId then
-                local mezzed = xt.Mezzed and xt.Mezzed()
-                if mezzed and mezzed ~= '' then
+                if Targeting and Targeting.isMezzed and Targeting.isMezzed(xt) then
                     local mx, my = xt.X(), xt.Y()
                     if mx and my then
                         local dx, dy = mx - loc.x, my - loc.y

@@ -35,15 +35,15 @@ local STALL_MS = 6000
 local getMobAssessor = lazy('sidekick-next.healing.mob_assessor')
 
 local function firstHater()
-    local xtCount = tonumber(mq.TLO.Me.XTarget()) or 0
-    for i = 1, xtCount do
-        local xt = mq.TLO.Me.XTarget(i)
-        if xt and xt() and xt.ID() and xt.ID() > 0 then
-            local tt = (xt.TargetType and xt.TargetType() or ''):lower()
-            if tt:find('hater') then
-                return xt.ID(), (xt.CleanName and xt.CleanName()) or '',
-                    tonumber(xt.Distance and xt.Distance() or nil) or 999
-            end
+    -- SideKick's combat contract requires XTarget slot 1 to be Auto Hater.
+    -- Reading that sentinel directly avoids enumerating every XTarget slot in
+    -- both the Tank and healing processes merely to find the first hater.
+    local xt = mq.TLO.Me.XTarget(1)
+    if xt and xt() and xt.ID() and xt.ID() > 0 then
+        local tt = (xt.TargetType and xt.TargetType() or ''):lower()
+        if tt == 'auto hater' then
+            return xt.ID(), (xt.CleanName and xt.CleanName()) or '',
+                tonumber(xt.Distance and xt.Distance() or nil) or 999
         end
     end
     return nil

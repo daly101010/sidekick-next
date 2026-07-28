@@ -61,6 +61,15 @@ local State = {
     stateSendFailures = 0,
     lastStateSendError = nil,
     lastWorkerStateSendAt = {},
+    actorQueueOverflows = 0,
+    workerProtocolRejects = 0,
+    supervisorProtocolRejects = 0,
+    supervisorQueueOverflows = 0,
+    supervisorDrops = 0,
+    supervisorDropReasons = {},
+    dropReasons = {},
+    totalDrops = 0,
+    recoveryHeartbeatFences = {},
 
     supervisorSeen = false,
     supervisorLastSeenAt = 0,
@@ -92,6 +101,8 @@ local dropbox = nil
 local mailboxDropboxes = {}
 local pendingActorMessages = {}
 local MAX_PENDING_ACTOR_MESSAGES = 2000
+local pendingActorHead = 1
+local pendingActorCount = 0
 local pendingLatestByKey = {}
 local COALESCE_TYPES = {
     heartbeat = true,
@@ -111,6 +122,12 @@ local _restartTracker = {}
 local _pendingReload = nil
 local _lastCoordinatorTickAt = State.startedAtMs
 local _wasInGame = State.worldState.inGame
+
+local function countDrop(reason)
+    reason = tostring(reason or 'unknown')
+    State.totalDrops = State.totalDrops + 1
+    State.dropReasons[reason] = (State.dropReasons[reason] or 0) + 1
+end
 
 local function refreshLocalIdentity()
     _localIdentityName = tostring(lib.getMyName() or '')
@@ -150,12 +167,18 @@ end
 local function enqueueActorMessage(message)
     -- Actor handlers run with yielding disabled. Copy only serializable values
     -- and queue them for the coordinator coroutine.
-    local content = copyWireValue(message(), 0, {})
-    if type(content) ~= 'table' then return end
+    local okContent, raw = pcall(function() return message() end)
+    local content = okContent and copyWireValue(raw, 0, {}) or nil
+    if type(content) ~= 'table' then
+        countDrop(okContent and 'malformed_actor_message'
+            or 'actor_message_read_failed')
+        return
+    end
     local sender = message.sender or {}
+    local senderScript = lib.actorSenderEndpoint(sender)
     local senderCopy = {
         mailbox = tostring(sender.mailbox or ''),
-        script = tostring(sender.script or ''),
+        script = tostring(senderScript or ''),
         account = tostring(sender.account or ''),
         server = tostring(sender.server or ''),
         character = tostring(sender.character or ''),
@@ -178,25 +201,26 @@ local function enqueueActorMessage(message)
         entry.key = key
         pendingLatestByKey[key] = entry
     end
-    if #pendingActorMessages >= MAX_PENDING_ACTOR_MESSAGES then
-        local dropped = table.remove(pendingActorMessages, 1)
+    if pendingActorCount >= MAX_PENDING_ACTOR_MESSAGES then
+        local dropped = pendingActorMessages[pendingActorHead]
+        pendingActorMessages[pendingActorHead] = nil
+        pendingActorHead = (pendingActorHead % MAX_PENDING_ACTOR_MESSAGES) + 1
+        pendingActorCount = pendingActorCount - 1
+        State.actorQueueOverflows = State.actorQueueOverflows + 1
+        countDrop('actor_queue_overflow')
         if dropped and dropped.key then pendingLatestByKey[dropped.key] = nil end
     end
-    pendingActorMessages[#pendingActorMessages + 1] = entry
-end
-
-local function parseSenderScript(mailbox)
-    if type(mailbox) ~= 'string' then return nil end
-    local script = mailbox:match('^[^:]+:([^:]+):')
-    if script and script:find('/', 1, true) then return script end
-    return nil
+    local tail = ((pendingActorHead + pendingActorCount - 1)
+        % MAX_PENDING_ACTOR_MESSAGES) + 1
+    pendingActorMessages[tail] = entry
+    pendingActorCount = pendingActorCount + 1
 end
 
 local function resolveSenderScript(sender)
     sender = type(sender) == 'table' and sender or {}
-    local script = tostring(sender.script or '')
-    if script ~= '' then return script end
-    return parseSenderScript(sender.mailbox)
+    local script = lib.actorSenderEndpoint(sender)
+    if script == '' then return nil end
+    return script
 end
 
 local function isLocalMessage(content, sender)
@@ -224,23 +248,36 @@ local function isLocalMessage(content, sender)
 end
 
 local function isRegisteredWorkerMessage(content, sender)
-    if not isLocalMessage(content, sender) then return false, nil, nil end
-    if tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then
+    if not isLocalMessage(content, sender) then
+        countDrop('wrong_owner_or_route')
         return false, nil, nil
     end
-    local spec = lib.getWorkerSpec(content.module)
+    if tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then
+        State.workerProtocolRejects = State.workerProtocolRejects + 1
+        countDrop('worker_protocol_version')
+        local count = State.workerProtocolRejects
+        if count <= 3 or count % 100 == 0 then
+            debugLog('Worker protocol mismatch: module=%s got=%s expected=%s count=%d',
+                tostring(content.module or ''), tostring(content.version),
+                tostring(lib.LEASE_PROTOCOL_VERSION), count)
+        end
+        return false, nil, nil, 'wrong_protocol_version'
+    end
+    local spec = lib.getActiveWorkerSpec
+        and lib.getActiveWorkerSpec(content.module) or lib.getWorkerSpec(content.module)
     local senderScript = resolveSenderScript(sender)
-    if not spec or not senderScript or senderScript ~= spec.script then
+    if not spec or not senderScript
+        or not lib.actorSenderMatches(sender, spec.script, spec.module) then
+        countDrop(not spec and 'unregistered_worker'
+            or 'worker_script_route_mismatch')
         return false, spec, senderScript
     end
     return true, spec, senderScript
 end
 
 local function isUiSender(sender)
-    local senderScript = resolveSenderScript(sender)
-    if not senderScript then return false end
     for _, script in ipairs(lib.Scripts.UI or {}) do
-        if senderScript == script then return true end
+        if lib.actorSenderMatches(sender, script, 'supervisor') then return true end
     end
     return false
 end
@@ -384,22 +421,46 @@ local function noteSchedulerResult(kind, moduleName, ok, reason)
     if ok then
         State.pendingBroadcast = true
     else
+        countDrop('scheduler:' .. tostring(reason or 'rejected'))
         debugLog('%s rejected: module=%s reason=%s',
             tostring(kind), tostring(moduleName), tostring(reason))
     end
 end
 
 local function processSupervisorHeartbeat(content, sender, nowMs)
-    if not isLocalMessage(content, sender) or not isUiSender(sender) then return end
+    if not isLocalMessage(content, sender) or not isUiSender(sender) then
+        countDrop('supervisor_wrong_owner_or_route')
+        return
+    end
+    if tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then
+        State.supervisorProtocolRejects = State.supervisorProtocolRejects + 1
+        countDrop('supervisor_protocol_version')
+        local count = State.supervisorProtocolRejects
+        if count <= 3 or count % 100 == 0 then
+            debugLog('Supervisor protocol mismatch: got=%s expected=%s count=%d',
+                tostring(content.version), tostring(lib.LEASE_PROTOCOL_VERSION), count)
+        end
+        return
+    end
     local sentAtMs = tonumber(content.sentAtMs) or 0
-    if sentAtMs <= State.supervisorLastSentAt then return end
+    if sentAtMs <= State.supervisorLastSentAt then
+        countDrop('supervisor_stale_sequence')
+        return
+    end
     local sessionId = tostring(content.sessionId or '')
-    if sessionId == '' then return end
+    if sessionId == '' then
+        countDrop('supervisor_missing_session')
+        return
+    end
 
     State.supervisorSeen = true
     State.supervisorLastSeenAt = nowMs
     State.supervisorLastSentAt = sentAtMs
     State.supervisorSessionId = sessionId
+    State.supervisorQueueOverflows = tonumber(content.inboxOverflows) or 0
+    State.supervisorDrops = tonumber(content.inboxDrops) or 0
+    State.supervisorDropReasons = type(content.inboxDropReasons) == 'table'
+        and copyWireValue(content.inboxDropReasons, 0, {}) or {}
     if tostring(sender.mailbox or '') ~= '' then
         State.supervisorReplyMailbox = tostring(sender.mailbox)
     end
@@ -423,10 +484,19 @@ local function processSupervisorHeartbeat(content, sender, nowMs)
 end
 
 local function processSupervisorShutdown(content, sender, nowMs)
-    if not isLocalMessage(content, sender) or not isUiSender(sender) then return end
+    if not isLocalMessage(content, sender) or not isUiSender(sender) then
+        countDrop('supervisor_shutdown_wrong_route')
+        return
+    end
+    if tonumber(content.version) ~= tonumber(lib.LEASE_PROTOCOL_VERSION) then
+        State.supervisorProtocolRejects = State.supervisorProtocolRejects + 1
+        countDrop('supervisor_protocol_version')
+        return
+    end
     if not State.supervisorSeen
         or tostring(content.sessionId or '') == ''
         or content.sessionId ~= State.supervisorSessionId then
+        countDrop('supervisor_retired_or_unknown_session')
         return
     end
     if tostring(sender.mailbox or '') ~= '' then
@@ -441,11 +511,15 @@ local function processHeartbeat(content, sender, nowMs)
     local valid, spec, senderScript = isRegisteredWorkerMessage(content, sender)
     if not valid then return end
     local workerSessionId = tostring(content.workerSessionId or '')
-    if workerSessionId == '' then return end
+    if workerSessionId == '' then
+        countDrop('worker_missing_session')
+        return
+    end
 
     local previous = State.moduleHeartbeats[spec.module]
     local sentAtMs = tonumber(content.sentAtMs) or 0
     if previous and sentAtMs <= (tonumber(previous.sentAtMs) or 0) then
+        countDrop('worker_stale_heartbeat')
         return
     end
     State.knownModules[spec.module] = true
@@ -457,13 +531,27 @@ local function processHeartbeat(content, sender, nowMs)
         workerSessionId = workerSessionId,
         script = spec.script,
         mailbox = tostring(sender.mailbox or ''),
+        intentActive = content.intentActive == true,
+        intentReason = tostring(content.intentReason or ''),
+        stateInboxOverflows = tonumber(content.stateInboxOverflows) or 0,
+        stateDrops = tonumber(content.stateDrops) or 0,
+        stateDropReasons = type(content.stateDropReasons) == 'table'
+            and copyWireValue(content.stateDropReasons, 0, {}) or nil,
         counters = type(content.counters) == 'table'
             and copyWireValue(content.counters, 0, {}) or nil,
     }
 
     State.scheduler:observeWorkerSession(
         spec.module, workerSessionId, senderScript, nowMs)
-    if content.dirtyEffects == true or content.needsRecovery == true then
+    local recoveryFence = State.recoveryHeartbeatFences[spec.module]
+    local recoveryHeartbeatFenced = recoveryFence
+        and tostring(recoveryFence.workerSessionId or '') == workerSessionId
+        and sentAtMs <= (tonumber(recoveryFence.sentAtMs) or 0)
+    local heartbeatNeedsRecovery = State.scheduler:heartbeatNeedsRecovery(
+        content, spec.module, workerSessionId)
+    if recoveryHeartbeatFenced and heartbeatNeedsRecovery then
+        countDrop('worker_recovery_heartbeat_fenced')
+    elseif heartbeatNeedsRecovery then
         State.scheduler:requestRecovery(
             spec.module, workerSessionId, senderScript, nowMs)
     end
@@ -494,7 +582,11 @@ local function processLeaseMessage(kind, content, sender, nowMs)
     end
     local ok, reason
     if kind == 'request' then
-        ok, reason = State.scheduler:request(content, senderScript, nowMs)
+        if not heartbeatFresh(heartbeat, nowMs) then
+            ok, reason = false, 'worker_not_ready'
+        else
+            ok, reason = State.scheduler:request(content, senderScript, nowMs)
+        end
     elseif kind == 'withdraw' then
         ok, reason = State.scheduler:withdraw(content, senderScript, nowMs)
     elseif kind == 'renew' then
@@ -503,12 +595,25 @@ local function processLeaseMessage(kind, content, sender, nowMs)
         ok, reason = State.scheduler:release(content, senderScript, nowMs)
     elseif kind == 'recovered' then
         ok, reason = State.scheduler:recovered(content, senderScript, nowMs)
+        if ok then
+            -- A dirty heartbeat sent before this recovery report can arrive
+            -- later through a different Actor mailbox. Fence it by the
+            -- worker's own monotonic send timestamp so it cannot recreate
+            -- recovery that has already completed.
+            State.recoveryHeartbeatFences[spec.module] = {
+                workerSessionId = tostring(content.workerSessionId or ''),
+                sentAtMs = tonumber(content.sentAtMs) or 0,
+            }
+        end
     end
     noteSchedulerResult(kind, content.module, ok, reason)
 end
 
 local function processMessage(content, sender, nowMs)
-    if type(content) ~= 'table' then return end
+    if type(content) ~= 'table' then
+        countDrop('malformed_queued_message')
+        return
+    end
     local msgType = tostring(content.msgType or '')
     local mailbox = tostring(sender and sender.mailbox or '')
     if msgType == '' then
@@ -537,13 +642,22 @@ local function processMessage(content, sender, nowMs)
         processLeaseMessage('release', content, sender, nowMs)
     elseif msgType == 'lease:recovered' then
         processLeaseMessage('recovered', content, sender, nowMs)
+    else
+        countDrop('unknown_message_type')
     end
 end
 
 local function drainActorMessages()
-    if #pendingActorMessages == 0 then return end
-    local pending = pendingActorMessages
+    if pendingActorCount == 0 then return end
+    local pending = {}
+    for offset = 0, pendingActorCount - 1 do
+        local index = ((pendingActorHead + offset - 1)
+            % MAX_PENDING_ACTOR_MESSAGES) + 1
+        pending[#pending + 1] = pendingActorMessages[index]
+    end
     pendingActorMessages = {}
+    pendingActorHead = 1
+    pendingActorCount = 0
     pendingLatestByKey = {}
     refreshLocalIdentity()
     local nowMs = lib.getTimeMs()
@@ -570,10 +684,17 @@ local function buildModuleDiagnostics(nowMs)
             heartbeatAge = age,
             stale = heartbeat ~= nil and not heartbeatFresh(heartbeat, nowMs),
             workerSessionId = heartbeat and heartbeat.workerSessionId or nil,
+            intentActive = heartbeat and heartbeat.intentActive == true,
+            intentReason = heartbeat and heartbeat.intentReason or nil,
             requestId = request and request.requestId or nil,
             requestAge = request
                 and math.max(0, nowMs - (request.receivedAtMs or 0)) or 0,
             requestTtl = request and request.requestTtlMs or 0,
+            stateInboxOverflows = heartbeat
+                and (tonumber(heartbeat.stateInboxOverflows) or 0) or 0,
+            stateDrops = heartbeat
+                and (tonumber(heartbeat.stateDrops) or 0) or 0,
+            stateDropReasons = heartbeat and heartbeat.stateDropReasons or nil,
             counters = heartbeat and heartbeat.counters or nil,
         }
     end
@@ -601,12 +722,24 @@ local function buildStatePayload()
         schedulerAvailable = schedulerState.available,
         schedulerUnavailableReason = schedulerState.unavailableReason,
         schedulerFault = schedulerState.faultReason,
+        schedulerMetrics = schedulerState.metrics,
         worldState = State.worldState,
         moduleDiag = buildModuleDiagnostics(nowMs),
         team = ActorsTeam.getSnapshot(),
         automationPaused = State.automationPaused == true,
         settingsRevision = tonumber(State.settingsRevision) or 0,
         humanizeOverride = tostring(State.humanizeOverride or 'auto'),
+        transportDiag = {
+            totalDrops = State.totalDrops,
+            dropReasons = copyWireValue(State.dropReasons, 0, {}),
+            actorQueueOverflows = State.actorQueueOverflows,
+            workerProtocolRejects = State.workerProtocolRejects,
+            supervisorProtocolRejects = State.supervisorProtocolRejects,
+            supervisorQueueOverflows = State.supervisorQueueOverflows,
+            supervisorDrops = State.supervisorDrops,
+            supervisorDropReasons =
+                copyWireValue(State.supervisorDropReasons, 0, {}),
+        },
     }
 end
 
@@ -767,6 +900,7 @@ local function sendSupervisorShutdownAck()
     if mailbox == '' then return end
     local payload = {
         msgType = 'supervisor_shutdown_drained',
+        version = lib.LEASE_PROTOCOL_VERSION,
         ownerName = lib.getMyName(),
         ownerServer = lib.getMyServer(),
         sessionId = State.supervisorSessionId,
@@ -796,7 +930,10 @@ local function rebaseAfterLongSchedulerPause(gapMs)
         heartbeat.receivedAtMs = (heartbeat.receivedAtMs or 0) + gapMs
     end
     for _, request in pairs(State.scheduler.requests) do
-        request.receivedAtMs = (request.receivedAtMs or 0) + gapMs
+        local receivedAtMs = request.receivedAtMs or 0
+        local lastReceivedAtMs = request.lastReceivedAtMs or receivedAtMs
+        request.receivedAtMs = receivedAtMs + gapMs
+        request.lastReceivedAtMs = lastReceivedAtMs + gapMs
         request.expiresAtMs = (request.expiresAtMs or 0) + gapMs
     end
     local lease = State.scheduler.lease
@@ -949,10 +1086,13 @@ mq.bind('/sk_coord', function(command, argument)
             tostring(lease and lease.requestId or '-'),
             tostring(lease and lease.status or '-'),
             tostring(lease and lease.tier or '-'))
-        printf('\ay[SK-Coordinator]\ax requests=%d recoveryRequests=%d queue=%d sends=%d failures=%d fault=%s',
+        printf('\ay[SK-Coordinator]\ax requests=%d recoveryRequests=%d queue=%d overflows=%d sends=%d failures=%d fault=%s',
             schedulerState.requestCount, schedulerState.recoveryRequestCount,
-            #pendingActorMessages, State.stateSendAttempts,
+            pendingActorCount, State.actorQueueOverflows, State.stateSendAttempts,
             State.stateSendFailures, tostring(schedulerState.faultReason or '-'))
+        printf('\ay[SK-Coordinator]\ax protocolRejects workers=%d supervisor=%d supervisorQueueOverflows=%d',
+            State.workerProtocolRejects, State.supervisorProtocolRejects,
+            State.supervisorQueueOverflows)
     elseif command == 'team' then
         local team = ActorsTeam.getSnapshot()
         printf('\ay[SK-Team]\ax enabled=%s ready=%s team=%s leader=%s members=%d peers=%d',

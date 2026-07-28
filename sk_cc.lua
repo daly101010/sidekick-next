@@ -40,9 +40,9 @@ local function trace(fmt, ...)
     if line == _lastTraceLine then return end
     _lastTraceLine = line
     if persistedDebug then
-        decisionLog.debug('%s @%.1fs', line, os.clock() % 1000)
+        decisionLog.debug('%s', line)
     else
-        print(string.format('\am[CC-Trace]\ax %s @%.1fs', line, os.clock() % 1000))
+        print(string.format('%s \am[CC-Trace]\ax %s', lib.timestampPrefix(), line))
     end
 end
 
@@ -74,6 +74,13 @@ local function spellEngine()
     return ok and engine or nil
 end
 
+local function hasCharmObligation()
+    local charm = CC.charm or {}
+    return (tonumber(charm.petId) or 0) > 0
+        or (tonumber(charm.pendingCharmTargetId) or 0) > 0
+        or (type(charm.breakSteps) == 'table' and #charm.breakSteps > 0)
+end
+
 local function computePending()
     local s = settings()
     local charmAction, charmReason = CC.selectCharmAction(s)
@@ -99,10 +106,22 @@ local function computePending()
 end
 
 module.onTick = function(self)
+    local mezAvailable = CC.hasLoadedMezSpell()
+    local charmObligation = hasCharmObligation()
+    if not mezAvailable and not charmObligation then
+        _pendingAction = nil
+        _pendingReason = 'no_loaded_mez_spell'
+        _lastMezReason = _pendingReason
+        self:setIntent(false, nil, _pendingReason)
+        return
+    end
+
     -- The runtime cache is per-process and nothing else ticks it here —
     -- without this, Cache.xtarget.haters stays empty forever and every
     -- mez/charm selection returns no_target.
-    Cache.tick()
+    -- In consolidated mode the Combat host owns the cache cadence and may
+    -- suppress heavy scans while XTarget[1] has no Auto Hater.
+    if not self.componentMode then Cache.tick() end
     CC.tick()
     local petAction = CC.charmTick(settings())
     -- Drain the process-local spell engine whenever it's mid-state: once an
@@ -116,7 +135,8 @@ module.onTick = function(self)
     mq.doevents()
     local action, _, reason
     local eng = spellEngine()
-    if not self.currentRequestId and eng and eng.isBusy and eng.isBusy() then
+    if not self.componentMode and not self.currentRequestId
+        and eng and eng.isBusy and eng.isBusy() then
         action = {
             kind = 'cc_engine_recovery',
             reason = 'orphan_spell_engine',
@@ -124,10 +144,21 @@ module.onTick = function(self)
             targetName = '',
         }
         reason = action.reason
+    elseif self.componentMode and self.domainHostileActivity ~= true then
+        -- Charm-state upkeep and break detection above remain live. New charm
+        -- acquisition and mez discovery sleep until the Auto-Hater sentinel
+        -- says there is hostile work to inspect.
+        action = nil
+        reason = 'no_auto_hater'
     else
         action, _, reason = computePending()
     end
-    if petAction and (petAction.petCommand == 'backoff' or not action) then
+    local petCommandAllowed = petAction
+        and (petAction.petCommand == 'backoff'
+            or not self.componentMode
+            or self.domainKillAuthorized == true)
+    if petCommandAllowed
+        and (petAction.petCommand == 'backoff' or not action) then
         action = petAction
         reason = petAction.reason
     end
@@ -174,6 +205,7 @@ module.getAction = function()
         petCommand = action.petCommand,
         skipBoundaryTarget = action.kind == 'cc_engine_recovery',
         breaksInvis = action.kind ~= 'cc_engine_recovery',
+        isAE = action.isAE == true,
         reason = action.reason or 'mez',
         idempotencyKey = string.format('cc:%s:%d:%s',
             tostring(action.reason or 'mez'),
@@ -199,7 +231,9 @@ local function dispatchAction(action)
         success, reason = CC.castMez(
             tonumber(action.targetId) or 0,
             tostring(action.targetName or ''),
-            tostring(action.spellName or action.name or ''))
+            tostring(action.spellName or action.name or ''), {
+                isAE = action.isAE == true,
+            })
         if success then Counters.bump('mez_cast') end
     end
     _lastDispatch = string.format('%s=%s%s', reasonTag,
@@ -232,7 +266,20 @@ module.executeAction = function(self)
 end
 
 
+-- The legacy callback above is retained only as migration reference and must
+-- never be selected by ModuleBase.
+module.executeAction = nil
 module:enableUnifiedExecutor({
+    preflight = function(action)
+        if action and action.kind == 'pet_command'
+            and action.petCommand == 'attack'
+            and module.componentMode
+            and (module.domainKillAuthorized ~= true
+                or tonumber(action.targetId) ~= tonumber(module.domainKillTargetId)) then
+            return false, 'kill_authorization_changed'
+        end
+        return true
+    end,
     dispatch = function(action)
         if action.kind == 'cc_engine_recovery' then
             local engine = spellEngine()
@@ -311,14 +358,17 @@ mq.bind('/sk_cc', function(cmd)
     if tostring(cmd or ''):lower() == 'debug' then
         _debug = not _debug
         CC.trace = trace
-        print(string.format('\at[SK CC]\ax decision trace %s', _debug and 'ON' or 'OFF'))
+        print(string.format('%s \at[SK CC]\ax decision trace %s',
+            lib.timestampPrefix(), _debug and 'ON' or 'OFF'))
         return
     end
     local s = settings()
     local function echo(fmt, ...)
-        print(string.format('\at[SK CC]\ax ' .. fmt, ...))
+        print(string.format('%s \at[SK CC]\ax ' .. fmt, lib.timestampPrefix(), ...))
     end
     local charm = CC.charm or {}
+    local mezAvailable, mezSpell, mezSlot, activeSet =
+        CC.hasLoadedMezSpell(true)
     local steps = charm.breakSteps and table.concat(charm.breakSteps, '>') or '-'
     local localCount, remoteCount, totalCount = CC.getCounts()
     local engState = '-'
@@ -333,6 +383,9 @@ mq.bind('/sk_cc', function(cmd)
         tostring(s.MezzingEnabled == true), tostring(s.CharmEnabled == true),
         tostring(_pendingAction and (_pendingAction.reason or _pendingAction.spellName) or '-'),
         tostring(_pendingReason), tostring(module.priority), engState)
+    echo('mezCapability=%s spell=%s slot=%d activeSet=%s',
+        tostring(mezAvailable), tostring(mezSpell or ''),
+        tonumber(mezSlot) or 0, tostring(activeSet or ''))
     echo('pet=%d(%s) breakSteps=%s pendingCharm=%d attempts=%s mezReason=%s charmReason=%s',
         tonumber(charm.petId) or 0, tostring(charm.petName or ''),
         steps, tonumber(charm.pendingCharmTargetId) or 0,
@@ -348,6 +401,8 @@ end)
 
 module:enablePeerActors()
 module:run(50)
-if _mobIntel and _mobIntel.shutdown then pcall(_mobIntel.shutdown) end
+if not module.componentMode and _mobIntel and _mobIntel.shutdown then
+    pcall(_mobIntel.shutdown)
+end
 
 return module

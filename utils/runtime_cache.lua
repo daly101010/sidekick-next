@@ -41,10 +41,23 @@ local _lastHeavyUpdate = 0
 local _lastLightUpdate = 0
 local _lastBuffScan = 0
 local _lastBuffCleanup = 0
+local _lightReadyAt = 0
+local _heavyReadyAt = 0
+local _heavyScanEnabled = true
+local _lastHostileActivityCheck = -math.huge
+local _hostileActivity = false
 local HEAVY_INTERVAL = 0.10  -- 100ms for group HP/position scans (healing needs fresh data)
 local LIGHT_INTERVAL = 0.05  -- 50ms for lightweight self checks
+local HOSTILE_ACTIVITY_INTERVAL = 0.10
 local BUFF_SCAN_INTERVAL = 3.0  -- 3s between buff scans (expensive due to retargeting)
 local BUFFSTATE_CLEANUP_INTERVAL = 30.0  -- 30s between prunes of stale buffState entries
+
+-- Cached identity fields (id/name/class/level rarely change during a session)
+local _cachedId = 0
+local _cachedName = ''
+local _cachedClass = ''
+local _cachedLevel = 0
+local _identityCached = false
 
 function M.init()
     M.me = {}
@@ -52,7 +65,63 @@ function M.init()
     M.group = {}
     M.xtarget = {}
     M.buffState = {}
+    _lastHeavyUpdate = 0
+    _lastLightUpdate = 0
+    _lightReadyAt = 0
+    _heavyReadyAt = 0
+    _heavyScanEnabled = true
+    _lastHostileActivityCheck = -math.huge
+    _hostileActivity = false
     _identityCached = false
+end
+
+--- Enable or suppress this Lua process's expensive Group/XTarget scan.
+--- Consolidated domain hosts set this before their component sensors run, so
+--- component-local Cache.tick() calls cannot accidentally reopen the scan.
+function M.setHeavyScanEnabled(enabled)
+    local nextEnabled = enabled ~= false
+    if nextEnabled == _heavyScanEnabled then return end
+    _heavyScanEnabled = nextEnabled
+    if not nextEnabled then
+        -- An inactive aggressive-XTarget sentinel is an authoritative empty
+        -- hostile set. Do not let consumers act on the previous heavy snapshot.
+        M.xtarget = {
+            count = 0,
+            haters = {},
+            aggroDeficitCount = 0,
+        }
+    end
+end
+
+--- Cheap combat-activity sentinel for configured Auto-Hater XTarget slot 1.
+--- This is deliberately not kill authorization; it only answers whether
+--- Tank/Combat should perform their heavier discovery scans.
+function M.hasAutoHaterActivity(force)
+    local now = os.clock()
+    if force ~= true
+        and (now - _lastHostileActivityCheck) < HOSTILE_ACTIVITY_INTERVAL then
+        return _hostileActivity
+    end
+    _lastHostileActivityCheck = now
+
+    -- Slot 1 is a configuration contract, not a target choice. EQ slides the
+    -- next Auto Hater into it when the current entry disappears, so two cheap
+    -- reads are sufficient to decide whether the full XTarget scan should run.
+    -- Distance, death, mez, and charm protection belong to that full scan.
+    local active = false
+    pcall(function()
+        local xt = mq.TLO.Me.XTarget(1)
+        if not (xt and xt()) then return end
+        local id = tonumber(xt.ID and xt.ID() or 0) or 0
+        local targetType = tostring(
+            xt.TargetType and xt.TargetType() or ''):lower()
+        active = id > 0
+            and (targetType == 'auto hater'
+                or (xt.Aggressive and xt.Aggressive() == true))
+    end)
+
+    _hostileActivity = active
+    return _hostileActivity
 end
 
 function M.tick()
@@ -64,7 +133,8 @@ function M.tick()
     -- update on every call, and a light-first early return would starve the
     -- heavy update forever — leaving xtarget/group snapshots permanently
     -- empty (tank saw 0 haters mid-combat).
-    if (now - _lastHeavyUpdate) >= HEAVY_INTERVAL then
+    if _heavyScanEnabled
+        and (now - _lastHeavyUpdate) >= HEAVY_INTERVAL then
         _lastHeavyUpdate = now
         M.updateHeavy()
     elseif (now - _lastLightUpdate) >= LIGHT_INTERVAL then
@@ -81,13 +151,6 @@ function M.tick()
         M.cleanupBuffState()
     end
 end
-
--- Cached identity fields (id/name/class/level rarely change during a session)
-local _cachedId = 0
-local _cachedName = ''
-local _cachedClass = ''
-local _cachedLevel = 0
-local _identityCached = false
 
 function M.updateLight()
     local me = mq.TLO.Me
@@ -201,6 +264,7 @@ function M.updateLight()
     else
         M.target = {}
     end
+    _lightReadyAt = os.clock()
 end
 
 function M.updateHeavy()
@@ -339,9 +403,54 @@ function M.updateHeavy()
         haters = haters,
         aggroDeficitCount = aggroDeficitCount,
     }
+    _heavyReadyAt = os.clock()
 end
 
 -- Staleness accessors
+
+--- Readiness distinguishes "not scanned in this Lua process" from an empty
+--- group or XTarget result.
+---@param section string self|target|group|xtarget|heavy|light
+function M.isReady(section)
+    section = tostring(section or ''):lower()
+    if section == 'self' or section == 'me' or section == 'target'
+        or section == 'light' then
+        return _lightReadyAt > 0
+    end
+    if section == 'group' or section == 'xtarget' or section == 'heavy' then
+        return _heavyReadyAt > 0
+    end
+    return _lightReadyAt > 0 and _heavyReadyAt > 0
+end
+
+function M.getSelfSnapshot()
+    if not M.isReady('self') then return nil, 'cache_not_ready' end
+    return M.me
+end
+
+function M.getGroupSnapshot()
+    if not M.isReady('group') then return nil, 'cache_not_ready' end
+    return M.group
+end
+
+function M.getXTargetHaters()
+    if not M.isReady('xtarget') then return nil, 'cache_not_ready' end
+    return M.xtarget.haters or {}
+end
+
+function M.getSnapshot()
+    if not M.isReady() then return nil, 'cache_not_ready' end
+    return {
+        me = M.me,
+        target = M.target,
+        group = M.group,
+        xtarget = M.xtarget,
+        inCombat = M.inCombat(),
+        burnActive = M.burnActive == true,
+        lightUpdatedAt = _lightReadyAt,
+        heavyUpdatedAt = _heavyReadyAt,
+    }
+end
 
 --- Get age of light-update data (self, target) in seconds
 ---@return number Age in seconds since last light update

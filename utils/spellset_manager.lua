@@ -707,7 +707,9 @@ function M._runBuffSwap_DISABLED(buffSwapSpells, rotationSpells, waitForMemorize
             ctx.buffTargetIsTank = (cls == 'WAR' or cls == 'PAL' or cls == 'SHD')
             ctx.buffTargetIsHealer = (cls == 'CLR' or cls == 'DRU' or cls == 'SHM')
             ctx.buffTargetIsMelee = (cls == 'WAR' or cls == 'PAL' or cls == 'SHD' or cls == 'MNK' or cls == 'ROG' or cls == 'BER' or cls == 'RNG' or cls == 'BST')
-            ctx.buffTargetIsCaster = (cls == 'WIZ' or cls == 'MAG' or cls == 'ENC' or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM')
+            ctx.buffTargetIsCaster = (cls == 'WIZ' or cls == 'MAG' or cls == 'ENC'
+                or cls == 'NEC' or cls == 'CLR' or cls == 'DRU' or cls == 'SHM'
+                or cls == 'PAL' or cls == 'SHD' or cls == 'RNG' or cls == 'BST')
             -- Check group role
             local group = mq.TLO.Group
             if group then

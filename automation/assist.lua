@@ -50,12 +50,9 @@ function M.setEnabled(val)
     CasterAssist.setEnabled(val)
 
     if not M.enabled then
-        if _CombatAssist and _CombatAssist.stop then
-            _CombatAssist.stop()
-        else
-            stopEngagement()
-        end
-        -- Clear target tracking when disabled
+        -- This helper is also mirrored by the UI process. Cleanup belongs to
+        -- sk_assist's leased assist_stop action; issuing /attack or /stick
+        -- here would let a settings sync mutate gameplay outside the lease.
         M.currentTargetId = nil
     end
 end
@@ -70,11 +67,12 @@ function M.updateTargetFromTank()
     M.tankName = tankState.tankName or M.tankName
 
     -- Update primary from tank
-    if tankState.primaryTargetId then
+    if tankState.killAuthorized == true and tankState.primaryTargetId then
         M.primaryTargetId = tankState.primaryTargetId
         M.lastTankBroadcast = os.clock()
         return true
     end
+    M.primaryTargetId = nil
 
     -- Check if tank data is stale (> 5 seconds)
     return (os.clock() - M.lastTankBroadcast) < 5

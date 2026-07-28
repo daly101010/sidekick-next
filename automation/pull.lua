@@ -25,6 +25,7 @@ local getSkLib    = lazy.once('sidekick-next.sk_lib')
 local getHumanize = lazy.once('sidekick-next.humanize')
 local getChase    = lazy.once('sidekick-next.automation.chase')
 local getActors   = lazy.once('sidekick-next.utils.actors_coordinator')
+local getFeignSafety = lazy.once('sidekick-next.utils.feign_safety')
 
 local M = {}
 local READY_TIMEOUT_MS = 10000
@@ -714,6 +715,16 @@ function M.tick(opts)
     opts = opts or {}
     local allowActions = opts.allowActions ~= false
     if not State.initialized then M.init() end
+
+    local FeignSafety = getFeignSafety()
+    if FeignSafety and FeignSafety.isManagedFeign
+        and FeignSafety.isManagedFeign() == true
+    then
+        -- The worker lifecycle owns cancellation/finalization under its exact
+        -- lease. This sensor path must not stop nav or attack out of lease.
+        return
+    end
+
     if not Config.enabled and State.pullState == M.STATES.IDLE then return end
 
     -- Broadcast pull:intent every ~2s while enabled, so peer pullers can

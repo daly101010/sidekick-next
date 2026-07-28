@@ -27,7 +27,10 @@ function M.int(label, settingKey, current, min, max, onChange, opts)
     -- Label
     imgui.Text(label)
     if tooltip and imgui.IsItemHovered() then
-        imgui.SetTooltip(tooltip)
+        -- MQ's SetTooltip treats its first argument as a printf format.
+        -- Pass user-facing tooltip text as data so literal '%' characters do
+        -- not raise "invalid option to format" during the ImGui draw callback.
+        imgui.SetTooltip('%s', tostring(tooltip))
     end
 
     imgui.SameLine()
@@ -41,7 +44,7 @@ function M.int(label, settingKey, current, min, max, onChange, opts)
 
     -- Tooltip on slider
     if tooltip and imgui.IsItemHovered() then
-        imgui.SetTooltip(tooltip)
+        imgui.SetTooltip('%s', tostring(tooltip))
     end
 
     -- Callback
@@ -65,7 +68,7 @@ function M.float(label, settingKey, current, min, max, onChange, opts)
     -- Label
     imgui.Text(label)
     if tooltip and imgui.IsItemHovered() then
-        imgui.SetTooltip(tooltip)
+        imgui.SetTooltip('%s', tostring(tooltip))
     end
 
     imgui.SameLine()
@@ -79,7 +82,7 @@ function M.float(label, settingKey, current, min, max, onChange, opts)
 
     -- Tooltip on slider
     if tooltip and imgui.IsItemHovered() then
-        imgui.SetTooltip(tooltip)
+        imgui.SetTooltip('%s', tostring(tooltip))
     end
 
     -- Callback
@@ -104,7 +107,7 @@ function M.labeled(label, settingKey, current, min, max, isFloat, onChange, opts
     -- Label column
     imgui.Text(label)
     if tooltip and imgui.IsItemHovered() then
-        imgui.SetTooltip(tooltip)
+        imgui.SetTooltip('%s', tostring(tooltip))
     end
 
     -- Align slider to right

@@ -30,6 +30,11 @@ local MANA_BUFFER_PCT_OF_COST = 0.03
 local MANA_RETRY_BACKOFF_MS = 1500
 local TELEMETRY_INTERVAL_MS = 1000
 local _lastTelemetryAtMs = 0
+local _forensicsDamageHooked = false
+local _forensicsDamageBatch = {}
+local _lastForensicsDamageSendAt = 0
+local FORENSICS_DAMAGE_BATCH_MS = 250
+local FORENSICS_DAMAGE_BATCH_MAX = 25
 
 local function clearPendingAction()
     _pendingAction = nil
@@ -45,7 +50,9 @@ local function commandEcho(fmt, ...)
     else
         msg = tostring(fmt)
     end
-    pcall(function() print(string.format('\ag[SK Healing]\ax %s', msg)) end)
+    pcall(function()
+        print(string.format('%s \ag[SK Healing]\ax %s', lib.timestampPrefix(), msg))
+    end)
 end
 
 local function ensureCoreLoaded()
@@ -67,12 +74,44 @@ local function syncSettings()
     return Core.Settings or {}
 end
 
+local function attachForensicsDamageFeed()
+    if _forensicsDamageHooked or not Healing.addIncomingDamageListener then return end
+    _forensicsDamageHooked = Healing.addIncomingDamageListener(
+        function(targetId, targetName, amount, source, dmgType)
+            if Core.Settings and Core.Settings.DeathForensicsEnabled == false then return end
+            if #_forensicsDamageBatch >= 200 then
+                table.remove(_forensicsDamageBatch, 1)
+            end
+            _forensicsDamageBatch[#_forensicsDamageBatch + 1] = {
+                targetId = tonumber(targetId) or 0,
+                targetName = tostring(targetName or ''),
+                amount = tonumber(amount) or 0,
+                source = tostring(source or ''),
+                dmgType = tostring(dmgType or ''),
+            }
+        end) == true
+end
+
+local function flushForensicsDamage(self, force)
+    if #_forensicsDamageBatch == 0 or not self or not self.sendToLocalUi then return end
+    local now = lib.getTimeMs()
+    if not force and #_forensicsDamageBatch < FORENSICS_DAMAGE_BATCH_MAX
+        and (now - _lastForensicsDamageSendAt) < FORENSICS_DAMAGE_BATCH_MS then
+        return
+    end
+    local batch = _forensicsDamageBatch
+    _forensicsDamageBatch = {}
+    _lastForensicsDamageSendAt = now
+    self:sendToLocalUi('forensics:damage', { events = batch })
+end
+
 local function ensureHealingInitialized(settings)
     if not settings or settings.DoHeals ~= true then return false end
     if not isHealerClass() then return false end
     if not Healing.isInitialized() then
         Healing.init()
     end
+    if Healing.isInitialized() then attachForensicsDamageFeed() end
     return Healing.isInitialized()
 end
 
@@ -260,24 +299,6 @@ local function maybeSendAnalyticsTelemetry(peerActors)
     })
 end
 
-local function buildHealthStatus()
-    local me = mq.TLO.Me
-    if not me or not me() then return nil end
-    local hp = lib.safeNum(function() return me.PctHPs() end, 0)
-    return {
-        id = 'status:update',
-        script = 'sidekick-healing',
-        zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
-        hp = hp,
-        currentHP = lib.safeNum(function() return me.CurrentHPs() end, 0),
-        maxHP = lib.safeNum(function() return me.MaxHPs() end, 0),
-        characterId = lib.safeNum(function() return me.ID() end, 0),
-        class = tostring(me.Class and me.Class.ShortName and me.Class.ShortName() or ''):upper(),
-        dead = lib.safeTLO(function() return me.Dead() end, false) == true or hp <= 0,
-        hovering = lib.safeTLO(function() return me.Hovering() end, false) == true,
-    }
-end
-
 local function actionPriority(action)
     return action and action.tier == 'emergency' and lib.Priority.EMERGENCY or lib.Priority.HEALING
 end
@@ -286,6 +307,15 @@ local function intentKey(action)
     if not action then return nil end
     return string.format('%s:%s:%d', tostring(action.tier or 'heal'),
         tostring(action.spellName or action.name or ''), tonumber(action.claimTargetId or action.targetId) or 0)
+end
+
+local function peerClaimReason(prefix, winner)
+    winner = type(winner) == 'table' and winner or {}
+    return string.format('%s_%s:peerAge=%sms:lease=%sms',
+        tostring(prefix or 'claimed_by'),
+        tostring(winner.from or 'peer'),
+        tostring(winner.peerAgeMs or '?'),
+        tostring(winner.leaseRemainingMs or '?'))
 end
 
 local function distributedIntentReady(action, ttlMs)
@@ -318,7 +348,7 @@ local function distributedIntentReady(action, ttlMs)
 
     local won, winner = Healing.isClaimWinner(action)
     if not won then
-        return false, string.format('claimed_by_%s', tostring(winner and winner.from or 'peer'))
+        return false, peerClaimReason('claimed_by', winner)
     end
     return true
 end
@@ -362,12 +392,6 @@ end
 -------------------------------------------------------------------------------
 
 module.onTick = function(self)
-    -- All characters run this worker, so it is also the common health-snapshot
-    -- publisher used to discover heal targets outside the local group.
-    if self.peerActors and self.peerActors.tick then
-        self.peerActors.tick({ status = buildHealthStatus(), peerOnly = true })
-    end
-
     local settings = syncSettings()
     if not settings then
         clearPendingAction()
@@ -399,7 +423,8 @@ module.onTick = function(self)
         return
     end
 
-    Healing.tickSensors()
+    Healing.tickSensors({ readOnly = true })
+    flushForensicsDamage(self, false)
     maybeSendAnalyticsTelemetry(self.peerActors)
 
     if self:ownsLease() then
@@ -562,7 +587,7 @@ module.executeAction = function(self)
 
     local stillWinner, winner = Healing.isClaimWinner(action)
     if not stillWinner then
-        return true, string.format('claim_lost_to_%s', tostring(winner and winner.from or 'peer'))
+        return true, peerClaimReason('claim_lost_to', winner)
     end
 
     local castInfo = Healing.prepareHealCast(action)
@@ -613,7 +638,7 @@ module.executeAction = function(self)
 
         -- Keep the single healing brain current while it owns the casting
         -- coroutine. This preserves emergency preemption without a second VM.
-        Healing.tickSensors()
+        Healing.tickSensors({ readOnly = true })
         maybeSendAnalyticsTelemetry(self.peerActors)
 
         if castInfo.tier ~= 'emergency' then
@@ -655,6 +680,9 @@ module.executeAction = function(self)
 end
 
 
+-- The legacy callback above is retained only as migration reference and must
+-- never be selected by ModuleBase.
+module.executeAction = nil
 module:enableUnifiedExecutor({
     preflight = function(action)
         local settings = syncSettings()
@@ -676,7 +704,7 @@ module:enableUnifiedExecutor({
 
         local stillWinner, winner = Healing.isClaimWinner(action)
         if not stillWinner then
-            return false, string.format('claim_lost_to_%s', tostring(winner and winner.from or 'peer'))
+            return false, peerClaimReason('claim_lost_to', winner)
         end
 
         local castInfo = Healing.prepareHealCast(action)
@@ -699,7 +727,7 @@ module:enableUnifiedExecutor({
             action._healRegistered = true
         end
 
-        Healing.tickSensors()
+        Healing.tickSensors({ readOnly = true })
         maybeSendAnalyticsTelemetry(self and self.peerActors)
 
         if castInfo.tier ~= 'emergency' then
@@ -837,8 +865,11 @@ end)
 
 module:enablePeerActors()
 module:run(50)
-if Healing and Healing.shutdown then
-    Healing.shutdown()
+if not module.componentMode then
+    flushForensicsDamage(module, true)
+    if Healing and Healing.shutdown then
+        Healing.shutdown()
+    end
 end
 
 return module
