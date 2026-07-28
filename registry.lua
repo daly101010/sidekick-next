@@ -85,6 +85,7 @@ M.defaults = {
     SideKickButtonsSubtab = { type = 'text', Default = 'aas', Category = 'UI', DisplayName = 'Buttons Subtab' },
 
     SideKickBarEnabled = { type = 'bool', Default = true, Category = 'Bar', DisplayName = 'Show Ability Bar' },
+    WorkerStatusHUDVisible = { type = 'bool', Default = false, Category = 'UI', DisplayName = 'Worker Status HUD' },
     SideKickBarCell = { type = 'number', Default = 48, Category = 'Bar', DisplayName = 'Cell Size' },
     SideKickBarRows = { type = 'number', Default = 2, Category = 'Bar', DisplayName = 'Rows' },
     SideKickBarGap = { type = 'number', Default = 4, Category = 'Bar', DisplayName = 'Gap' },
@@ -526,7 +527,7 @@ end
 local MODULE_KEYS = {
     ui = [[
         SideKickTheme SideKickSyncThemeWithGT SideKickDebugSettings SideKickLogLevel SideKickLogFile
-        SideKickLogFilter SideKickModuleLogLevels DashboardVisible HealPreviewVisible
+        SideKickLogFilter SideKickModuleLogLevels DashboardVisible HealPreviewVisible WorkerStatusHUDVisible
         SideKickMainEnabled SideKickOptionsManual SideKickOptionsPosX SideKickOptionsPosY
         SideKickOptionsWidth SideKickOptionsHeight SideKickMainAnchor SideKickMainAnchorTarget
         SideKickMainAnchorGap SideKickMainButtonScale SideKickMainRounding SideKickMainWidth

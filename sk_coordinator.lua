@@ -538,6 +538,9 @@ local function processHeartbeat(content, sender, nowMs)
         mailbox = tostring(sender.mailbox or ''),
         intentActive = content.intentActive == true,
         intentReason = tostring(content.intentReason or ''),
+        -- Per-character status HUD signals.
+        idleReason = tostring(content.idleReason or content.intentReason or ''),
+        lastActionAt = tonumber(content.lastActionAt) or 0,
         stateInboxOverflows = tonumber(content.stateInboxOverflows) or 0,
         stateDrops = tonumber(content.stateDrops) or 0,
         stateDropReasons = type(content.stateDropReasons) == 'table'
@@ -693,6 +696,8 @@ local function buildModuleDiagnostics(nowMs)
             workerSessionId = heartbeat and heartbeat.workerSessionId or nil,
             intentActive = heartbeat and heartbeat.intentActive == true,
             intentReason = heartbeat and heartbeat.intentReason or nil,
+            idleReason = heartbeat and heartbeat.idleReason or nil,
+            lastActionAt = heartbeat and tonumber(heartbeat.lastActionAt) or 0,
             requestId = request and request.requestId or nil,
             requestAge = request
                 and math.max(0, nowMs - (request.receivedAtMs or 0)) or 0,
@@ -881,10 +886,6 @@ local function checkModuleHealth()
             local status = lib.getLuaScriptStatus(spec.script)
             local reportedAgeMs = age == math.huge
                 and math.max(0, nowMs - State.startedAtMs) or age
-            debugLog('WATCHDOG: Module %s heartbeat stale (%dms), Lua status=%s',
-                spec.module, reportedAgeMs, tostring(status))
-            printf('\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs (Lua status: %s)',
-                spec.module, reportedAgeMs / 1000, tostring(status))
             local lease = State.scheduler.lease
             if lease and lease.holderModule == spec.module
                 and lease.status ~= 'recovering' then
@@ -897,6 +898,14 @@ local function checkModuleHealth()
                 attemptRestart(spec.module, spec.script)
                 State.moduleHeartbeats[spec.module] = nil
             elseif heartbeat then
+                -- Report only an observed heartbeat becoming stale. An EXITED
+                -- worker clears this record; attemptRestart owns its bounded
+                -- restart logging, so a permanently absent worker cannot emit
+                -- this breadcrumb on every watchdog tick.
+                debugLog('WATCHDOG: Module %s heartbeat stale (%dms), Lua status=%s',
+                    spec.module, reportedAgeMs, tostring(status))
+                printf('\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs (Lua status: %s)',
+                    spec.module, reportedAgeMs / 1000, tostring(status))
                 -- MQ2Lua process state is authoritative for restart decisions;
                 -- keep the process, but never restore its fenced lease.
                 heartbeat.receivedAtMs = nowMs

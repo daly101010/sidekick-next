@@ -64,6 +64,7 @@ LZ.getRemoteAbilities = lazy.init('sidekick-next.ui.remote_abilities')
 LZ.getAggroWarning = lazy.init('sidekick-next.ui.aggro_warning')
 LZ.getActorsDebug = lazy('sidekick-next.ui.actors_debug')
 LZ.getCoordinatorDebug = lazy.init('sidekick-next.ui.coordinator_debug')
+LZ.getWorkerStatusHud = lazy('sidekick-next.ui.worker_status_hud')
 LZ.getIntelligenceDebug = lazy.init('sidekick-next.ui.intelligence_debug')
 
 -- Runtime cache, action executor, and spell engine (lazy-loaded)
@@ -2389,6 +2390,9 @@ local function main()
     _bindCmd('/skactors', function()
         local M = LZ.getActorsDebug() if M then M.toggle() end
     end)
+    _bindCmd('/skhud', function()
+        local M = LZ.getWorkerStatusHud() if M then M.toggle() end
+    end)
     _bindCmd('/skimport', function(...)
         queueMuleAssistImport({ ... })
     end)
@@ -2747,6 +2751,7 @@ local function main()
         do local M = LZ.getAggroWarning() if M then M.draw() end end
         do local M = LZ.getActorsDebug() if M then M.render() end end
         do local M = LZ.getCoordinatorDebug() if M then M.render() end end
+        do local M = LZ.getWorkerStatusHud() if M then M.render() end end
         do local M = LZ.getSpellSetEditor() if M then M.render() end end
         PerfMonitor.draw()
 

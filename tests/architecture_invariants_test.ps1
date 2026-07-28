@@ -29,6 +29,19 @@ function Reject-Text {
     }
 }
 
+function Require-Regex {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Pattern,
+        [Parameter(Mandatory)][string]$Description
+    )
+    $script:checked++
+    $content = Get-Content -LiteralPath $Path -Raw
+    if (-not [regex]::IsMatch($content, $Pattern)) {
+        $script:failures.Add("${Path}: missing ${Description}")
+    }
+}
+
 Require-Text 'sk_module_base.lua' 'function self:cancelUnifiedAction' 'central unified-executor cancellation'
 Require-Text 'sk_module_base.lua' 'ActionExecutor.consumeResult()' 'executor terminal-result drain'
 Require-Text 'sk_module_base.lua' "boundaryReason or 'boundary_rejected')" 'mutation-boundary executor cleanup'
@@ -234,6 +247,8 @@ Require-Text 'utils/safe_write.lua' 'Paths.ensureDir(parent)' 'atomic writer par
 Reject-Text 'utils/claim_ledger.lua' "mq.configDir or 'config') .. '/SideKick'" 'production claim-ledger path'
 Reject-Text 'utils/throttled_log.lua' 'In-game echo disabled' 'disabled throttled logger'
 Require-Text 'sk_coordinator.lua' '[SK-Watchdog]' 'stale worker console breadcrumb'
+Require-Regex 'sk_coordinator.lua' "elseif heartbeat then[\s\S]{0,900}printf\('\\ar\[SK-Watchdog\]" 'watchdog breadcrumb inside observed-heartbeat branch'
+Require-Text 'sk_coordinator.lua' 'attemptRestart owns its bounded' 'EXITED worker logging delegated to restart throttle'
 Require-Text 'ui/settings/tab_pull.lua' 'local _, clicked = imgui.Selectable(m, sel)' 'Pull mode combo click result'
 Require-Text 'ui/settings/tab_pull.lua' 'local _, clicked = imgui.Selectable(id, sel)' 'Pull ability combo click result'
 Require-Text 'ui/spell_set_editor.lua' 'local _, clicked = imgui.Selectable(name, isSelected)' 'spell-set combo click result'
@@ -243,6 +258,86 @@ Require-Text 'utils/claim_ledger.lua' 'local _, clicked = imgui.Selectable(label
 Require-Text 'ui/components/search_input.lua' 'local _, clicked = imgui.Selectable(matchStr, false)' 'search suggestion click result'
 Require-Text 'ui/components/search_input.lua' 'local _, clicked = imgui.Selectable(ft, i == typeIdx)' 'search filter combo click result'
 Reject-Text 'test_eq_classic_ui.lua' 'if ImGui.Selectable(p.name, selected)' 'classic UI selected-state return misuse'
+
+# Cross-file: every Actors.publish/ActorsCoordinator.publish/M.publish topic literal
+# used anywhere in the tree must have a matching entry in TOPIC_CONTRACTS. Catches
+# the class of bug where a new topic is introduced without a routing scope declared
+# (which would fail closed at runtime with 'unregistered_publish_topic:X').
+function Assert-PublishTopicsRegistered {
+    $script:checked++
+    $coordinatorPath = 'utils/actors_coordinator.lua'
+    $coordinator = Get-Content -LiteralPath $coordinatorPath -Raw
+    $contractsBlock = [regex]::Match($coordinator,
+        "local TOPIC_CONTRACTS\s*=\s*\{([\s\S]*?)\n\}")
+    if (-not $contractsBlock.Success) {
+        $script:failures.Add("${coordinatorPath}: TOPIC_CONTRACTS table not found")
+        return
+    }
+    $registered = @{}
+    foreach ($m in [regex]::Matches($contractsBlock.Groups[1].Value,
+        "\['([^']+)'\]\s*=\s*\{\s*scope\s*=\s*'(fleet|same_script)'")) {
+        $registered[$m.Groups[1].Value] = $m.Groups[2].Value
+    }
+    $publishRegex = [regex]"(?:Actors|ActorsCoordinator|module\.peerActors|self\.peerActors|self\.actorsCoordinator|M)\.publish\(\s*'([^']+)'"
+    $scanPaths = Get-ChildItem -Path . -Recurse -Include *.lua `
+        | Where-Object { $_.FullName -notmatch '\\tests\\' -and $_.FullName -notmatch '\\docs\\' }
+    foreach ($file in $scanPaths) {
+        $text = Get-Content -LiteralPath $file.FullName -Raw
+        foreach ($m in $publishRegex.Matches($text)) {
+            $topic = $m.Groups[1].Value
+            if (-not $registered.ContainsKey($topic)) {
+                $rel = Resolve-Path -LiteralPath $file.FullName -Relative
+                $script:failures.Add("${rel}: publish topic '${topic}' not in TOPIC_CONTRACTS")
+            }
+        }
+    }
+}
+Assert-PublishTopicsRegistered
+
+# Cross-file: every topic in TOPIC_CONTRACTS should have at least one producer
+# somewhere in the tree. A registered-but-unused topic is dead surface area —
+# either the producer was removed or the contract was added speculatively; both
+# want cleanup. Skips topics with an explicit dead-entry marker in the contract
+# comment so intentional placeholders can opt out.
+function Assert-RegisteredTopicsHaveProducer {
+    $script:checked++
+    $coordinatorPath = 'utils/actors_coordinator.lua'
+    $coordinator = Get-Content -LiteralPath $coordinatorPath -Raw
+    $contractsBlock = [regex]::Match($coordinator,
+        "local TOPIC_CONTRACTS\s*=\s*\{([\s\S]*?)\n\}")
+    if (-not $contractsBlock.Success) { return }
+    $registered = @()
+    foreach ($m in [regex]::Matches($contractsBlock.Groups[1].Value,
+        "\['([^']+)'\]\s*=\s*\{[^}]*\},?\s*(?:--\s*(dead|dynamic)[^\r\n]*)?")) {
+        # Skip topics explicitly marked dead (intentional placeholder) or
+        # dynamic (published via a computed topic name that this text-based
+        # scan cannot follow).
+        if (-not $m.Groups[2].Success) { $registered += $m.Groups[1].Value }
+    }
+    $allLua = Get-ChildItem -Path . -Recurse -Include *.lua `
+        | Where-Object { $_.FullName -notmatch '\\tests\\' -and $_.FullName -notmatch '\\docs\\' }
+    $allText = ($allLua | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+    foreach ($topic in $registered) {
+        $literal = "publish('" + $topic + "'"
+        if (-not $allText.Contains($literal)) {
+            $script:failures.Add("${coordinatorPath}: TOPIC_CONTRACTS['${topic}'] has no producer (mark ' -- dead' if intentional)")
+        }
+    }
+}
+Assert-RegisteredTopicsHaveProducer
+
+# Per-worker heartbeat carries idleReason + lastActionAt so the per-character
+# status HUD can render 'why isn't this worker acting?' without new actor sends.
+# These fields are piggybacked on the existing MODULE_HEARTBEAT cadence.
+Require-Text 'sk_module_base.lua' "idleReason = tostring(self.intent" 'heartbeat idle-reason field'
+Require-Text 'sk_module_base.lua' 'lastActionAt = tonumber(self.lastActionAtMs)' 'heartbeat last-action timestamp'
+Require-Text 'sk_module_base.lua' 'self.lastActionAtMs = nowMs()' 'last-action timestamp updated on finishAction'
+Require-Text 'sk_coordinator.lua' "idleReason = tostring(content.idleReason" 'coordinator ingests heartbeat idle-reason'
+Require-Text 'sk_coordinator.lua' 'lastActionAt = tonumber(content.lastActionAt)' 'coordinator ingests last-action timestamp'
+Require-Text 'ui/worker_status_hud.lua' 'function M.render' 'per-character worker status HUD entry point'
+Require-Text 'SideKick.lua' "'sidekick-next.ui.worker_status_hud'" 'worker status HUD lazy-registered in UI process'
+Require-Text 'SideKick.lua' 'LZ.getWorkerStatusHud() if M then M.render()' 'worker status HUD rendered in imgui loop'
+Require-Text 'registry.lua' 'WorkerStatusHUDVisible' 'worker status HUD toggle setting'
 
 Write-Output "architecture_invariants_test: $checked checks, $($failures.Count) failures"
 $failures | ForEach-Object { Write-Output $_ }

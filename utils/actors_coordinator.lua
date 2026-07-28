@@ -72,7 +72,7 @@ local TOPIC_CONTRACTS = {
     ['tank:settled'] = { scope = 'fleet' },
     ['tank:taunt_run'] = { scope = 'fleet' },
     ['tank:taunt_done'] = { scope = 'fleet' },
-    ['tank:mode'] = { scope = 'fleet' },
+    ['tank:mode'] = { scope = 'fleet' }, -- dead: contract reserved for a future tank-mode broadcast (receiver exists at line 1766)
     ['tank:camp_anchor'] = { scope = 'fleet' },
     ['cc:mezlist'] = { scope = 'fleet' },
     ['cc:claim'] = { scope = 'fleet' },
@@ -105,8 +105,8 @@ local TOPIC_CONTRACTS = {
     ['rez:completed'] = { scope = 'same_script' },
 
     -- Explicit presence overlays. Actor Team is the base presence/trust plane.
-    ['peer:vitals'] = { scope = 'same_script' },
-    ['peer:capabilities'] = { scope = 'same_script' },
+    ['peer:vitals'] = { scope = 'same_script' }, -- dynamic: published via M.publish(statusTopic, ...) with dynamic topic
+    ['peer:capabilities'] = { scope = 'same_script' }, -- dynamic: published via M.publish(statusTopic, ...) with dynamic topic
 }
 M.TOPIC_CONTRACTS = {}
 for topic, contract in pairs(TOPIC_CONTRACTS) do

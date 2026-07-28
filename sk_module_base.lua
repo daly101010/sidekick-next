@@ -587,6 +587,10 @@ function M.create(moduleName, legacyPriority)
             reason = tostring(normalized.reason or normalized.phase or 'completed'),
             result = normalized,
         }
+        -- Timestamp every completed action for the per-character status HUD.
+        -- Failure phases still count as "did something" — a mez that resisted
+        -- is different from a mez the worker never tried.
+        self.lastActionAtMs = nowMs()
         if not self:_runFinalizer() then return false end
         return self:_sendRelease()
     end
@@ -713,6 +717,10 @@ function M.create(moduleName, legacyPriority)
             needsRecovery = self.needsRecovery == true,
             intentActive = self.intent and self.intent.active == true,
             intentReason = tostring(self.intent and self.intent.reason or 'unknown'),
+            -- Per-character status HUD signals: 'why isn't this worker acting?'
+            -- Both piggyback on the existing HEARTBEAT cadence — no new sends.
+            idleReason = tostring(self.intent and self.intent.reason or ''),
+            lastActionAt = tonumber(self.lastActionAtMs) or 0,
             stateInboxOverflows = tonumber(self.stateInboxOverflows) or 0,
             stateDrops = tonumber(self.stateDrops) or 0,
             stateDropReasons = actorSafeCopy(self.stateDropReasons),
