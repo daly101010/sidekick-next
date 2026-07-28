@@ -67,7 +67,10 @@ profiles and its Humanize subsystem is forced off.
 
 Domain ordering is local and deterministic. Support evaluates Healing, Cures,
 then Resurrection and may interrupt an active resurrection workflow for a new
-heal or cure. Combat gives managed feign exclusive control; otherwise it
+heal or cure. The Support host ticks its process-local runtime cache before
+component evaluation so Cure-in-combat and moving guards consume a current
+snapshot in the consolidated profile. Combat gives managed feign exclusive
+control; otherwise it
 evaluates CC, Debuff, Assist, Disciplines, then DPS. Only managed-feign safety
 or a new CC action may interrupt another active Combat component. Once a spell
 has issued `/cast` and entered executor `waiting_start` or `running`, CC is
@@ -226,18 +229,27 @@ resumed while runtime pause/resume behavior remains unchanged.
 Workers gate global pause on the coordinator state packet, not their
 process-local persisted settings snapshot. This prevents a worker that loaded
 during startup from remaining paused after the fleet has resumed.
+The versioned `sk:supervisor` heartbeat is also the documented UI control
+snapshot. It carries `automationPaused`, `settingsRevision`,
+`humanizeOverride`, and `leasePreemptionEnabled` together; the coordinator
+copies those fields into `sk:state`, and workers apply them only from that
+validated state. `humanizeOverride` is therefore not an unrelated hidden
+topic, and adding another runtime-wide control requires versioning and
+documenting this snapshot contract.
 
 `sk_items.lua` is the sole coordinated owner of configured item clicks and
-manual UI activations. The item bar sends a local `item:manual` Actor request;
-AA, discipline, spell, and skill buttons send `action:manual`. ImGui callbacks
-only copy scalar request data and enqueue transport: TLO revalidation and every
-mutating command occur later in the worker's yieldable loop after it receives
-the coordinator's single action lease. Manual requests share one bounded FIFO,
-take precedence over automatic item candidates, and are removed on terminal
-success/failure. Preemption preserves a live request for retry. There is no
-direct UI compatibility path. The Remote Abilities window targets the same
-worker mailbox on the selected Actor Team character; the destination worker,
-not `/dex`, obtains that character's lease and performs the action.
+manual UI activations. Item, AA, discipline, spell, and skill requests use the
+standard `worker:command` envelope with `component=items`; only its `command`
+and scalar `data` differ. ImGui callbacks only copy scalar request data and
+enqueue transport: TLO revalidation and every mutating command occur later in
+the worker's yieldable loop after it receives the coordinator's single action
+lease. Manual requests share one bounded FIFO, take precedence over automatic
+item candidates, and are removed on terminal success/failure. Preemption
+preserves a live request for retry. There is no direct UI compatibility path.
+The Remote Abilities window resolves the active Items worker from the worker
+registry and targets that command envelope to the selected Actor Team
+character; the destination worker, not `/dex`, obtains that character's lease
+and performs the action.
 The Items worker also owns global cursor cleanup independently of configured
 automatic items and automation level. It observes `Cursor.ID` without mutating
 state and starts a five-second grace period for that exact item identity. If the
@@ -319,7 +331,7 @@ configured minimum distance requests another movement lease. The configured
 retreat distance is a destination, not a maximum-radius trigger, so standoff
 never moves a caster toward a distant primary.
 
-`sk_chase.lua` is the dedicated out-of-combat chase worker. It uses
+`sk_chase.lua` is the dedicated chase worker. It uses
 `automation/chase.lua` for read-only intent selection, records an exact target
 fingerprint, and requests its fixed DPS-tier lease only when movement is
 needed. A granted movement slice is bounded to 15 seconds. Stalls, start
@@ -330,6 +342,12 @@ a usable Nav, MoveTo, or Stick route reports `no_movement_backend` and does not
 churn the scheduler. Finalization stops Nav, MoveTo, follow/stick, and any held
 movement keys before release. `/sk_chase status` reports the selected backend,
 backend capabilities, active movement phase, failure streak, and backoff.
+Melee combat and AutoFire always suppress Chase. General combat state, active
+XTarget haters, and pet combat suppress it only while Ranged Standoff is
+enabled and the chase target remains within `max(150, 4 * ChaseDistance)`.
+This lets standoff own ordinary in-combat positioning without stranding a
+non-standoff character or a group whose tank pursues a runner beyond the
+leash.
 Chase is not a catch-all utility worker, and the UI host does not tick chase
 movement. If a prior process leaves a valid chase ownership
 marker, read-only inspection marks the worker dirty and the coordinator grants
@@ -375,10 +393,13 @@ AE prohibition and mezzed mobs are never fallback kill targets.
 `TankSafeAECheck` additionally suppresses AE hate when the nearby NPC count
 exceeds the active XTarget-hater count.
 
-The primary `status:update` Actor heartbeat and coordinator-owned Actor Team
-state include the sender's current target ID/type/name.
-`utils/actors_coordinator.lua` merges partial worker heartbeats so they cannot
-erase that target telemetry. A fresh `target:primary` publication from the
+The coordinator-owned Actor Team state is the authoritative fleet presence,
+trust, role, vitals, and current-target source. Script-local overlays add only
+data that has a real consumer in that process: Support workers publish
+`peer:vitals` for healing latency, and the UI publishes `peer:capabilities`
+for Remote Abilities and rich UI status. The old `status:update` topic is
+receive-only compatibility and is not a second presence source of truth.
+A fresh `target:primary` publication from the
 authorized tank/assist authority carries both the declared ID and an explicit
 `killAuthorized` bit. CC protects the declared ID immediately; offensive Combat
 components require a positive ID plus `killAuthorized=true`. A fresh zero,
@@ -467,9 +488,10 @@ input.
 
 `utils/actors_coordinator.lua` validates the v2 peer envelope before feature
 dispatch, preserves validated sender provenance for local telemetry consumers,
-and drains only a bounded number of queued messages per worker tick. Ordinary
-workers publish a two-second same-role heartbeat; Support may publish faster
-when health changes. Distributed claim consumers share
+and drains only a bounded number of queued messages per worker tick. Actor Team
+provides normal worker presence. Support publishes its script-local vitals
+overlay at a health-responsive cadence; the UI publishes its capability
+overlay change-driven with a two-second heartbeat. Distributed claim consumers share
 `utils/coordination_policy.lua`: an unknown first-contact peer remains usable
 until the claim expires, but a previously observed peer fails closed while its
 heartbeat is stale, unavailable, dead, outside the expected zone/team, or
@@ -491,6 +513,11 @@ ticks, TTL/scheduler rejects, and queue overflow. Worker heartbeats include
 their state-inbox drop map, the supervisor reports its acknowledgement inbox,
 and the peer gateway exposes its reason map in transport diagnostics. Logging
 of these counters occurs later from normal coroutines, never Actor callbacks.
+The peer gateway also counts logical publications separately from physical
+recipient attempts, failures, and estimated wire bytes. Worker heartbeats
+carry cumulative totals and ten-second rates; the coordinator aggregates these
+under `transportDiag.actorOutbound`, while Coordinator diagnostics shows both
+the fleet aggregate and the local gateway budget.
 
 Actor sender authentication uses `message.sender.mailbox`, which MacroQuest
 returns as a fully-qualified address (`lua:script:actor`, with some builds also
@@ -737,14 +764,23 @@ and overflow telemetry. The plane is handled inside `sk_coordinator.lua`,
 `sk_module_base.lua`, and
 `utils/actors_team.lua`.
 
-**`sidekick` peer plane.** Mailbox `sidekick`, ~30 topics fanned out via
-`ActorsCoordinator.broadcastFleet(topic, payload)`. Envelope key is `id`.
+**`sidekick` peer plane.** Mailbox `sidekick`, with every publishable topic
+declared in `ActorsCoordinator.TOPIC_CONTRACTS`. Producers call only
+`ActorsCoordinator.publish(topic, payload)`; the registry chooses either
+`fleet` fan-out or `same_script` delivery. Unknown topics fail closed.
+Envelope key is `id`.
 This is the plane for cross-character feature state — target selection, mez
 lists, buff status, cure requests, tank positioning, charm-pet identity,
 healing HoT snapshots, and domain-specific `heal:claim`, `buff:claim`,
 `debuff:claim`, and `cc:claim` messages. These claims coordinate peer intent;
 they neither grant nor subdivide the coordinator's one local action lease. If
 you are adding "everyone should know X", this is the plane.
+
+There is no public `broadcast` / `broadcastFleet` choice. Cross-component
+topics such as `pull:incoming`, `mobhp:update`, and `assist:me` are registered
+as `fleet`; same-role claims are registered as `same_script`. This prevents a
+producer from compiling successfully with the wrong MQ Actor address and then
+failing only when producer and consumer move into different script names.
 
 Full protocol unification (single envelope, single topic namespace) is
 deferred. The local plane validates the Actor sender route together with
@@ -766,8 +802,12 @@ same-sender packets arrived out of order (network jitter, MQ delay):
 - `cc:charmpet` — the enchanter's protected charm pet
 - `pull:intent` — cooperative puller election
 
-`ActorsCoordinator.broadcastFleet` wraps SideKick peer payloads in the v2
+`ActorsCoordinator.publish` wraps SideKick peer payloads in the v2
 Actor envelope with a per-sender session and monotonic sequence.
+Transport session fencing is endpoint-wide, but replay/order high-water marks
+are stored per `(endpoint, topic)`. Because the sender sequence is global
+across all topics, comparing it endpoint-wide would incorrectly reject a valid
+lower-sequence message when a later message on another topic arrives first.
 Receivers call `isStaleGuardedMessage(id, content, sender)` and drop same-
 session packets with sequence ≤ last accepted. A new `sessionId` (sender
 restart) resets the sequence gate. SideKick peer messages without a valid
@@ -778,7 +818,27 @@ To add a new guarded topic:
 1. Add the id to `GUARDED_TOPICS` in `utils/actors_coordinator.lua`.
 2. In the receiver block, call `if isStaleGuardedMessage(id, content, sender) then return end`
    after your zone / authorization gates.
-3. Send via `broadcastFleet` — the augmentation is automatic.
+3. Declare its delivery scope in `TOPIC_CONTRACTS` and send via `publish`;
+   routing and sequence augmentation are automatic.
+
+### Standard worker telemetry and commands
+
+UI-bound worker data uses one outer `worker:telemetry` envelope:
+`telemetryVersion`, `module`, `stream`, `streamSequence`, `sentAtMs`, and
+`data`. Named streams such as `heal:telemetry`, `rez:telemetry`,
+`action:trace`, and `session:damage` remain semantic/QoS boundaries, but they
+share one validated receive handler through
+`registerTelemetryCallback(stream, callback)`. Telemetry is local-character
+only and cannot authorize gameplay.
+
+UI-to-worker requests use one `worker:command` envelope:
+`commandVersion`, `module`, `component`, `command`, `requestId`,
+`commandSequence`, `sentAtMs`, and `data`. Callers use
+`sendWorkerCommand(module, command, data, opts)`; it resolves the destination
+script from the active worker registry, including consolidated profiles.
+Receivers use `registerWorkerCommand(component, callback)`, copy bounded scalar
+intent in the Actor callback, and perform TLO reads, yielding work, and
+mutations later in their normal worker loop under a lease.
 
 ### Camp anchor and puller election
 

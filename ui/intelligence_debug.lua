@@ -269,17 +269,14 @@ function M.init()
         if type(getter) == 'function' then pcall(getter) end
     end
     local Actors = Mods.Actors()
-    if Actors and Actors.registerMessageCallback then
-        Actors.registerMessageCallback('intel:telemetry', function(content, sender, fromMe)
+    if Actors and Actors.registerTelemetryCallback then
+        Actors.registerTelemetryCallback('intel:telemetry', function(content, _, sender)
             local trusted = lib.actorSenderMatches(
                 sender, 'sidekick-next/sk_dps', 'sidekick')
                 or lib.actorSenderMatches(
                     sender, 'sidekick-next/sk_combat', 'sidekick')
-            if fromMe ~= true or not trusted then
-                return false
-            end
+            if not trusted then return end
             M.setTelemetry(content)
-            return true
         end)
     end
 end

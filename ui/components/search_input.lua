@@ -317,10 +317,11 @@ function M.withSuggestions(inputId, text, suggestions, themeName, opts)
             if imgui.BeginTooltip then
                 imgui.BeginTooltip()
 
-                for i, match in ipairs(matches) do
+                for _, match in ipairs(matches) do
                     local matchStr = tostring(match)
 
-                    if imgui.Selectable(matchStr, false) then
+                    local _, clicked = imgui.Selectable(matchStr, false)
+                    if clicked then
                         selectedSuggestion = match
                         newText = matchStr
                         changed = true
@@ -363,7 +364,8 @@ function M.filter(inputId, text, filterType, filterTypes, themeName, opts)
     local newType = filterType
     if imgui.BeginCombo(inputId .. '_type', filterType or filterTypes[1]) then
         for i, ft in ipairs(filterTypes) do
-            if imgui.Selectable(ft, i == typeIdx) then
+            local _, clicked = imgui.Selectable(ft, i == typeIdx)
+            if clicked then
                 newType = ft
             end
         end

@@ -372,7 +372,8 @@ local function RenderSettings()
             ImGui.SameLine()
 
             -- Selectable name
-            if ImGui.Selectable(p.name, selected) then
+            local _, clicked = ImGui.Selectable(p.name, selected)
+            if clicked then
                 State.selectedPiece = p.id
             end
 

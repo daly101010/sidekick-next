@@ -37,8 +37,6 @@ local MEMORIZE_TIMEOUT_MS = 12000   -- Max time to wait for memorization
 local WAIT_POLL_MS = 100            -- Poll interval for wait functions
 local MANUAL_SCAN_INTERVAL_MS = 250 -- Polling is cheap and runs only while idle/OOC
 local MANUAL_SETTLE_MS = 750        -- Require a stable post-memorization layout
-local WORKER_SCRIPT = 'sidekick-next/sk_scribing'
-local APPLY_TOPIC = 'spellset:apply'
 local STATUS_TOPIC = 'spellset:status'
 local TRANSPORT_TTL_MS = 5000
 local COMMAND_RETRY_MS = 1000
@@ -260,13 +258,13 @@ function M.initializeWorker()
     if _workerTransportInitialized then return true end
     _workerMode = true
     local Actors = getActorsCoordinator()
-    if not Actors or not Actors.registerMessageCallback then return false end
-    Actors.registerMessageCallback(APPLY_TOPIC, function(content, sender, fromMe)
+    if not Actors or not Actors.registerWorkerCommand then return false end
+    Actors.registerWorkerCommand('scribing',
+        function(command, content, envelope, sender, fromMe)
         -- Actor callbacks retain no message handle and perform no TLO, file,
         -- gameplay, send, or yielding work.
-        if type(content) ~= 'table'
-            or tostring(content.id or ''):lower() ~= APPLY_TOPIC
-            or not hasValidActorEnvelope(content)
+        if tostring(command or ''):lower() ~= 'apply_spellset'
+            or not hasValidActorEnvelope(envelope)
             or not isLocalUiSender(sender, fromMe)
             or #_commandInbox >= MAX_COMMAND_INBOX then
             return true
@@ -274,7 +272,7 @@ function M.initializeWorker()
         local copied = copyApplyMessage(content, sender)
         if copied then _commandInbox[#_commandInbox + 1] = copied end
         return true
-    end)
+        end)
     _workerTransportInitialized = true
     return true
 end
@@ -282,12 +280,11 @@ end
 function M.initializeClient()
     if _clientTransportInitialized then return true end
     local Actors = getActorsCoordinator()
-    if not Actors or not Actors.registerMessageCallback then return false end
-    Actors.registerMessageCallback(STATUS_TOPIC, function(content, _, fromMe)
-        if fromMe ~= true or #_clientStatusInbox >= MAX_COMMAND_INBOX then return true end
+    if not Actors or not Actors.registerTelemetryCallback then return false end
+    Actors.registerTelemetryCallback(STATUS_TOPIC, function(content)
+        if #_clientStatusInbox >= MAX_COMMAND_INBOX then return end
         local copied = copyStatusMessage(content)
         if copied then _clientStatusInbox[#_clientStatusInbox + 1] = copied end
-        return true
     end)
     _clientTransportInitialized = true
     return true
@@ -355,7 +352,7 @@ function M.publishWorkerStatus(reason, force)
     _lastWorkerStatus = signature
     _lastWorkerStatusAtMs = now
     local Actors = getActorsCoordinator()
-    if not Actors or not Actors.sendToLocalScript then return false end
+    if not Actors or not Actors.sendTelemetryToScript then return false end
     local payload = {
         busy = busy,
         pendingSet = pendingSet or '',
@@ -367,7 +364,8 @@ function M.publishWorkerStatus(reason, force)
     local scripts = type(lib.Scripts.UI) == 'table' and lib.Scripts.UI
         or { lib.Scripts.UI }
     for _, scriptName in ipairs(scripts) do
-        local ok = Actors.sendToLocalScript(scriptName, STATUS_TOPIC, payload)
+        local ok = Actors.sendTelemetryToScript(
+            scriptName, 'scribing', STATUS_TOPIC, payload)
         sent = ok or sent
     end
     return sent
@@ -1090,8 +1088,8 @@ function M.processPending()
     queued.lastSentAtMs = now
     queued.issuedAtMs = now
     local Actors = getActorsCoordinator()
-    if not Actors or not Actors.sendToLocalScript then return end
-    Actors.sendToLocalScript(WORKER_SCRIPT, APPLY_TOPIC, {
+    if not Actors or not Actors.sendWorkerCommand then return end
+    Actors.sendWorkerCommand('scribing', 'apply_spellset', {
         setName = queued.setName,
         saveFirst = queued.saveFirst == true,
         requestId = queued.requestId,
@@ -1099,7 +1097,7 @@ function M.processPending()
         ttlMs = TRANSPORT_TTL_MS,
         ownerName = lib.getMyName(),
         ownerServer = lib.getMyServer(),
-    })
+    }, { component = 'scribing', requestId = queued.requestId })
 end
 
 --- Cancel the pending spell set

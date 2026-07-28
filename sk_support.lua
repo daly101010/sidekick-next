@@ -5,6 +5,7 @@ local module = Domain.create({
     name = 'support',
     priority = lib.Priority.HEALING,
     components = { 'healing', 'cures', 'resurrection' },
+    cache = true,
     shouldInterrupt = function(_, active, winner)
         return active == 'resurrection'
             and (winner == 'healing' or winner == 'cures')

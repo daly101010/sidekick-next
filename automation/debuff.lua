@@ -272,14 +272,14 @@ end
 -- @param debuffType string Debuff type
 function M.broadcastClaim(mobId, debuffType)
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     -- Send zone explicitly so the receiver doesn't have to depend on the
     -- _remoteCharacters fallback (which can be stale during zone-in).
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
 
-    Actors.broadcast('debuff:claim', {
+    Actors.publish('debuff:claim', {
         mobId = mobId,
         debuffType = debuffType,
         claimer = _selfName,
@@ -290,11 +290,11 @@ end
 
 function M.broadcastRelease(mobId, debuffType)
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName
         and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
-    Actors.broadcast('debuff:release', {
+    Actors.publish('debuff:release', {
         mobId = mobId,
         debuffType = debuffType,
         claimer = _selfName,
@@ -390,12 +390,12 @@ end
 -- @param duration number|nil Duration
 function M.broadcastDebuffLanded(mobId, debuffType, spellName, duration)
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
 
-    Actors.broadcast('debuff:landed', {
+    Actors.publish('debuff:landed', {
         mobId = mobId,
         debuffType = debuffType,
         spellName = spellName or '',

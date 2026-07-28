@@ -759,7 +759,7 @@ function M.broadcastBuffList()
     if not next(M.localBuffs) then return end
 
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local now = os.clock()
     local buffs = {}
@@ -783,7 +783,7 @@ function M.broadcastBuffList()
 
     if not next(buffs) then return end
 
-    Actors.broadcast('buff:list', {
+    Actors.publish('buff:list', {
         buffs = buffs,
         sender = _selfName,
         timestamp = now,
@@ -833,7 +833,7 @@ end
 --- Broadcast our blocked buffs
 function M.broadcastBlocks()
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local Core = getCore()
     if not Core or not Core.Settings then return end
@@ -846,7 +846,7 @@ function M.broadcastBlocks()
         end
     end
 
-    Actors.broadcast('buff:blocks', {
+    Actors.publish('buff:blocks', {
         charName = _selfName,
         blockedTypes = blocked,
     })
@@ -882,8 +882,8 @@ function M.claimBuff(targetId, buffCategory)
     }
 
     local Actors = getActors()
-    if Actors and Actors.broadcast then
-        Actors.broadcast('buff:claim', {
+    if Actors and Actors.publish then
+        Actors.publish('buff:claim', {
             targetId = id,
             buffType = buffCategory,
             claimer = _selfName,
@@ -908,8 +908,8 @@ function M.renewClaim(targetId, buffCategory)
     claim.lastBroadcastAt = now
 
     local Actors = getActors()
-    if Actors and Actors.broadcast then
-        Actors.broadcast('buff:claim', {
+    if Actors and Actors.publish then
+        Actors.publish('buff:claim', {
             targetId = id,
             buffType = buffCategory,
             claimer = _selfName,
@@ -1040,8 +1040,8 @@ function M.trackLocalBuff(targetId, buffCategory, spellId, spellName, duration)
 
     -- Broadcast immediately
     local Actors = getActors()
-    if Actors and Actors.broadcast then
-        Actors.broadcast('buff:landed', {
+    if Actors and Actors.publish then
+        Actors.publish('buff:landed', {
             targetId = id,
             buffType = buffCategory,
             caster = _selfName,

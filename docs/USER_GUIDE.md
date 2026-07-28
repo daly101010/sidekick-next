@@ -202,7 +202,7 @@ Controls all automated behaviors.
 | Target | (empty) | Character name if Role = byname |
 | Distance | 30 | Units to maintain from chase target |
 
-Chase is owned by a dedicated out-of-combat worker. It selects the destination
+Chase is owned by a dedicated movement worker. It selects the destination
 without changing game state, then requests the same single action lease used by
 every other worker before movement starts. Each movement slice is bounded to
 15 seconds. On completion, cancellation, or preemption it stops Nav, MoveTo,
@@ -210,6 +210,11 @@ follow/stick, and held movement keys before releasing the lease. Chase is not a
 general utility module and it never runs from the UI render loop. If SideKick
 restarts with a chase-owned movement marker still present, cleanup obtains a
 fenced recovery lease even when Chase is disabled or automation is paused.
+Melee combat and AutoFire pause Chase. With Ranged Standoff enabled, ordinary
+combat also pauses it while the chase target remains within a generous leash;
+Chase resumes if the target runs beyond `max(150, 4 × Chase Distance)`. With
+Ranged Standoff disabled, combat state alone does not stop following the
+configured chase target.
 
 **Combat Mode Section**
 
@@ -560,18 +565,25 @@ lease and cannot authorize gameplay on their own.
 | Window bounds | Share window positions for UI anchoring |
 | Team presence | Share coordinator state, active lease holder/phase, role, and module readiness |
 
-The generic Actors peer count and Actor Team peer count are different. Generic
-peers are every live SideKick status sender visible through Actors. Actor Team
-peers share the same trusted raid, group, or manual team identity and are the
-only OOG peers eligible for automated resurrection.
+Actor Team is the authoritative trusted presence list. It carries each
+member's zone, class, role, vitals, current target, lease summary, and worker
+readiness. The older generic peer table is now only a script-local overlay:
+Support receives health-responsive vitals for healing, while the UI receives
+capabilities for Remote Abilities. It should not be interpreted as a second
+team membership count. Actor Team peers are the only out-of-group peers
+eligible for automated resurrection.
 
 If Coordinator diagnostics has not received a state snapshot, it shows the
 coordinator Lua process status, received packet count, and last route/protocol
 rejection instead of only displaying a waiting message.
+Coordinator diagnostics also separates logical Actor publications from
+physical recipient sends and shows the ten-second fleet send rate, failures,
+and estimated wire volume. A fleet topic may produce many physical sends even
+though it represents one logical state update.
 
 ### Setup
 
-1. Leave Options > Integration > Actors Enabled on to publish UI status and expose the team controls
+1. Leave Options > Integration > Actors Enabled on to publish the UI capability overlay and expose the team controls
 2. Leave Enable Team Presence on and Team Mode on `auto`, or give every intended character the same manual team name
 3. Run SideKick on each character
 4. Open Coordinator > Actor Team or use `/sk_coord team` to verify membership and leader election

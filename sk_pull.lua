@@ -39,14 +39,13 @@ local function isLocalUiSender(sender, fromMe)
     return false
 end
 
-local function receiveManualRequest(content, sender, fromMe)
+local function receiveManualRequest(command, content, envelope, sender, fromMe)
     if type(content) ~= 'table'
-        or tostring(content.id or ''):lower() ~= 'pull:manual'
-        or not hasValidV2Envelope(content)
+        or not hasValidV2Envelope(envelope)
         or not isLocalUiSender(sender, fromMe) then
         return true
     end
-    local command = tostring(content.command or ''):lower()
+    command = tostring(command or ''):lower()
     if command ~= 'pulltarget' and command ~= 'clearignore'
         and command ~= 'camp' and command ~= 'status' then
         return true
@@ -61,8 +60,8 @@ end
 
 local function ensureActorCallbacks(coordinator)
     if _actorCallbacksRegistered or not coordinator then return end
-    if not coordinator.registerMessageCallback then return end
-    coordinator.registerMessageCallback('pull:manual', receiveManualRequest)
+    if not coordinator.registerWorkerCommand then return end
+    coordinator.registerWorkerCommand('pull', receiveManualRequest)
     _actorCallbacksRegistered = true
 end
 
@@ -99,11 +98,12 @@ local function publishTelemetry(state)
     local now = lib.getTimeMs()
     if (now - _lastTelemetryAt) < 250 then return end
     _lastTelemetryAt = now
-    if not module.peerActors or not module.peerActors.sendToLocalScript then return end
+    if not module.peerActors or not module.peerActors.sendTelemetryToScript then return end
     local scripts = type(lib.Scripts.UI) == 'table'
         and lib.Scripts.UI or { lib.Scripts.UI }
     for _, scriptName in ipairs(scripts) do
-        pcall(module.peerActors.sendToLocalScript, scriptName, 'pull:telemetry', {
+        pcall(module.peerActors.sendTelemetryToScript,
+            scriptName, module.name, 'pull:telemetry', {
             state = tostring(state.state or ''),
             reason = tostring(state.reason or ''),
             pullId = tonumber(state.pullId) or 0,

@@ -279,12 +279,12 @@ end
 local function maybeSendAnalyticsTelemetry(peerActors)
     local now = lib.getTimeMs()
     if (now - _lastTelemetryAtMs) < TELEMETRY_INTERVAL_MS then return end
-    if not peerActors or not peerActors.sendToLocalScript then return end
+    if not peerActors or not peerActors.sendTelemetryToScript then return end
     local analytics = Healing.Analytics
     if not analytics or not analytics.getStats then return end
 
     _lastTelemetryAtMs = now
-    peerActors.sendToLocalScript('sidekick-next', 'heal:telemetry', {
+    peerActors.sendTelemetryToScript('sidekick-next', 'healing', 'heal:telemetry', {
         character = mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or '',
         zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
         sentAtMs = now,

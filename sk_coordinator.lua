@@ -342,6 +342,11 @@ local function buildTeamTickSnapshot()
         dead = State.worldState.selfDead == true,
         incapacitated = State.worldState.incapacitated == true,
         automationPaused = State.automationPaused == true,
+        hpPct = tonumber(lib.safeTLO(function() return mq.TLO.Me.PctHPs() end, 0)) or 0,
+        manaPct = tonumber(lib.safeTLO(function() return mq.TLO.Me.PctMana() end, 0)) or 0,
+        endurancePct = tonumber(lib.safeTLO(function()
+            return mq.TLO.Me.PctEndurance()
+        end, 0)) or 0,
         activePriority = schedulerState.activePriority,
         targetId = targetId,
         targetType = targetType,
@@ -539,6 +544,8 @@ local function processHeartbeat(content, sender, nowMs)
             and copyWireValue(content.stateDropReasons, 0, {}) or nil,
         counters = type(content.counters) == 'table'
             and copyWireValue(content.counters, 0, {}) or nil,
+        actorTransport = type(content.actorTransport) == 'table'
+            and copyWireValue(content.actorTransport, 0, {}) or nil,
     }
 
     State.scheduler:observeWorkerSession(
@@ -696,9 +703,34 @@ local function buildModuleDiagnostics(nowMs)
                 and (tonumber(heartbeat.stateDrops) or 0) or 0,
             stateDropReasons = heartbeat and heartbeat.stateDropReasons or nil,
             counters = heartbeat and heartbeat.counters or nil,
+            actorTransport = heartbeat and heartbeat.actorTransport or nil,
         }
     end
     return diagnostics
+end
+
+local function buildActorTransportSummary(nowMs)
+    local summary = {
+        logical = 0,
+        attempts = 0,
+        failures = 0,
+        estimatedBytes = 0,
+        logicalPerSecond = 0,
+        attemptsPerSecond = 0,
+        failuresPerSecond = 0,
+        estimatedBytesPerSecond = 0,
+    }
+    for _, heartbeat in pairs(State.moduleHeartbeats) do
+        local transport = heartbeatFresh(heartbeat, nowMs)
+            and type(heartbeat.actorTransport) == 'table'
+            and heartbeat.actorTransport or nil
+        if transport then
+            for key in pairs(summary) do
+                summary[key] = summary[key] + (tonumber(transport[key]) or 0)
+            end
+        end
+    end
+    return summary
 end
 
 local function buildStatePayload()
@@ -739,6 +771,7 @@ local function buildStatePayload()
             supervisorDrops = State.supervisorDrops,
             supervisorDropReasons =
                 copyWireValue(State.supervisorDropReasons, 0, {}),
+            actorOutbound = buildActorTransportSummary(nowMs),
         },
     }
 end
@@ -846,6 +879,12 @@ local function checkModuleHealth()
         if age > lib.Timing.MODULE_CRASH_MS
             and (heartbeat or (nowMs - State.startedAtMs) > lib.Timing.MODULE_CRASH_MS) then
             local status = lib.getLuaScriptStatus(spec.script)
+            local reportedAgeMs = age == math.huge
+                and math.max(0, nowMs - State.startedAtMs) or age
+            debugLog('WATCHDOG: Module %s heartbeat stale (%dms), Lua status=%s',
+                spec.module, reportedAgeMs, tostring(status))
+            printf('\ar[SK-Watchdog]\ax Module "%s" has not sent a heartbeat in %.1fs (Lua status: %s)',
+                spec.module, reportedAgeMs / 1000, tostring(status))
             local lease = State.scheduler.lease
             if lease and lease.holderModule == spec.module
                 and lease.status ~= 'recovering' then

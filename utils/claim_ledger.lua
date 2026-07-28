@@ -263,7 +263,8 @@ function M.draw(imgui)
     if imgui.BeginCombo('##claim_session', items[_selectedHistoryIdx + 1] or 'Current') then
         for i, label in ipairs(items) do
             local isSel = (_selectedHistoryIdx == (i - 1))
-            if imgui.Selectable(label, isSel) then
+            local _, clicked = imgui.Selectable(label, isSel)
+            if clicked then
                 _selectedHistoryIdx = i - 1
             end
         end

@@ -399,10 +399,10 @@ local function claimCure(targetId, debuffType)
     -- Broadcast claim. Include zone explicitly so the receiver doesn't have
     -- to depend on the _remoteCharacters fallback during zone-in.
     local Actors = getActors()
-    if Actors and Actors.broadcast then
+    if Actors and Actors.publish then
         local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
         if myZone == '' or myZone == 'NULL' then myZone = nil end
-        Actors.broadcast('cure:claim', {
+        Actors.publish('cure:claim', {
             targetId = id,
             debuffType = debuffType,
             claimer = _state.selfName,
@@ -550,12 +550,12 @@ end
 
 local function broadcastCureLanded(targetId, debuffType, spellName)
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
 
-    Actors.broadcast('cure:landed', {
+    Actors.publish('cure:landed', {
         targetId = targetId,
         debuffType = debuffType,
         spellName = spellName or '',
@@ -571,7 +571,7 @@ end
 --- Broadcast our cure capabilities to peers in zone so they can shard with us.
 function M.broadcastCapabilities()
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
@@ -580,7 +580,7 @@ function M.broadcastCapabilities()
     local caps = {}
     for k, v in pairs(_state.canCure) do caps[k] = v end
 
-    Actors.broadcast('cure:capabilities', {
+    Actors.publish('cure:capabilities', {
         canCure = caps,
         zone = myZone,
         sentAt = os.time(),

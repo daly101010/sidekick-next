@@ -828,6 +828,8 @@ function M.drawContent()
     else
         schedulingState = 'Idle'
     end
+    local actorOutbound = State.last.transportDiag
+        and State.last.transportDiag.actorOutbound or {}
     local rows = {
         { 'Scheduling Priority', schedulingState },
         { 'Lifecycle', tostring(State.last.lifecycle or '?') },
@@ -842,6 +844,14 @@ function M.drawContent()
         { 'Tick ID', tostring(State.last.tickId or '?') },
         { 'Counted Drops', tostring(State.last.transportDiag
             and State.last.transportDiag.totalDrops or 0) },
+        { 'Actor Sends / s', string.format('%.1f',
+            tonumber(actorOutbound.attemptsPerSecond) or 0) },
+        { 'Actor Publications / s', string.format('%.1f',
+            tonumber(actorOutbound.logicalPerSecond) or 0) },
+        { 'Actor Send Failures', tostring(
+            tonumber(actorOutbound.failures) or 0) },
+        { 'Actor Wire Estimate / s', string.format('%.1f KB',
+            (tonumber(actorOutbound.estimatedBytesPerSecond) or 0) / 1024) },
         { 'Request TTL Expiries', tostring(State.last.schedulerMetrics
             and State.last.schedulerMetrics.requestExpiries or 0) },
         { 'Age (s)', string.format('%.2f', ageMs / 1000) },
@@ -935,6 +945,27 @@ function M.drawContent()
                 lastSend.lastError ~= '' and lastSend.lastError or '-') },
             { 'Event Counts', #reasonCounts > 0
                 and table.concat(reasonCounts, ', ') or '-' },
+        })
+    end
+
+    if imgui.CollapsingHeader('Local Actor Send Budget##actorsends') then
+        local actorDebug = ActorsCoordinator.getDebugState
+            and ActorsCoordinator.getDebugState() or {}
+        local outbound = actorDebug.transport
+            and actorDebug.transport.outbound or {}
+        renderTable('##coord_actor_sends', {
+            { 'Logical Publications', tostring(outbound.logical or 0) },
+            { 'Physical Send Attempts', tostring(outbound.attempts or 0) },
+            { 'Failures', tostring(outbound.failures or 0) },
+            { 'Publications / s', string.format('%.1f',
+                tonumber(outbound.logicalPerSecond) or 0) },
+            { 'Sends / s', string.format('%.1f',
+                tonumber(outbound.attemptsPerSecond) or 0) },
+            { 'Wire Estimate / s', string.format('%.1f KB',
+                (tonumber(outbound.estimatedBytesPerSecond) or 0) / 1024) },
+            { 'Rate Window', string.format('%.0fs',
+                tonumber(outbound.windowSeconds) or 0) },
+            { 'Last Failure', tostring(outbound.lastFailure or '-') },
         })
     end
 

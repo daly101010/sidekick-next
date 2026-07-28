@@ -606,8 +606,8 @@ end
 
 local function clearLocalIntent(reason, broadcast)
     local intent = Runtime.localIntent
-    if broadcast ~= false and intent and module.peerActors and module.peerActors.broadcast then
-        module.peerActors.broadcast('rez:cancelled', {
+    if broadcast ~= false and intent and module.peerActors and module.peerActors.publish then
+        module.peerActors.publish('rez:cancelled', {
             corpseId = intent.corpseId,
             zone = zoneShort(),
             reason = reason or 'no_longer_needed',
@@ -702,6 +702,11 @@ local function receiveConsentRequest(content, sender, fromMe)
     return true
 end
 
+local function receiveConsentCommand(command, content, _, sender, fromMe)
+    if tostring(command or '') ~= 'request_consent' then return false end
+    return receiveConsentRequest(content, sender, fromMe)
+end
+
 local function consentRequestValid(entry)
     if type(entry) ~= 'table' or not settingBool('RezCoordinateActors', true) then
         return false, 'actor_rez_coordination_disabled'
@@ -757,11 +762,12 @@ end
 
 local function ensureActorCallbacks(self)
     if Runtime.actorCallbacksRegistered or not self.peerActors then return end
-    if not self.peerActors.registerMessageCallback then return end
+    if not self.peerActors.registerMessageCallback
+        or not self.peerActors.registerWorkerCommand then return end
     self.peerActors.registerMessageCallback('rez:claim', receivePeerIntent)
     self.peerActors.registerMessageCallback('rez:cancelled', receivePeerCancelled)
     self.peerActors.registerMessageCallback('rez:completed', receivePeerCompleted)
-    self.peerActors.registerMessageCallback('rez:consent_request', receiveConsentRequest)
+    self.peerActors.registerWorkerCommand('resurrection', receiveConsentCommand)
     Runtime.actorCallbacksRegistered = true
 end
 
@@ -811,7 +817,7 @@ local function localWinsIntent(target, resource)
 
     if (now - intent.lastSentAtMs) >= INTENT_REFRESH_MS then
         intent.lastSentAtMs = now
-        module.peerActors.broadcast('rez:claim', {
+        module.peerActors.publish('rez:claim', {
             corpseId = target.corpseId,
             targetName = target.memberName,
             targetClass = target.classShort,
@@ -1115,8 +1121,8 @@ local function finishWorkflow(success, reason)
 
     if workflow.targetId and workflow.targetId > 0 then
         Runtime.lastAttempt[workflow.targetId] = nowMs()
-        if module.peerActors and module.peerActors.broadcast and not workflow.completionBroadcast then
-            module.peerActors.broadcast(success and 'rez:completed' or 'rez:cancelled', {
+        if module.peerActors and module.peerActors.publish and not workflow.completionBroadcast then
+            module.peerActors.publish(success and 'rez:completed' or 'rez:cancelled', {
                 corpseId = workflow.targetId,
                 targetName = workflow.targetName,
                 resourceKind = workflow.resource and workflow.resource.kind or '',
@@ -1173,8 +1179,8 @@ local function beginRestore(success, reason)
         and not workflow.completionBroadcast then
         workflow.completionBroadcast = true
         Runtime.lastAttempt[workflow.targetId] = nowMs()
-        if module.peerActors and module.peerActors.broadcast then
-            module.peerActors.broadcast('rez:completed', {
+        if module.peerActors and module.peerActors.publish then
+            module.peerActors.publish('rez:completed', {
                 corpseId = workflow.targetId,
                 targetName = workflow.targetName,
                 resourceKind = workflow.resource and workflow.resource.kind or '',
@@ -1249,17 +1255,19 @@ local function startWorkflow(action)
         startedAtMs = nowMs(),
     }
     if Runtime.workflow.targetSource == 'actor_team'
-        and module.peerActors and module.peerActors.sendToCharacter then
+        and module.peerActors and module.peerActors.sendWorkerCommand then
         local team = module.state and module.state.team or {}
-        local rezScript = lib.WorkerProfile == 'consolidated'
-            and 'sidekick-next/sk_support' or 'sidekick-next/sk_resurrection'
-        module.peerActors.sendToCharacter(rezScript,
-            Runtime.workflow.targetName, tostring(action.targetServer or ''),
-            'rez:consent_request', {
+        local rezModule = lib.WorkerProfile == 'consolidated'
+            and 'support' or 'resurrection'
+        module.peerActors.sendWorkerCommand(rezModule, 'request_consent', {
                 targetName = Runtime.workflow.targetName,
                 rezzer = myName(),
                 teamId = tostring(team.teamId or ''),
                 zone = zoneShort(),
+            }, {
+                component = 'resurrection',
+                character = Runtime.workflow.targetName,
+                server = tostring(action.targetServer or ''),
             })
     end
     echo('Starting %s rez on %s using %s', lib.inCombat() and 'combat' or 'OOC',
@@ -1576,12 +1584,13 @@ local function stepWorkflow()
 end
 
 local function sendTelemetry(self, force)
-    if not self.peerActors or not self.peerActors.sendToLocalScript then return end
+    if not self.peerActors or not self.peerActors.sendTelemetryToScript then return end
     local now = nowMs()
     if not force and (now - Runtime.lastTelemetryAtMs) < 500 then return end
     Runtime.lastTelemetryAtMs = now
     local workflow = Runtime.workflow
-    self.peerActors.sendToLocalScript('sidekick-next', 'rez:telemetry', {
+    self.peerActors.sendTelemetryToScript(
+        'sidekick-next', self.name, 'rez:telemetry', {
         reason = Runtime.reason,
         inCombat = lib.inCombat(),
         oocEnabled = settingBool('AutoRezOOC', true),

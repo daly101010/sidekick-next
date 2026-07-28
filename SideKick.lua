@@ -227,14 +227,14 @@ local function queueAbilityActivation(def)
     local targetId = tonumber(def.targetId)
 
     enqueue(function()
-        local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_items', 'action:manual', {
+        local sent = ActorsCoordinator.sendWorkerCommand('items', 'activate', {
             requestId = requestId,
             requestedAtMs = mq.gettime(),
             kind = kind,
             name = name,
             aaId = aaId,
             targetId = targetId,
-        })
+        }, { component = 'items', requestId = requestId })
         if not sent then
             print(string.format('\ar[SideKick Actions]\ax Could not queue %s: action worker transport unavailable', name))
         end
@@ -249,12 +249,12 @@ local function queueItemActivation(entry)
     local requestId = string.format('ui:%d:%d', mq.gettime(), _itemManualRequestCounter)
 
     enqueue(function()
-        local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_items', 'item:manual', {
+        local sent = ActorsCoordinator.sendWorkerCommand('items', 'use_item', {
             requestId = requestId,
             requestedAtMs = mq.gettime(),
             itemName = itemName,
             slotKey = slotKey,
-        })
+        }, { component = 'items', requestId = requestId })
         if not sent then
             print(string.format('\ar[SideKick Items]\ax Could not queue %s: item worker transport unavailable', itemName))
         end
@@ -1918,22 +1918,20 @@ local function main()
     end
     do
         local monitor = LZ.getHealingMonitor()
-        if monitor and ActorsCoordinator.registerMessageCallback then
-            ActorsCoordinator.registerMessageCallback('heal:telemetry', function(content)
+        if monitor and ActorsCoordinator.registerTelemetryCallback then
+            ActorsCoordinator.registerTelemetryCallback('heal:telemetry', function(content)
                 monitor.setTelemetry(content)
-                return true
             end)
         end
     end
-    if ActorsCoordinator.registerMessageCallback then
-        ActorsCoordinator.registerMessageCallback('rez:telemetry', function(content)
+    if ActorsCoordinator.registerTelemetryCallback then
+        ActorsCoordinator.registerTelemetryCallback('rez:telemetry', function(content)
             local debugUi = LZ.getCoordinatorDebug()
             if debugUi and debugUi.setRezTelemetry then
                 debugUi.setRezTelemetry(content)
             end
-            return true
         end)
-        ActorsCoordinator.registerMessageCallback('pull:telemetry', function(content)
+        ActorsCoordinator.registerTelemetryCallback('pull:telemetry', function(content)
             _G.SK_PULL_TELEMETRY = {
                 state = tostring(content.state or ''),
                 reason = tostring(content.reason or ''),
@@ -1942,14 +1940,12 @@ local function main()
                 ownsLease = content.ownsLease == true,
                 receivedAt = mq.gettime(),
             }
-            return true
         end)
-        ActorsCoordinator.registerMessageCallback('action:trace', function(content)
+        ActorsCoordinator.registerTelemetryCallback('action:trace', function(content)
             local debugUi = LZ.getCoordinatorDebug()
             if debugUi and debugUi.setActionTrace then
                 debugUi.setActionTrace(content)
             end
-            return true
         end)
     end
 
@@ -2258,10 +2254,9 @@ local function main()
         local command = tostring(sub or 'status'):lower()
         if command == 'pulltarget' or command == 'clearignore' or command == 'camp' or command == 'status' then
             local targetId = command == 'pulltarget' and (tonumber(mq.TLO.Target.ID()) or 0) or 0
-            local sent = ActorsCoordinator.sendToLocalScript('sidekick-next/sk_pull', 'pull:manual', {
-                command = command,
+            local sent = ActorsCoordinator.sendWorkerCommand('pull', command, {
                 targetId = targetId,
-            })
+            }, { component = 'pull' })
             if not sent then
                 mq.cmd('/echo \\ar[SK Pull]\\ax worker transport unavailable')
             end
@@ -2877,7 +2872,7 @@ local function main()
                 burnActive = Core.Settings.BurnActive == true,
                 settingsOpen = State.settingsOpen == true,
             })
-            ActorsCoordinator.tick({ status = status })
+            ActorsCoordinator.tick({ peerCapabilities = status })
 
             -- Tank-side consolidated group vitals for UI consumers (no-op
             -- unless CombatMode == 'tank'; rate-limited internally).

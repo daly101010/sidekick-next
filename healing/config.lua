@@ -948,12 +948,14 @@ function M.save()
     -- Notify coordinated workers that their in-memory copy is stale. The
     -- receiver reloads from disk in its normal tick, never in an Actor callback.
     local ac = package.loaded['sidekick-next.utils.actors_coordinator']
-    if ac and ac.sendToScript then
-        pcall(ac.sendToScript, 'sidekick-next/sk_healing', 'heal:config', {
+    if ac and ac.sendWorkerCommand then
+        local lib = require('sidekick-next.sk_lib')
+        local owner = lib.isActiveWorker('support') and 'support' or 'healing'
+        pcall(ac.sendWorkerCommand, owner, 'reload_config', {
             revision = os.time(),
             character = mq.TLO.Me and mq.TLO.Me.CleanName and mq.TLO.Me.CleanName() or '',
             zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
-        })
+        }, { component = 'healing' })
     end
     return true
 end

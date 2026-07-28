@@ -122,7 +122,8 @@ local function renderHeader()
     if imgui.BeginCombo("##SetSelector", previewName) then
         for _, name in ipairs(setNames) do
             local isSelected = (name == state.selectedSet)
-            if imgui.Selectable(name, isSelected) then
+            local _, clicked = imgui.Selectable(name, isSelected)
+            if clicked then
                 state.selectedSet = name
                 Persistence.setActiveSet(name)
                 saveSpellSets(Persistence)

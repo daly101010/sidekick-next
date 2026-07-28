@@ -421,14 +421,14 @@ function M.init()
         -- SpellEngines live in workers. Consume their explicitly routed feeds
         -- rather than initializing duplicate combat parsers in this process.
         local ok, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok and Actors and Actors.registerMessageCallback then
-            Actors.registerMessageCallback('forensics:damage', function(content)
+        if ok and Actors and Actors.registerTelemetryCallback then
+            Actors.registerTelemetryCallback('forensics:damage', function(content)
                 for _, event in ipairs(type(content.events) == 'table' and content.events or {}) do
                     M.onIncomingDamage(event.targetId, event.targetName, event.amount,
                         event.source, event.dmgType)
                 end
             end)
-            Actors.registerMessageCallback('forensics:cast', function(content)
+            Actors.registerTelemetryCallback('forensics:cast', function(content)
                 M.onCastComplete(content.castData, content.result)
             end)
         end

@@ -74,22 +74,22 @@ local function isAllowedUiSender(sender, fromMe)
     return false
 end
 
-local function receiveManualMessage(content, sender, fromMe)
-    local messageId = type(content) == 'table' and tostring(content.id or ''):lower() or ''
+local function receiveManualMessage(command, content, envelope, sender, fromMe)
+    command = tostring(command or ''):lower()
     if type(content) ~= 'table'
-        or (messageId ~= 'item:manual' and messageId ~= 'action:manual')
-        or not hasValidV2Envelope(content)
+        or (command ~= 'use_item' and command ~= 'activate')
+        or not hasValidV2Envelope(envelope)
         or not isAllowedUiSender(sender, fromMe) then
         return true
     end
 
-    local requestId = tostring(content.requestId or '')
+    local requestId = tostring(content.requestId or envelope.requestId or '')
     local name = tostring(content.itemName or content.name or '')
     local slotKey = tostring(content.slotKey or '')
-    local kind = messageId == 'item:manual'
+    local kind = command == 'use_item'
         and lib.ActionKind.USE_ITEM or tostring(content.kind or ''):lower()
     if trim(name) == '' or #name > 256 or #requestId > 128
-        or #slotKey > 128 or (messageId == 'action:manual' and not MANUAL_ACTION_KINDS[kind]) then
+        or #slotKey > 128 or (command == 'activate' and not MANUAL_ACTION_KINDS[kind]) then
         return true
     end
     if #Runtime.incomingManual >= MAX_MANUAL_QUEUE then
@@ -100,7 +100,7 @@ local function receiveManualMessage(content, sender, fromMe)
         requestedAtMs = tonumber(content.requestedAtMs),
         kind = kind,
         name = name,
-        itemName = messageId == 'item:manual' and name or nil,
+        itemName = command == 'use_item' and name or nil,
         slotKey = slotKey,
         aaId = tonumber(content.aaId),
         targetId = tonumber(content.targetId),
@@ -111,9 +111,8 @@ end
 
 local function ensureActorCallbacks(coordinator)
     if Runtime.actorCallbacksRegistered or not coordinator then return end
-    if not coordinator.registerMessageCallback then return end
-    coordinator.registerMessageCallback('item:manual', receiveManualMessage)
-    coordinator.registerMessageCallback('action:manual', receiveManualMessage)
+    if not coordinator.registerWorkerCommand then return end
+    coordinator.registerWorkerCommand('items', receiveManualMessage)
     Runtime.actorCallbacksRegistered = true
 end
 

@@ -97,7 +97,8 @@ function M.draw(settings, themeNames, onChange)
     if imgui.BeginCombo('Mode##pull_mode', cfg.mode) then
         for _, m in ipairs(MODES) do
             local sel = (m == cfg.mode)
-            if imgui.Selectable(m, sel) then Pull.persistKnob('mode', m) end
+            local _, clicked = imgui.Selectable(m, sel)
+            if clicked then Pull.persistKnob('mode', m) end
         end
         imgui.EndCombo()
     end
@@ -109,7 +110,8 @@ function M.draw(settings, themeNames, onChange)
         if imgui.BeginCombo('Pull ability##pull_ability', cfg.ability) then
             for _, id in ipairs(options) do
                 local sel = (id == cfg.ability)
-                if imgui.Selectable(id, sel) then Pull.persistKnob('ability', id) end
+                local _, clicked = imgui.Selectable(id, sel)
+                if clicked then Pull.persistKnob('ability', id) end
             end
             imgui.EndCombo()
         end

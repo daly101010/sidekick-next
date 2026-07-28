@@ -331,7 +331,7 @@ function M.broadcastMezList()
     if not next(M.localMezzes) then return end
 
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local now = os.clock()
     local mezList = {}
@@ -351,7 +351,7 @@ function M.broadcastMezList()
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
 
-    (Actors.broadcastFleet or Actors.broadcast)('cc:mezlist', {
+    Actors.publish('cc:mezlist', {
         mobs = mezList,
         sender = mq.TLO.Me.CleanName(),
         timestamp = now, -- sender-local os.clock (paired with expires for backward compatibility)
@@ -632,7 +632,7 @@ end
 -- @param mobName string|nil Mob name
 function M.broadcastClaim(mobId, mobName)
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     -- Include zone explicitly so the coordinator's senderInSameZone helper
     -- doesn't have to fall back to _remoteCharacters[name].zone (which can be
@@ -641,7 +641,7 @@ function M.broadcastClaim(mobId, mobName)
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
 
-    (Actors.broadcastFleet or Actors.broadcast)('cc:claim', {
+    Actors.publish('cc:claim', {
         mobId = mobId,
         mobName = mobName or '',
         claimer = _selfName,
@@ -729,13 +729,15 @@ local function protectedKillTargets()
             'configured_mainassist')
     end
 
-    -- Actor status carries the MA target for out-of-group teams.
-    if Actors and Actors.getRemoteCharacters and next(assistNames) then
-        local now = os.clock()
+    -- Actor Team is the authoritative cross-script/cross-character presence
+    -- plane and carries the MA target for out-of-group teams.
+    if Actors and Actors.getTeamSnapshot and next(assistNames) then
         local myZone = ''
         pcall(function() myZone = tostring(mq.TLO.Zone.ShortName() or ''):lower() end)
-        for name, data in pairs(Actors.getRemoteCharacters() or {}) do
-            local targetAge = now - (tonumber(data.targetUpdatedAt) or 0)
+        local team = Actors.getTeamSnapshot() or {}
+        for _, data in ipairs(team.members or {}) do
+            local name = tostring(data.character or '')
+            local targetAge = (tonumber(data.ageMs) or math.huge) / 1000
             local peerZone = tostring(data.zone or ''):lower()
             if assistNames[tostring(name):lower()]
                 and targetAge >= 0
@@ -1572,11 +1574,11 @@ function M.broadcastCharmState(force)
         return
     end
     local Actors = getActors()
-    if not (Actors and Actors.broadcast) then return end
+    if not (Actors and Actors.publish) then return end
     M.charm.lastBroadcastAt = now
     local myZone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or nil
     if myZone == '' or myZone == 'NULL' then myZone = nil end
-    (Actors.broadcastFleet or Actors.broadcast)('cc:charmpet', {
+    Actors.publish('cc:charmpet', {
         petId = tonumber(M.charm.petId) or 0,
         petName = tostring(M.charm.petName or ''),
         -- Protection remains published during charm-break recovery, but Tank

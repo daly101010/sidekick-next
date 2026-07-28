@@ -119,7 +119,7 @@ local function queueRemoteAbility(charName, server, ability)
     State.pendingActions[#State.pendingActions + 1] = {
         character = tostring(charName or ''),
         server = tostring(server or ''),
-        messageId = sourceKind == 'item' and 'item:manual' or 'action:manual',
+        command = sourceKind == 'item' and 'use_item' or 'activate',
         payload = {
             requestId = string.format('remote-ui:%d:%d', mq.gettime(), State.requestCounter),
             requestedAtMs = mq.gettime(),
@@ -507,12 +507,13 @@ function M.tick()
     local pending = State.pendingActions
     State.pendingActions = {}
     for _, request in ipairs(pending) do
-        ActorsCoordinator.sendToCharacter(
-            'sidekick-next/sk_items',
-            request.character,
-            request.server,
-            request.messageId,
-            request.payload)
+        ActorsCoordinator.sendWorkerCommand('items', request.command,
+            request.payload, {
+                component = 'items',
+                character = request.character,
+                server = request.server,
+                requestId = request.payload.requestId,
+            })
     end
 end
 

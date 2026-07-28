@@ -284,14 +284,14 @@ function M.init()
         and _G.SIDEKICK_NEXT_CONFIG.COORDINATED_MODE ~= false
     if coordinated then
         local ok, Actors = pcall(require, 'sidekick-next.utils.actors_coordinator')
-        if ok and Actors and Actors.registerMessageCallback then
-            Actors.registerMessageCallback('session:damage', function(content)
+        if ok and Actors and Actors.registerTelemetryCallback then
+            Actors.registerTelemetryCallback('session:damage', function(content)
                 for _, event in ipairs(type(content.events) == 'table' and content.events or {}) do
                     onDamageEvent(event)
                 end
             end)
             -- Reuse the worker terminal-cast feed consumed by death forensics.
-            Actors.registerMessageCallback('forensics:cast', function(content)
+            Actors.registerTelemetryCallback('forensics:cast', function(content)
                 M.onCastComplete(content.castData, content.result)
             end)
         end

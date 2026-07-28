@@ -936,7 +936,8 @@ local function renderDemoWindow()
         imgui.PushItemWidth(120)
         if imgui.BeginCombo('##theme_select', State.themeName) then
             for _, name in ipairs(THEME_NAMES) do
-                if imgui.Selectable(name, name == State.themeName) then
+                local _, clicked = imgui.Selectable(name, name == State.themeName)
+                if clicked then
                     State.themeName = name
                     for i, n in ipairs(THEME_NAMES) do
                         if n == name then State.selectedTheme = i break end

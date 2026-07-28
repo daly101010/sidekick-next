@@ -122,7 +122,8 @@ local function renderIncomingTab()
     end
 
     -- Remote characters
-    imgui.TextColored(1, 0.8, 0.5, 1, 'Remote Characters (status:update from other SideKick instances):')
+    imgui.TextColored(1, 0.8, 0.5, 1,
+        'Remote Characters (script-local vitals/capability overlay):')
     local remoteChars = ActorsCoord.getRemoteCharacters()
     local charCount = 0
     for _ in pairs(remoteChars) do charCount = charCount + 1 end

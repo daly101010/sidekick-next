@@ -326,11 +326,11 @@ local function executeHeal(spellName, targetId, tier, isHoT)
             if SpellEvents and SpellEvents.registerHotCast then
                 SpellEvents.registerHotCast(targetName, spellName, hotTickAmount, hotDuration, mq.gettime())
             end
-            if ActorsCoordinator and ActorsCoordinator.broadcast and Config and Config.broadcastEnabled then
+            if ActorsCoordinator and ActorsCoordinator.publish and Config and Config.broadcastEnabled then
                 -- Wall-clock epoch seconds for cross-peer comparison.
                 local castTimeSec = (castTimeMs or 0) / 1000
                 local exp = os.time() + castTimeSec + (hotDuration or 18)
-                ActorsCoordinator.broadcast('heal:hots', {
+                ActorsCoordinator.publish('heal:hots', {
                     targetId = targetId,
                     spellName = spellName,
                     expiresAt = exp,
@@ -777,13 +777,13 @@ local function registerHealCast(castInfo)
         if SpellEvents and SpellEvents.registerHotCast then
             SpellEvents.registerHotCast(castInfo.targetName or '', spellName, hotTickAmount, hotDuration, mq.gettime())
         end
-        if ActorsCoordinator and ActorsCoordinator.broadcast and Config and Config.broadcastEnabled then
+        if ActorsCoordinator and ActorsCoordinator.publish and Config and Config.broadcastEnabled then
             -- Wall-clock epoch seconds so cross-peer receivers can compare.
             local castTimeSec = (castInfo.castTimeMs or 0) / 1000
             local exp = os.time() + castTimeSec + (hotDuration or 18)
             local hotTargetIds = castInfo.groupHotTargetIds or { targetId }
             for _, hotTargetId in ipairs(hotTargetIds) do
-                ActorsCoordinator.broadcast('heal:hots', {
+                ActorsCoordinator.publish('heal:hots', {
                     targetId = hotTargetId,
                     spellName = spellName,
                     expiresAt = exp,
@@ -989,8 +989,11 @@ function M.initPhased(phase)
                     M.handleActorMessage('heal:cancelled', content, senderName)
                 end)
             end
-            if ac.registerMessageCallback then
-                ac.registerMessageCallback('heal:config', function(content)
+            if ac.registerWorkerCommand then
+                ac.registerWorkerCommand('healing',
+                    function(command, content, _, _, fromMe)
+                    if tostring(command or '') ~= 'reload_config' then return false end
+                    if fromMe ~= true then return true end
                     local mine = tostring(mq.TLO.Me.CleanName() or mq.TLO.Me.Name() or ''):lower()
                     local target = tostring(content.character or ''):lower()
                     if target == '' or target == mine then _configReloadPending = true end
@@ -1498,10 +1501,10 @@ end
 
 -- Broadcast functions for multi-healer coordination
 function M.broadcastIncoming(targetId, spellName, expectedAmount, remainingMs, isHoT)
-    if not ActorsCoordinator or not ActorsCoordinator.broadcast then return end
+    if not ActorsCoordinator or not ActorsCoordinator.publish then return end
     if not Config.broadcastEnabled then return end
 
-    ActorsCoordinator.broadcast('heal:incoming', {
+    ActorsCoordinator.publish('heal:incoming', {
         targetId = targetId,
         spellName = spellName,
         expectedAmount = expectedAmount,
@@ -1512,10 +1515,10 @@ function M.broadcastIncoming(targetId, spellName, expectedAmount, remainingMs, i
 end
 
 function M.broadcastLanded(targetId, spellName)
-    if not ActorsCoordinator or not ActorsCoordinator.broadcast then return end
+    if not ActorsCoordinator or not ActorsCoordinator.publish then return end
     if not Config.broadcastEnabled then return end
 
-    ActorsCoordinator.broadcast('heal:landed', {
+    ActorsCoordinator.publish('heal:landed', {
         targetId = targetId,
         spellName = spellName,
         zone = mq.TLO.Zone and mq.TLO.Zone.ShortName and mq.TLO.Zone.ShortName() or '',
@@ -1523,10 +1526,10 @@ function M.broadcastLanded(targetId, spellName)
 end
 
 function M.broadcastCancelled(targetId, spellName, reason)
-    if not ActorsCoordinator or not ActorsCoordinator.broadcast then return end
+    if not ActorsCoordinator or not ActorsCoordinator.publish then return end
     if not Config.broadcastEnabled then return end
 
-    ActorsCoordinator.broadcast('heal:cancelled', {
+    ActorsCoordinator.publish('heal:cancelled', {
         targetId = targetId,
         spellName = spellName,
         reason = reason,
@@ -1594,7 +1597,7 @@ local function buildClaimMetrics(action, reuseBroadcast)
 end
 
 function M.broadcastClaim(action, ttlMs)
-    if not ActorsCoordinator or not ActorsCoordinator.broadcast or not action then return false end
+    if not ActorsCoordinator or not ActorsCoordinator.publish or not action then return false end
     if Config and Config.broadcastEnabled == false then return false end
     local targetId = tonumber(action.claimTargetId or action.targetId) or 0
     if targetId <= 0 then return false end
@@ -1602,7 +1605,7 @@ function M.broadcastClaim(action, ttlMs)
     local priority = tier == 'emergency' and 0 or 1
     local metrics = buildClaimMetrics(action, false)
     _lastClaimMetrics = { key = claimMetricsKey(action), metrics = metrics }
-    ActorsCoordinator.broadcast('heal:claim', {
+    ActorsCoordinator.publish('heal:claim', {
         targetId = targetId,
         spellName = metrics.spellName,
         tier = tier,

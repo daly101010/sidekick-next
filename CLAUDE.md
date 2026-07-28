@@ -34,10 +34,11 @@ Parent: `F:\lua\CLAUDE.md` for shared mq/ImGui/actors patterns.
 
 - **Actors addressing:** `{ mailbox = 'sidekick' }` with no `script` routes to
   `currentScript:sidekick` — it reaches the SAME script on other characters
-  only, never sibling scripts. Cross-script state (tank primary, mez list,
-  charm pet) must go through `Actors.broadcastFleet()` (explicit fan-out to
-  every fleet script, ~16 sends ≈1ms each). `M.broadcast()` keeps same-script
-  semantics for intra-role claim traffic (healer↔healer, mezzer↔mezzer).
+  only, never sibling scripts. Peer producers call
+  `ActorsCoordinator.publish()` and must declare their topic in
+  `TOPIC_CONTRACTS`; the registry owns fleet versus same-script routing.
+  Unknown topics fail closed. UI telemetry and manual actions use
+  `worker:telemetry` and `worker:command`, not ad-hoc topic/address pairs.
 - **The runtime cache is per-process.** Consolidated domain hosts tick once
   before their components. Standalone/legacy workers that consult cached data
   must still tick. Use `Cache.isReady()` or the readiness accessors: nil means

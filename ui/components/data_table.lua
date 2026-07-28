@@ -288,7 +288,9 @@ function M.draw(tableId, columns, data, themeName, opts)
                             selectFlags = ImGuiSelectableFlags.SpanAllColumns or 0
                         end
 
-                        if imgui.Selectable('##row' .. rowIdx, isSelected, selectFlags, 0, rowHeight) then
+                        local _, clicked = imgui.Selectable(
+                            '##row' .. rowIdx, isSelected, selectFlags, 0, rowHeight)
+                        if clicked then
                             state.selectedRow = rowIdx
                             selectedRow = row
                         end

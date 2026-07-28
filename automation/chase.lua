@@ -268,7 +268,8 @@ function M.validateFingerprint(fingerprint)
     return spawn, nil
 end
 
-function M.combatBlockReason()
+function M.combatBlockReason(settings, chaseSpawn)
+    settings = settings or {}
     if not mq.TLO or not mq.TLO.Me or not safeValue(function() return mq.TLO.Me() end, nil) then
         return 'no_character'
     end
@@ -276,16 +277,34 @@ function M.combatBlockReason()
     if safeBool(function() return mq.TLO.Me.Hovering() end) then return 'hovering' end
     if safeBool(function() return mq.TLO.Me.Combat() end) then return 'melee_combat' end
     if safeBool(function() return mq.TLO.Me.AutoFire() end) then return 'autofire' end
-    if safeString(function() return mq.TLO.Me.CombatState() end, ''):upper() == 'COMBAT' then
-        return 'combat_state'
-    end
-    if safeNum(function() return mq.TLO.Me.XTHaterCount() end, 0) > 0 then
-        return 'active_haters'
-    end
-    if safeValue(function() return mq.TLO.Me.Pet() end, nil)
-        and safeBool(function() return mq.TLO.Me.Pet.Combat() end)
-    then
-        return 'pet_combat'
+
+    -- Ranged standoff owns ordinary in-combat positioning. Chase yields only
+    -- when standoff is enabled and the tank remains inside a generous leash;
+    -- beyond it, keeping up with a tank pursuing a runner takes precedence.
+    -- Classes with standoff disabled must continue following during combat.
+    if settings.CasterStandoffEnabled == true then
+        local combatReason = nil
+        if safeString(function() return mq.TLO.Me.CombatState() end, ''):upper() == 'COMBAT' then
+            combatReason = 'combat_state'
+        elseif safeNum(function() return mq.TLO.Me.XTHaterCount() end, 0) > 0 then
+            combatReason = 'active_haters'
+        elseif safeValue(function() return mq.TLO.Me.Pet() end, nil)
+            and safeBool(function() return mq.TLO.Me.Pet.Combat() end)
+        then
+            combatReason = 'pet_combat'
+        end
+        if combatReason then
+            local chaseDistance = tonumber(settings.ChaseDistance)
+                or tonumber(M.state.distance) or 30
+            local leash = math.max(150, chaseDistance * 4)
+            local dist = M.distanceTo(chaseSpawn)
+            if not dist or dist <= leash then
+                return dist
+                    and string.format('standoff_%s:%.0f<=%.0f',
+                        combatReason, dist, leash)
+                    or ('standoff_' .. combatReason)
+            end
+        end
     end
 
     local casting = safeString(function() return mq.TLO.Me.Casting() end, '')
@@ -306,13 +325,13 @@ local function preflight(settings)
 
     local distance = tonumber(settings.ChaseDistance) or 30
     if not M.validateDistance(distance) then return nil, 'invalid_distance' end
-    local combatReason = M.combatBlockReason()
-    if combatReason then return nil, combatReason end
 
     local fingerprint, reason = M.fingerprint(settings)
     if not fingerprint then return nil, reason end
     local spawn, validateReason = M.validateFingerprint(fingerprint)
     if not spawn then return nil, validateReason end
+    local combatReason = M.combatBlockReason(settings, spawn)
+    if combatReason then return nil, combatReason end
     return {
         fingerprint = fingerprint,
         spawn = spawn,

@@ -36,7 +36,7 @@ local function buildPeerHeartbeat(moduleName)
         return mq.TLO.Me.MaxHPs()
     end, 0) or 0
     return {
-        id = 'status:update',
+        id = 'peer:vitals',
         script = tostring(moduleName or ''),
         zone = inGame and lib.safeTLO(function()
             return mq.TLO.Zone.ShortName()
@@ -688,6 +688,21 @@ function M.create(moduleName, legacyPriority)
     function self:sendHeartbeat()
         if not self.dropbox then return end
         local inGame = lib.isInGame()
+        local actorTransport = nil
+        if self.peerActors and self.peerActors.getOutboundSummary then
+            local metrics = self.peerActors.getOutboundSummary()
+            actorTransport = {
+                logical = tonumber(metrics.logical) or 0,
+                attempts = tonumber(metrics.attempts) or 0,
+                failures = tonumber(metrics.failures) or 0,
+                estimatedBytes = tonumber(metrics.estimatedBytes) or 0,
+                logicalPerSecond = tonumber(metrics.logicalPerSecond) or 0,
+                attemptsPerSecond = tonumber(metrics.attemptsPerSecond) or 0,
+                failuresPerSecond = tonumber(metrics.failuresPerSecond) or 0,
+                estimatedBytesPerSecond =
+                    tonumber(metrics.estimatedBytesPerSecond) or 0,
+            }
+        end
         self:_sendLeaseMessage(mailbox('HEARTBEAT', 'sk:hb'), {
             msgType = 'heartbeat',
             ready = inGame and self:hasValidState() and not self.awaitingResumeState,
@@ -702,6 +717,7 @@ function M.create(moduleName, legacyPriority)
             stateDrops = tonumber(self.stateDrops) or 0,
             stateDropReasons = actorSafeCopy(self.stateDropReasons),
             counters = ActionCounters.snapshot(),
+            actorTransport = actorTransport,
         })
     end
 
@@ -961,13 +977,13 @@ function M.create(moduleName, legacyPriority)
                 gateway = coordinator
             end
         end
-        if not (gateway and gateway.sendToLocalScript) then return false end
+        if not (gateway and gateway.sendTelemetryToScript) then return false end
         local scripts = type(lib.Scripts.UI) == 'table'
             and lib.Scripts.UI or { lib.Scripts.UI }
         local sent = false
         for _, scriptName in ipairs(scripts) do
-            local ok, result = pcall(gateway.sendToLocalScript,
-                scriptName, msgId, safePayload)
+            local ok, result = pcall(gateway.sendTelemetryToScript,
+                scriptName, self.name, msgId, safePayload)
             sent = sent or (ok and result == true)
         end
         return sent
@@ -1254,12 +1270,12 @@ function M.create(moduleName, legacyPriority)
             end
 
             if self.peerActors and self.peerActors.tick then
-                self.peerActors.tick({
-                    status = buildPeerHeartbeat(self.name),
-                    peerOnly = true,
-                    healthResponsive = self.name == 'healing'
-                        or self.name == 'support',
-                })
+                local peerOpts = {}
+                if self.name == 'healing' or self.name == 'support' then
+                    peerOpts.peerVitals = buildPeerHeartbeat(self.name)
+                    peerOpts.healthResponsive = true
+                end
+                self.peerActors.tick(peerOpts)
             end
             if mq.doevents then pcall(mq.doevents) end
 

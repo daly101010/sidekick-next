@@ -126,7 +126,7 @@ end
 function M.broadcastNeed(category, opts)
     opts = opts or {}
     local Actors = getActors()
-    if not Actors or not Actors.broadcast then return end
+    if not Actors or not Actors.publish then return end
 
     local payload = {
         category = tostring(category or ''),
@@ -136,7 +136,7 @@ function M.broadcastNeed(category, opts)
     }
     if payload.category == '' then return end
 
-    Actors.broadcast('buff:need', payload)
+    Actors.publish('buff:need', payload)
 
     -- Also record locally so our own `findBuffNeed()` can prioritize it on
     -- the next tick, before any peer responds.
