@@ -78,7 +78,7 @@ Reject-Text 'sk_dps.lua' '_lastValidTarget' 'unused legacy target cache'
 Reject-Text 'docs/USER_GUIDE.md' 'SpellRotationEnabled' 'removed SpellRotationEnabled setting'
 Require-Text 'SideKick.lua' "Core.set('AutomationPaused', false, { source = 'startup_auto_resume' })" 'startup auto-resume'
 Reject-Text 'automation/chase.lua' "settings.AutomationPaused == true" 'stale process-local Chase pause gate'
-Require-Text 'automation/chase.lua' 'if settings.CasterStandoffEnabled == true then' 'standoff-scoped Chase combat yield'
+Require-Text 'automation/chase.lua' 'if settings.CasterStandoffEnabled == true and M.hasStandoffDemand() then' 'standoff-demand-scoped Chase combat yield'
 Require-Text 'automation/chase.lua' 'local leash = math.max(150, chaseDistance * 4)' 'Chase combat leash exception'
 Require-Text 'automation/chase.lua' 'M.combatBlockReason(settings, spawn)' 'validated Chase target combat gate'
 Reject-Text 'docs/USER_GUIDE.md' 'automation/tank.lua' 'nonexistent tank helper path'
@@ -225,14 +225,18 @@ Require-Text 'sk_tank.lua' "'primaryActor stage=%s reason=%s" 'Tank primary send
 Require-Text 'sk_combat.lua' "mq.bind('/sk_combat'" 'Combat-local primary receive diagnostics'
 Require-Text 'sk_combat.lua' "'executor phase=%s reason=%s" 'Combat executor lifecycle diagnostics'
 Require-Text 'sk_combat.lua' "'spellEngine state=%s spell=%s" 'Combat spell-engine diagnostics'
-Require-Text 'sk_combat.lua' "host.domainDeferredInterrupt = 'cc_after_cast'" 'CC defers to an in-flight cast'
+Require-Text 'sk_combat.lua' "and 'cc_after_cast' or 'debuff_after_cast'" 'CC and Debuff defer to an in-flight cast'
 Require-Text 'sk_combat.lua' 'phase == ActionExecutor.PHASE.WAITING_START' 'pre-cast window interruption fence'
 Require-Text 'sk_combat.lua' 'phase == ActionExecutor.PHASE.RUNNING' 'running cast interruption fence'
-Require-Text 'sk_assist.lua' 'or (_casterRouting and _standoffNeeded)' 'consolidated Assist standoff candidate admission'
-Require-Text 'sk_assist.lua' 'self.domainKillAuthorized == true' 'Tank-primary standoff combat authorization'
-Require-Text 'sk_assist.lua' 'local enabled = assistEnabled or standoffEnabled' 'standoff independent of melee Assist mode'
-Require-Text 'sk_assist.lua' 'enabled = assistEnabled,' 'standoff does not enable CombatAssist attack/stick'
-Require-Text 'sk_assist.lua' 'selectTarget(settings, true)' 'standoff positioning bypasses melee engage threshold'
+Require-Text 'sk_combat.lua' "reason:find('peer_settling:', 1, true) == 1" 'Debuff claim-settle priority barrier'
+Require-Text 'sk_combat.lua' "winner == 'debuff' and active == 'dps'" 'Debuff replaces queued DPS'
+Require-Text 'sk_combat.lua' "'debuff_after_cast'" 'Debuff defers after mutation boundary'
+Require-Text 'utils/domain_orchestrator.lua' 'host:withdrawLeaseRequest(reason)' 'queued domain replacement withdraws without tokenless release'
+Require-Text 'sk_dps.lua' "workflow = 'dps_standoff_cast'" 'DPS-owned standoff and exact cast workflow'
+Require-Text 'sk_dps.lua' 'module.domainKillAuthorized == true' 'Tank-primary standoff combat authorization'
+Require-Text 'sk_dps.lua' 'CasterAssist.getStandoffNeed(' 'standoff independent of melee Assist mode'
+Require-Text 'sk_assist.lua' 'The setting alone' 'standoff setting does not enable Assist attack/stick'
+Require-Text 'sk_dps.lua' 'standoff_cast_issued' 'standoff movement retains lease through exact cast'
 Require-Text 'automation/caster_assist.lua' "reason == 'initial_position'" 'leased initial standoff positioning'
 Require-Text 'automation/caster_assist.lua' "return false, 'outside_minimum'" 'standoff never moves inward toward distant targets'
 Require-Text 'automation/cc.lua' 'function M.hasLoadedMezSpell' 'active spell-set mez capability gate'
@@ -247,6 +251,17 @@ Require-Text 'utils/safe_write.lua' 'Paths.ensureDir(parent)' 'atomic writer par
 Require-Text 'utils/safe_write.lua' 'if not dirOk then' 'atomic writer treats nil ensureDir returns as failure'
 Require-Text 'utils/safe_write.lua' 'openWriteWithRetry' 'atomic writer retries ENOENT-after-mkdir on Windows'
 Reject-Text 'utils/safe_write.lua' 'mq.delay(' 'atomic writer must not yield the caller'
+
+# Companion damage feed wire contract: consumer subscribes to mailbox
+# 'companion_events', filters on payload.sender, skips heal + incoming (this
+# module is outgoing-only), and stops registering its own mq.event handlers
+# when the feed is active. Producer side lives in F:\lua\companion.
+Require-Text 'utils/damage_events.lua' "COMPANION_MAILBOX = 'companion_events'" 'companion feed mailbox constant'
+Require-Text 'utils/damage_events.lua' 'function M.setCompanionFeedEnabled' 'companion feed opt-in entrypoint'
+Require-Text 'utils/damage_events.lua' "content.sender or ''" 'companion feed filters on sender identity'
+Require-Text 'utils/damage_events.lua' 'if content.incoming == true or content.kind ==' 'companion feed skips incoming + heal'
+Require-Text 'utils/damage_events.lua' 'if _scope then M.unregisterEvents() end' 'companion feed unregisters local parser to avoid double-counting'
+Require-Text 'registry.lua' 'UseCompanionDamageFeed' 'companion damage feed setting registered'
 
 # Legacy tiered-healer surface: removed entirely — Healing Intelligence is the
 # only heal path for CLR/DRU/SHM/PAL, per-character thresholds live in

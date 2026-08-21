@@ -35,6 +35,14 @@ local _listeners = {}
 local _registeredNames = {}   -- event names currently registered (for teardown)
 local _scope = nil            -- 'full' | 'lean' | nil (not registered)
 
+-- Companion subscriber state (see M.enableCompanionFeed). When active, we
+-- skip our own mq.event registrations entirely; companion is the sole parser.
+local COMPANION_MAILBOX = 'companion_events'
+local _companionActor = nil
+local _companionSender = nil     -- character name we expect events from
+local _companionDropCount = 0
+local _companionAcceptCount = 0
+
 local getCore = lazy('sidekick-next.utils.core')
 
 local function parseAmount(value)
@@ -172,12 +180,104 @@ function M.ensureScope()
     end
 end
 
+-- ============================================================================
+-- Companion feed (opt-in): subscribe to F:\lua\companion's normalized parser
+-- output instead of running our own mq.event handlers. Companion registers
+-- ~55 patterns; we register ~24 (full scope). Doubling that per character is
+-- pure waste. When enabled, we skip local mq.event registration and dispatch
+-- companion's events into our listener bus.
+--
+-- Filter on payload.sender == myCharName: companion's actor broadcasts reach
+-- every character running a companion listener, but only the same-character
+-- events are ours to consume (third-person events are already in that
+-- character's own chat log — the local companion picks them up there).
+-- ============================================================================
+
+--- Enable/disable the companion feed. When enabling, unregisters any local
+--- mq.event handlers first so we don't double-count. When disabling, restores
+--- the local scope.
+--- @param enabled boolean
+function M.setCompanionFeedEnabled(enabled)
+    if enabled == true then
+        if _companionActor then return true end
+        local ok, actors = pcall(require, 'actors')
+        if not ok or not actors or not actors.register then
+            return false, 'actors_unavailable'
+        end
+        _companionSender = tostring(mq.TLO.Me.CleanName() or '')
+        _companionActor = actors.register(COMPANION_MAILBOX, function(message)
+            local content = message()
+            if type(content) ~= 'table' or content.id ~= 'evt' then return end
+            -- Only trust our own companion's parse output. Cross-character
+            -- broadcasts land here too but the local combat log already fed
+            -- our own listeners (before we disabled mq.events) or will feed
+            -- the local companion (once it's the only parser).
+            if tostring(content.sender or '') ~= _companionSender then
+                _companionDropCount = _companionDropCount + 1
+                return
+            end
+            -- Only outgoing damage flows through this module (incoming lives
+            -- in healing/damage_parser). Skip heal, skip incoming.
+            if content.incoming == true or content.kind == 'heal' then return end
+            local source = tostring(content.source or '')
+            local mine = source == _companionSender
+            local attacker = mine and 'me' or source
+            dispatch(content.target, content.amount, mine, content.kind,
+                content.ability, attacker)
+            _companionAcceptCount = _companionAcceptCount + 1
+        end)
+        if not _companionActor then return false, 'actor_register_failed' end
+        if _scope then M.unregisterEvents() end
+        return true
+    else
+        if _companionActor then
+            pcall(function() _companionActor:unregister() end)
+            _companionActor = nil
+            _companionSender = nil
+        end
+        -- Re-register local mq.event handlers so we don't go silent.
+        if not _scope then M.registerEvents() end
+        return true
+    end
+end
+
+--- Diagnostics: which parser is running + companion feed counters.
+function M.getObserverStatus()
+    return {
+        source = _companionActor and 'companion' or 'local',
+        scope = _scope,
+        companionAccepted = _companionAcceptCount,
+        companionDropped = _companionDropCount,
+    }
+end
+
+--- Auto-resolve: check the setting on every ensureScope call so a runtime
+--- toggle (via /skset UseCompanionDamageFeed true) takes effect on next tick.
+local function applyCompanionSetting()
+    local Core = getCore()
+    if not Core then return end
+    local want = (Core.Settings and Core.Settings.UseCompanionDamageFeed) == true
+    local have = _companionActor ~= nil
+    if want and not have then M.setCompanionFeedEnabled(true) end
+    if not want and have then M.setCompanionFeedEnabled(false) end
+end
+
+-- Hook into ensureScope so setting changes get picked up on the same cadence
+-- as CombatMode toggles (workers call ensureScope periodically).
+local _origEnsureScope = M.ensureScope
+function M.ensureScope()
+    applyCompanionSetting()
+    if not _companionActor then _origEnsureScope() end
+end
+
 function M.init()
-    M.registerEvents()
+    applyCompanionSetting()
+    if not _companionActor then M.registerEvents() end
 end
 
 function M.shutdown()
     M.unregisterEvents()
+    if _companionActor then M.setCompanionFeedEnabled(false) end
 end
 
 return M

@@ -235,6 +235,7 @@ M.defaults = {
 
     -- Debuffer Settings (Shaman, Enchanter, Mage)
     DebuffAllTask = { type = 'bool', Default = false, Category = 'Debuff', DisplayName = 'Debuff All Task Mobs' },
+    DebuffEarlyRange = { type = 'number', Default = 50, Category = 'Debuff', DisplayName = 'Early Debuff Range (0 = disabled)' },
 
     -- Caster Assist Settings
     CasterStandoffEnabled = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Caster Standoff (Ranged Casting)' },
@@ -269,6 +270,11 @@ M.defaults = {
 
     -- Damage observer scope (chat event pattern matching)
     DamageObserver = { type = 'text', Default = 'auto', Category = 'Combat', DisplayName = 'Damage Observer (auto/always/never)' },
+    -- When true, subscribe to F:\lua\companion's normalized parser output
+    -- (mailbox 'companion_events') instead of registering our own mq.event
+    -- handlers. Halves per-character parse cost when companion is running on
+    -- the same character. Off by default; take effect after next tick.
+    UseCompanionDamageFeed = { type = 'bool', Default = false, Category = 'Combat', DisplayName = 'Use Companion Damage Feed' },
 
     -- Tank: auto-peel and flee-handoff
     TankAutoPeel = { type = 'bool', Default = true, Category = 'Combat', DisplayName = 'Auto-Peel (Protect Squishies First)' },
@@ -477,6 +483,7 @@ local VALIDATORS = {
 
     -- Percentages: 0-100
     AssistAt = { min = 0, max = 100 },
+    DebuffEarlyRange = { min = 0, max = 200 },
     MeditationAggroPct = { min = 0, max = 100 },
     MeditationHPStartPct = { min = 0, max = 100 },
     MeditationHPStopPct = { min = 0, max = 100 },
@@ -572,7 +579,7 @@ local MODULE_KEYS = {
         CasterStandoffEnabled CasterStandoffMin CasterStandoffMax
         TankAutoPeel TankPeelMinPriority TankFleeHandoff TankFleeHpThreshold
         TankFleeMinRecedeRate TankFleeHandoffWindowSec TankFleeMinAdds
-        DamageObserver DeathForensicsEnabled
+        DamageObserver UseCompanionDamageFeed DeathForensicsEnabled
         ReadinessEnabled ReadinessAnnounce ReadyHpPct ReadyManaPct ReadyEndPct
     ]],
     debuff = [[ DebuffAllTask ]],
