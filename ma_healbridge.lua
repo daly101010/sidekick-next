@@ -28,6 +28,13 @@ local function macroInt(name)
     return tonumber(macroVar(name)) or 0
 end
 
+local function macroBool(name)
+    local v = macroVar(name)
+    if type(v) == 'boolean' then return v end
+    v = tostring(v or '')
+    return v == 'TRUE' or (tonumber(v) or 0) > 0
+end
+
 local function scriptRunning(name)
     local s = mq.TLO.Lua and mq.TLO.Lua.Script(name)
     return s and s.Status and s.Status() == 'RUNNING'
@@ -35,7 +42,8 @@ end
 
 -- ---------------------------------------------------------------- guards
 if scriptRunning('sidekick-next') or scriptRunning('sidekick-next/sk_support')
-    or scriptRunning('sidekick-next/sk_healing') then
+    or scriptRunning('sidekick-next/sk_healing') or scriptRunning('sidekick-next/sk_start')
+    or scriptRunning('sidekick-next/sk_coordinator') or scriptRunning('sidekick-next/sk_emergency') then
     log('\arRefusing to start: full SideKick is running on this character (two healing brains).')
     return
 end
@@ -125,15 +133,18 @@ end
 -- Register successful HoT casts so hot_analyzer/proactive see them; direct
 -- heals are already learned from the "You healed" chat events.
 local lastSeenAck = 0
-local publishedAction = nil
+local publishedBySeq = {}
 local function registerConfirmedCast()
     local ack = macroInt('SmartHealAck')
     if ack <= lastSeenAck then return end
+    local action = publishedBySeq[ack]
     lastSeenAck = ack
-    local action = publishedAction
     if action and action.isHoT and tostring(macroVar('SmartHealResult') or '') == 'CAST_SUCCESS' then
         local castInfo = Healing.prepareHealCast(action)
         if castInfo then Healing.registerHealCast(castInfo) end
+    end
+    for seq in pairs(publishedBySeq) do
+        if seq <= ack then publishedBySeq[seq] = nil end
     end
 end
 
@@ -152,10 +163,17 @@ while true do
         end
     else
         macroGoneSince = nil
+        local macroSeq = macroInt('SmartHealSeq')
+        if macroSeq < state.seq then
+            -- muleassist restarted: its outer vars reset to 0
+            BridgeState.noteMacroSeq(state, macroSeq)
+            lastSeenAck = macroInt('SmartHealAck')
+            publishedBySeq = {}
+        end
         local active = macroInt('SmartHealsOn') > 0
             and macroInt('HealsOn') > 0
-            and macroInt('BuffMode') == 0
-            and macroInt('ZombieMode') == 0
+            and not macroBool('BuffMode')
+            and not macroBool('ZombieMode')
         local action = nil
         if active then
             local maId = macroInt('MainAssistID')
@@ -170,7 +188,7 @@ while true do
         end
         local varsets = BridgeState.next(state, action, macroInt('SmartHealAck'))
         if varsets then
-            publishedAction = action
+            publishedBySeq[state.seq] = action
             for _, pair in ipairs(varsets) do
                 mq.cmdf('/varset %s %s', pair[1], pair[2])
             end

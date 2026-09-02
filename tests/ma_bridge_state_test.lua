@@ -48,4 +48,16 @@ assert(pub[3][2] == 'single', 'nil tier defaults to single')
 assert(State.actionKey(act('A', 1, 't')) ~= State.actionKey(act('A', 2, 't')), 'key includes target')
 assert(State.actionKey(nil) == nil, 'nil action has nil key')
 
+-- macro restart: macro's seq falls behind ours -> clear lastKey so we republish
+s = State.newState()
+pub = State.next(s, act('Renewal', 7, 'single'), 0)
+assert(pub and s.seq == 1, 'restart setup publish')
+State.noteMacroSeq(s, 1)
+assert(s.lastKey ~= nil, 'equal macro seq must not clear lastKey')
+assert(State.next(s, act('Renewal', 7, 'single'), 0) == nil, 'no spurious republish')
+State.noteMacroSeq(s, 0)
+assert(s.lastKey == nil, 'behind macro seq clears lastKey')
+pub = State.next(s, act('Renewal', 7, 'single'), 0)
+assert(pub and s.seq == 2, 'republish after macro restart')
+
 print('ma_bridge_state_test OK')

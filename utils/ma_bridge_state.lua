@@ -40,4 +40,13 @@ function M.next(state, action, ackSeq)
     }
 end
 
+--- Call each loop with the macro's live SmartHealSeq. A macro restart resets
+--- its outer variables to 0; when the macro's seq falls behind ours, clear
+--- lastKey so the next action republishes at a fresh seq.
+function M.noteMacroSeq(state, macroSeq)
+    if (tonumber(macroSeq) or 0) < state.seq then
+        state.lastKey = nil
+    end
+end
+
 return M
