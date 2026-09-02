@@ -321,15 +321,40 @@ so its DPS component cannot cast during that Assist episode.
 `automation/assist.lua` is a helper library — it must not run automatic
 assist actions from the UI host; the worker owns that.
 
-Ranged Standoff is also an Assist component action. A fresh authorized Tank
-primary admits its initial positioning before the local caster has entered
-`CombatState=COMBAT`; the target-selection turn and subsequent Nav turn remain
-separate leased mutations. Its toggle can activate this narrow component path
-while Combat Mode is off; the underlying `CombatAssist` engine remains disabled
-so standoff cannot enable attack or stick. Once planted, only crossing the
-configured minimum distance requests another movement lease. The configured
-retreat distance is a destination, not a maximum-radius trigger, so standoff
-never moves a caster toward a distant primary.
+Ranged Standoff is a DPS prerequisite, not a general Assist positioning
+action. `sk_dps.lua` first selects the exact ready spell and consults
+`Spell.TargetType` plus `Spell.AERange`; only `Targeted AE` with a positive
+AE radius can produce a `dps_standoff_cast` workflow. The executor re-reads both
+members at dispatch rather than trusting the planner's earlier classification.
+Movement and the exact selected cast execute as one `dps_standoff_cast`
+workflow under one Combat lease. DPS does not release and reconsider another
+spell between the prerequisite and cast. Ordinary single-target, point-blank, and
+untargeted-AE spells never request standoff. A fresh authorized Tank primary
+admits initial positioning before the local caster has entered
+`CombatState=COMBAT`. Once planted, only crossing the configured minimum while
+another Targeted-AE spell is selected requests movement again. The configured
+retreat distance is a destination rather than a maximum-radius trigger, so
+standoff never moves a caster toward a distant primary. A mob targeting the
+caster suppresses the move to avoid kiting. Candidate destinations require
+both a Nav path and location-to-target LOS; arrival LOS is revalidated, and a
+failed plant selects another bounded candidate instead of accepting an
+unchecked fallback.
+
+Debuff has one narrow pre-combat admission exception. If the ordinary combat
+evidence gate is still closed, `sk_debuff.lua` may select only the exact
+`domainKillTargetId` supplied by the Combat host when that live NPC is within
+`DebuffEarlyRange` (default 50) and has line of sight. A value of zero disables
+the exception. The same authorization, identity, range, and LOS checks run
+again in executor preflight. This does not authorize Assist, disciplines, DPS,
+or a different nearby NPC; all normal spell conditions, readiness, peer claims,
+effect-presence checks, and the local action lease still apply.
+Debuff's 300 ms peer-claim convergence window is also a Combat-domain priority
+barrier. During `peer_settling`, the domain does not admit lower-ranked DPS;
+it waits without requesting a lease, then selects the settled Debuff action.
+If a DPS request was already queued when Debuff became eligible, the domain
+withdraws it before dispatch. An action in `WAITING_START` or `RUNNING` has
+crossed the mutation boundary and is still allowed to drain normally; Debuff
+runs next instead of forcing a cast or standoff interruption.
 
 `sk_chase.lua` is the dedicated chase worker. It uses
 `automation/chase.lua` for read-only intent selection, records an exact target
@@ -343,11 +368,14 @@ churn the scheduler. Finalization stops Nav, MoveTo, follow/stick, and any held
 movement keys before release. `/sk_chase status` reports the selected backend,
 backend capabilities, active movement phase, failure streak, and backoff.
 Melee combat and AutoFire always suppress Chase. General combat state, active
-XTarget haters, and pet combat suppress it only while Ranged Standoff is
-enabled and the chase target remains within `max(150, 4 * ChaseDistance)`.
-This lets standoff own ordinary in-combat positioning without stranding a
-non-standoff character or a group whose tank pursues a runner beyond the
-leash.
+XTarget haters, and pet combat suppress it only while DPS is publishing a
+fresh local Targeted-AE standoff demand and the chase target remains within
+`max(150, 4 * ChaseDistance)`. The targeted `worker:telemetry` signal is
+refreshed at most twice per second and expires after 1.5 seconds, so a failed
+Combat worker cannot leave Chase disabled. This lets the selected standoff
+prerequisite take movement ownership without suppressing ordinary in-combat
+following for single-target rotations or stranding a group whose tank pursues
+a runner beyond the leash.
 Chase is not a catch-all utility worker, and the UI host does not tick chase
 movement. If a prior process leaves a valid chase ownership
 marker, read-only inspection marks the worker dirty and the coordinator grants
@@ -873,3 +901,16 @@ Consumers treat every field as optional, use the feed only while fresh (<2s),
 and keep their own TLO polling as fallback. Distance / LineOfSight / viewer
 zone logic must stay locally polled (relative to the viewer, not the tank).
 Healing decisions never consume this feed (latency).
+
+## ma_healbridge (external consumer: muleassist)
+
+`ma_healbridge.lua` is a headless standalone script (launched by
+`muleassist.mac` when its `SmartHealsOn` INI toggle is set) that runs the
+`healing/` facade in selection-only mode: init phases 1-4, `tickSensors`,
+`buildHealAction({ignoreSpellEngine=true})`. It never casts; recommendations
+flow to the macro via `/varset` (SmartHealSpell/TargetID/Tier/Seq + a
+SmartHealBeat heartbeat) and the macro reports consumption via SmartHealAck /
+SmartHealResult, read back with `mq.TLO.Macro.Variable`. Broadcast/claims are
+disabled (`Config.broadcastEnabled=false`); it refuses to start when the full
+SideKick fleet is running on the character. Pure publish/ack bookkeeping lives
+in `utils/ma_bridge_state.lua` (tested: `tests/ma_bridge_state_test.lua`).
