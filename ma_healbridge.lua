@@ -272,7 +272,7 @@ shSend = function(payload)
     if not shActor then
         if not shWarned then
             shWarned = true
-            log('\\ayCompanion feed unavailable - SmartHeals cards will show no data.')
+            log('\ayCompanion feed unavailable - SmartHeals cards will show no data.')
         end
         return
     end
@@ -379,7 +379,7 @@ while true do
                 spell     = tostring(action.spellName),
                 target    = tostring(action.targetName),
                 tier      = tostring(action.tier or 'single'),
-                trigger   = tostring(action.reason or ''),
+                trigger   = action.reason and tostring(action.reason) or nil,
                 targetPct = shT and tonumber(shT.pctHP) or nil,
                 targetDps = shT and tonumber(shT.recentDps) or nil,
                 isHoT     = action.isHoT == true,
