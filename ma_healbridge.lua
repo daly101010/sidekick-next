@@ -6,6 +6,7 @@ local mq = require('mq')
 local Healing = require('sidekick-next.healing')
 local HealerClasses = require('sidekick-next.utils.healer_classes')
 local BridgeState = require('sidekick-next.utils.ma_bridge_state')
+local HealLog = require('sidekick-next.healing.logger')
 
 local LOOP_MS = 200
 local MACRO_GONE_EXIT_MS = 10000
@@ -14,8 +15,13 @@ local function log(fmt, ...)
     print(string.format('\ag[MA-HealBridge]\ax ' .. fmt, ...))
 end
 
+-- 'Running' means the macro has reached its SmartHeals declare block, not merely started:
+-- a bridge that outlives a macro restart would otherwise /varset SmartHealBeat during LoadIni
+-- (hundreds of lines before the declare) and spam 'variable not found'.
 local function macroRunning()
-    return mq.TLO.Macro() == 'muleassist.mac'
+    if mq.TLO.Macro() ~= 'muleassist.mac' then return false end
+    local d = mq.TLO.Defined('SmartHealBeat')
+    return d ~= nil and d() == true
 end
 
 local function macroVar(name)
@@ -76,6 +82,16 @@ end
 Healing.Config.broadcastEnabled = false
 Healing.Config.healPetsEnabled = macroInt('HealGroupPetsOn') > 0
 log('Ready. broadcast=off healPets=%s', tostring(Healing.Config.healPetsEnabled))
+-- 13k+ HOT_DECISION blocks per hour and nothing in the bridge acts on them
+if Healing.Config.logCategories then Healing.Config.logCategories.hotCoverage = false end
+-- Spell assignment happens before the file logger opens, so echo it here (diagnostic).
+for _, cat in ipairs({ 'fast', 'small', 'medium', 'large', 'group', 'hot', 'hotLight', 'groupHot', 'promised', 'selfHeal' }) do
+    local list = Healing.Config.spells and Healing.Config.spells[cat] or {}
+    if #list > 0 then log('  %s: %s', cat, table.concat(list, ', ')) end
+end
+if not (Healing.Config.HasConfiguredSpells and Healing.Config.HasConfiguredSpells()) then
+    log('rNo heal spells were assigned from the spell bar - the bridge will never recommend a heal.')
+end
 
 -- ------------------------------------------- external targets (out-of-group)
 -- TargetMonitor only scans the group. Feed the out-of-group MA and XTarHeal PC
@@ -139,6 +155,8 @@ local function registerConfirmedCast()
     if ack <= lastSeenAck then return end
     local action = publishedBySeq[ack]
     lastSeenAck = ack
+    HealLog.info('bridge', 'ACK seq=%d result=%s (%s on %s)', ack, tostring(macroVar('SmartHealResult')),
+        action and tostring(action.spellName) or '?', action and tostring(action.targetName) or '?')
     if action and action.isHoT and tostring(macroVar('SmartHealResult') or '') == 'CAST_SUCCESS' then
         local castInfo = Healing.prepareHealCast(action)
         if castInfo then Healing.registerHealCast(castInfo) end
@@ -146,6 +164,85 @@ local function registerConfirmedCast()
     for seq in pairs(publishedBySeq) do
         if seq <= ack then publishedBySeq[seq] = nil end
     end
+end
+
+-- ------------------------------------------- unknown-MaxHP fallback + heal floor
+-- Out-of-group PCs (XTarHeal slots) only resolve MaxHP through DanNet; when that
+-- fails sidekick falls back to defaultRemoteMaxHP=100000, which turns an 86% target
+-- into a 14000hp deficit and makes the biggest heal look right. Use the largest
+-- MaxHP we actually know (self + DanNet-resolved targets) as the estimate instead.
+local function applyMaxHPFallback()
+    local best = tonumber(mq.TLO.Me.MaxHPs()) or 0
+    local tm = Healing.TargetMonitor
+    if tm and tm.getAllTargets then
+        for _, t in pairs(tm.getAllTargets() or {}) do
+            if t.maxHPKnown and (tonumber(t.maxHP) or 0) > best then best = tonumber(t.maxHP) end
+        end
+    end
+    if best > 100 and Healing.Config.defaultRemoteMaxHP ~= best then
+        Healing.Config.defaultRemoteMaxHP = best
+    end
+end
+
+-- [Heals] SmartHealFloorPct: minimum deficit % before a non-emergency direct heal is
+-- recommended (sidekick default is 10% squishy / 15% other / 20% low pressure).
+local lastFloor = nil
+local function applyHealFloor()
+    local floor = macroInt('SmartHealFloorPct')
+    if floor <= 0 or floor == lastFloor then return end
+    lastFloor = floor
+    Healing.Config.minHealPct = floor
+    Healing.Config.nonSquishyMinHealPct = math.max(floor, 15)
+    Healing.Config.lowPressureMinDeficitPct = math.max(floor, 20)
+    log('Heal floor: %d%% deficit (nonSquishy %d%%, lowPressure %d%%)', floor,
+        Healing.Config.nonSquishyMinHealPct, Healing.Config.lowPressureMinDeficitPct)
+end
+
+-- Spell assignment is decided once at init; sidekick proper only re-reads the gems on
+-- a manual /sk rescan. Poll the bar so a heal memmed mid-session joins its category.
+local lastGemScan = 0
+local function rescanGems()
+    local now = mq.gettime()
+    if (now - lastGemScan) < 10000 then return end
+    lastGemScan = now
+    if not Healing.Config.mergeFromSpellBar then return end
+    local added, additions = Healing.Config.mergeFromSpellBar()
+    for _, add in ipairs(additions or {}) do
+        log('Memorized heal added: %s -> %s', add.name, add.category)
+    end
+end
+
+-- [Heals] SmartHealEmergencyPct: below this HP% a target is an emergency - fastest direct
+-- heal, no HoTs, no group heals. sidekick's CLR default of 25% is far too low for this
+-- server's melee (2026-09-10: tank at 42% under 1700 DPS got a 2s HoT and died).
+local lastEmergency = nil
+local function applyEmergencyPct()
+    local pct = macroInt('SmartHealEmergencyPct')
+    if pct <= 0 then pct = 45 end
+    if pct == lastEmergency then return end
+    lastEmergency = pct
+    Healing.Config.emergencyPct = pct
+    log('Emergency line: %d%% (fastest direct heal, HoTs/group heals suppressed below it)', pct)
+end
+
+-- HoT veto: sidekick documents that direct heals take over below 100-hotMaxDeficitPct
+-- (65%), yet the log shows single-target HoT picks at 42% and 57% on a tank under
+-- 800-1700 DPS. Enforce it here and re-run selection with HoTs disabled so the tick
+-- still yields a direct heal instead of nothing.
+local function vetoHot(action, opts)
+    if not action or not action.isHoT or action.tier == 'groupHot' then return action end
+    local tm = Healing.TargetMonitor
+    local t = tm and tm.getTarget and tm.getTarget(tonumber(action.targetId) or 0) or nil
+    local pct = t and tonumber(t.pctHP) or 100
+    local floor = 100 - (tonumber(Healing.Config.hotMaxDeficitPct) or 35)
+    if pct >= floor then return action end
+    local saved = Healing.Config.hotEnabled
+    Healing.Config.hotEnabled = false
+    local direct = Healing.buildHealAction(opts)
+    Healing.Config.hotEnabled = saved
+    HealLog.info('bridge', 'HOT VETO: %s on %s at %d%% (< %d%%) -> %s', tostring(action.spellName),
+        tostring(action.targetName), pct, floor, direct and tostring(direct.spellName) or 'none')
+    return direct
 end
 
 -- ---------------------------------------------------------------- main loop
@@ -180,15 +277,19 @@ while true do
             feedExternalTargets(maId)
             Healing.tickSensors({ readOnly = true })
             applyTankRole(maId)
+            applyMaxHPFallback()
+            applyHealFloor()
+            applyEmergencyPct()
+            rescanGems()
             registerConfirmedCast()
-            action = Healing.buildHealAction({
-                ignoreSpellEngine = true,
-                skipIfCasting = false,
-            })
+            local selOpts = { ignoreSpellEngine = true, skipIfCasting = false }
+            action = vetoHot(Healing.buildHealAction(selOpts), selOpts)
         end
         local varsets = BridgeState.next(state, action, macroInt('SmartHealAck'))
         if varsets then
             publishedBySeq[state.seq] = action
+            HealLog.info('bridge', 'PUBLISH seq=%d %s on %s [%s] %s', state.seq, tostring(action.spellName),
+                tostring(action.targetName), tostring(action.tier or 'single'), tostring(action.details or action.reason or ''))
             for _, pair in ipairs(varsets) do
                 mq.cmdf('/varset %s %s', pair[1], pair[2])
             end
