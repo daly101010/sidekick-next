@@ -7,6 +7,12 @@ local Healing = require('sidekick-next.healing')
 local HealerClasses = require('sidekick-next.utils.healer_classes')
 local BridgeState = require('sidekick-next.utils.ma_bridge_state')
 local HealLog = require('sidekick-next.healing.logger')
+local actorsOk, actors = pcall(require, 'actors')
+-- Forward-declared: registerConfirmedCast and vetoHot (below) call shSend
+-- before its definition further down (which sits just above the main loop),
+-- and a plain `local function shSend` there would leave those earlier call
+-- sites resolving to an unrelated global. Assigned, not redeclared, later.
+local shSend
 
 local LOOP_MS = 200
 local MACRO_GONE_EXIT_MS = 10000
@@ -157,6 +163,7 @@ local function registerConfirmedCast()
     lastSeenAck = ack
     HealLog.info('bridge', 'ACK seq=%d result=%s (%s on %s)', ack, tostring(macroVar('SmartHealResult')),
         action and tostring(action.spellName) or '?', action and tostring(action.targetName) or '?')
+    shSend({ kind = 'ack', seq = ack, result = tostring(macroVar('SmartHealResult')) })
     if action and action.isHoT and tostring(macroVar('SmartHealResult') or '') == 'CAST_SUCCESS' then
         local castInfo = Healing.prepareHealCast(action)
         if castInfo then Healing.registerHealCast(castInfo) end
@@ -242,7 +249,79 @@ local function vetoHot(action, opts)
     Healing.Config.hotEnabled = saved
     HealLog.info('bridge', 'HOT VETO: %s on %s at %d%% (< %d%%) -> %s', tostring(action.spellName),
         tostring(action.targetName), pct, floor, direct and tostring(direct.spellName) or 'none')
+    shSend({
+        kind = 'veto', spell = tostring(action.spellName), target = tostring(action.targetName),
+        pct = pct, replacement = direct and tostring(direct.spellName) or nil,
+    })
     return direct
+end
+
+-- ------------------------------------------- companion feed
+-- Companion renders the SmartHeals Outcomes/Decisions cards from these. MQ
+-- registers a Lua actor mailbox as '<script>:<name>' and an address-less send
+-- only reaches the sender's own script, so every send fans out to each script
+-- that might be hosting the companion parser -- the same fix companion's own
+-- group.lua applies to 'companion_dps'. Sends to a mailbox nobody registered
+-- are dropped silently.
+local SH_MAILBOX = 'companion_smartheal'
+local SH_SCRIPTS = { 'companion', 'maui', 'medley' }
+local shActor    = nil
+local shWarned   = false
+
+shSend = function(payload)
+    if not shActor then
+        if not shWarned then
+            shWarned = true
+            log('\\ayCompanion feed unavailable - SmartHeals cards will show no data.')
+        end
+        return
+    end
+    pcall(function()
+        for _, script in ipairs(SH_SCRIPTS) do
+            shActor:send({ mailbox = SH_MAILBOX, script = script }, payload)
+        end
+    end)
+end
+
+if actorsOk and actors then
+    -- Registered as a no-op receiver purely so send() has a valid endpoint;
+    -- companion registers its own callback on the same mailbox name.
+    local okReg, a = pcall(actors.register, SH_MAILBOX, function() end)
+    if okReg then shActor = a end
+end
+
+-- Config is resent only when a value actually changes, so this is a handful of
+-- messages per session rather than one per loop.
+local shLastConfig = nil
+local function shConfig()
+    local key = string.format('%s|%s|%s|%s',
+        tostring(Healing.Config.emergencyPct), tostring(Healing.Config.minHealPct),
+        tostring(mq.TLO.Spawn(macroInt('MainAssistID')).CleanName() or ''),
+        tostring(macroInt('SmartHealDebug') > 0))
+    if key == shLastConfig then return end
+    shLastConfig = key
+    shSend({
+        kind         = 'config',
+        emergencyPct = tonumber(Healing.Config.emergencyPct),
+        floorPct     = tonumber(Healing.Config.minHealPct),
+        maName       = mq.TLO.Spawn(macroInt('MainAssistID')).CleanName(),
+        shadow       = macroInt('SmartHealDebug') > 0,
+    })
+end
+
+-- The macro increments SmartHealNetFires every time CheckHealth's emergency
+-- safety net casts the legacy MA heal. Nothing in that cast is distinguishable
+-- from any other legacy heal in the chat log, so poll the counter and report
+-- the delta.
+local shLastNet = nil
+local function shNet()
+    local n = macroInt('SmartHealNetFires')
+    if shLastNet == nil then shLastNet = n; return end
+    if n > shLastNet then
+        shSend({ kind = 'net', count = n - shLastNet })
+    end
+    -- A macro restart zeroes the counter; resync without reporting a negative.
+    shLastNet = n
 end
 
 -- ---------------------------------------------------------------- main loop
@@ -280,6 +359,8 @@ while true do
             applyMaxHPFallback()
             applyHealFloor()
             applyEmergencyPct()
+            shConfig()
+            shNet()
             rescanGems()
             registerConfirmedCast()
             local selOpts = { ignoreSpellEngine = true, skipIfCasting = false }
@@ -290,6 +371,19 @@ while true do
             publishedBySeq[state.seq] = action
             HealLog.info('bridge', 'PUBLISH seq=%d %s on %s [%s] %s', state.seq, tostring(action.spellName),
                 tostring(action.targetName), tostring(action.tier or 'single'), tostring(action.details or action.reason or ''))
+            local shT = Healing.TargetMonitor and Healing.TargetMonitor.getTarget
+                and Healing.TargetMonitor.getTarget(tonumber(action.targetId) or 0) or nil
+            shSend({
+                kind      = 'decision',
+                seq       = state.seq,
+                spell     = tostring(action.spellName),
+                target    = tostring(action.targetName),
+                tier      = tostring(action.tier or 'single'),
+                trigger   = tostring(action.reason or ''),
+                targetPct = shT and tonumber(shT.pctHP) or nil,
+                targetDps = shT and tonumber(shT.recentDps) or nil,
+                isHoT     = action.isHoT == true,
+            })
             for _, pair in ipairs(varsets) do
                 mq.cmdf('/varset %s %s', pair[1], pair[2])
             end
