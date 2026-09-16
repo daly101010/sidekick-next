@@ -75,14 +75,41 @@ if not macroRunning() then
 end
 
 -- ---------------------------------------------------------------- init
-log('Initializing healing intelligence (phases 1-4, headless)...')
-for phase = 1, 4 do
+-- All phases, still headless: phase 5 only loads the UI modules (never drawn here) and MobAssessor,
+-- but it is also what arms tickSensors' optional block (damage_parser/damage_attribution upkeep,
+-- mob_assessor zone tiers). Stopping at phase 4 left those dead for the whole session.
+local initPhases = tonumber(Healing.TOTAL_INIT_PHASES) or 5
+log('Initializing healing intelligence (phases 1-%d, headless)...', initPhases)
+for phase = 1, initPhases do
     Healing.initPhased(phase)
     mq.delay(50)
 end
 if not Healing.isInitialized() then
     log('\arHealing init failed - exiting. Legacy heals remain active.')
     return
+end
+-- Healing.Config is sidekick's own profile module: Config.save() writes every key of it to this
+-- character's healing config, which full SideKick loads. Remember the profile's values for the
+-- keys this bridge overrides (below and in the apply* helpers) so a save made while the bridge
+-- runs (mergeFromSpellBar in rescanGems) writes those instead of muleassist's.
+local BRIDGE_OVERRIDES = { 'broadcastEnabled', 'healPetsEnabled', 'defaultRemoteMaxHP', 'minHealPct',
+    'nonSquishyMinHealPct', 'lowPressureMinDeficitPct', 'emergencyPct' }
+local profileValues = {}
+for _, k in ipairs(BRIDGE_OVERRIDES) do profileValues[k] = Healing.Config[k] end
+profileValues.hotCoverage = Healing.Config.logCategories and Healing.Config.logCategories.hotCoverage
+
+-- Put `values` into Config for every overridden key; returns what was there before.
+local function swapBridgeOverrides(values)
+    local cfg, prev = Healing.Config, {}
+    for _, k in ipairs(BRIDGE_OVERRIDES) do
+        prev[k] = cfg[k]
+        cfg[k] = values[k]
+    end
+    if cfg.logCategories then
+        prev.hotCoverage = cfg.logCategories.hotCoverage
+        cfg.logCategories.hotCoverage = values.hotCoverage
+    end
+    return prev
 end
 -- v1: standalone. No cross-healer claims/broadcasts (spec decision).
 Healing.Config.broadcastEnabled = false
@@ -213,7 +240,11 @@ local function rescanGems()
     if (now - lastGemScan) < 10000 then return end
     lastGemScan = now
     if not Healing.Config.mergeFromSpellBar then return end
+    -- mergeFromSpellBar saves the whole Config when it adds a heal: persist the profile's own
+    -- values for the bridge's overrides, then put the overrides back.
+    local live = swapBridgeOverrides(profileValues)
     local added, additions = Healing.Config.mergeFromSpellBar()
+    swapBridgeOverrides(live)
     for _, add in ipairs(additions or {}) do
         log('Memorized heal added: %s -> %s', add.name, add.category)
     end
