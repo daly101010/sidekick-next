@@ -355,6 +355,32 @@ local function shNet()
     shLastNet = n
 end
 
+-- SmartHealBeat holds the macro's smart path on and legacy heal selection off, yet
+-- buildHealAction only picks a heal that is ready in a gem (isSpellUsable needs SpellReady).
+-- Beat only while a configured heal is memorized, so a healer whose heals are unmemmed or
+-- AA/clicky heals the legacy way instead of not at all. Gems are read at most once a second.
+local HEAL_GEM_CHECK_MS = 1000
+local lastHealGemCheck = 0
+local healGemCached = false
+local function healMemorized()
+    local now = mq.gettime()
+    if (now - lastHealGemCheck) < HEAL_GEM_CHECK_MS then return healGemCached end
+    lastHealGemCheck = now
+    healGemCached = false
+    for _, list in pairs(Healing.Config.spells or {}) do
+        if type(list) == 'table' then
+            for _, name in ipairs(list) do
+                if type(name) == 'string' and name ~= ''
+                    and (tonumber(mq.TLO.Me.Gem(name)()) or 0) > 0 then
+                    healGemCached = true
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 -- ---------------------------------------------------------------- main loop
 local state = BridgeState.newState()
 local macroGoneSince = nil
@@ -419,7 +445,11 @@ while true do
                 mq.cmdf('/varset %s %s', pair[1], pair[2])
             end
         end
-        mq.cmdf('/varset SmartHealBeat %d', state.beat)
+        -- No beat while no configured heal is memorized: the macro's fresh timer lapses and legacy
+        -- selection takes over until one is. A selected action is itself a ready gem heal.
+        if action or healMemorized() then
+            mq.cmdf('/varset SmartHealBeat %d', state.beat)
+        end
     end
     mq.delay(LOOP_MS)
 end
