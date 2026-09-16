@@ -367,8 +367,10 @@ local function healMemorized()
     if (now - lastHealGemCheck) < HEAL_GEM_CHECK_MS then return healGemCached end
     lastHealGemCheck = now
     healGemCached = false
-    for _, list in pairs(Healing.Config.spells or {}) do
-        if type(list) == 'table' then
+    -- promised is only consulted to choose a HoT size, never picked; selfHeal is picked only with selfHealEnabled
+    for cat, list in pairs(Healing.Config.spells or {}) do
+        if type(list) == 'table' and cat ~= 'promised'
+            and (cat ~= 'selfHeal' or Healing.Config.selfHealEnabled) then
             for _, name in ipairs(list) do
                 if type(name) == 'string' and name ~= ''
                     and (tonumber(mq.TLO.Me.Gem(name)()) or 0) > 0 then
