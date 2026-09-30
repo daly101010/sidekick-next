@@ -116,8 +116,12 @@ local KIND_COLORS = {
 local function rowVisible(r)
     if not UI.filterKinds[r.kind] then return false end
     if UI.filterText ~= '' then
-        local hay = (Ledger.formatRow(r)):lower()
-        if not hay:find(UI.filterText:lower(), 1, true) then return false end
+        -- the text is cached per row and rebuilt only when the row closes (its duration changes)
+        if r._text == nil or r._textClosed ~= r.closedAt then
+            r._text = (Ledger.formatRow(r)):lower()
+            r._textClosed = r.closedAt
+        end
+        if not r._text:find(UI.filterText:lower(), 1, true) then return false end
     end
     return true
 end
@@ -174,9 +178,8 @@ local function drawLive()
                 imgui.TableNextRow()
                 imgui.TableNextColumn()
                 local sel = UI.selected == r.id
-                if imgui.Selectable(Ledger.clock(r.openedAt) .. '##' .. r.id, sel, ImGuiSelectableFlags.SpanAllColumns) then
-                    UI.selected = sel and nil or r.id
-                end
+                local _, clicked = imgui.Selectable(Ledger.clock(r.openedAt) .. '##' .. r.id, sel, ImGuiSelectableFlags.SpanAllColumns)
+                if clicked then UI.selected = (not sel) and r.id or nil end
                 imgui.TableNextColumn()
                 local c = KIND_COLORS[r.kind] or { 1, 1, 1, 1 }
                 imgui.TextColored(c[1], c[2], c[3], c[4], r.kind .. (r.closedAt and '' or ' (open)'))
@@ -250,11 +253,15 @@ local function drawWindow()
     local open, show = imgui.Begin('Raid Heal Ledger', UI.show)
     UI.show = open
     if show then
-        local status = string.format('brain %s | %d boxes fresh, %d stale | %s | %s%s',
+        local status = string.format('brain %s | %d boxes fresh, %d stale | %s | %s',
             myName, UI.boxesFresh, UI.boxesStale, inCombat and 'in combat' or 'out of combat',
-            store.path and 'writing ' .. store.path or (store.failed and ('file: ' .. store.failed) or 'no file yet'),
-            next(otherBrains) and '  \arANOTHER BRAIN IS RUNNING' or '')
+            store.path and 'writing ' .. store.path or (store.failed and ('file: ' .. store.failed) or 'no file yet'))
         imgui.TextWrapped(status)
+        if next(otherBrains) then
+            local names = {}
+            for n in pairs(otherBrains) do names[#names + 1] = n end
+            imgui.TextColored(1, 0.3, 0.3, 1, 'ANOTHER BRAIN IS RUNNING: ' .. table.concat(names, ', ') .. ' - stop one (/healbrain stop)')
+        end
         if imgui.BeginTabBar('ledger_tabs') then
             if imgui.BeginTabItem('Live gaps') then drawLive() imgui.EndTabItem() end
             if imgui.BeginTabItem('Fights and boxes') then drawSummary() imgui.EndTabItem() end

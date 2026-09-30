@@ -91,7 +91,9 @@ local function amMainAssist()
 end
 
 -- ---------------------------------------------------------------- spell facts
+local factsCache = {}   -- static per spell name: range, cast time, mana cost, kind
 local function spellFacts(name)
+    if factsCache[name] then return factsCache[name] end
     local f = { range = 0, castMs = 0, mana = 0, kind = 'other', aerange = 0 }
     local sp = mq.TLO.Spell(name)
     local aa = mq.TLO.Me.AltAbility(name)
@@ -100,7 +102,7 @@ local function spellFacts(name)
     if sp and sp() then src = sp
     elseif aa and aa() and aa.Spell and aa.Spell() then src = aa.Spell
     elseif it and it() and it.Spell and it.Spell() then src = it.Spell end
-    if not src then return f end
+    if not src then return f end   -- unknown name: not cached, so a later scribe/memorize is picked up
     f.range = num(function() return src.MyRange() end, 0)
     f.aerange = num(function() return src.AERange() end, 0)
     f.castMs = num(function() return src.MyCastTime() end, 0)
@@ -112,6 +114,7 @@ local function spellFacts(name)
     elseif st == 'detrimental' then f.kind = 'other'
     elseif sub:find('duration') then f.kind = 'hot'
     else f.kind = 'direct' end
+    factsCache[name] = f
     return f
 end
 
@@ -213,12 +216,13 @@ local function spawnRecord(sp, name, group, isPet)
     if not sp or not sp() then return nil end
     local id = num(function() return sp.ID() end)
     if id <= 0 then return nil end
-    local ty = str(function() return sp.Type() end)
+    local hp = num(function() return sp.PctHPs() end)
+    -- a dead member's spawn stays type PC at 0 HP (the corpse is another spawn): Dead() or 0 HP
     return id, {
         name = name or str(function() return sp.CleanName() end),
-        hp = num(function() return sp.PctHPs() end),
+        hp = hp,
         x = num(function() return sp.X() end), y = num(function() return sp.Y() end), z = num(function() return sp.Z() end),
-        dead = (ty == 'Corpse'),
+        dead = bool(function() return sp.Dead() end) or hp <= 0,
         class = str(function() return sp.Class.ShortName() end),
         group = group, pet = isPet == true,
     }
@@ -229,26 +233,22 @@ local function buildTargets(gkey, withRaid)
     local n = num(function() return mq.TLO.Group.Members() end)
     for i = 1, n do
         local m = mq.TLO.Group.Member(i)
+        -- keyed by tostring(id): a sparse integer-keyed table is not a safe actors payload
         local id, rec = spawnRecord(m, nil, gkey, false)
-        if id and id ~= myId then out[id] = rec end
+        if id and id ~= myId then out[tostring(id)] = rec end
         local pid, prec = spawnRecord(m and m.Pet, nil, gkey, true)
-        if pid then out[pid] = prec end
+        if pid then out[tostring(pid)] = prec end
     end
     if withRaid then
         local rn = num(function() return mq.TLO.Raid.Members() end)
         for i = 1, rn do
             local rm = mq.TLO.Raid.Member(i)
-            local rid = num(function() return rm.ID() end)
-            if rid > 0 and rid ~= myId and not out[rid] then
+            -- only raiders with a spawn in this zone: no position means the brain cannot judge range
+            local rid = num(function() return rm.Spawn.ID() end)
+            if rid > 0 and rid ~= myId and not out[tostring(rid)] then
                 local rg = num(function() return rm.Group() end)
-                local id, rec = spawnRecord(mq.TLO.Spawn(rid), str(function() return rm.Name() end), 'raid:' .. rg, false)
-                if id then
-                    out[id] = rec
-                else
-                    -- not in zone or not a spawn we can see: HP only
-                    out[rid] = { name = str(function() return rm.Name() end), hp = num(function() return rm.PctHPs() end),
-                                 class = str(function() return rm.Class.ShortName() end), group = 'raid:' .. rg, dead = false }
-                end
+                local id, rec = spawnRecord(rm.Spawn, str(function() return rm.Name() end), 'raid:' .. rg, false)
+                if id then out[tostring(id)] = rec end
             end
         end
     end
@@ -298,9 +298,12 @@ local function collectEvents(nowMs, cast)
     local idx = macroInt('WhyNotIdx')
     local text = idx > 0 and macroVar(string.format('WhyNot[%d]', idx)) or nil
     if text and text ~= hs.whynotText and hs.seeded then
+        -- "[HH:MM:SS] Where: What -> Who: Why (xN)": strip the stamp, the spell sits between the first ':' and '->'
         local tid, who = whynotTarget(text)
-        events[#events + 1] = { kind = 'withheld', spell = text:match(':%s*([^%->]+)%->') and trim(text:match(':%s*([^%->]+)%->')) or nil,
-            targetId = tid or 0, targetName = who, reason = text:gsub('^%[[^%]]*%]%s*', ''), ts = nowMs }
+        local body = text:gsub('^%[[^%]]*%]%s*', '')
+        local spell = body:match('^[^:]+:%s*(.-)%s*%->')
+        events[#events + 1] = { kind = 'withheld', spell = (spell and spell ~= '') and spell or nil,
+            targetId = tid or 0, targetName = who, reason = body, ts = nowMs }
     end
     hs.whynotText = text
     hs.seeded = true
@@ -392,6 +395,7 @@ while running do
                 healLine = macroInt('SingleHealPoint'), tankLine = macroInt('SingleHealPointMA'),
                 healTank = macroVar('HealTank'), healTankId = macroInt('HealTankID'),
                 healsOn = macroInt('HealsOn'), curesOn = macroInt('CuresOn'), whynotLast = whynot,
+                healPets = macroInt('HealGroupPetsOn') > 0,
                 isMA = isMA, combat = macroInt('CombatStart') > 0,
             } or nil,
             events = events,

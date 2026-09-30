@@ -162,7 +162,8 @@ end
 -- a ready direct line on this box that fits a target at hp within range dist
 local function fittingDirect(box, hp, dist)
     for _, ln in ipairs((box.snap.lines or {}).direct or {}) do
-        if ln.ready and ln.mana ~= false and (ln.pct or 0) >= hp and (dist == nil or (ln.range or 0) >= dist) then
+        -- unknown geometry (a target with no position) never fits: no row from a guess
+        if ln.ready and ln.mana ~= false and (ln.pct or 0) >= hp and dist ~= nil and (ln.range or 0) >= dist then
             return ln
         end
     end
@@ -182,7 +183,7 @@ end
 
 local function fittingCure(box, types, dist)
     for _, cl in ipairs((box.snap.lines or {}).cures or {}) do
-        if cl.ready and (dist == nil or (cl.range or 0) >= dist) then
+        if cl.ready and dist ~= nil and (cl.range or 0) >= dist then
             local any = true
             for _ in pairs(cl.types or {}) do any = false end
             if any then return cl end
@@ -279,10 +280,11 @@ local function detectUnhealedAndLate(L, nowMs, healers, opened)
             ep.underSince, ep.candidateSince, ep.lateRowed = nil, nil, nil
             closeRow(L, 'unhealed:' .. id, nowMs)
         else
-            -- under any fresh healer's line for this target?
+            -- under any fresh healer's line for this target? (a pet only counts for a healer that heals pets)
             local under, candidates = false, {}
             for _, h in ipairs(healers) do
                 local line = lineFor(h.box, id)
+                if t.pet and not ((h.box.snap.macro or {}).healPets) then line = -1 end
                 if t.hp <= line then
                     under = true
                     local d = dist3(boxPos(h.box), t)
@@ -429,7 +431,7 @@ local function detectMissedGroup(L, nowMs, healers, opened)
                         if t.group == groupKey and not t.dead and not t.pet and t.hp and t.hp >= 1 and t.hp <= (gl.pct or 0)
                             and t.ts and (nowMs - t.ts) <= L.opts.staleMs then
                             local d = dist3(hp, t)
-                            if d == nil or d <= (gl.range or 0) then
+                            if d ~= nil and d <= (gl.range or 0) then
                                 n = n + 1
                                 names[#names + 1] = string.format('%s %d%%', tostring(t.name), t.hp)
                             end
@@ -547,6 +549,14 @@ end
 
 local function sampleHistory(L, nowMs)
     local keepN = math.floor(L.opts.deathWindowMs / L.opts.sampleMs) + 1
+    -- forget spawns nobody has reported for a minute (resummoned pets, zoned members)
+    for id, t in pairs(L.targets) do
+        if t.ts and (nowMs - t.ts) > 60000 then
+            L.targets[id] = nil
+            L.episodes[id] = nil
+            L.cureEpisodes[id] = nil
+        end
+    end
     for _, t in pairs(L.targets) do
         if t.hp then
             t.hist[#t.hist + 1] = { nowMs, t.hp }
@@ -653,10 +663,13 @@ end
 
 -- ------------------------------------------------------------------ formatting
 
+-- local wall clock, as the file's fight records and the macro's /whynot stamps (mq.gettime() is epoch ms)
 local function clock(ms)
     if not ms then return '--:--:--.---' end
     local s = math.floor(ms / 1000)
-    return string.format('%02d:%02d:%02d.%03d', math.floor(s / 3600) % 24, math.floor(s / 60) % 60, s % 60, ms % 1000)
+    local ok, hms = pcall(os.date, '%H:%M:%S', s)
+    if not ok or type(hms) ~= 'string' then hms = string.format('%02d:%02d:%02d', math.floor(s / 3600) % 24, math.floor(s / 60) % 60, s % 60) end
+    return string.format('%s.%03d', hms, ms % 1000)
 end
 M.clock = clock
 

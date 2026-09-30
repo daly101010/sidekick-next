@@ -58,7 +58,7 @@ end
 local function ensureDir(dir)
     local probe = io.open(dir .. '/.probe', 'w')
     if probe then probe:close() os.remove(dir .. '/.probe') return true end
-    os.execute('mkdir "' .. dir .. '"')
+    os.execute('mkdir "' .. dir .. '" 2>nul')
     probe = io.open(dir .. '/.probe', 'w')
     if probe then probe:close() os.remove(dir .. '/.probe') return true end
     return false
