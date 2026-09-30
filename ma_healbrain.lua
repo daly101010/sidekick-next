@@ -43,6 +43,7 @@ local UI = {
     open = true, show = false, echo = false, paused = false,
     filterKinds = {}, filterText = '', selected = nil, tab = 'live',
     boxes = {}, boxesFresh = 0, boxesStale = 0, lastTickAt = 0,
+    healerGaps = {}, healerGapsAt = 0,   -- [box] = { own = n, candidate = n }, rebuilt once a second
 }
 for _, k in ipairs(Ledger.KINDS) do UI.filterKinds[k] = true end
 local inCombat = false
@@ -247,6 +248,106 @@ local function drawSummary()
     end
 end
 
+-- gap rows per healer: rows it caused (healer field) and rows where it could have acted (candidate)
+local function rebuildHealerGaps(now)
+    if (now - UI.healerGapsAt) < 1000 then return end
+    UI.healerGapsAt = now
+    local out = {}
+    for _, r in ipairs(ledger.rows) do
+        if r.healer then
+            out[r.healer] = out[r.healer] or { own = 0, candidate = 0 }
+            out[r.healer].own = out[r.healer].own + 1
+        end
+        for _, c in ipairs(r.candidates or {}) do
+            out[c.box] = out[c.box] or { own = 0, candidate = 0 }
+            out[c.box].candidate = out[c.box].candidate + 1
+        end
+    end
+    UI.healerGaps = out
+end
+
+local function pct(v) return v < 100 and (tostring(v) .. '%') or '-' end
+
+local function drawHealers()
+    local night = Ledger.nightSummary(ledger)
+    local kinds = {}
+    for _, k in ipairs(Ledger.KINDS) do if (night.byKind[k] or 0) > 0 then kinds[#kinds + 1] = k .. ' ' .. night.byKind[k] end end
+    imgui.Text(string.format('Ledger: %d fights, %d gap rows%s', night.fights, night.rows, #kinds > 0 and ('  (' .. table.concat(kinds, ', ') .. ')') or ''))
+    imgui.Separator()
+    imgui.Text('Each box\'s /healreport counters (1Hz), with the ledger rows it caused and the rows where it could have acted:')
+    local names = {}
+    for name, box in pairs(ledger.boxes) do
+        if box.snap and box.snap.stats and (box.snap.macro and ((box.snap.macro.healsOn or 0) > 0 or (box.snap.macro.curesOn or 0) > 0)) then names[#names + 1] = name end
+    end
+    table.sort(names)
+    local last = ledger.fights[#ledger.fights]
+    if imgui.BeginTable('healers', 10, ImGuiTableFlags.RowBg + ImGuiTableFlags.Borders + ImGuiTableFlags.ScrollY + ImGuiTableFlags.Resizable, 0, 300) then
+        imgui.TableSetupColumn('Box', ImGuiTableColumnFlags.WidthFixed, 90)
+        imgui.TableSetupColumn('Heals (tank/grp/self/pet/xtar)', ImGuiTableColumnFlags.WidthFixed, 170)
+        imgui.TableSetupColumn('Group heals (withheld)', ImGuiTableColumnFlags.WidthFixed, 110)
+        imgui.TableSetupColumn('Cures (held/unready)', ImGuiTableColumnFlags.WidthFixed, 110)
+        imgui.TableSetupColumn('Interrupts', ImGuiTableColumnFlags.WidthFixed, 70)
+        imgui.TableSetupColumn('DPS cut', ImGuiTableColumnFlags.WidthFixed, 55)
+        imgui.TableSetupColumn('Failed', ImGuiTableColumnFlags.WidthFixed, 55)
+        imgui.TableSetupColumn('Lowest (tank/anyone)', ImGuiTableColumnFlags.WidthFixed, 130)
+        imgui.TableSetupColumn('Gaps (own/could act)', ImGuiTableColumnFlags.WidthFixed, 110)
+        imgui.TableSetupColumn('Last fight cast%/idle%', ImGuiTableColumnFlags.WidthStretch)
+        imgui.TableHeadersRow()
+        local tot = { single = 0, group = 0, groupRange = 0, cure = 0, ints = 0, dpsCut = 0, fail = 0 }
+        for _, name in ipairs(names) do
+            local st = ledger.boxes[name].snap.stats
+            local stale = (mq.gettime() - (ledger.boxes[name].receivedAt or 0)) > 1000
+            local g = UI.healerGaps[name] or { own = 0, candidate = 0 }
+            local ints = st.intHeal + st.intTap + st.intMob + st.intNPC
+            tot.single = tot.single + st.single ; tot.group = tot.group + st.group ; tot.groupRange = tot.groupRange + st.groupRange
+            tot.cure = tot.cure + st.cure ; tot.ints = tot.ints + ints ; tot.dpsCut = tot.dpsCut + st.dpsCut ; tot.fail = tot.fail + st.fail
+            imgui.TableNextRow()
+            imgui.TableNextColumn()
+            if stale then imgui.TextColored(1, 0.5, 0.5, 1, name .. ' (stale)') else imgui.Text(name) end
+            imgui.TableNextColumn() imgui.Text(string.format('%d (%d/%d/%d/%d/%d)', st.single, st.tank, st.groupT, st.self, st.pet, st.oog))
+            imgui.TableNextColumn() imgui.Text(string.format('%d (%d)', st.group, st.groupRange))
+            imgui.TableNextColumn() imgui.Text(string.format('%d (%d/%d)', st.cure, st.cureHeld, st.cureUnready))
+            imgui.TableNextColumn()
+            if ints > 0 then imgui.TextColored(1, 0.8, 0.4, 1, tostring(ints)) else imgui.Text('0') end
+            imgui.TableNextColumn() imgui.Text(tostring(st.dpsCut))
+            imgui.TableNextColumn()
+            if st.fail > 0 then imgui.TextColored(1, 0.6, 0.6, 1, tostring(st.fail)) else imgui.Text('0') end
+            imgui.TableNextColumn() imgui.Text(string.format('%s / %s%s', pct(st.tankLow), pct(st.lowPct), (st.lowPct < 100 and st.lowName) and (' ' .. st.lowName) or ''))
+            imgui.TableNextColumn()
+            if g.own + g.candidate > 0 then imgui.TextColored(1, 0.8, 0.4, 1, string.format('%d / %d', g.own, g.candidate)) else imgui.Text('0 / 0') end
+            imgui.TableNextColumn()
+            local h = last and last.healers[name]
+            imgui.Text(h and string.format('%d%% / %d%%', h.castingPct, h.idleReadyPct) or '-')
+        end
+        imgui.TableNextRow()
+        imgui.TableNextColumn() imgui.Text('all')
+        imgui.TableNextColumn() imgui.Text(tostring(tot.single))
+        imgui.TableNextColumn() imgui.Text(string.format('%d (%d)', tot.group, tot.groupRange))
+        imgui.TableNextColumn() imgui.Text(tostring(tot.cure))
+        imgui.TableNextColumn() imgui.Text(tostring(tot.ints))
+        imgui.TableNextColumn() imgui.Text(tostring(tot.dpsCut))
+        imgui.TableNextColumn() imgui.Text(tostring(tot.fail))
+        imgui.TableNextColumn() imgui.Text('')
+        imgui.TableNextColumn() imgui.Text(tostring(night.rows))
+        imgui.TableNextColumn() imgui.Text('')
+        imgui.EndTable()
+    end
+    if #names == 0 then imgui.Text('no healer or curer box is reporting yet') end
+    imgui.Separator()
+    for _, name in ipairs(names) do
+        local st = ledger.boxes[name].snap.stats
+        if st.line and st.line ~= '' then imgui.TextWrapped(st.line) end
+    end
+    if imgui.Button('Reset every box\'s counters (/healreport reset)') then
+        mq.cmd('/healreport reset')          -- this box (/dgze reaches the others, not the sender)
+        mq.cmd('/dgze /healreport reset')
+        Ledger.reset(ledger)
+        UI.selected = nil
+    end
+    imgui.SameLine()
+    if imgui.Button('Broadcast every box\'s line (/healreport all)') then mq.cmd('/healreport all') end
+end
+
 local function drawWindow()
     if not UI.show then return end
     imgui.SetNextWindowSize(900, 520, ImGuiCond.FirstUseEver)
@@ -264,6 +365,7 @@ local function drawWindow()
         end
         if imgui.BeginTabBar('ledger_tabs') then
             if imgui.BeginTabItem('Live gaps') then drawLive() imgui.EndTabItem() end
+            if imgui.BeginTabItem('Healers') then drawHealers() imgui.EndTabItem() end
             if imgui.BeginTabItem('Fights and boxes') then drawSummary() imgui.EndTabItem() end
             imgui.EndTabBar()
         end
@@ -358,6 +460,7 @@ while running do
     local fresh, stale = 0, 0
     for _, b in pairs(UI.boxes) do if (now - b.at) <= 1000 then fresh = fresh + 1 else stale = stale + 1 end end
     UI.boxesFresh, UI.boxesStale, UI.lastTickAt = fresh, stale, now
+    rebuildHealerGaps(now)
     if (now - lastBeat) >= HEARTBEAT_MS then
         heartbeat()
         lastBeat = now

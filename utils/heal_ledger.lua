@@ -14,6 +14,9 @@
 --               cures = { {name, types = {poison=true,...} (empty = any), range, ready} } },
 --     targets = { [id] = { name, hp, x, y, z, dead, class, group, pet, counters = {p,d,c,co} | nil } },
 --     macro = { healLine, tankLine, healTank, healTankId, healsOn, curesOn },
+--     stats = { line = <HealStats one-liner>, single, tank, groupT, self, pet, oog, tap, mob, intHeal, intTap, intMob,
+--               intNPC, dpsCut, fail, failLast, group, groupRange, smart, smartFail, cure, cureGroup, cureHeld,
+--               cureUnready, skip, lowPct, lowName, tankLow, fights, sinceSec }   (the macro's /healreport counters, 1Hz)
 --     events = { {kind='interrupt'|'withheld'|'cast', spell, targetId, targetName, reason, ts} } }
 --
 -- Gap kinds: unhealed, late, duplicate, uncured, missed_group, interrupted_nothing, death, withheld.
@@ -87,6 +90,7 @@ function M.ingest(L, snap, nowMs)
     if box.snap then
         if snap.lines == nil then snap.lines = box.snap.lines end
         if snap.macro == nil then snap.macro = box.snap.macro end
+        if snap.stats == nil then snap.stats = box.snap.stats end
     end
     box.snap = snap
     box.receivedAt = nowMs

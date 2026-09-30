@@ -7,6 +7,7 @@
 -- Design: F:\macros\muleassist\docs\superpowers\specs\2026-09-30-heal-coordinator-design.md
 local mq = require('mq')
 local actorsOk, actors = pcall(require, 'actors')
+local imguiOk, imgui = pcall(require, 'ImGui')
 
 local LOOP_MS = 250
 local LINES_MS = 1000
@@ -174,6 +175,25 @@ local function buildLines()
     return out
 end
 
+-- ---------------------------------------------------------------- /healreport counters (1Hz)
+local STAT_INTS = {
+    single = 'HSSingle', tank = 'HSTank', groupT = 'HSGroupT', self = 'HSSelf', pet = 'HSPet', oog = 'HSOOG',
+    tap = 'HSTap', mob = 'HSMob', intHeal = 'HSIntHeal', intTap = 'HSIntTap', intMob = 'HSIntMob', intNPC = 'HSIntNPC',
+    dpsCut = 'HSDPSCut', fail = 'HSFail', group = 'HSGroup', groupRange = 'HSGroupRange', smart = 'HSSmart',
+    smartFail = 'HSSmartFail', cure = 'HSCure', cureGroup = 'HSCureGroup', cureHeld = 'HSCureHeld',
+    cureUnready = 'HSCureUnready', skip = 'HSSkip', lowPct = 'HSLowPct', tankLow = 'HSTankLow', fights = 'HSFights',
+}
+local function buildStats()
+    local st = {}
+    for key, var in pairs(STAT_INTS) do st[key] = macroInt(var) end
+    st.failLast = macroVar('HSFailLast')
+    st.lowName = macroVar('HSLowName')
+    st.line = macroVar('HealStats')
+    local runTime = num(function() return mq.TLO.Macro.RunTime() end, 0)
+    st.sinceSec = math.max(0, runTime - macroInt('HSSince'))
+    return st
+end
+
 -- ---------------------------------------------------------------- counters
 local function myCounters()
     local c = {
@@ -314,6 +334,56 @@ end
 local dropbox = nil
 local brain = { name = nil, seenAt = 0 }
 local sent, sendFails = 0, 0
+local stats = nil          -- last buildStats(), drawn by the window
+local UI = { show = false }
+
+-- ---------------------------------------------------------------- own window: this box's HealStats
+local function statRow(label, value)
+    imgui.TableNextRow()
+    imgui.TableNextColumn() imgui.Text(label)
+    imgui.TableNextColumn() imgui.Text(tostring(value))
+end
+
+local function drawWindow()
+    if not UI.show then return end
+    imgui.SetNextWindowSize(420, 360, ImGuiCond.FirstUseEver)
+    local open, show = imgui.Begin('Heal Stats - ' .. myName, UI.show)
+    UI.show = open
+    if show then
+        local age = brain.seenAt > 0 and (mq.gettime() - brain.seenAt) or -1
+        if age >= 0 and age < 3000 then
+            imgui.TextColored(0.5, 1, 0.5, 1, string.format('brain %s (%.1fs)', tostring(brain.name), age / 1000))
+        else
+            imgui.TextColored(1, 0.6, 0.4, 1, 'no brain heard - rows are not being recorded')
+        end
+        local st = stats
+        if not st then
+            imgui.Text('waiting for the macro...')
+        else
+            imgui.Text(string.format('%d fights, %dm%02ds since reset', st.fights, math.floor(st.sinceSec / 60), st.sinceSec % 60))
+            if imgui.BeginTable('healstats', 2, ImGuiTableFlags.RowBg + ImGuiTableFlags.Borders) then
+                imgui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed, 150)
+                imgui.TableSetupColumn('', ImGuiTableColumnFlags.WidthStretch)
+                statRow('Single heals', string.format('%d  (tank %d, group %d, self %d, pet %d, xtar %d)', st.single, st.tank, st.groupT, st.self, st.pet, st.oog))
+                statRow('Taps / nuke-heals', string.format('%d / %d', st.tap, st.mob))
+                statRow('Interrupted', string.format('%d  (past line %d, tap %d, nuke-heal %d, NPC %d)', st.intHeal + st.intTap + st.intMob + st.intNPC, st.intHeal, st.intTap, st.intMob, st.intNPC))
+                statRow('Nukes cut for a heal', st.dpsCut)
+                statRow('Failed casts', string.format('%d%s', st.fail, st.failLast and (' (last: ' .. st.failLast .. ')') or ''))
+                statRow('Group heals', string.format('%d cast, %d withheld for range', st.group, st.groupRange))
+                statRow('Smart heals', string.format('%d cast, %d failed', st.smart, st.smartFail))
+                statRow('Cures', string.format('%d (%d group), held %d, not ready %d', st.cure, st.cureGroup, st.cureHeld, st.cureUnready))
+                statRow('Skipped (/whynot)', st.skip)
+                statRow('Lowest seen', string.format('tank %s, anyone %s', st.tankLow < 100 and (st.tankLow .. '%') or '-', st.lowPct < 100 and (tostring(st.lowName) .. ' ' .. st.lowPct .. '%') or '-'))
+                imgui.EndTable()
+            end
+            if st.line and st.line ~= '' then imgui.TextWrapped(st.line) end
+        end
+        if imgui.Button('/healreport reset') then mq.cmd('/healreport reset') end
+        imgui.SameLine()
+        if imgui.Button('/healreport') then mq.cmd('/healreport') end
+    end
+    imgui.End()
+end
 
 if actorsOk and actors then
     local okReg, box = pcall(actors.register, AGENT_MAILBOX, function(message)
@@ -340,9 +410,16 @@ end
 log('Agent running as %s (%dms).', myName, LOOP_MS)
 
 local running = true
+if imguiOk and imgui and mq.imgui and type(mq.imgui.init) == 'function' then
+    mq.imgui.init('HealAgentStats', drawWindow)
+    -- shown by default on a box that heals or cures; /healagent hide
+    UI.show = (macroInt('HealsOn') > 0 or macroInt('CuresOn') > 0)
+end
 mq.bind('/healagent', function(cmd)
     cmd = tostring(cmd or ''):lower()
     if cmd == 'stop' then running = false return end
+    if cmd == 'show' then UI.show = true return end
+    if cmd == 'hide' then UI.show = false return end
     local age = brain.seenAt > 0 and (mq.gettime() - brain.seenAt) or -1
     log('sent %d (fails %d); brain %s %s', sent, sendFails, tostring(brain.name or 'none'),
         age >= 0 and string.format('seen %.1fs ago', age / 1000) or 'never seen')
@@ -369,6 +446,7 @@ while running do
         local sendLines = (now - lastLinesAt) >= LINES_MS
         if sendLines then
             lines = buildLines()
+            stats = buildStats()
             lastLinesAt = now
         end
         local isMA = amMainAssist()
@@ -390,6 +468,7 @@ while running do
                 casting = cast, counters = myCounters(),
             },
             lines = sendLines and lines or nil,
+            stats = sendLines and stats or nil,
             targets = targets,
             macro = sendLines and {
                 healLine = macroInt('SingleHealPoint'), tankLine = macroInt('SingleHealPointMA'),

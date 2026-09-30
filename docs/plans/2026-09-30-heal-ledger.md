@@ -21,7 +21,19 @@ on the box whose MainAssist is itself. At runtime `/changevarint Heals HealBrain
 By hand: `/lua run sidekick-next/ma_healagent` everywhere, `/lua run sidekick-next/ma_healbrain` on the MA.
 
 `/healbrain show|hide|report|reset|echo on|off|pause on|off|set <threshold> <ms>|stop`
-`/healagent` prints the agent's send count and whether it hears a brain.
+`/healagent [show|hide]` prints the agent's send count and whether it hears a brain, or shows/hides its window.
+
+## Windows
+
+- **Raid Heal Ledger** (brain, MA's box). Live gaps: every row, filter by kind or text, click one for who
+  could have acted. Healers: one line per healing or curing box with its `/healreport` counters (heals by
+  bucket, group heals and the ones withheld for range, cures with holds and not-ready, interrupts, nukes
+  cut, failed casts, lowest HP seen), the ledger rows it caused and the rows where it could have acted,
+  its casting and idle-with-a-ready-heal share of the last fight, a totals line, each box's one-line
+  HealStats, and buttons that reset or broadcast every box's counters. Fights and boxes: per-fight gap
+  counts and healer utilisation, which boxes report and which are stale.
+- **Heal Stats - <name>** (agent, every healing or curing box). That box's live `/healreport` counters,
+  whether it hears the brain, and reset/print buttons. `/healagent hide` closes it.
 
 Rows go to `config/HealingLogs/heal-ledger-YYYY-MM-DD.jsonl` (one JSON object per line: gap rows,
 fight_start, fight_end with the fight summary) and to the "Raid Heal Ledger" window (Live gaps tab:
